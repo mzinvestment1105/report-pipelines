@@ -1,0 +1,133 @@
+name: マクロレポート日次
+
+"on":
+  schedule:
+    - cron: '30 21 * * 0-4'   # 月-金 06:30 JST (= 前日 21:30 UTC)
+  workflow_dispatch:
+    inputs:
+      target_date:
+        description: '対象日付 (YYYY-MM-DD・空欄で当日)'
+        required: false
+        default: ''
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Determine target date
+        id: date
+        run: |
+          if [ -n "${{ github.event.inputs.target_date }}" ]; then
+            echo "value=${{ github.event.inputs.target_date }}" >> $GITHUB_OUTPUT
+          else
+            echo "value=$(TZ=Asia/Tokyo date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout report-pipelines
+        uses: actions/checkout@v4
+        with:
+          path: report-pipelines
+
+      - name: Setup SSH for private repo
+        env:
+          PRIVATE_REPO_DEPLOY_KEY: ${{ secrets.PRIVATE_REPO_DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$PRIVATE_REPO_DEPLOY_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+      - name: Clone private repo (mizuki-fund)
+        run: |
+          git clone git@github.com:mzinvestment1105/mizuki-fund.git private-repo
+
+      - name: Copy pipelines into private working tree
+        run: |
+          cp -f report-pipelines/bi/pipelines/*.py private-repo/bi/pipelines/
+          cp -f report-pipelines/bi/pipelines/requirements.txt private-repo/bi/pipelines/
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: report-pipelines/bi/pipelines/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r report-pipelines/bi/pipelines/requirements.txt
+
+      - name: Fetch raw data (RSS + Finnhub)
+        working-directory: ./private-repo/bi/pipelines
+        env:
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+          PYTHONIOENCODING: utf-8
+        run: |
+          python fetch_rss.py --category all
+          python fetch_finnhub.py --date ${{ steps.date.outputs.value }}
+
+      - name: Build macro prompt (generate_macro_report.py)
+        id: build_prompt
+        working-directory: ./private-repo/bi/pipelines
+        env:
+          PYTHONIOENCODING: utf-8
+        continue-on-error: true
+        run: |
+          python generate_macro_report.py \
+            --date ${{ steps.date.outputs.value }} \
+            --allow-stale-deep-research \
+            --force
+          # exit 2 = 新着なし。0 と 2 は OK。
+          if [ "$?" = "1" ]; then exit 1; fi
+
+      - name: Skip if no new articles
+        if: steps.build_prompt.outputs.exit_code == '2'
+        run: |
+          curl -s -X POST "${{ secrets.DISCORD_WEBHOOK_MACRO }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"content\": \"⏭ マクロレポート skip（新着記事なし）\n${{ steps.date.outputs.value }}\"}"
+          exit 0
+
+      - name: Generate macro report via Claude Code
+        uses: anthropics/claude-code-base-action@beta
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt_file: report-pipelines/prompts/macro-report.md
+          allowed_tools: "Read,Write,Edit,Bash"
+          timeout_minutes: "20"
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+          PRIVATE_REPO_ROOT: private-repo
+
+      - name: Send Discord
+        working-directory: ./private-repo/bi/pipelines
+        env:
+          DISCORD_WEBHOOK_MACRO: ${{ secrets.DISCORD_WEBHOOK_MACRO }}
+          PYTHONIOENCODING: utf-8
+        run: |
+          python send_macro_discord.py --date ${{ steps.date.outputs.value }}
+
+      - name: Commit and push to private repo
+        working-directory: ./private-repo
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # 一時コピーしたスクリプトは戻す
+          git checkout -- bi/pipelines/ 2>/dev/null || true
+          git add market/daily/
+          if ! git diff --staged --quiet; then
+            git commit -m "data: macro report ${{ steps.date.outputs.value }}"
+            git fetch origin master
+            git rebase origin/master || (git diff --name-only --diff-filter=U | xargs -I{} git checkout --theirs {}; git diff --name-only --diff-filter=U | xargs git add; git -c core.editor=true rebase --continue)
+            git push origin master
+          fi
+
+      - name: Discord 通知（失敗）
+        if: failure()
+        env:
+          DISCORD_WEBHOOK_MACRO: ${{ secrets.DISCORD_WEBHOOK_MACRO }}
+        run: |
+          curl -s -X POST "$DISCORD_WEBHOOK_MACRO" \
+            -H "Content-Type: application/json" \
+            -d "{\"content\": \"❌ マクロレポート失敗\n${{ steps.date.outputs.value }}\nログ確認: https://github.com/${{ github.repository }}/actions\"}"

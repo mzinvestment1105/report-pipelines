@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environment
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs / temp
+*.log
+*.tmp
+_tmp_*
+_check_*
+
+# Outputs (本リポでは生成物を保持しない・Private リポに push back)
+outputs/
+bi/outputs/
+market/
+portfolio/
+research/
+context/
+playbook/
+agents/
+.claude/
+.trash/
+
+# Test artifacts
+*_test.parquet
+*_test.xlsx
+test_*/
