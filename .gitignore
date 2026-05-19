@@ -41,10 +41,10 @@ market/
 portfolio/
 research/
 context/
-playbook/
-agents/
 .claude/
 .trash/
+# 注: agents/ と playbook/ は Public 同梱対象（PMがPrivate側のpushを忘れても
+# Public版を workflow が overlay することで品質維持・2026-05-19 PM指示）
 
 # Test artifacts
 *_test.parquet
