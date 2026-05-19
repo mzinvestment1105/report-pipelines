@@ -1,7 +1,7 @@
 """
 マクロレポート自動生成スクリプト
 
-前日との差分を検出し、新着記事があれば Claude API で sonnet_macro.md を生成する。
+前日との差分を検出し、新着記事があれば後続の Claude 分析用プロンプトを生成する。
 新着なしの場合は exit code 2 を返す（CI での skip 判定に使う）。
 
 使い方:
@@ -11,7 +11,7 @@
 
 exit codes:
   0  正常生成
-  1  エラー（API失敗・ファイル未存在等）
+  1  エラー（ファイル未存在等）
   2  新着記事なし（skip）
 """
 
@@ -86,22 +86,6 @@ def _refresh_inputs(target_date: date) -> None:
     )
 
 
-def _latest_deep_research_date(macro_dir: Path) -> date | None:
-    """
-    market/daily/macro/ の *_deep_research.md から最新日付を返す。
-    ファイル名先頭の YYYY-MM-DD を日付として解釈する。
-    """
-    dates: list[date] = []
-    for p in macro_dir.glob("*_deep_research.md"):
-        name = p.name
-        if len(name) >= 10:
-            try:
-                dates.append(date.fromisoformat(name[:10]))
-            except ValueError:
-                continue
-    return max(dates) if dates else None
-
-
 # ---------------------------------------------------------------------------
 # 市況スナップショット
 # ---------------------------------------------------------------------------
@@ -166,7 +150,6 @@ def build_prompt(
     snapshot: str,
     target_date: str,
     finnhub_raw: str | None = None,
-    deep_research: str | None = None,
 ) -> str:
     agent_spec = (AGENTS_DIR / "macro_analyst.md").read_text(encoding="utf-8")
 
@@ -198,18 +181,6 @@ def build_prompt(
 ---
 """
 
-    deep_research_section = ""
-    if deep_research:
-        deep_research_section = f"""
----
-## Deep Research 定性分析（外部入力）
-以下は Perplexity 等の Deep Research による詳細調査結果です。
-定量データ・一次情報を積極的に活用し、レポートの各テーマセクションに反映してください。
-
-{deep_research}
----
-"""
-
     return f"""\
 あなたは Mizuki Fund のマクロ経済アナリストです。
 以下の情報をもとに本日（{target_date}）のマクロレポートを生成してください。
@@ -222,59 +193,17 @@ def build_prompt(
 {delta_section}{finnhub_section}
 ## 本日のニュース生データ（{target_date}_news_raw.md 全文）
 {today_raw}
-{deep_research_section}
+
 ---
 上記情報をもとに agents/macro_analyst.md の仕様に従い、
-`{target_date}_sonnet_macro.md` として出力するレポートを日本語で生成してください。
+`{target_date}.md` として出力するレポートを日本語で生成してください。
 マークダウン形式で出力し、コードブロックで囲まないこと。
 
-## ⚠️ 必須出力ルール（絶対に省略禁止）
+## 出力ルール
 
-レポートの**最後**に、必ず以下のフォーマットで「Deep Research 候補」セクションを出力すること。
-このセクションは**省略不可・「なし」の場合もその旨を明記**すること。
-候補が思いつかない場合でも「Deep Research 候補なし（本日は全テーマ解像度十分）」と書くこと。
-
-```
-## 📌 Deep Research 候補
-
-- [ ] 〇〇について（理由: △△が不明確なため）
-- [ ] 〇〇について（理由: △△の影響度を定量化したい）
-```
-
-上記フォーマットを守り、「このレポートで重要だが解像度が足りない」「掘り下げると投資判断が変わりうる」論点を3〜5件リストアップすること。
-"""
-
-
-def build_deep_research_prompt(
-    today_raw: str,
-    target_date: str,
-    finnhub_raw: str | None = None,
-) -> str:
-    """
-    外部調査用の Deep Research プロンプトを生成する。
-    """
-    finnhub_section = finnhub_raw[:8000] if finnhub_raw else "（Finnhubデータなし）"
-    return f"""# マクロ Deep Research プロンプト ({target_date})
-
-以下の生データをもとに、{target_date} 時点の日本株マクロ判断に直結する深掘りを実施してください。
-
-## 重点論点（必須）
-1. 要人発言（日本総理・米国大統領・FRB・日銀）で市場に効く新情報
-2. 直近1週間の地政学・原油・金利変動の因果整理
-3. 今後1〜2週間の日本株セクター別インパクト（強弱）
-4. 反証シナリオ（強気/弱気の崩れる条件）
-
-## 出力要件
-- 日本語
-- 事実/根拠/含意を分けて記述
-- 数値は可能な限り前回比・予想比を付記
-- 末尾に「追加確認が必要な論点」を3件以上
-
-## 当日ニュース生データ（抜粋）
-{today_raw[:12000]}
-
-## Finnhubデータ（抜粋）
-{finnhub_section}
+- Deep Research 候補セクションは出力しない（2026-05-19 PM 確定・マクロレポート廃止）
+- agents/macro_analyst.md の「レポート構成」セクションに従い、市況スナップショット → 重要テーマ → 逆張りシグナル → 総合見通しの順で書く
+- 専門用語は中学生レベルの注釈をつける
 """
 
 
@@ -288,16 +217,14 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--date", default=date.today().strftime("%Y-%m-%d"))
     parser.add_argument("--force", action="store_true", help="新着なしでも強制生成")
-    parser.add_argument("--snapshot-only", action="store_true", help="市況スナップショットだけ取得して表示（API不要）")
+    parser.add_argument("--snapshot-only", action="store_true", help="市況スナップショットだけ取得して表示")
     parser.add_argument("--no-ensure-fresh", action="store_true", help="入力ファイルの鮮度チェックと自動更新を行わない")
     parser.add_argument("--fresh-max-minutes", type=int, default=180, help="target_date が今日の場合の鮮度しきい値（分）")
-    parser.add_argument("--deep-research-max-days", type=int, default=7, help="Deep Research を任意扱いできる最大経過日数")
-    parser.add_argument("--allow-stale-deep-research", action="store_true", help="Deep Research 7日ルールを一時的に無効化")
     args = parser.parse_args()
     target_date_str: str = args.date
     target_date_obj = date.fromisoformat(target_date_str)
 
-    # スナップショットのみモード（Claude Code手動生成時に使う）
+    # スナップショットのみモード
     if args.snapshot_only:
         print("市況データ取得中 (yfinance)...")
         print(get_market_snapshot())
@@ -352,52 +279,16 @@ def main() -> None:
     else:
         print(f"Finnhub データなし（{finnhub_path.name}）- fetch_finnhub.py を先に実行するとグローバルニュースが追加されます")
 
-    # Deep Research 7日ルール:
-    # 最新の Deep Research が一定日数より古い場合は、当日分 Deep Research を必須化する。
-    latest_dr_date = _latest_deep_research_date(MACRO_DIR)
-    needs_fresh_deep = (
-        latest_dr_date is None
-        or (target_date_obj - latest_dr_date).days > args.deep_research_max_days
-    )
-    if needs_fresh_deep and not args.allow_stale_deep_research:
-        required_dr_path = MACRO_DIR / f"{target_date_str}_deep_research.md"
-        if not required_dr_path.exists():
-            latest_text = latest_dr_date.isoformat() if latest_dr_date else "なし"
-            print(
-                "[ERROR] Deep Research が古いため当日分が必須です。\n"
-                f"  最新Deep Research日付: {latest_text}\n"
-                f"  必須ファイル: {required_dr_path.name}\n"
-                "  対応: 当日分 Deep Research を実行して保存後、再実行してください。",
-                file=sys.stderr,
-            )
-            sys.exit(EXIT_ERR)
-
-    # Deep Research データを読み込む（当日ファイル優先）
-    deep_research_path = MACRO_DIR / f"{target_date_str}_deep_research.md"
-    deep_research_prompt_path = MACRO_DIR / f"{target_date_str}_deep_research_prompt.md"
-    deep_research: str | None = None
-    if deep_research_path.exists():
-        deep_research = deep_research_path.read_text(encoding="utf-8")
-        print(f"Deep Research データあり: {deep_research_path.name} ({len(deep_research):,} 文字)")
-    else:
-        print(f"Deep Research なし({deep_research_path.name}) -- Perplexity 結果をこのパスに保存すると自動統合されます")
-
     # 市況スナップショット取得
     print("市況データ取得中 (yfinance)...")
     snapshot = get_market_snapshot()
 
-    # Deep Research プロンプトを必ず発行
-    dr_prompt = build_deep_research_prompt(today_raw, target_date_str, finnhub_raw)
-    deep_research_prompt_path.write_text(dr_prompt, encoding="utf-8")
-    print(f"[OK] Deep Researchプロンプト保存: {deep_research_prompt_path.name}")
+    prompt = build_prompt(today_raw, yesterday_report, snapshot, target_date_str, finnhub_raw)
 
-    prompt = build_prompt(today_raw, yesterday_report, snapshot, target_date_str, finnhub_raw, deep_research)
-
-    # rawファイルに保存（Claude Code インタラクティブ生成用）
+    # rawファイルに保存（後続の Claude 分析用）
     raw_output_path = MARKET_DIR / f"{target_date_str}_macro_raw.md"
     raw_output_path.write_text(prompt, encoding="utf-8")
     print(f"[OK] raw保存完了: {raw_output_path.name}")
-    print(f"   -> Claude Code にマクロレポート生成を依頼してください。")
 
 
 if __name__ == "__main__":

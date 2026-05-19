@@ -43,10 +43,15 @@ jobs:
         run: |
           git clone git@github.com:mzinvestment1105/mizuki-fund.git private-repo
 
-      - name: Copy pipelines into private working tree
+      - name: Copy pipelines and static files from Public into private working tree
+        # PMがPrivate側へのpushを忘れた場合でも、Public側の最新ファイルで上書きすることで
+        # 自動化の品質を保つ（agents/macro_analyst.md・playbook/*.md・Pythonスクリプト）
         run: |
           cp -f report-pipelines/bi/pipelines/*.py private-repo/bi/pipelines/
           cp -f report-pipelines/bi/pipelines/requirements.txt private-repo/bi/pipelines/
+          mkdir -p private-repo/agents private-repo/playbook
+          cp -f report-pipelines/agents/*.md private-repo/agents/ 2>/dev/null || true
+          cp -f report-pipelines/playbook/*.md private-repo/playbook/ 2>/dev/null || true
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -74,12 +79,13 @@ jobs:
           PYTHONIOENCODING: utf-8
         continue-on-error: true
         run: |
-          python generate_macro_report.py \
-            --date ${{ steps.date.outputs.value }} \
-            --allow-stale-deep-research \
-            --force
-          # exit 2 = 新着なし。0 と 2 は OK。
-          if [ "$?" = "1" ]; then exit 1; fi
+          set +e
+          python generate_macro_report.py --date ${{ steps.date.outputs.value }} --force
+          ec=$?
+          echo "exit_code=$ec" >> $GITHUB_OUTPUT
+          # exit 2 = 新着なし（OK）・exit 0 = 正常生成・exit 1 = エラー
+          if [ "$ec" = "1" ]; then exit 1; fi
+          exit 0
 
       - name: Skip if no new articles
         if: steps.build_prompt.outputs.exit_code == '2'
