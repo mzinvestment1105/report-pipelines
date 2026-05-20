@@ -45,10 +45,12 @@ jobs:
 
       - name: Copy pipelines and static files from Public into private working tree
         # PMがPrivate側へのpushを忘れた場合でも、Public側の最新ファイルで上書きすることで
-        # 自動化の品質を保つ（agents/macro_analyst.md・playbook/*.md・Pythonスクリプト）
+        # 自動化の品質を保つ（agents/macro_analyst.md・playbook/*.md・Pythonスクリプト + lib/）
         run: |
           cp -f report-pipelines/bi/pipelines/*.py private-repo/bi/pipelines/
           cp -f report-pipelines/bi/pipelines/requirements.txt private-repo/bi/pipelines/
+          mkdir -p private-repo/bi/pipelines/lib
+          cp -rf report-pipelines/bi/pipelines/lib/*.py private-repo/bi/pipelines/lib/ 2>/dev/null || true
           mkdir -p private-repo/agents private-repo/playbook
           cp -f report-pipelines/agents/*.md private-repo/agents/ 2>/dev/null || true
           cp -f report-pipelines/playbook/*.md private-repo/playbook/ 2>/dev/null || true

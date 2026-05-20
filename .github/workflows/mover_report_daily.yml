@@ -48,6 +48,8 @@ jobs:
         run: |
           cp -f report-pipelines/bi/pipelines/*.py private-repo/bi/pipelines/
           cp -f report-pipelines/bi/pipelines/requirements.txt private-repo/bi/pipelines/
+          mkdir -p private-repo/bi/pipelines/lib
+          cp -rf report-pipelines/bi/pipelines/lib/*.py private-repo/bi/pipelines/lib/ 2>/dev/null || true
           mkdir -p private-repo/agents private-repo/playbook
           cp -f report-pipelines/agents/*.md private-repo/agents/ 2>/dev/null || true
           cp -f report-pipelines/playbook/*.md private-repo/playbook/ 2>/dev/null || true
