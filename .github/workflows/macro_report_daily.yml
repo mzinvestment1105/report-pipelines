@@ -119,8 +119,9 @@ jobs:
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          # 一時コピーしたスクリプトは戻す
-          git checkout -- bi/pipelines/ 2>/dev/null || true
+          # Public から overlay した一時コピーは全て元に戻す（bi/pipelines・agents・playbook）
+          git checkout -- bi/pipelines/ agents/ playbook/ 2>/dev/null || true
+          git clean -fd bi/pipelines/ agents/ playbook/ 2>/dev/null || true
           git add market/daily/
           if ! git diff --staged --quiet; then
             git commit -m "data: macro report ${{ steps.date.outputs.value }}"
