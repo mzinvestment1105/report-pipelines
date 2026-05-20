@@ -6,9 +6,14 @@
 
 1. 環境変数 `TARGET_DATE`（形式: YYYY-MM-DD）を Bash で取得してください。
 2. 環境変数 `PRIVATE_REPO_ROOT`（既定: `private-repo`）を取得。
-3. `${PRIVATE_REPO_ROOT}/market/daily/${TARGET_DATE}_macro_raw.md` を Read で読み込んでください。
-4. このファイルは `bi/pipelines/generate_macro_report.py` が事前に構築した**完成プロンプト**です。市況スナップショット・本日のニュース生データ・前日レポート・エージェント仕様が全て含まれています。
-5. ファイル冒頭の指示に従ってマクロレポート本体を生成し、`${PRIVATE_REPO_ROOT}/market/daily/macro/${TARGET_DATE}.md` に Write で保存してください。
+3. **【必須・ローカル `/macro-report` と品質同等にするため】以下のファイルを Read ツールで順番に読み込んでください**：
+   - `${PRIVATE_REPO_ROOT}/playbook/philosophy.md` — 逆張り原則・PMの投資スタンス
+   - `${PRIVATE_REPO_ROOT}/playbook/indicators.md` — PMが重視するマクロ指標
+   - `${PRIVATE_REPO_ROOT}/market/macro_thesis.md` — 現在のマクロ見通し（存在しない場合はスキップ）
+4. `${PRIVATE_REPO_ROOT}/market/daily/${TARGET_DATE}_macro_raw.md` を Read で読み込んでください。このファイルは `bi/pipelines/generate_macro_report.py` が事前に構築した**完成プロンプト**で、市況スナップショット・本日のニュース生データ・前日レポート・エージェント仕様が含まれています。
+5. **上記 3〜4 で取得した全文脈（投資哲学 + 重視指標 + マクロ見通し + 当日情報）を踏まえて**、`_macro_raw.md` 冒頭の指示に従ってマクロレポート本体を生成し、`${PRIVATE_REPO_ROOT}/market/daily/macro/${TARGET_DATE}.md` に Write で保存してください。
+
+**ローカル `/macro-report` スキルとの品質同等が目的**です。投資哲学・重視指標・現在のマクロ見通しを文脈に含めることで、ローカル版と同じ深さの分析を実現してください。
 
 ## 必須ルール（絶対遵守）
 
