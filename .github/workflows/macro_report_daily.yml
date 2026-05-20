@@ -63,6 +63,10 @@ jobs:
       - name: Install dependencies
         run: pip install -r report-pipelines/bi/pipelines/requirements.txt
 
+      - name: Install Playwright Chromium
+        run: |
+          playwright install chromium --with-deps
+
       - name: Fetch raw data (RSS + Finnhub)
         working-directory: ./private-repo/bi/pipelines
         env:
@@ -106,13 +110,13 @@ jobs:
           TARGET_DATE: ${{ steps.date.outputs.value }}
           PRIVATE_REPO_ROOT: private-repo
 
-      - name: Send Discord
+      - name: Send Discord (JPEG)
         working-directory: ./private-repo/bi/pipelines
         env:
           DISCORD_WEBHOOK_MACRO: ${{ secrets.DISCORD_WEBHOOK_MACRO }}
           PYTHONIOENCODING: utf-8
         run: |
-          python send_macro_discord.py --date ${{ steps.date.outputs.value }}
+          python send_report_jpeg_discord.py --kind macro --date ${{ steps.date.outputs.value }}
 
       - name: Commit and push to private repo
         working-directory: ./private-repo

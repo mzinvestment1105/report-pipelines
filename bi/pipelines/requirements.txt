@@ -19,3 +19,7 @@ pdfminer.six>=20221105
 streamlit>=1.33.0
 feedparser>=6.0.0
 pyyaml>=6.0.0
+
+# JPEG レポート画像化（send_report_jpeg_discord.py + lib/md_to_jpeg.py）
+markdown>=3.5
+playwright>=1.40.0
