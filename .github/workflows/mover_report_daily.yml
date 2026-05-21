@@ -107,15 +107,19 @@ jobs:
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          # Public から overlay した一時コピーは全て元に戻す
+          # Public から overlay した一時コピーをすべて掃除
           git checkout -- bi/pipelines/ agents/ playbook/ 2>/dev/null || true
           git clean -fd bi/pipelines/ agents/ playbook/ 2>/dev/null || true
           git add market/daily/
           if ! git diff --staged --quiet; then
+            # 残りの未追跡・未ステージ変更を退避して rebase をクリーンに走らせる
+            git stash push --keep-index --include-untracked -m "ci-cleanup" 2>/dev/null || true
             git commit -m "data: mover report ${{ steps.date.outputs.value }}"
             git fetch origin master
             git rebase origin/master || (git diff --name-only --diff-filter=U | xargs -I{} git checkout --theirs {}; git diff --name-only --diff-filter=U | xargs git add; git -c core.editor=true rebase --continue)
             git push origin master
+            # 退避した一時変更は破棄（Public 側 overlay なので保存不要）
+            git stash drop 2>/dev/null || true
           fi
 
       - name: Discord 通知（失敗）
