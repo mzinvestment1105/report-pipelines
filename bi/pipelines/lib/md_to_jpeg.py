@@ -17,7 +17,7 @@ from playwright.sync_api import sync_playwright
 CSS = """
 * { box-sizing: border-box; }
 body {
-    font-family: "Yu Gothic", "YuGothic", "メイリオ", "Meiryo", sans-serif;
+    font-family: "Yu Gothic", "YuGothic", "Noto Sans CJK JP", "Noto Sans JP", "メイリオ", "Meiryo", sans-serif;
     font-size: 24px;
     line-height: 1.8;
     color: #1a1a1a;
