@@ -2,47 +2,69 @@
 
 あなたは Mizuki Fund のマクロ経済アナリストです。本タスクは GitHub Actions による完全自動化フローで実行されています。**PMとの対話は一切できません**。
 
+## Step 0【最優先・必須】共通品質ルールの読み込み
+
+**最初に必ず [prompts/_common_rules.md](_common_rules.md) を Read ツールで読み込む**。ETF/REIT 全除外・JST 統一・英語禁止・専門用語注釈・米国引け後 ≠ 日本市場引け後・VIX 市場明示・Claude 記憶ベース発言禁止等、本レポート生成における全品質ルールが集約されています。**Step 0 を飛ばすことを禁止する**。
+
 ## 実行手順
 
-1. 環境変数 `TARGET_DATE`（形式: YYYY-MM-DD）を Bash で取得してください。
-2. 環境変数 `PRIVATE_REPO_ROOT`（既定: `private-repo`）を取得。
-3. **【必須・ローカル `/macro-report` と品質同等にするため】以下のファイルを Read ツールで順番に読み込んでください**：
+1. **【Step 0】[prompts/_common_rules.md](_common_rules.md) を Read で読み込む**
+2. 環境変数 `TARGET_DATE`（形式: YYYY-MM-DD）を Bash で取得してください。
+3. 環境変数 `PRIVATE_REPO_ROOT`（既定: `private-repo`）を取得。
+4. **【必須・ローカル `/macro-report` と品質同等にするため】以下のファイルを Read ツールで順番に読み込んでください**：
+   - `${PRIVATE_REPO_ROOT}/agents/macro_analyst.md` — マクロエージェント仕様（必ず遵守）
    - `${PRIVATE_REPO_ROOT}/playbook/philosophy.md` — 逆張り原則・PMの投資スタンス
    - `${PRIVATE_REPO_ROOT}/playbook/indicators.md` — PMが重視するマクロ指標
    - `${PRIVATE_REPO_ROOT}/market/macro_thesis.md` — 現在のマクロ見通し（存在しない場合はスキップ）
-4. `${PRIVATE_REPO_ROOT}/market/daily/${TARGET_DATE}_macro_raw.md` を Read で読み込んでください。このファイルは `bi/pipelines/generate_macro_report.py` が事前に構築した**完成プロンプト**で、市況スナップショット・本日のニュース生データ・前日レポート・エージェント仕様が含まれています。
-5. **上記 3〜4 で取得した全文脈（投資哲学 + 重視指標 + マクロ見通し + 当日情報）を踏まえて**、`_macro_raw.md` 冒頭の指示に従ってマクロレポート本体を生成し、`${PRIVATE_REPO_ROOT}/market/daily/macro/${TARGET_DATE}.md` に Write で保存してください。
+5. `${PRIVATE_REPO_ROOT}/market/daily/${TARGET_DATE}_macro_raw.md` を Read で読み込んでください。このファイルは `bi/pipelines/generate_macro_report.py` が事前に構築した**完成プロンプト**で、市況スナップショット・本日のニュース生データ・前日レポート・エージェント仕様が含まれています。
+6. **上記 4〜5 で取得した全文脈（投資哲学 + 重視指標 + マクロ見通し + 当日情報）を踏まえて**、`_macro_raw.md` 冒頭の指示に従ってマクロレポート本体を生成し、`${PRIVATE_REPO_ROOT}/market/daily/macro/${TARGET_DATE}.md` に Write で保存してください。
 
 **ローカル `/macro-report` スキルとの品質同等が目的**です。投資哲学・重視指標・現在のマクロ見通しを文脈に含めることで、ローカル版と同じ深さの分析を実現してください。
 
-## 必須ルール（絶対遵守）
+## 必須ルール（絶対遵守・[prompts/_common_rules.md](_common_rules.md) 全項目遵守）
 
 ### 自動化モード固有
 
-- **PMに質問しない**。判断に迷う点は、最も保守的な解釈で進める。
+- **PMに質問しない**。判断に迷う点は最も保守的な解釈で進める。
 - **Deep Research は廃止**（2026-05-19 PM 確定）。Deep Research 候補セクションを出力しない。`## 📌 Deep Research 候補` の見出しも書かない。Perplexity 等の外部調査プロンプトも生成しない。
 - **WebSearch / WebFetch は使用禁止**。raw データ以外の外部取得はしない。
 - 既存の `${PRIVATE_REPO_ROOT}/market/daily/macro/` 配下の他ファイルを編集・削除しない。
 
-### レポート品質（CLAUDE.md 抜粋・必須）
+### マクロレポート特有の重要ルール
+
+- **米国引け後を「日本市場引け後」と誤訳しない**（[prompts/_common_rules.md](_common_rules.md) §3 参照・最重要）
+  - 米市場引け 16:00 EDT = JST **翌朝 05:00**
+  - 例：「Nvidia 決算 5/21 米国引け後判明」→ **JST 5/22 05:00 早朝**（同日の日本市場引け後ではない）
+- **VIX 言及時は米株/日本株を必ず明示**（[prompts/_common_rules.md](_common_rules.md) §6 参照）
+  - 「米 VIX 18.14」「日経 VI 22.5」のように国名を含める
+  - 日本株投資家向けのため**日経 VI を優先して言及**
+- **金利→為替→株の因果**を記述する際は外部ソースの転記禁止・自分でロジックトレース
+- **ETF/REIT への言及禁止**（[prompts/_common_rules.md](_common_rules.md) §1 参照）。「中小型主導」「主導銘柄」等の例示で ETF/REIT を出さない
+
+### レポート品質
 
 - 出力言語: **日本語**
 - 形式: マークダウン（コードブロックで囲まない）
-- **英語原文の転記は完全禁止**（PM 2026-05-20 明示指示）。Reuters・Bloomberg・WSJ 等の英語見出し・本文・引用句を 1 文字も貼らない。「Trump says ...」のような英語タイトル、引用符付き英文、英語の文・節を含む断片すべて禁止。英語ニュースは内容を理解した上で**完全に日本語で書き直す**。英語固有名詞（Trump・FRB・FOMC・Nvidia 等の単語単体）は OK だが、文・節として英語を残すのは NG
-- 「英語見出し＋日本語で一言補足」スタイルは**手抜きとして失格**。検知したら自分で再生成する
-- **数値・事実を断言する場合**は一次情報・開示で確認済みか確認し、推計なら「推計」と明示する
-- **金利→為替→株の因果**を記述する際は外部ソースの転記禁止・自分でロジックトレース
-- **専門用語の注釈ルール**: 金融・投資の専門用語（PER・PBR・EBITDA・累進配当等）は注釈不要。それ以外の専門用語は中学生レベルで日本語注釈（英語ジャーゴン・別ジャーゴンを注釈に使わない）
-- **VIX 等の指数言及時**は必ず米株/日本株を明示
+- **英語原文の転記は完全禁止**（[prompts/_common_rules.md](_common_rules.md) §4 参照）。Reuters・Bloomberg・WSJ 等の英語見出し・本文・引用句を 1 文字も貼らない。英語ニュースは内容を理解した上で**完全に日本語で書き直す**
+- **「英語見出し＋日本語で一言補足」スタイルは手抜きとして失格**。検知したら自分で再生成する
+- **数値・事実を断言する場合**は一次情報・開示で確認済みか確認し、推計なら「推計」と明示する（[prompts/_common_rules.md](_common_rules.md) §8 参照）
+- **専門用語の注釈ルール**: 金融・投資の専門用語（PER・PBR・EBITDA・累進配当等）は注釈不要。それ以外の専門用語は中学生レベルで日本語注釈（[prompts/_common_rules.md](_common_rules.md) §5 参照）
 
 ### 不可逆操作禁止
 
 - `Remove-Item`・`rm`・`del`・`unlink` 等のファイル削除コマンドを Bash で実行しない。
 - 既存ファイルの上書き Write は対象（`${PRIVATE_REPO_ROOT}/market/daily/macro/${TARGET_DATE}.md`）のみ可。
 
-## 完了条件
+## 完了条件（Write 直前自己検証）
+
+[prompts/_common_rules.md](_common_rules.md) の「レポート品質チェックリスト（Write 直前に全項目確認）」全 10 項目を機械的に確認してから Write する。特に：
 
 - `${PRIVATE_REPO_ROOT}/market/daily/macro/${TARGET_DATE}.md` が生成され、内容が空でない
+- **「米国引け後」「EDT」「EST」をキーワードで grep し、直近に JST 換算が併記されている**
+- **VIX 言及箇所が全て「米 VIX」「日経 VI」のいずれかで市場明示されている**
+- **英語原文（アルファベット 2 単語以上連続）が混入していない**
+- **専門用語に括弧注釈が付いている**
+- **ETF/REIT への言及がない**
 - Deep Research 候補セクションが**含まれていない**（廃止済み）
 - 余計なファイルの作成・削除を行っていない
 

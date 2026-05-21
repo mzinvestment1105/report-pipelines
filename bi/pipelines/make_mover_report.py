@@ -197,13 +197,64 @@ def build_full_table(
 
     # screening_master未登録銘柄（IPO直後等）の MarketCodeName を
     # JQuantsのコード体系（末尾Aは新興市場IPO）からグロースと推定して補完
+    # ただし ETF/REIT/上場投信 は個別株として扱わないため除外
+    # （2026-05-20 200A NEXT FUNDS 日経半導体株指数連動型上場投信を誤ってグロース個別株として
+    #  動意銘柄レポートに含めた事案の再発防止・[memory feedback_etf_reit_not_individual.md] 参照）
     if "MarketCodeName" in df.columns:
         mask = df["MarketCodeName"].isna()
         if mask.any():
-            df.loc[mask & df["Code"].str.endswith("A"), "MarketCodeName"] = MARKET_GROWTH
+            etf_reit_keywords = (
+                "ETF|上場投信|上場投資信託|NEXT FUNDS|iShares|MAXIS|"
+                "ダイワ上場|J-REIT|不動産投資法人|投資法人|リート|"
+                "連動型上場|レバレッジ|インバース"
+            )
+            company_name_str = df.get("CompanyName", pd.Series([None] * len(df))).astype(str)
+            is_etf_reit = (
+                # 銘柄名が取得できない（screening_master に登録されていない個別株 or ETF/REIT）
+                df.get("CompanyName", pd.Series([None] * len(df))).isna()
+                # 銘柄名がコードと同じ（ETF/REIT の典型・200A 200A 等）
+                | (company_name_str == df["Code"].astype(str))
+                # 銘柄名に ETF/REIT 系キーワード
+                | company_name_str.str.contains(etf_reit_keywords, na=False, regex=True)
+            )
+            # ETF/REIT でない末尾 A 銘柄のみ「グロース」と推定（個別株 IPO 直後）
+            df.loc[
+                mask & df["Code"].str.endswith("A") & ~is_etf_reit,
+                "MarketCodeName"
+            ] = MARKET_GROWTH
 
     if "MarketCap" in df.columns:
         df["MarketCapOku"] = pd.to_numeric(df["MarketCap"], errors="coerce") / 1e8
+
+    # PM 2026-05-22 確定: ETF/REIT/上場投信を全レポート全セクションから完全除外
+    # raw データ生成時点で除外することで claude-code-action が ETF を Top10 に入れる事故を構造的に防止
+    # [prompts/_common_rules.md §1] [memory feedback_etf_reit_not_individual.md]
+    if "CompanyName" in df.columns:
+        etf_reit_keywords_full = (
+            r"ETF|ETN|上場投信|上場投資信託|投信|NEXT FUNDS|iShares|MAXIS|"
+            r"ダイワ上場|日経連動|指数連動|連動型上場|"
+            r"レバレッジ|インバース|ブル\d|ベア\d|ダブル\s?(ブル|ベア)|"
+            r"J-REIT|REIT|リート|不動産投資法人|投資法人|インフラファンド"
+        )
+        company_name_str = df["CompanyName"].astype(str)
+        is_etf_reit = (
+            df["CompanyName"].isna()
+            | (company_name_str == df["Code"].astype(str))
+            | company_name_str.str.contains(etf_reit_keywords_full, na=False, regex=True)
+        )
+        excluded_count = int(is_etf_reit.sum())
+        if excluded_count:
+            print(
+                f"[ETF/REIT filter] {excluded_count} 銘柄を完全除外: "
+                + ", ".join(
+                    f"{c} {n}"
+                    for c, n in zip(
+                        df.loc[is_etf_reit, "Code"].head(20).tolist(),
+                        df.loc[is_etf_reit, "CompanyName"].head(20).fillna("N/A").tolist(),
+                    )
+                )
+            )
+        df = df[~is_etf_reit].copy()
 
     return df.drop_duplicates("Code").reset_index(drop=True)
 

@@ -13,7 +13,7 @@ name: 動意銘柄レポート日次
 jobs:
   generate:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 50
 
     steps:
       - name: Determine target date
@@ -82,14 +82,16 @@ jobs:
         run: |
           python make_mover_report.py --date ${{ steps.date.outputs.value }} --no-pdf
 
-      - name: Generate mover report via Claude Code (Opus 4.7)
+      - name: Generate mover report via Claude Code (Opus 4.7 + max thinking)
         uses: anthropics/claude-code-base-action@beta
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           model: claude-opus-4-7
           prompt_file: report-pipelines/prompts/mover-report.md
-          allowed_tools: "Read,Write,Edit,Bash,Grep"
-          timeout_minutes: "25"
+          allowed_tools: "Read,Write,Edit,Bash,Grep,Glob"
+          timeout_minutes: "30"
+          claude_env: |
+            MAX_THINKING_TOKENS: 32000
         env:
           TARGET_DATE: ${{ steps.date.outputs.value }}
           PRIVATE_REPO_ROOT: private-repo

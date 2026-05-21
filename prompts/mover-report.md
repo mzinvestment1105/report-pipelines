@@ -4,19 +4,24 @@
 
 **重要**: 本自動化は light 版（[/mover-report-short](../.claude/commands/mover-report-short.md) 相当・グロースのみ・PDF なし・軽量）です。プライム・スタンダードのレポートは出力しません。
 
+## Step 0【最優先・必須】共通品質ルールの読み込み
+
+**最初に必ず [prompts/_common_rules.md](_common_rules.md) を Read ツールで読み込む**。ETF/REIT 全除外・銘柄行フォーマット・JST 統一・英語禁止・専門用語注釈・Claude 記憶ベース発言禁止等、本レポート生成における全品質ルールが集約されています。**Step 0 を飛ばすことを禁止する**。
+
 ## 実行手順
 
-1. 環境変数 `TARGET_DATE`（形式: YYYY-MM-DD）を Bash で取得してください。
-2. 環境変数 `PRIVATE_REPO_ROOT`（既定: `private-repo`）を取得。
-3. **【必須・ローカルと品質同等にするため】以下のファイルを Read ツールで順番に読み込んでください**：
+1. **【Step 0】[prompts/_common_rules.md](_common_rules.md) を Read で読み込む**
+2. 環境変数 `TARGET_DATE`（形式: YYYY-MM-DD）を Bash で取得してください。
+3. 環境変数 `PRIVATE_REPO_ROOT`（既定: `private-repo`）を取得。
+4. **【必須・ローカルと品質同等にするため】以下のファイルを Read ツールで順番に読み込んでください**：
    - `${PRIVATE_REPO_ROOT}/agents/mover_analyst.md` — エージェント仕様（必ず遵守・グロース部分のみ適用）
    - `${PRIVATE_REPO_ROOT}/playbook/philosophy.md` — 逆張り原則・PMの投資スタンス
    - `${PRIVATE_REPO_ROOT}/playbook/stock_criteria.md` — 銘柄選定基準
    - `${PRIVATE_REPO_ROOT}/market/daily/macro/` 配下の直近 1〜2 件（地合い把握）
    - `${PRIVATE_REPO_ROOT}/market/daily/movers/` 配下の直近 1〜2 件（前日継続銘柄追跡）
-4. `${PRIVATE_REPO_ROOT}/market/daily/${TARGET_DATE}_movers_raw.md` を Read で読み込んでください。
+5. `${PRIVATE_REPO_ROOT}/market/daily/${TARGET_DATE}_movers_raw.md` を Read で読み込んでください。
    - **raw データ全件読み込み（必須）**: ファイル本体は 500〜700KB / 3,000〜4,000 行ある場合があります。引数なしの Read は禁止です。
-   - **正しい読み方**: まず `Grep(pattern="^### \\d+[A-Z]?\\s", path=raw_path, output_mode="content", -n=true, head_limit=200)` で全銘柄エントリの行番号を取得。グロース市場の `[グロース]` 表記の銘柄エントリを全件抽出し、各銘柄について `Read(file, offset={行番号}, limit=70)` で個別読み込みする。
+   - **正しい読み方**: まず Grep で `^### \d+[A-Z]?\s` パターンで全銘柄エントリ行番号取得 → 各銘柄について `Read(file, offset={行番号}, limit=70)` で個別読み込み
 
 ## レポート構成（出力セクション）
 
@@ -24,12 +29,51 @@
 
 - **0. 地合いサマリー**
 - **1. セクター別フロー**（タイトルに「東証全市場・プライム/スタンダード/グロース合算」と明記）
-- **6. グロース 値上がり Top 10**（テーブル禁止・銘柄エントリ形式）
-- **7. グロース 値下がり Bottom 5**
-- **8. 売買代金 グロース Top 10**
+- **6. グロース 値上がり Top 10**（**個別株のみ・ETF/REIT 完全除外**）
+- **7. グロース 値下がり Bottom 5**（**個別株のみ・ETF/REIT 完全除外**）
+- **8. 売買代金 グロース Top 10**（**個別株のみ・ETF/REIT 完全除外**）
 - **9. 明日のスイング戦略メモ**
 
-各銘柄エントリは [agents/mover_analyst.md](../agents/mover_analyst.md) の指定形式（事業モデル + 材料 + 詳細）を遵守。
+**注意**: ETF/REIT/上場投信は raw データに「[グロース]」と記録されていても **完全除外**。raw 全件から ETF/REIT を除外した個別株リストで Top 10・Bottom 5 を構成する（raw の上位 10 銘柄に ETF が混ざっていたら**繰り上げて個別株のみで 10 銘柄を確保**）。
+
+各銘柄エントリは [agents/mover_analyst.md](../agents/mover_analyst.md) の指定形式（事業モデル + 材料 + 詳細）を遵守。**ただし銘柄見出し行は本ファイルの「銘柄行フォーマット」セクションを優先**。
+
+## 銘柄行フォーマット（厳守・[prompts/_common_rules.md](_common_rules.md) §2 参照）
+
+各銘柄エントリの見出し行は以下フォーマット：
+
+```
+### {順位}位 {コード} {銘柄名}　{前日比+/-X.X%}　（終値 X円 / 売買代金 Y億円 / 時価総額 Z億円）
+```
+
+### 必須要素（欠落禁止）
+
+- **コード**（4桁・末尾アルファベット含む）
+- **銘柄名**（フルネーム）
+- **前日比%**
+- **終値**（円・カンマ付き）
+- **売買代金**（億円・「不明」「N/A」禁止）
+- **時価総額**（億円・「不明」「N/A」禁止）
+
+### 取得不能時の処理
+
+- raw データに売買代金・時価総額が欠落している場合、`${PRIVATE_REPO_ROOT}/bi/outputs/screening_master.parquet` を Bash + Python ワンライナーで参照して補完を試みる
+- それでも取得不能な場合は当該銘柄を**除外**（記載不可・繰り上げて別銘柄を採用）
+
+### 時価総額の本文重複禁止
+
+時価総額を本文（事業モデル説明等）に「時価26億の小型グロース」のような形で重複記載しない。**時価総額は銘柄行の括弧内のみ**に書く（PM ご指示・読みやすさのため）。
+
+## ETF/REIT 検知（[prompts/_common_rules.md](_common_rules.md) §1 参照・最重要）
+
+raw データの各銘柄について以下を機械的にチェックし、該当したら**全セクションから完全除外**：
+
+1. **銘柄名 = コード**（例：「200A 200A」「490A 490A」）
+2. **銘柄名キーワード**: 「ETF」「上場投信」「上場投資信託」「投信」「NEXT FUNDS」「iShares」「MAXIS」「ダイワ上場」「日経連動」「指数連動」「指数連動型」「指数連動型上場投信」「TOPIX 連動」「J-REIT」「REIT」「リート」「不動産投資法人」「インフラファンド」「ETN」
+3. **セクター nan + 末尾 A コード**
+4. **screening_master.parquet 未登録**
+
+除外した分は raw 上位リストから繰り上げて個別株のみで Top 10・Bottom 5・売買代金 Top 10 を埋める。
 
 ## 必須ルール（絶対遵守）
 
@@ -40,26 +84,31 @@
 - **WebSearch / WebFetch は使用禁止**（raw データで完結）。
 - プライム・スタンダード関連セクションは**出力しない**（light 版）。
 
-### レポート品質（必須）
+### レポート品質（[prompts/_common_rules.md](_common_rules.md) 全項目遵守）
 
 - 出力言語: **日本語**
 - 形式: マークダウン（コードブロックで囲まない）
-- **英語原文の転記は完全禁止**（PM 2026-05-20 明示指示）。英語ニュースは内容を理解した上で完全に日本語で書き直す。英語固有名詞（Trump・FRB・FOMC・Nvidia 等の単語単体）は OK。
-- **時刻表記は JST 統一**（PM 2026-05-20 明示指示）。米国時間で言及する場合は必ず JST を主体に・米国時間を括弧補足。
-- **「詳細未取得」「銘柄情報取得失敗」と書く前に**、必ず Grep + offset 指定 Read で当該銘柄エントリが raw にあるか確認すること。raw に存在するのに未取得扱いするのはプロセス違反。
-- **数値・事実を断言する場合**は raw データで確認済みか確認し、推計なら「推計」と明示する。
-- **PMの逆張り原則**（個人投資家の逆を行く）を踏まえ、過熱銘柄には逆張り警戒フラグを付ける。
+- **英語原文の転記は完全禁止**（[prompts/_common_rules.md](_common_rules.md) §4 参照）
+- **時刻表記は JST 統一**（[prompts/_common_rules.md](_common_rules.md) §3 参照）
+- **専門用語に中学生レベル注釈必須**（[prompts/_common_rules.md](_common_rules.md) §5 参照）
+- **Claude の記憶ベース発言禁止**（[prompts/_common_rules.md](_common_rules.md) §8 参照）
+- **「詳細未取得」「銘柄情報取得失敗」と書く前に**、必ず Grep + offset 指定 Read で当該銘柄エントリが raw にあるか確認すること
+- **PMの逆張り原則**を踏まえ、過熱銘柄には逆張り警戒フラグを付ける
 
 ### 不可逆操作禁止
 
-- `Remove-Item`・`rm`・`del`・`unlink` 等のファイル削除コマンドを Bash で実行しない。
-- 既存ファイルの上書き Write は対象（`${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}.md`）のみ可。
+- `Remove-Item`・`rm`・`del`・`unlink` 等のファイル削除コマンドを Bash で実行しない
+- 既存ファイルの上書き Write は対象（`${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}.md`）のみ可
 
-## 完了条件
+## 完了条件（Write 直前自己検証）
+
+[prompts/_common_rules.md](_common_rules.md) の「レポート品質チェックリスト（Write 直前に全項目確認）」全 10 項目を機械的に確認してから Write する。特に：
 
 - `${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}.md` が生成され、内容が空でない
-- グロース 値上がり Top 10・値下がり Bottom 5・売買代金 Top 10 の全銘柄について raw データから読み込み済み
-- Deep Research 候補セクションが**含まれていない**（廃止済み）
+- **ETF/REIT/上場投信が 1 件も混入していない**（grep で銘柄名キーワード検証）
+- 全銘柄の見出し行に「コード + 銘柄名 + 前日比% + 終値 + 売買代金 + 時価総額」が揃っている
+- グロース 値上がり Top 10・値下がり Bottom 5・売買代金 Top 10 が**個別株のみで件数充足**している
+- Deep Research 候補セクションが含まれていない（廃止済み）
 - 余計なファイルの作成・削除を行っていない
 
 完了したら処理を終了してください。

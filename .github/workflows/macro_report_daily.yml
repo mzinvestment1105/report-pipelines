@@ -13,7 +13,7 @@ name: マクロレポート日次
 jobs:
   generate:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
       - name: Determine target date
@@ -108,14 +108,16 @@ jobs:
             -d "{\"content\": \"⏭ マクロレポート skip（新着記事なし）\n${{ steps.date.outputs.value }}\"}"
           exit 0
 
-      - name: Generate macro report via Claude Code
+      - name: Generate macro report via Claude Code (Opus 4.7 + max thinking)
         uses: anthropics/claude-code-base-action@beta
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           model: claude-opus-4-7
           prompt_file: report-pipelines/prompts/macro-report.md
-          allowed_tools: "Read,Write,Edit,Bash"
-          timeout_minutes: "20"
+          allowed_tools: "Read,Write,Edit,Bash,Grep,Glob"
+          timeout_minutes: "30"
+          claude_env: |
+            MAX_THINKING_TOKENS: 32000
         env:
           TARGET_DATE: ${{ steps.date.outputs.value }}
           PRIVATE_REPO_ROOT: private-repo
