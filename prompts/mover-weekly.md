@@ -81,13 +81,20 @@ for market in ["プライム", "スタンダード", "グロース"]:
 - **週間売買代金** = `AvgDailyValue5d × 5` を億円換算
 - **時価総額** = `MarketCap` 列（億円換算）
 
-### 各銘柄エントリの本文構成
+### 各銘柄エントリの本文構成（PM 2026-05-23 確定・需給セクション必須化）
 
 各銘柄に以下を必ず含める：
 
 - **事業モデル**: 50〜100 文字
 - **週間の動意理由**: TDNet・ニュース・テーマ等から判定（明確な理由不明の場合は「明確な理由なし・需給主導」と明記）
-- **需給（信用・株価水準）**: parquet の `LongMargin_Latest`・`ShortMargin_Latest`・`MarginRatio`・`Scr_*`系を活用して 1 行コメント
+- **需給（信用・機関空売り・株価水準）必須**: 以下全要素を必ず転記。1 つでも欠落したら**当該銘柄を除外して繰り上げる**：
+  - 信用買い残（`LongMargin_Latest`・前週比 `LongMargin_WkSeq01〜04` 推移）
+  - 信用売り残（`ShortMargin_Latest`・前週比 `ShortMargin_WkSeq01〜04` 推移）
+  - 信用倍率（`MarginRatio` = 買い残 ÷ 売り残）
+  - **機関空売り（5%超報告制度）**：`Scr_InstShort_to_Mcap`・`ShortPositionsToSharesOutstandingRatio`・`ShortPositionsInSharesNumber`・`DiscretionaryInvestmentContractorName`（証券会社名・Nomura / Goldman / JPMorgan 等が表示されている場合）
+  - 信用残の時価総額比（`Scr_LongMargin_to_SharesOutstanding`・`Scr_LongMargin_to_AvgVol5d`）
+  - 株価水準（MA25 乖離率・52 週高安・現在位置）
+  - **PM への 1 行コメント**: 信用過熱度・株価水準・機関空売り動向・逆張り警戒等の総合判断
 - **スイング観点**: 来週への継続性・次の節目・リスク
 
 ## ETF/REIT 検知（最重要・[prompts/_common_rules.md §1](_common_rules.md)）
