@@ -28,6 +28,25 @@ cd ${PRIVATE_REPO_ROOT}/bi/pipelines && python fetch_theme_momentum.py
 
 6. **生成された raw データを読み込み**（[bi/outputs/](../bi/outputs/) または [market/daily/theme/](../market/daily/theme/) 配下）。
 
+7. **【最重要・PM 2026-05-23 確定】20 テーマ × WebSearch 並列実行（ローカル品質と同等担保）**：
+
+   人気テーマ 10 + 急上昇テーマ 10 の **各テーマ 1 本ずつ WebSearch を発行**する。**5 本ずつ 4 セットの並列実行**で 19-20 テーマ分を網羅。
+
+   ### WebSearch の使い方
+   - 「**なぜそのテーマが盛り上がっているか**」の市況文脈・ニュース解釈に使う
+   - **ETL・API・MCP で取れる情報（テーマ構成銘柄・時価総額・株価変化）は WebSearch で代替しない**（CLAUDE.md WebSearch 禁止ルール）
+   - クエリ例: 「{テーマ名} 株価 急上昇 理由 2026年5月」「{テーマ名} 関連株 注目 ニュース」
+   - 日本語ソース優先（株探・みんかぶ・日経・Reuters 等）
+
+   ### 補助 WebFetch
+   - 事業モデル不明銘柄は `finance.yahoo.co.jp/quote/{code}.T/profile` を WebFetch で参照
+   - ETL データに無い時価総額・代表銘柄の追加情報も WebFetch で補完可
+
+   ### 並列実行の指針
+   - 1 セット 5 本程度を並列発行
+   - 既存マクロ・国策情報で書ける場合は省略可（半導体・AI 等の頻出テーマ）
+   - エラー時は次のクエリに進む・全件失敗時は raw データのみで構成
+
 ## レポート構成（出力セクション）
 
 `${PRIVATE_REPO_ROOT}/market/daily/theme/${TARGET_DATE}_themes_summary.md` に Write で保存。

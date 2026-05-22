@@ -96,7 +96,11 @@ raw データの各銘柄について以下を機械的にチェックし、該�
 
 - **PMに質問しない**。判断に迷う点は最も保守的な解釈で進める。
 - **Deep Research は廃止**（2026-05-19 PM 確定）。`## 📌 Deep Research 候補` セクションを出力しない。
-- **WebSearch / WebFetch は使用禁止**（raw データで完結）。
+- **WebSearch / WebFetch は raw データで動意理由が特定できない銘柄のみ使用**（PM 2026-05-23 確定・ローカル品質と同等担保）：
+  - `movers_raw` で動意理由が特定できない銘柄について、Claude が WebSearch / WebFetch で「なぜ動いたか」を確認
+  - 外部ツール（Perplexity 等）への依存は禁止・Claude が WebSearch で直接実施
+  - Deep Research プロンプト発行・`{date}_deep_research.md` ファイル作成は禁止（2026-05-19 PM 確定）
+  - 取得できなかった理由は「未取得」「確証なし」と明示・推測補完しない
 - プライム・スタンダード・グロース全市場のセクションを**全て出力する**（フル版・PM 2026-05-23 確定）。
 
 ### レポート品質（[prompts/_common_rules.md](_common_rules.md) 全項目遵守）

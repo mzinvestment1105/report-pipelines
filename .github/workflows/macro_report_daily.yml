@@ -115,7 +115,7 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           model: claude-opus-4-7
           prompt_file: report-pipelines/prompts/macro-report.md
-          allowed_tools: "Read,Write,Edit,Bash,Grep,Glob"
+          allowed_tools: "Read,Write,Edit,Bash,Grep,Glob,WebSearch,WebFetch"
           timeout_minutes: "30"
           claude_env: |
             MAX_THINKING_TOKENS: 32000
