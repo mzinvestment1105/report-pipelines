@@ -91,25 +91,74 @@ def _refresh_inputs(target_date: date) -> None:
 # 市況スナップショット
 # ---------------------------------------------------------------------------
 
-def get_market_snapshot() -> str:
-    lines = ["| 指標 | 水準 | 前日比 | 備考 |", "|------|------|--------|------|"]
+def get_market_snapshot(target_date: str | None = None) -> str:
+    """yfinance から市況スナップショットを取得する。
+
+    fast_info は実行時刻依存（東京市場閉鎖中は前日値・米国市場開場中は前日終値）で
+    レポート対象日と取得日がズレる重大事故が発生したため、history() ベースに改修。
+
+    target_date が指定された場合: その日付以下の最新確定終値を「当日」とする
+    指定なしの場合: 最新確定終値を使う
+
+    各行に「取得日（YYYY-MM-DD）」を必ず備考欄に明記し、target_date と乖離がある
+    場合は ⚠️ で警告表示する。
+    """
+    from datetime import date as date_cls
+    lines = ["| 指標 | 水準 | 前日比 | 取得日 / 備考 |", "|------|------|--------|------|"]
+
+    target: date_cls | None = None
+    if target_date:
+        try:
+            target = date_cls.fromisoformat(target_date)
+        except ValueError:
+            target = None
+
     for name, ticker in SNAPSHOT_TICKERS.items():
         try:
-            info = yf.Ticker(ticker).fast_info
-            close = info.last_price
-            prev  = info.previous_close
-            if close is not None and prev is not None and prev != 0:
-                chg = close - prev
-                pct = chg / prev * 100
-                comment = ""
-                if name == "VIX":
-                    if close >= 30:
-                        comment = "⚠️ 恐怖ゾーン"
-                    elif close <= 15:
-                        comment = "楽観ゾーン"
-                lines.append(f"| {name} | {close:,.2f} | {chg:+,.2f} ({pct:+.2f}%) | {comment} |")
+            # 14 日分取得（営業日 10 日程度カバー・週末や休場を吸収）
+            hist = yf.Ticker(ticker).history(period="14d", auto_adjust=False)
+            if hist.empty:
+                lines.append(f"| {name} | 取得不可 | ─ | 履歴データなし |")
+                continue
+
+            # Close が NaN の行（FX 週末等）は除外
+            hist = hist.dropna(subset=["Close"])
+            if len(hist) < 2:
+                lines.append(f"| {name} | 取得不可 | ─ | 有効な Close 行が 2 件未満 |")
+                continue
+
+            # target_date 以下の最新営業日を「当日」とする
+            if target is not None:
+                hist_filtered = hist[hist.index.date <= target]
+                if hist_filtered.empty or len(hist_filtered) < 2:
+                    hist_filtered = hist  # フォールバック: 最新確定値
             else:
-                lines.append(f"| {name} | 取得不可 | ─ | ─ |")
+                hist_filtered = hist
+
+            close = float(hist_filtered["Close"].iloc[-1])
+            prev = float(hist_filtered["Close"].iloc[-2])
+            latest_date = hist_filtered.index[-1].date()
+
+            if prev == 0:
+                lines.append(f"| {name} | 取得不可 | ─ | prev_close=0 |")
+                continue
+
+            chg = close - prev
+            pct = chg / prev * 100
+
+            comment_parts: list[str] = [f"close={latest_date.isoformat()}"]
+            if target is not None and latest_date != target:
+                # 取得日と対象日が乖離している場合は警告マーク
+                comment_parts.append(f"⚠️ target={target.isoformat()} と乖離")
+            if name == "VIX":
+                if close >= 30:
+                    comment_parts.append("⚠️ 恐怖ゾーン")
+                elif close <= 15:
+                    comment_parts.append("楽観ゾーン")
+
+            lines.append(
+                f"| {name} | {close:,.2f} | {chg:+,.2f} ({pct:+.2f}%) | {' / '.join(comment_parts)} |"
+            )
         except Exception as e:
             lines.append(f"| {name} | 取得不可 | ─ | {e} |")
     return "\n".join(lines)
@@ -222,6 +271,12 @@ def build_prompt(
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    # Windows cp932 環境でも絵文字を含む出力が落ちないよう UTF-8 強制
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
+    except (AttributeError, ValueError):
+        pass
+
     load_dotenv(_ENV_PATH)
 
     parser = argparse.ArgumentParser()
@@ -236,8 +291,8 @@ def main() -> None:
 
     # スナップショットのみモード
     if args.snapshot_only:
-        print("市況データ取得中 (yfinance)...")
-        print(get_market_snapshot())
+        print(f"市況データ取得中 (yfinance) target_date={target_date_str}...")
+        print(get_market_snapshot(target_date_str))
         sys.exit(EXIT_OK)
 
     # news_raw.md を読み込む
@@ -289,9 +344,9 @@ def main() -> None:
     else:
         print(f"Finnhub データなし（{finnhub_path.name}）- fetch_finnhub.py を先に実行するとグローバルニュースが追加されます")
 
-    # 市況スナップショット取得
-    print("市況データ取得中 (yfinance)...")
-    snapshot = get_market_snapshot()
+    # 市況スナップショット取得（target_date を渡して取得日の整合性を保証）
+    print(f"市況データ取得中 (yfinance) target_date={target_date_str}...")
+    snapshot = get_market_snapshot(target_date_str)
 
     prompt = build_prompt(today_raw, yesterday_report, snapshot, target_date_str, finnhub_raw)
 
