@@ -72,37 +72,29 @@ jobs:
         run: |
           playwright install chromium --with-deps
 
-      - name: Verify screening_master freshness
+      - name: Check screening_master parquet existence (no update・PM 2026-05-23 確定)
+        # PM 明示指示: screening_master 更新は 5 時間かかるため本 workflow 内で走らせない。
+        # screening_master.yml の cron (16:30 JST) で別途更新される設計に依存・存在確認のみ。
         working-directory: ./private-repo/bi/pipelines
         env:
-          JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
           PYTHONIOENCODING: utf-8
           TARGET_DATE: ${{ steps.date.outputs.value }}
         run: |
           python - <<'PY'
-          import datetime as dt
-          import os, subprocess, sys
+          import os, sys
           from pathlib import Path
           import pandas as pd
 
           parquet = Path("../outputs/screening_master.parquet")
-          today_iso = os.environ.get("TARGET_DATE") or dt.date.today().isoformat()
-          needs_update = True
-          if parquet.exists():
-              try:
-                  df = pd.read_parquet(parquet)
-                  if "DataDate" in df.columns:
-                      latest = pd.to_datetime(df["DataDate"]).max().date().isoformat()
-                      print(f"screening_master DataDate: {latest} (target: {today_iso})")
-                      if latest >= today_iso:
-                          needs_update = False
-              except Exception as e:
-                  print(f"parquet read error: {e}")
-          if needs_update:
-              print("screening_master が古いため更新を実行します")
-              subprocess.check_call([sys.executable, "make_screening_master_v2.py"])
-          else:
-              print("screening_master は当日分で更新済み・スキップします")
+          if not parquet.exists():
+              print(f"[WARN] screening_master.parquet が見つかりません: {parquet}")
+              print("       本 workflow では更新しない設計のため、screening_master.yml が事前に走っている前提です")
+              sys.exit(0)
+          df = pd.read_parquet(parquet)
+          latest = pd.to_datetime(df["DataDate"]).max().date().isoformat() if "DataDate" in df.columns else "unknown"
+          target = os.environ.get("TARGET_DATE", "")
+          print(f"screening_master DataDate: {latest} (target: {target})")
+          print("PM 確定: 古くてもそのまま使う・更新は実行しない")
           PY
 
       - name: Generate sector_stock_weekly.parquet (--anchor friday)
