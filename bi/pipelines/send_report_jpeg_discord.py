@@ -143,10 +143,51 @@ def main() -> int:
         return 1
 
     out_dir = REPO_ROOT / "bi" / "outputs" / "report_jpegs"
+
+    md_text = md_path.read_text(encoding="utf-8")
+
+    # movers は市場別 3 セット（プライム・スタンダード・グロース）に分割して送信
+    # PM 2026-05-23 ご指示: 動意レポートは「プライム / スタンダード / グロースで画像は分けて」
+    if args.kind == "movers":
+        markets = split_movers_by_market(md_text)
+        if not markets:
+            print("ERROR: 動意レポートの市場別分割に失敗・通常モードでフォールバック")
+            markets = [("ALL", md_text)]
+
+        if args.skip_send:
+            for label, md_part in markets:
+                p = out_dir / f"movers_{identifier}_{label.lower()}.jpg"
+                render_markdown_to_jpeg(md_part, p, kind=args.kind, footer="@noctra_jp / Mizuki Fund")
+                print(f"  saved: {p}  size={p.stat().st_size:,} bytes")
+            return 0
+
+        for label, md_part in markets:
+            p = out_dir / f"movers_{identifier}_{label.lower()}.jpg"
+            print(f"[render] movers/{label} → {p.name}")
+            render_markdown_to_jpeg(md_part, p, kind=args.kind, footer="@noctra_jp / Mizuki Fund")
+            print(f"  saved: {p}  size={p.stat().st_size:,} bytes")
+
+            content = f"**{cfg['label']}（{label}）** {identifier}"
+            payload = {
+                "content": content,
+                "attachments": [{"id": 0, "filename": p.name}],
+            }
+            with p.open("rb") as f:
+                files = {
+                    "payload_json": (None, json.dumps(payload), "application/json"),
+                    "files[0]": (p.name, f, "image/jpeg"),
+                }
+                r = requests.post(webhook, files=files)
+            print(f"  status: {r.status_code}")
+            if r.status_code >= 400:
+                print(f"    body: {r.text[:300]}")
+                return 1
+        print("DONE")
+        return 0
+
     out_path = out_dir / f"{args.kind}_{identifier}.jpg"
 
     print(f"[1/3] rendering {args.kind} → JPEG")
-    md_text = md_path.read_text(encoding="utf-8")
     # Discord 送信は PM 個人閲覧のみ・ブランド表示 OK
     # SNS 用画像生成時は md_to_jpeg.render_markdown_to_jpeg を直接呼び出し footer=None を指定すること
     render_markdown_to_jpeg(md_text, out_path, kind=args.kind, footer="@noctra_jp / Mizuki Fund")
@@ -176,6 +217,92 @@ def main() -> int:
         return 1
     print("DONE")
     return 0
+
+
+def split_movers_by_market(md_text: str) -> list[tuple[str, str]]:
+    """動意レポート Markdown を市場別（プライム / スタンダード / グロース）に分割する。
+
+    各市場用 Markdown には以下を含める：
+    - 共通ヘッダ（タイトル + セクション 0 地合いサマリー + セクション 1 セクター別フロー）
+    - 市場固有セクション（値上がり Top・値下がり Bottom）
+    - 売買代金（市場別部分のみ）
+    - セクション 9 明日のスイング戦略メモ（共通フッタ）
+
+    セクション番号と見出しに含まれる「プライム」「スタンダード」「グロース」キーワードで判定。
+
+    Returns:
+        [(市場ラベル, 該当 Markdown), ...] 形式・3 件
+    """
+    import re
+
+    # トップタイトル + セクション 0・1 を抽出（共通ヘッダ）
+    header_match = re.search(r"^(.*?)(?=^## 2\.)", md_text, flags=re.DOTALL | re.MULTILINE)
+    common_header = header_match.group(1).rstrip() if header_match else ""
+
+    # セクション 9（明日のスイング戦略メモ）を抽出（共通フッタ）
+    footer_match = re.search(r"(^## 9\..*)", md_text, flags=re.DOTALL | re.MULTILINE)
+    common_footer = footer_match.group(1).rstrip() if footer_match else ""
+
+    # セクション 2-8 を見出し単位で抽出
+    section_pattern = re.compile(r"^(## \d+\..*?)(?=^## \d+\.|\Z)", flags=re.DOTALL | re.MULTILINE)
+    sections = {m.group(1).split("\n", 1)[0].strip(): m.group(1).rstrip() for m in section_pattern.finditer(md_text)}
+
+    # 売買代金セクション内部を市場別に分割（セクション 8）
+    section_8 = next((v for k, v in sections.items() if k.startswith("## 8.")), "")
+
+    def _extract_market_in_section8(market_kw: str) -> str:
+        """セクション 8 内から特定市場部分を抽出する。"""
+        if not section_8:
+            return ""
+        # `### プライム` `### スタンダード` `### グロース` のようなサブヘッダで分割
+        sub_pattern = re.compile(r"(^### .*?)(?=^### |\Z)", flags=re.DOTALL | re.MULTILINE)
+        subs = sub_pattern.findall(section_8)
+        for sub in subs:
+            first_line = sub.split("\n", 1)[0]
+            if market_kw in first_line:
+                return sub.rstrip()
+        # サブヘッダで分かれていない場合は元のまま含める（pre-split）
+        return section_8
+
+    def _find_section(prefix_num: int, market_kw: str | None = None) -> str:
+        """セクション番号と任意のキーワードでセクションを検索する。"""
+        for k, v in sections.items():
+            if k.startswith(f"## {prefix_num}."):
+                if market_kw is None or market_kw in k:
+                    return v
+        return ""
+
+    # 市場別構成（セクション番号と該当市場キーワード）
+    market_setup: list[tuple[str, list[str]]] = [
+        ("プライム", [
+            _find_section(2),  # 2. プライム 値上がり Top 5
+            _find_section(3),  # 3. プライム 値下がり Bottom 5
+            _extract_market_in_section8("プライム"),
+        ]),
+        ("スタンダード", [
+            _find_section(4),  # 4. スタンダード 値上がり Top 5
+            _find_section(5),  # 5. スタンダード 値下がり Bottom 5
+            _extract_market_in_section8("スタンダード"),
+        ]),
+        ("グロース", [
+            _find_section(6),  # 6. グロース 値上がり Top 10
+            _find_section(7),  # 7. グロース 値下がり Bottom 5
+            _extract_market_in_section8("グロース"),
+        ]),
+    ]
+
+    result: list[tuple[str, str]] = []
+    for market_label, body_parts in market_setup:
+        body_parts_clean = [p for p in body_parts if p]
+        if not body_parts_clean:
+            continue
+        # セクション 8 を含む場合は「## 8. 売買代金（{市場}）」見出しとして付与
+        # （pre-split の場合は元の見出しがそのまま残るのでスキップ）
+        body_text = "\n\n".join(body_parts_clean)
+        md_part = f"{common_header}\n\n{body_text}\n\n{common_footer}".strip()
+        result.append((market_label, md_part))
+
+    return result
 
 
 def _notify_failure(*, webhook_env: str, label: str, identifier: str, reason: str) -> None:
