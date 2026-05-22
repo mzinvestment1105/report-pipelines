@@ -29,6 +29,39 @@ raw データの各銘柄について以下のいずれかに該当したら **E
 - 関連 memory: [feedback_etf_reit_not_individual.md](C:/Users/mizuk/.claude/projects/c--Users-mizuk-2026--investment-Mizuki-Fund/memory/feedback_etf_reit_not_individual.md)
 - GHA 共通ルール: [prompts/_common_rules.md §1](C:/Users/mizuk/report-pipelines/prompts/_common_rules.md)
 
+### 需給（信用・株価水準）セクション必須（PM 2026-05-22 確定・最上位）
+
+動意銘柄レポートの**全銘柄エントリ**で、事業モデル・材料・スイング観点と並んで「**需給（信用・株価水準）**」セクションを必ず出力する。raw データの `**需給（信用・株価水準）:**` ブロックを必ず転記する。
+
+#### 必須要素
+
+- **信用残（買 / 売・信用倍率）**：直近報告日基準
+- **信用買残 / 時価総額の比率**（%）
+- **信用買残 / 発行済株数の比率**（%・参考）
+- **解消日数（信用買残 ÷ 5 日平均出来高）**（日数）
+- **信用買残 週次推移（直近 6 週）**：数列 + 増加/横ばい/減少判定 + 変化率
+- **信用売残 週次推移（直近 3 週）**：参考値
+- **機関空売り比率**（発行株比・5% 超報告対象のみ）
+- **直近 60 営業日レンジ**：高値 / 安値 / 現在位置（レンジ下から ○% + 高値・安値からの乖離 %）
+- **直近 20 営業日レンジ**：高値 / 安値 / 現在位置
+
+#### 必須コメント
+
+需給ブロック直後に **PM への一言コメント**（信用過熱度・株価水準・逆張り警戒シグナル等の総合判断）を必ず書く。
+
+#### 数値の記憶ベース禁止（最上位）
+
+需給数値は**必ず raw データから転記**。「通常 5% 以下と推定」「出来高豊富で消化容易」のような Claude の記憶ベース推測を**全面禁止**。一次データのみで評価する。
+
+#### raw データに需給ブロック欠落時
+
+該当銘柄を**レポートから除外**（繰り上げで別銘柄に置き換え）。
+
+#### 関連
+
+- 詳細ルール: [prompts/_common_rules.md §2-B](C:/Users/mizuk/report-pipelines/prompts/_common_rules.md)
+- 実装: [bi/pipelines/make_mover_report.py](../bi/pipelines/make_mover_report.py) の `build_supply_block` / `compute_price_levels` / `fetch_ohlc_history`
+
 ### 銘柄行フォーマット強制（PM 2026-05-22 確定）
 
 各銘柄エントリの見出し行は以下フォーマットで統一する：

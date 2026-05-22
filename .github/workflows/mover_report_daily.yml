@@ -2,7 +2,7 @@ name: 動意銘柄レポート日次
 
 "on":
   schedule:
-    - cron: '0 8 * * 1-5'   # 月-金 17:00 JST (= 同日 08:00 UTC・引け後 2 時間で TDNet 反映完了)
+    - cron: '30 8 * * 1-5'   # 月-金 17:30 JST (= 同日 08:30 UTC・screening_master 16:30 更新後 + TDNet 反映完了)
   workflow_dispatch:
     inputs:
       target_date:
@@ -72,6 +72,45 @@ jobs:
       - name: Install Playwright Chromium
         run: |
           playwright install chromium --with-deps
+
+      - name: Verify screening_master freshness (must be today's)
+        # PM 2026-05-22 確定: 動意レポートに需給ブロックを含めるため、
+        # 当日の screening_master.parquet が必須。古い場合は make_screening_master_v2.py を実行して更新する
+        working-directory: ./private-repo/bi/pipelines
+        env:
+          JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
+          PYTHONIOENCODING: utf-8
+        run: |
+          python - <<'PY'
+          import datetime as dt
+          import os
+          import subprocess
+          import sys
+          from pathlib import Path
+          import pandas as pd
+
+          parquet = Path("../outputs/screening_master.parquet")
+          today_iso = os.environ.get("TARGET_DATE") or dt.date.today().isoformat()
+          needs_update = True
+          if parquet.exists():
+              try:
+                  df = pd.read_parquet(parquet)
+                  if "DataDate" in df.columns:
+                      latest = pd.to_datetime(df["DataDate"]).max().date().isoformat()
+                      print(f"screening_master DataDate: {latest} (target: {today_iso})")
+                      if latest >= today_iso:
+                          needs_update = False
+              except Exception as e:
+                  print(f"parquet read error: {e}")
+
+          if needs_update:
+              print("screening_master が古いため更新を実行します")
+              subprocess.check_call([sys.executable, "make_screening_master_v2.py"])
+          else:
+              print("screening_master は当日分で更新済み・スキップします")
+          PY
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
 
       - name: Generate movers raw (make_mover_report.py --no-pdf)
         working-directory: ./private-repo/bi/pipelines

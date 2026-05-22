@@ -151,6 +151,224 @@ def fetch_daily_all(client, target_date: date) -> pd.DataFrame:
     return df
 
 
+def fetch_ohlc_history(
+    client,
+    target_codes: set[str],
+    today_date: date,
+    n_days: int = 60,
+    cache_dir: Path | None = None,
+) -> pd.DataFrame:
+    """直近 n_days 営業日の OHLC を target_codes 銘柄について取得。
+
+    JQuants `/equities/bars/daily?date=YYYY-MM-DD` を日付ごとに呼び出して
+    全銘柄一括取得 → target_codes でフィルタする方式。
+    キャッシュ: cache_dir/ohlc_history_{today}.parquet
+    """
+    if cache_dir is None:
+        cache_dir = BASE_DIR / ".." / "data" / "raw"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_dir / f"ohlc_history_{today_date.isoformat()}.parquet"
+
+    if cache_path.exists():
+        try:
+            cached = pd.read_parquet(cache_path)
+            cached["Code"] = cached["Code"].astype(str).str[:4]
+            return cached[cached["Code"].isin(target_codes)].copy()
+        except Exception:
+            pass
+
+    rows_all: list[dict] = []
+    days_found = 0
+    cursor = today_date
+    max_calendar_days = n_days * 2 + 20  # 営業日 60 確保のため余裕を持ったループ
+    for _ in range(max_calendar_days):
+        if days_found >= n_days:
+            break
+        rows = fetch_paginated_v2(
+            client,
+            "/equities/bars/daily",
+            params={"date": cursor.strftime("%Y-%m-%d")},
+            sleep_seconds=0.6,
+        )
+        if rows:
+            for r in rows:
+                rows_all.append({
+                    "Code": str(r.get("code", ""))[:4],
+                    "Date": cursor.isoformat(),
+                    "Open":   r.get("o", r.get("Open")),
+                    "High":   r.get("h", r.get("High")),
+                    "Low":    r.get("l", r.get("Low")),
+                    "Close":  r.get("c", r.get("Close")),
+                    "Volume": r.get("v", r.get("Volume")),
+                })
+            days_found += 1
+        cursor -= timedelta(days=1)
+
+    if not rows_all:
+        return pd.DataFrame()
+
+    full = pd.DataFrame(rows_all)
+    for col in ("Open", "High", "Low", "Close", "Volume"):
+        full[col] = pd.to_numeric(full[col], errors="coerce")
+
+    try:
+        full.to_parquet(cache_path, index=False)
+    except Exception:
+        pass
+
+    return full[full["Code"].isin(target_codes)].copy()
+
+
+def compute_price_levels(hist_df: pd.DataFrame, code4: str, close_today: float) -> dict:
+    """52週・1ヶ月の高安、現在水準を計算して返す。
+
+    hist_df: fetch_ohlc_history の戻り値（複数銘柄分・60 営業日分）
+    """
+    df = hist_df[hist_df["Code"] == code4].copy()
+    if df.empty or pd.isna(close_today):
+        return {}
+    df = df.sort_values("Date")
+    n = len(df)
+    df60 = df  # 取得済み 60 営業日
+    df20 = df.tail(20)
+    out = {}
+    if df60["High"].notna().any():
+        h60 = df60["High"].max()
+        l60 = df60["Low"].min()
+        out["High_60d"] = h60
+        out["Low_60d"]  = l60
+        if h60 and l60 and (h60 != l60):
+            out["Pos60_pct"] = (close_today - l60) / (h60 - l60) * 100
+        out["FromHigh60_pct"] = (close_today / h60 - 1) * 100 if h60 else None
+        out["FromLow60_pct"]  = (close_today / l60 - 1) * 100 if l60 else None
+    if df20["High"].notna().any():
+        h20 = df20["High"].max()
+        l20 = df20["Low"].min()
+        out["High_20d"] = h20
+        out["Low_20d"]  = l20
+        if h20 and l20 and (h20 != l20):
+            out["Pos20_pct"] = (close_today - l20) / (h20 - l20) * 100
+        out["FromHigh20_pct"] = (close_today / h20 - 1) * 100 if h20 else None
+        out["FromLow20_pct"]  = (close_today / l20 - 1) * 100 if l20 else None
+    out["DaysCovered"] = n
+    return out
+
+
+def build_supply_block(row: pd.Series, hist_df: pd.DataFrame | None) -> list[str]:
+    """個別銘柄の「需給（信用・株価水準）」ブロックを生成する。
+
+    PM 2026-05-22 確定の必須セクション。信用残・時価総額比・週次推移・機関空売り・
+    52 週/1 ヶ月の高安・現在水準を 1 銘柄ぶん出力する。
+    """
+    code4 = normalize_code_4(row["Code"])
+    close_today = row.get("Close_T")
+    mcap_yen = row.get("MarketCap")
+
+    long_m  = row.get("LongMarginTradeVolume")
+    short_m = row.get("ShortMarginTradeVolume")
+    lm_per_shares = row.get("Scr_LongMargin_to_SharesOutstanding")
+    lm_per_vol5d  = row.get("Scr_LongMargin_to_AvgVol5d")
+    inst_short    = row.get("ShortPositionsToSharesOutstandingRatio")
+    avg_vol5d     = row.get("AvgDailyVolume5d")
+
+    lines: list[str] = ["**需給（信用・株価水準）:**"]
+
+    # --- 信用残（最新） ---
+    if pd.notna(long_m):
+        long_str = f"{long_m/1e4:.1f}万株"
+    else:
+        long_str = "─"
+    if pd.notna(short_m):
+        short_str = f"{short_m/1e4:.1f}万株"
+    else:
+        short_str = "─"
+    ratio_str = "─"
+    if pd.notna(long_m) and pd.notna(short_m):
+        if short_m and short_m > 0:
+            ratio_str = f"{long_m/short_m:.2f} 倍"
+        elif long_m and long_m > 0:
+            ratio_str = "∞（売り残ゼロ）"
+        else:
+            ratio_str = "0.00 倍"
+    lines.append(f"- 信用残: 買 {long_str} / 売 {short_str}（信用倍率 {ratio_str}）")
+
+    # --- 時価総額比・5日平均出来高比 ---
+    mcap_pct_str = "─"
+    if pd.notna(long_m) and pd.notna(close_today) and pd.notna(mcap_yen) and mcap_yen > 0:
+        mcap_pct = long_m * close_today / mcap_yen * 100
+        mcap_pct_str = f"{mcap_pct:.2f}%"
+    vol_days_str = "─"
+    if pd.notna(lm_per_vol5d) and lm_per_vol5d > 0:
+        vol_days_str = f"{lm_per_vol5d:.1f} 日分"
+    elif pd.notna(long_m) and pd.notna(avg_vol5d) and avg_vol5d > 0:
+        vol_days_str = f"{long_m / avg_vol5d:.1f} 日分"
+    lm_per_shares_str = "─"
+    if pd.notna(lm_per_shares):
+        lm_per_shares_str = f"{lm_per_shares*100:.2f}%"
+    lines.append(
+        f"- 信用買残 / 時価総額: {mcap_pct_str} "
+        f"／ 信用買残 / 発行済株数: {lm_per_shares_str} "
+        f"／ 解消日数（信用買残 ÷ 5日平均出来高）: {vol_days_str}"
+    )
+
+    # --- 信用買残 週次推移（直近 6 週） ---
+    wk_long = [row.get(f"LongMargin_WkSeq0{i}") for i in (3, 4, 5, 6, 7, 8)]
+    wk_long_clean = [v for v in wk_long if pd.notna(v)]
+    if len(wk_long_clean) >= 2:
+        wk_str = " → ".join(f"{v/1e4:.0f}万" for v in wk_long_clean)
+        diff = wk_long_clean[-1] - wk_long_clean[0]
+        if wk_long_clean[0]:
+            chg_pct = diff / wk_long_clean[0] * 100
+            chg_label = "増加" if chg_pct > 5 else "減少" if chg_pct < -5 else "横ばい"
+            chg_str = f"{chg_label}（{chg_pct:+.1f}%）"
+        else:
+            chg_str = "判定不可"
+        lines.append(f"- 信用買残 週次推移（古→新・直近6週）: {wk_str}　判定: {chg_str}")
+    else:
+        lines.append("- 信用買残 週次推移: 過去データなし")
+
+    # --- 信用売残 週次推移（参考・短く） ---
+    wk_short = [row.get(f"ShortMargin_WkSeq0{i}") for i in (6, 7, 8)]
+    wk_short_clean = [v for v in wk_short if pd.notna(v)]
+    if len(wk_short_clean) >= 2:
+        wk_short_str = " → ".join(f"{v/1e4:.1f}万" for v in wk_short_clean)
+        lines.append(f"- 信用売残 週次推移（直近3週）: {wk_short_str}")
+
+    # --- 機関空売り（5% 超報告対象のみ） ---
+    if pd.notna(inst_short) and inst_short > 0:
+        lines.append(f"- 機関空売り比率（発行株比・5%超報告）: {inst_short*100:.2f}%")
+    else:
+        lines.append("- 機関空売り比率: 5%超報告対象外（または報告なし）")
+
+    # --- 株価水準（52週/1ヶ月レンジ・現在位置） ---
+    levels = compute_price_levels(hist_df, code4, close_today) if hist_df is not None and not hist_df.empty else {}
+    if levels.get("High_60d") is not None:
+        h60 = levels.get("High_60d"); l60 = levels.get("Low_60d")
+        pos60 = levels.get("Pos60_pct")
+        from_h60 = levels.get("FromHigh60_pct")
+        from_l60 = levels.get("FromLow60_pct")
+        pos60_str = f"レンジ下から {pos60:.0f}%" if pos60 is not None else "─"
+        h60_diff = f"高値からマイナス {abs(from_h60):.1f}%" if from_h60 is not None else "─"
+        l60_diff = f"安値からプラス {from_l60:.1f}%" if from_l60 is not None else "─"
+        lines.append(
+            f"- 直近60営業日（≒3ヶ月）レンジ: 高値 {h60:,.0f}円 / 安値 {l60:,.0f}円 "
+            f"／ 現在位置: {pos60_str}（{h60_diff} / {l60_diff}）"
+        )
+    if levels.get("High_20d") is not None:
+        h20 = levels.get("High_20d"); l20 = levels.get("Low_20d")
+        pos20 = levels.get("Pos20_pct")
+        pos20_str = f"レンジ下から {pos20:.0f}%" if pos20 is not None else "─"
+        lines.append(
+            f"- 直近20営業日（≒1ヶ月）レンジ: 高値 {h20:,.0f}円 / 安値 {l20:,.0f}円 "
+            f"／ 現在位置: {pos20_str}"
+        )
+    if not levels:
+        lines.append("- 株価水準（60d/20d レンジ）: 取得不可")
+
+    lines.append("")
+    return lines
+
+
 def resolve_trading_days(client, target_date: date, lookback: int = 14) -> tuple[date, date]:
     found: list[date] = []
     for i in range(lookback):
@@ -222,6 +440,42 @@ def build_full_table(
                 mask & df["Code"].str.endswith("A") & ~is_etf_reit,
                 "MarketCodeName"
             ] = MARKET_GROWTH
+
+    # PM 2026-05-22 確定: 需給ブロック（信用残・株価水準）を全銘柄に付与するため、
+    # screening_master.parquet から信用・出来高関連列をマージする
+    # [prompts/_common_rules.md] [memory feedback_mover_supply_required.md]
+    supply_cols = [
+        c for c in (
+            "LongMarginTradeVolume",
+            "ShortMarginTradeVolume",
+            "LongMargin_WkSeq01",
+            "LongMargin_WkSeq02",
+            "LongMargin_WkSeq03",
+            "LongMargin_WkSeq04",
+            "LongMargin_WkSeq05",
+            "LongMargin_WkSeq06",
+            "LongMargin_WkSeq07",
+            "LongMargin_WkSeq08",
+            "ShortMargin_WkSeq01",
+            "ShortMargin_WkSeq02",
+            "ShortMargin_WkSeq03",
+            "ShortMargin_WkSeq04",
+            "ShortMargin_WkSeq05",
+            "ShortMargin_WkSeq06",
+            "ShortMargin_WkSeq07",
+            "ShortMargin_WkSeq08",
+            "Scr_LongMargin_to_SharesOutstanding",
+            "Scr_LongMargin_to_AvgVol5d",
+            "ShortPositionsToSharesOutstandingRatio",
+            "AvgDailyVolume5d",
+            "AvgDailyValue5d",
+            "NumberOfIssuedAndOutstandingSharesAtTheEndOfFiscalYearIncludingTreasuryStock",
+        ) if c in master_df.columns
+    ]
+    if supply_cols:
+        supply_meta = master_df[["Code"] + supply_cols].copy()
+        supply_meta["Code"] = supply_meta["Code"].astype(str).str[:4]
+        df = df.merge(supply_meta, on="Code", how="left")
 
     if "MarketCap" in df.columns:
         df["MarketCapOku"] = pd.to_numeric(df["MarketCap"], errors="coerce") / 1e8
@@ -598,6 +852,7 @@ def _append_detail(
     row: pd.Series,
     tdnet_data: dict,
     yahoo_data: dict,
+    hist_df: pd.DataFrame | None = None,
 ) -> None:
     code4   = normalize_code_4(row["Code"])
     _name   = row.get("CompanyName", code4)
@@ -629,6 +884,10 @@ def _append_detail(
     if description:
         lines.append(f"- 事業: {description}")
     lines.append("")
+
+    # PM 2026-05-22 確定: 需給（信用・株価水準）ブロックを必須セクションとして挿入
+    # [prompts/_common_rules.md] [memory feedback_mover_supply_required.md]
+    lines += build_supply_block(row, hist_df)
 
     # 過去Deep Dive
     if research:
@@ -823,6 +1082,7 @@ def build_report(
     macro_snippet: str,
     today: date,
     prev: date,
+    hist_df: pd.DataFrame | None = None,
 ) -> str:
     lines = [
         f"# 動意銘柄レポート 生データ ({today.strftime('%Y-%m-%d')})",
@@ -874,11 +1134,11 @@ def build_report(
 
         lines += [f"### 値上がり Top {cfg['top']}", ""]
         for _, row in top_df.iterrows():
-            _append_detail(lines, row, tdnet_data, yahoo_data)
+            _append_detail(lines, row, tdnet_data, yahoo_data, hist_df=hist_df)
 
         lines += [f"### 値下がり Bottom {cfg['bottom']}", ""]
         for _, row in bottom_df.iterrows():
-            _append_detail(lines, row, tdnet_data, yahoo_data)
+            _append_detail(lines, row, tdnet_data, yahoo_data, hist_df=hist_df)
 
         # 売買代金
         n = TURNOVER_CONFIG[market]
@@ -888,7 +1148,7 @@ def build_report(
             turnover_oku = row.get("Turnover", 0) / 1e8
             row = row.copy()
             row["_turnover_label"] = f"{turnover_oku:.0f}億円"
-            _append_detail(lines, row, tdnet_data, yahoo_data)
+            _append_detail(lines, row, tdnet_data, yahoo_data, hist_df=hist_df)
 
     # ---- Layer 5: グロース スイング候補バリュエーション ----
     recent_codes = load_recent_mover_codes(today)
@@ -1112,6 +1372,11 @@ def main() -> None:
     print("Yahoo Finance 取得中...")
     yahoo_data = fetch_yahoo_batch(fetch_codes)
 
+    # --- 60営業日 OHLC 履歴（株価水準ブロック用・PM 2026-05-22 確定） ---
+    print(f"60営業日 OHLC 履歴取得中（対象 {len(fetch_codes)} 銘柄）...")
+    hist_df = fetch_ohlc_history(client, set(fetch_codes), today_dt, n_days=60)
+    print(f"  履歴: {len(hist_df)} 行（{hist_df['Code'].nunique() if not hist_df.empty else 0} 銘柄カバー）")
+
     # --- マクロレポート ---
     macro_snippet = load_latest_macro_report()
 
@@ -1127,6 +1392,7 @@ def main() -> None:
         macro_snippet=macro_snippet,
         today=today_dt,
         prev=prev_dt,
+        hist_df=hist_df,
     )
 
     MARKET_DAILY_DIR.mkdir(parents=True, exist_ok=True)

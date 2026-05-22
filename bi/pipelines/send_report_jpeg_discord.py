@@ -104,6 +104,38 @@ def main() -> int:
         print(f"ERROR: report not found: {md_path}")
         return 1
 
+    # PM 2026-05-22 確定: 動意レポートは「需給（信用・株価水準）」セクションが
+    # 全銘柄エントリに含まれていなければ送信中止する（不完全レポートの発信防止）。
+    # [prompts/_common_rules.md §2-B] [memory feedback_mover_supply_required.md]
+    if args.kind == "movers":
+        md_text_pre = md_path.read_text(encoding="utf-8")
+        import re as _re
+        # 銘柄エントリ見出し（### N位 XXXX / ### XXXX）の行番号を取得
+        entry_pattern = _re.compile(r"^###\s+(?:\d+位\s+)?\d{3,4}[A-Z]?\s", _re.MULTILINE)
+        entry_matches = list(entry_pattern.finditer(md_text_pre))
+        if not entry_matches:
+            print("ERROR: 動意レポートに銘柄エントリが見つかりません。送信中止。")
+            _notify_failure(webhook_env=cfg["webhook_env"],
+                            label=cfg["label"], identifier=identifier,
+                            reason="銘柄エントリ 0 件")
+            return 1
+        # 各銘柄エントリの本文範囲を取得し、需給ブロックが含まれているか検証
+        missing: list[str] = []
+        for i, m in enumerate(entry_matches):
+            start = m.start()
+            end = entry_matches[i + 1].start() if i + 1 < len(entry_matches) else len(md_text_pre)
+            body = md_text_pre[start:end]
+            header_line = body.split("\n", 1)[0].strip("# ").strip()
+            if "需給" not in body:
+                missing.append(header_line)
+        if missing:
+            print(f"ERROR: 需給セクション欠落 {len(missing)} 件: {missing[:5]}")
+            _notify_failure(webhook_env=cfg["webhook_env"],
+                            label=cfg["label"], identifier=identifier,
+                            reason=f"需給セクション欠落 {len(missing)} 件 / 全 {len(entry_matches)} 銘柄")
+            return 1
+        print(f"[guard] 動意レポート需給セクション検証 OK（{len(entry_matches)} 銘柄）")
+
     # Webhook
     webhook = os.getenv(cfg["webhook_env"])
     if not webhook:
@@ -144,6 +176,27 @@ def main() -> int:
         return 1
     print("DONE")
     return 0
+
+
+def _notify_failure(*, webhook_env: str, label: str, identifier: str, reason: str) -> None:
+    """需給ガード等で送信中止になった際に Discord へ失敗通知を送る。"""
+    webhook = os.getenv(webhook_env)
+    if not webhook:
+        return
+    try:
+        requests.post(
+            webhook,
+            json={
+                "content": (
+                    f"❌ **{label} 発行停止** {identifier}\n"
+                    f"理由: {reason}\n"
+                    f"信用情報・株価水準セクションが揃わない不完全レポートのため送信を停止しました。"
+                )
+            },
+            timeout=10,
+        )
+    except Exception as e:
+        print(f"failure notify failed: {e}")
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@ name: スクリーニングマスター更新
 
 "on":
   schedule:
-    - cron: '0 10 * * 1-5'   # 月-金 19:00 JST
+    - cron: '30 7 * * 1-5'   # 月-金 16:30 JST (引け 15:00 後・動意 17:30 発火前に完了させる)
   workflow_dispatch:
 
 jobs:
