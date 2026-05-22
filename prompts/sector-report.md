@@ -18,14 +18,63 @@
    - `${PRIVATE_REPO_ROOT}/playbook/sector_criteria.md` — セクター選定基準（存在する場合）
    - `${PRIVATE_REPO_ROOT}/market/daily/macro/` 配下の直近 1〜2 件（地合い把握）
 
-5. **セクター raw データ生成**：
+5. **【最重要・GHA でも Deep Research 必須・PM 2026-05-23 確定】Deep Research を実施 → make_sector_raw.py に渡す**：
 
-```
-cd ${PRIVATE_REPO_ROOT}/bi/pipelines && python make_sector_raw.py --anchor friday --date ${TARGET_DATE}
+   ローカル運用と全く同じ精度を担保するため、GHA 内でも Deep Research を実施する。Claude Code Action が WebSearch を使って当週のセクター動向を調査 → 結果ファイル保存 → make_sector_raw.py に `--deep-research-file` で渡す。
+
+   ### 5-a. Deep Research プロンプト取得
+
+```bash
+cd ${PRIVATE_REPO_ROOT}/bi/pipelines
+python make_sector_raw.py --anchor friday --date ${TARGET_DATE} --no-ensure-fresh || true
 ```
 
-   - 出力: `${PRIVATE_REPO_ROOT}/bi/outputs/sector_weekly.parquet` / `sector_stock_weekly.parquet`
-   - エラーが出た場合は内容を報告して終了
+   このコマンドは「Deep Research が未入力です」で終了するが、**プロンプト本文が標準出力に出力される**。プロンプトの「分析観点」4 つを取り出す。
+
+   ### 5-b. Deep Research 実施（WebSearch ベース・必須）
+
+   以下 4 観点について WebSearch / WebFetch で当週調査を実施：
+
+   1. **今週の強弱要因**：マクロ・産業ニュース（米株・FRB・日銀・為替・原油・地政学・決算・テーマ）
+   2. **上位セクターの持続性**：上昇継続要因 vs 短期反応
+   3. **下位セクターの逆張り余地**：下落セクターの買い場
+   4. **来週以降の注目点**：決算・政策発表・イベント
+
+   各観点 3〜5 件の WebSearch クエリ実行・Reuters / 日経 / ヤフーファイナンス / みんかぶ / 株探等の日本語ソースを優先。
+
+   ### 5-c. Deep Research 結果を Write
+
+   `${PRIVATE_REPO_ROOT}/market/daily/sector/${TARGET_DATE}_deep_research.md` に以下フォーマットで Write：
+
+   ```markdown
+   # 日本株セクター週次 Deep Research（{TARGET_DATE}）
+
+   ## 1. 今週の強弱要因
+   <セクター別 400-600 字・出典添付>
+
+   ## 2. 上位セクターの持続性
+   <300-500 字>
+
+   ## 3. 下位セクターの逆張り余地
+   <300-500 字>
+
+   ## 4. 来週以降の注目点
+   <300-500 字>
+   ```
+
+   - セクター名を **太字** で明示
+   - 出典（URL or 出典名）を添付
+   - 日本語
+
+   ### 5-d. make_sector_raw.py を --deep-research-file 付きで実行
+
+```bash
+cd ${PRIVATE_REPO_ROOT}/bi/pipelines
+python make_sector_raw.py --anchor friday --date ${TARGET_DATE} --no-ensure-fresh \
+  --deep-research-file ../../market/daily/sector/${TARGET_DATE}_deep_research.md
+```
+
+   出力: `${PRIVATE_REPO_ROOT}/bi/outputs/sector_weekly.parquet` / `sector_stock_weekly.parquet`
 
 6. **生成された parquet を読み込み**：
    - `${PRIVATE_REPO_ROOT}/bi/outputs/sector_weekly.parquet`

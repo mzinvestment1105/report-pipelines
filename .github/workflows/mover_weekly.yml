@@ -97,30 +97,23 @@ jobs:
           print("PM 確定: 古くてもそのまま使う・更新は実行しない")
           PY
 
-      - name: Generate sector_stock_weekly.parquet (--anchor friday)
-        # 動意週次レポートが読む parquet を金曜終値ベースで更新
-        # --allow-no-deep-research: GHA では Deep Research 不要・スキップ可
-        # --no-ensure-fresh: 入力鮮度チェックを skip（依存スクリプト起動防止）
-        working-directory: ./private-repo/bi/pipelines
-        env:
-          JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
-          PYTHONIOENCODING: utf-8
-        run: |
-          python make_sector_raw.py --anchor friday --date ${{ steps.date.outputs.value }} --allow-no-deep-research --no-ensure-fresh
-
-      - name: Generate mover weekly report via Claude Code (Opus 4.7 + max thinking)
+      - name: Generate mover weekly report via Claude Code (Opus 4.7 + max thinking・Deep Research 内包)
+        # PM 2026-05-23 確定: ローカルと全く同じ精度を担保する。Deep Research は GHA 内で
+        # Claude Code Action が WebSearch を使って実施 → make_sector_raw.py に --deep-research-file
+        # で渡す → メインレポート生成、までを 1 Action で完結する。
         uses: anthropics/claude-code-base-action@beta
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           model: claude-opus-4-7
           prompt_file: report-pipelines/prompts/mover-weekly.md
-          allowed_tools: "Read,Write,Edit,Bash,Grep,Glob"
-          timeout_minutes: "35"
+          allowed_tools: "Read,Write,Edit,Bash,Grep,Glob,WebSearch,WebFetch"
+          timeout_minutes: "60"
           claude_env: |
             MAX_THINKING_TOKENS: 32000
         env:
           TARGET_DATE: ${{ steps.date.outputs.value }}
           PRIVATE_REPO_ROOT: private-repo
+          JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
 
       - name: Send Discord (JPEG・市場別 3 枚分割)
         working-directory: ./private-repo/bi/pipelines

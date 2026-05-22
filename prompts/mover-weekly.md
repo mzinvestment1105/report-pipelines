@@ -19,7 +19,66 @@
    - `${PRIVATE_REPO_ROOT}/playbook/stock_criteria.md` — 銘柄選定基準（存在する場合）
    - `${PRIVATE_REPO_ROOT}/market/daily/macro/` 配下の直近 1〜2 件（地合い把握）
    - `${PRIVATE_REPO_ROOT}/market/daily/movers/` 配下の直近 3〜5 件（週間動意の流れ追跡）
-5. **週次データ parquet を Python で読み込み・市場別ランキング抽出**：
+5. **【最重要・GHA でも Deep Research 必須・PM 2026-05-23 確定】Deep Research を実施 → make_sector_raw.py に渡す**：
+
+   ローカル運用と全く同じ精度を担保するため、GHA 内でも Deep Research を実施する。Claude Code Action が WebSearch を使って当週のセクター動向を調査 → 結果ファイル保存 → make_sector_raw.py に `--deep-research-file` で渡す。
+
+   ### 5-a. Deep Research プロンプト生成（make_sector_raw.py 経由）
+
+   ```bash
+   cd ${PRIVATE_REPO_ROOT}/bi/pipelines
+   python make_sector_raw.py --anchor friday --date ${TARGET_DATE} --no-ensure-fresh || true
+   ```
+
+   このコマンドは「Deep Research が未入力です」エラーで終了するが、その際に**プロンプト本文が標準出力に出力される**。標準出力からプロンプト本文を取り出す。
+
+   ### 5-b. Deep Research 実施（WebSearch ベース・必須）
+
+   Deep Research プロンプトの「分析観点」4 つに沿って、WebSearch / WebFetch で当週のセクター動向を調査する：
+
+   1. **今週の強弱要因**：各セクターの騰落を決定づけたマクロ・産業ニュース（米株動向・FRB・日銀・為替・原油・地政学・決算ピーク・テーマ動意）
+   2. **上位セクターの持続性**：上昇継続要因 vs 短期反応
+   3. **下位セクターの逆張り余地**：下落セクターに買い場
+   4. **来週以降の注目点**：決算・政策発表・イベント
+
+   各観点について `WebSearch` で 3〜5 件の調査クエリを実行し、Reuters / 日経 / ヤフーファイナンス / みんかぶ / 株探等の日本語ソースを優先的に拾う。
+
+   ### 5-c. Deep Research 結果を Write
+
+   調査結果を Markdown 形式で `${PRIVATE_REPO_ROOT}/market/daily/sector/${TARGET_DATE}_deep_research.md` に Write する。フォーマット：
+
+   ```markdown
+   # 日本株セクター週次 Deep Research（{TARGET_DATE}）
+
+   ## 1. 今週の強弱要因
+   <セクター別の上昇・下落要因を 400-600 字で記述・出典添付>
+
+   ## 2. 上位セクターの持続性
+   <強いセクターの継続可能性を 300-500 字で記述>
+
+   ## 3. 下位セクターの逆張り余地
+   <弱いセクターの反発条件を 300-500 字で記述>
+
+   ## 4. 来週以降の注目点
+   <来週の決算・政策イベント・テーマ動意を 300-500 字で記述>
+   ```
+
+   - 各観点を `##` 見出しで区切る
+   - セクター名を **太字** で明示する
+   - 根拠となるニュース・データに出典を添える（URL or 出典名）
+   - 日本語で出力する
+
+   ### 5-d. make_sector_raw.py 再実行（--deep-research-file 付き）
+
+   ```bash
+   cd ${PRIVATE_REPO_ROOT}/bi/pipelines
+   python make_sector_raw.py --anchor friday --date ${TARGET_DATE} --no-ensure-fresh \
+     --deep-research-file ../../market/daily/sector/${TARGET_DATE}_deep_research.md
+   ```
+
+   出力: `${PRIVATE_REPO_ROOT}/bi/outputs/sector_weekly.parquet` / `sector_stock_weekly.parquet` / `${PRIVATE_REPO_ROOT}/market/daily/${TARGET_DATE}_sector_raw.md`
+
+## 6. 週次データ parquet を Python で読み込み・市場別ランキング抽出
 
 ```python
 import pandas as pd
@@ -46,7 +105,7 @@ for market in ["プライム", "スタンダード", "グロース"]:
    - スタンダード: 上昇率 Top 5・下落率 Bottom 5・売買代金 Top 5
    - グロース: 上昇率 Top 10・下落率 Bottom 5・売買代金 Top 10
 
-6. **TDNet 週間サマリーの取得**（任意・存在する場合）：
+7. **TDNet 週間サマリーの取得**（任意・存在する場合）：
    - `${PRIVATE_REPO_ROOT}/market/daily/${TARGET_DATE}_movers_raw.md` から本日分の TDNet 情報を補完用に参照
 
 ## レポート構成（出力セクション・日次フル版と同フォーマット）
