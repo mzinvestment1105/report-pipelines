@@ -49,6 +49,11 @@ KIND_CONFIG = {
         "webhook_env": "DISCORD_WEBHOOK_MOVERS",
         "label": "動意銘柄レポート",
     },
+    "movers_weekly": {
+        "md_path": "market/daily/movers/{date}_weekly.md",
+        "webhook_env": "DISCORD_WEBHOOK_MOVERS",
+        "label": "動意銘柄レポート（週次）",
+    },
     "ideas": {
         "md_path": "market/daily/ideas/{date}.md",
         "webhook_env": "DISCORD_WEBHOOK_IDEAS",
@@ -146,23 +151,24 @@ def main() -> int:
 
     md_text = md_path.read_text(encoding="utf-8")
 
-    # movers は市場別 3 セット（プライム・スタンダード・グロース）に分割して送信
+    # movers / movers_weekly は市場別 3 セット（プライム・スタンダード・グロース）に分割して送信
     # PM 2026-05-23 ご指示: 動意レポートは「プライム / スタンダード / グロースで画像は分けて」
-    if args.kind == "movers":
+    if args.kind in ("movers", "movers_weekly"):
         markets = split_movers_by_market(md_text)
         if not markets:
             print("ERROR: 動意レポートの市場別分割に失敗・通常モードでフォールバック")
             markets = [("ALL", md_text)]
 
+        prefix = "movers_weekly" if args.kind == "movers_weekly" else "movers"
         if args.skip_send:
             for label, md_part in markets:
-                p = out_dir / f"movers_{identifier}_{label.lower()}.jpg"
+                p = out_dir / f"{prefix}_{identifier}_{label.lower()}.jpg"
                 render_markdown_to_jpeg(md_part, p, kind=args.kind, footer="@noctra_jp / Mizuki Fund")
                 print(f"  saved: {p}  size={p.stat().st_size:,} bytes")
             return 0
 
         for label, md_part in markets:
-            p = out_dir / f"movers_{identifier}_{label.lower()}.jpg"
+            p = out_dir / f"{prefix}_{identifier}_{label.lower()}.jpg"
             print(f"[render] movers/{label} → {p.name}")
             render_markdown_to_jpeg(md_part, p, kind=args.kind, footer="@noctra_jp / Mizuki Fund")
             print(f"  saved: {p}  size={p.stat().st_size:,} bytes")

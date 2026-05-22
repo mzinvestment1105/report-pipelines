@@ -1,0 +1,163 @@
+name: 動意銘柄レポート週次
+
+"on":
+  schedule:
+    - cron: '0 13 * * 5'   # 金曜 22:00 JST (= 13:00 UTC・日次フル版 17:30 JST の後・週末入り前)
+  workflow_dispatch:
+    inputs:
+      target_date:
+        description: '対象日付 (YYYY-MM-DD・空欄で当日の金曜)'
+        required: false
+        default: ''
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+
+    steps:
+      - name: Determine target date
+        id: date
+        run: |
+          if [ -n "${{ github.event.inputs.target_date }}" ]; then
+            echo "value=${{ github.event.inputs.target_date }}" >> $GITHUB_OUTPUT
+          else
+            echo "value=$(TZ=Asia/Tokyo date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout report-pipelines
+        uses: actions/checkout@v4
+        with:
+          path: report-pipelines
+
+      - name: Setup SSH for private repo
+        env:
+          PRIVATE_REPO_DEPLOY_KEY: ${{ secrets.PRIVATE_REPO_DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$PRIVATE_REPO_DEPLOY_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+      - name: Clone private repo (mizuki-fund)
+        run: |
+          git clone git@github.com:mzinvestment1105/mizuki-fund.git private-repo
+
+      - name: Copy pipelines and static files from Public into private working tree
+        run: |
+          cp -f report-pipelines/bi/pipelines/*.py private-repo/bi/pipelines/
+          cp -f report-pipelines/bi/pipelines/requirements.txt private-repo/bi/pipelines/
+          mkdir -p private-repo/bi/pipelines/lib
+          cp -rf report-pipelines/bi/pipelines/lib/*.py private-repo/bi/pipelines/lib/ 2>/dev/null || true
+          mkdir -p private-repo/agents private-repo/playbook
+          cp -f report-pipelines/agents/*.md private-repo/agents/ 2>/dev/null || true
+          cp -f report-pipelines/playbook/*.md private-repo/playbook/ 2>/dev/null || true
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: report-pipelines/bi/pipelines/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r report-pipelines/bi/pipelines/requirements.txt
+
+      - name: Install Japanese fonts (Noto Sans CJK JP)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq fonts-noto-cjk fonts-noto-cjk-extra
+
+      - name: Install Playwright Chromium
+        run: |
+          playwright install chromium --with-deps
+
+      - name: Verify screening_master freshness
+        working-directory: ./private-repo/bi/pipelines
+        env:
+          JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
+          PYTHONIOENCODING: utf-8
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+        run: |
+          python - <<'PY'
+          import datetime as dt
+          import os, subprocess, sys
+          from pathlib import Path
+          import pandas as pd
+
+          parquet = Path("../outputs/screening_master.parquet")
+          today_iso = os.environ.get("TARGET_DATE") or dt.date.today().isoformat()
+          needs_update = True
+          if parquet.exists():
+              try:
+                  df = pd.read_parquet(parquet)
+                  if "DataDate" in df.columns:
+                      latest = pd.to_datetime(df["DataDate"]).max().date().isoformat()
+                      print(f"screening_master DataDate: {latest} (target: {today_iso})")
+                      if latest >= today_iso:
+                          needs_update = False
+              except Exception as e:
+                  print(f"parquet read error: {e}")
+          if needs_update:
+              print("screening_master が古いため更新を実行します")
+              subprocess.check_call([sys.executable, "make_screening_master_v2.py"])
+          else:
+              print("screening_master は当日分で更新済み・スキップします")
+          PY
+
+      - name: Generate sector_stock_weekly.parquet (--anchor friday)
+        # 動意週次レポートが読む parquet を金曜終値ベースで更新
+        working-directory: ./private-repo/bi/pipelines
+        env:
+          JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
+          PYTHONIOENCODING: utf-8
+        run: |
+          python make_sector_raw.py --anchor friday --date ${{ steps.date.outputs.value }}
+
+      - name: Generate mover weekly report via Claude Code (Opus 4.7 + max thinking)
+        uses: anthropics/claude-code-base-action@beta
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          model: claude-opus-4-7
+          prompt_file: report-pipelines/prompts/mover-weekly.md
+          allowed_tools: "Read,Write,Edit,Bash,Grep,Glob"
+          timeout_minutes: "35"
+          claude_env: |
+            MAX_THINKING_TOKENS: 32000
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+          PRIVATE_REPO_ROOT: private-repo
+
+      - name: Send Discord (JPEG・市場別 3 枚分割)
+        working-directory: ./private-repo/bi/pipelines
+        env:
+          DISCORD_WEBHOOK_MOVERS: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
+          PYTHONIOENCODING: utf-8
+        run: |
+          python send_report_jpeg_discord.py --kind movers_weekly --date ${{ steps.date.outputs.value }}
+
+      - name: Commit and push to private repo
+        working-directory: ./private-repo
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -- bi/pipelines/ agents/ playbook/ 2>/dev/null || true
+          git clean -fd bi/pipelines/ agents/ playbook/ 2>/dev/null || true
+          git add market/daily/ bi/outputs/sector_weekly.parquet bi/outputs/sector_stock_weekly.parquet 2>/dev/null || git add market/daily/
+          if ! git diff --staged --quiet; then
+            git stash push --keep-index --include-untracked -m "ci-cleanup" 2>/dev/null || true
+            git commit -m "data: mover weekly ${{ steps.date.outputs.value }}"
+            git fetch origin master
+            git rebase origin/master || (git diff --name-only --diff-filter=U | xargs -I{} git checkout --theirs {}; git diff --name-only --diff-filter=U | xargs git add; git -c core.editor=true rebase --continue)
+            git push origin master
+            git stash drop 2>/dev/null || true
+          fi
+
+      - name: Discord 通知（失敗）
+        if: failure()
+        env:
+          DISCORD_WEBHOOK_MOVERS: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
+        run: |
+          curl -s -X POST "$DISCORD_WEBHOOK_MOVERS" \
+            -H "Content-Type: application/json" \
+            -d "{\"content\": \"❌ 動意週次レポート失敗\n${{ steps.date.outputs.value }}\nログ確認: https://github.com/${{ github.repository }}/actions\"}"
