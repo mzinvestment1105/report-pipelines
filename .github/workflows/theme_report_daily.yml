@@ -1,0 +1,128 @@
+name: テーマ動意レポート日次
+
+"on":
+  schedule:
+    - cron: '0 8 * * 1-5'   # 月-金 17:00 JST (= 08:00 UTC・東京引け 15:00 後・動意レポートと並行)
+  workflow_dispatch:
+    inputs:
+      target_date:
+        description: '対象日付 (YYYY-MM-DD・空欄で当日)'
+        required: false
+        default: ''
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Determine target date
+        id: date
+        run: |
+          if [ -n "${{ github.event.inputs.target_date }}" ]; then
+            echo "value=${{ github.event.inputs.target_date }}" >> $GITHUB_OUTPUT
+          else
+            echo "value=$(TZ=Asia/Tokyo date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout report-pipelines
+        uses: actions/checkout@v4
+        with:
+          path: report-pipelines
+
+      - name: Setup SSH for private repo
+        env:
+          PRIVATE_REPO_DEPLOY_KEY: ${{ secrets.PRIVATE_REPO_DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$PRIVATE_REPO_DEPLOY_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+      - name: Clone private repo (mizuki-fund)
+        run: |
+          git clone git@github.com:mzinvestment1105/mizuki-fund.git private-repo
+
+      - name: Copy pipelines and static files from Public into private working tree
+        run: |
+          cp -f report-pipelines/bi/pipelines/*.py private-repo/bi/pipelines/
+          cp -f report-pipelines/bi/pipelines/requirements.txt private-repo/bi/pipelines/
+          mkdir -p private-repo/bi/pipelines/lib
+          cp -rf report-pipelines/bi/pipelines/lib/*.py private-repo/bi/pipelines/lib/ 2>/dev/null || true
+          mkdir -p private-repo/agents private-repo/playbook
+          cp -f report-pipelines/agents/*.md private-repo/agents/ 2>/dev/null || true
+          cp -f report-pipelines/playbook/*.md private-repo/playbook/ 2>/dev/null || true
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: report-pipelines/bi/pipelines/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r report-pipelines/bi/pipelines/requirements.txt
+
+      - name: Install Japanese fonts (Noto Sans CJK JP)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq fonts-noto-cjk fonts-noto-cjk-extra
+
+      - name: Install Playwright Chromium
+        run: |
+          playwright install chromium --with-deps
+
+      - name: Generate themes raw (fetch_theme_momentum.py)
+        working-directory: ./private-repo/bi/pipelines
+        env:
+          PYTHONIOENCODING: utf-8
+        run: |
+          python fetch_theme_momentum.py
+
+      - name: Generate themes report via Claude Code (Opus 4.7 + max thinking)
+        uses: anthropics/claude-code-base-action@beta
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          model: claude-opus-4-7
+          prompt_file: report-pipelines/prompts/themes-report.md
+          allowed_tools: "Read,Write,Edit,Bash,Grep,Glob"
+          timeout_minutes: "20"
+          claude_env: |
+            MAX_THINKING_TOKENS: 32000
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+          PRIVATE_REPO_ROOT: private-repo
+
+      - name: Send Discord (JPEG)
+        working-directory: ./private-repo/bi/pipelines
+        env:
+          DISCORD_WEBHOOK_THEME: ${{ secrets.DISCORD_WEBHOOK_THEME }}
+          PYTHONIOENCODING: utf-8
+        run: |
+          python send_report_jpeg_discord.py --kind themes --date ${{ steps.date.outputs.value }}
+
+      - name: Commit and push to private repo
+        working-directory: ./private-repo
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -- bi/pipelines/ agents/ playbook/ 2>/dev/null || true
+          git clean -fd bi/pipelines/ agents/ playbook/ 2>/dev/null || true
+          git add market/daily/
+          if ! git diff --staged --quiet; then
+            git stash push --keep-index --include-untracked -m "ci-cleanup" 2>/dev/null || true
+            git commit -m "data: themes daily ${{ steps.date.outputs.value }}"
+            git fetch origin master
+            git rebase origin/master || (git diff --name-only --diff-filter=U | xargs -I{} git checkout --theirs {}; git diff --name-only --diff-filter=U | xargs git add; git -c core.editor=true rebase --continue)
+            git push origin master
+            git stash drop 2>/dev/null || true
+          fi
+
+      - name: Discord 通知（失敗）
+        if: failure()
+        env:
+          DISCORD_WEBHOOK_THEME: ${{ secrets.DISCORD_WEBHOOK_THEME }}
+        run: |
+          curl -s -X POST "$DISCORD_WEBHOOK_THEME" \
+            -H "Content-Type: application/json" \
+            -d "{\"content\": \"❌ テーマ動意レポート失敗\n${{ steps.date.outputs.value }}\nログ確認: https://github.com/${{ github.repository }}/actions\"}"
