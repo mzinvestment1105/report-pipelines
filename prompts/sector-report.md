@@ -95,10 +95,10 @@ python make_sector_raw.py --anchor friday --date ${TARGET_DATE} --no-ensure-fres
 
 ## 品質ルール
 
-- 全 19 セクターを網羅
+- 全 19 セクターを網羅（**1 セクターも省略禁止**・PM 2026-05-23 確定）
 - **ETF/REIT/上場投信は構成銘柄として記載しない**（[prompts/_common_rules.md §1](_common_rules.md)）
-- 銘柄名 + コード（コードなしも可・テーマレベルまでで可）
-- 専門用語は中学生レベルの注釈必須（[prompts/_common_rules.md §3](_common_rules.md)）
+- **銘柄名 + コードのセット表記必須**（[prompts/_common_rules.md §7](_common_rules.md) と整合・「コードなしも可」を撤回・PM 2026-05-23 確定）。テーマレベル言及でも個別銘柄を挙げる時は必ずコードを付ける
+- 専門用語は中学生レベルの注釈必須（[prompts/_common_rules.md §5](_common_rules.md)）
 - 時刻は全て JST・英語原文転記禁止
 - 数値は parquet データを忠実転記・Claude 記憶ベース禁止
 

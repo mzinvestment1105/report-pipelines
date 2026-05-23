@@ -70,10 +70,11 @@
 
 - **PMに質問しない**。判断に迷う点は最も保守的な解釈で進める。
 - **Deep Research は廃止**（2026-05-19 PM 確定）。Deep Research 候補セクションを出力しない。`## 📌 Deep Research 候補` の見出しも書かない。Perplexity 等の外部調査プロンプトも生成しない。
-- **WebSearch / WebFetch は raw データで説明できないマクロ論点のみ使用**（PM 2026-05-23 確定・ローカル品質と同等担保）：
-  - news_raw / finnhub_raw に該当ニュースが無い・解釈に不足がある場合のみ Claude が WebSearch で当該イベントを補完調査
-  - 補完調査は「なぜそのイベントが起きたか・市況への波及」を中心に・raw データに無い数値の追加取得には使わない
-  - 外部ツール（Perplexity 等）への依存は禁止・Claude が WebSearch で直接実施
+- **WebSearch / WebFetch を市況補完・数値補完・イベント解釈の全用途で積極使用**（PM 2026-05-23 確定・ローカル品質と同等担保・「raw に無い数値は使わない」制約を撤廃）：
+  - news_raw / finnhub_raw に該当ニュースが無い・解釈に不足がある場合、Claude が WebSearch で当該イベントを補完調査
+  - **市況スナップショット数値が yfinance で取得できない・stale 等の場合、株探・ヤフーファイナンス・Bloomberg JP・Reuters JP を WebFetch して最新値を取得**（PM 2026-05-23 確定・「raw に無い数値の追加取得には使わない」制約を明示撤廃）
+  - 「なぜそのイベントが起きたか・市況への波及」「具体的な数値」「定量的な背景」の全ての用途で使用
+  - 外部ツール（Perplexity 等）への依存は禁止・Claude が WebSearch / WebFetch で直接実施
   - Deep Research プロンプト発行・`{date}_deep_research.md` ファイル作成は禁止（2026-05-19 PM 確定・マクロは対象外）
 - 既存の `${PRIVATE_REPO_ROOT}/market/daily/macro/` 配下の他ファイルを編集・削除しない。
 

@@ -51,7 +51,7 @@
 - raw データの `**需給（信用・株価水準）:**` ブロックを必ず転記
 - 信用残・倍率・時価総額比・週次推移・機関空売り・60 日 / 20 日高安・現在位置を全て含む
 - ブロック末尾に**PM への 1 行コメント**を必ず書く（信用過熱度合い・株価水準・逆張り警戒等の総合判断）
-- raw データに需給ブロックが無い銘柄は**レポートから除外**（繰り上げ）
+- raw データに需給ブロックが無い銘柄は**絶対除外しない**（PM 2026-05-23 確定・ランキング書き換え禁止）。[prompts/_common_rules.md §2-B「raw データに需給ブロックが含まれていない場合」](_common_rules.md) の多段フォールバック手順（screening_master → sector_stock_weekly → WebFetch 株探・ヤフー）で必ず取得する。全試行失敗時のみ需給ブロック内に「取得失敗・調査要」と明示し銘柄自体は記載する
 
 ## 銘柄行フォーマット（厳守・[prompts/_common_rules.md](_common_rules.md) §2 参照）
 
@@ -70,10 +70,17 @@
 - **売買代金**（億円・「不明」「N/A」禁止）
 - **時価総額**（億円・「不明」「N/A」禁止）
 
-### 取得不能時の処理
+### 取得不能時の処理（PM 2026-05-23 確定・除外禁止）
 
-- raw データに売買代金・時価総額が欠落している場合、`${PRIVATE_REPO_ROOT}/bi/outputs/screening_master.parquet` を Bash + Python ワンライナーで参照して補完を試みる
-- それでも取得不能な場合は当該銘柄を**除外**（記載不可・繰り上げて別銘柄を採用）
+raw に売買代金・時価総額が欠落していたら、以下を**順番に全試行**して必ず取得（[prompts/_common_rules.md §2](_common_rules.md) と整合）：
+
+1. `${PRIVATE_REPO_ROOT}/bi/outputs/screening_master.parquet`（Bash + Python ワンライナーで query）
+2. `${PRIVATE_REPO_ROOT}/bi/outputs/sector_stock_weekly.parquet`
+3. WebFetch `https://kabutan.jp/stock/?code={code}`（株探の概要ページ）
+4. WebFetch `https://finance.yahoo.co.jp/quote/{code}.T`（ヤフーファイナンス）
+5. WebFetch `https://finance.yahoo.co.jp/quote/{code}.T/profile`（プロフィールページ）
+
+上記 1〜5 を全試行しても取得不能な場合のみ、当該数値のみを「取得失敗・調査要」と明示し銘柄自体は記載する。**ランキング書き換え目的での銘柄除外を絶対禁止**。
 
 ### 時価総額の本文重複禁止
 
