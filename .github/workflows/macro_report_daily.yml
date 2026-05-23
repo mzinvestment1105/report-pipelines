@@ -109,6 +109,19 @@ jobs:
             -d "{\"content\": \"⏭ マクロレポート skip（新着記事なし）\n${{ steps.date.outputs.value }}\"}"
           exit 0
 
+      - name: 既存マクロレポートファイルを削除（前回不良ファイル読込スキップ防止）
+        # PM 2026-05-23 確定: Claude が前回ファイルを読んで「既に完成」と判定する
+        # 構造的失敗を防止（mover_weekly run 26325536581 で発生）。
+        working-directory: ./private-repo
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+        run: |
+          TARGET_FILE="market/daily/macro/${TARGET_DATE}.md"
+          if [ -f "$TARGET_FILE" ]; then
+            echo "Removing existing $TARGET_FILE before Claude run..."
+            rm -f "$TARGET_FILE"
+          fi
+
       - name: Generate macro report via Claude Code (Opus 4.7 + max thinking)
         uses: anthropics/claude-code-base-action@beta
         with:

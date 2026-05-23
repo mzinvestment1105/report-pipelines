@@ -97,6 +97,23 @@ jobs:
           print("PM 確定: 古くてもそのまま使う・更新は実行しない")
           PY
 
+      - name: 既存週次レポートファイルを削除（前回不良ファイル読込スキップ防止）
+        # PM 2026-05-23 確定: Claude が前回不良ファイル（commit 3a562b0 等）を読んで
+        # 「既に完成」と判定し全 step スキップする構造的失敗（run 26325536581）を防止。
+        # Workflow 起動毎に対象日のファイルを削除して Claude を必ずゼロから走らせる。
+        working-directory: ./private-repo
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+        run: |
+          TARGET_FILE="market/daily/movers/${TARGET_DATE}_weekly.md"
+          if [ -f "$TARGET_FILE" ]; then
+            echo "Removing existing $TARGET_FILE before Claude run..."
+            rm -f "$TARGET_FILE"
+            echo "Done. Claude will generate from scratch."
+          else
+            echo "No existing $TARGET_FILE - Claude will generate fresh."
+          fi
+
       - name: Generate mover weekly report via Claude Code (Opus 4.7 + max thinking・Deep Research 内包)
         # PM 2026-05-23 確定: ローカルと全く同じ精度を担保する。Deep Research は GHA 内で
         # Claude Code Action が WebSearch を使って実施 → make_sector_raw.py に --deep-research-file

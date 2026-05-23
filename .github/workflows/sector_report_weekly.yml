@@ -98,6 +98,19 @@ jobs:
           print("PM 確定: 古くてもそのまま使う・更新は実行しない")
           PY
 
+      - name: 既存セクター週次レポートファイルを削除（前回不良ファイル読込スキップ防止）
+        # PM 2026-05-23 確定: Claude が前回ファイルを読んで「既に完成」と判定する
+        # 構造的失敗を防止（mover_weekly run 26325536581 で発生）。
+        working-directory: ./private-repo
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+        run: |
+          TARGET_FILE="market/daily/sector/${TARGET_DATE}.md"
+          if [ -f "$TARGET_FILE" ]; then
+            echo "Removing existing $TARGET_FILE before Claude run..."
+            rm -f "$TARGET_FILE"
+          fi
+
       - name: Generate sector report via Claude Code (Opus 4.7 + max thinking・Deep Research 内包)
         # PM 2026-05-23 確定: ローカルと全く同じ精度を担保する。Deep Research は GHA 内で
         # Claude Code Action が WebSearch を使って実施 → make_sector_raw.py に --deep-research-file
