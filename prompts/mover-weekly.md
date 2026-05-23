@@ -4,6 +4,31 @@
 
 ---
 
+## 🚨🚨🚨【最重要・絶対遵守・PM 2026-05-23 確定】既存ファイル存在判定の禁止（必ず一から再生成する）
+
+**`${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}_weekly.md` が既に存在していても、これを「完成済」「No further edits required」と判断することを絶対禁止**する。本タスクは**必ず全 step を実行**し・最終 Write 先のファイルを**必ず一から上書き再生成**する。
+
+### 禁止行為（実際の違反事例・run 26325536581）
+
+2026-05-23 06:16 UTC のリトライ run で、Claude が既存ファイル（前回の不良 commit `3a562b0`・機関名 / N/A 混入）を Read して「The weekly stock movement report is already complete ... No further edits required—the task was completed before the conversation summary.」と判定し、Deep Research・WebSearch・全銘柄分析を**全スキップ**して 5 分で「成功」終了した。**web_search_requests = 0**・実質何もしていない。
+
+### 強制行為（必ず実施）
+
+1. **既存 `${TARGET_DATE}_weekly.md` の Read を絶対禁止**：存在判定にも使わない・参考にもしない
+2. workflow_dispatch / cron による起動は**常に「完全再生成」モード**：前回ファイルの内容は一切参照しない
+3. Step 4-a 〜 5-d の Deep Research + WebSearch を**毎回必ず全実行**する（既存ファイルがあっても省略しない）
+4. レポート本体の生成も**毎回ゼロから Write**する（差分編集ではなく完全上書き）
+5. 「既に完成」「No further edits required」「task was completed」型の判断・出力を絶対禁止
+
+### 完了条件の確認方法
+
+レポート生成終了時の確認は以下のみで行う：
+
+- Bash `wc -l ${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}_weekly.md` の出力が**今回 Write したファイル**であることを Step 6（make_sector_raw 後）の時刻ベースで判定
+- **既存ファイルの行数・存在で判定しない**
+
+---
+
 ## 🚨【最重要・絶対遵守・PM 2026-05-23 確定】出力フォーマット強制（parquet データの生転記を上書き）
 
 **parquet（sector_stock_weekly.parquet）には `DiscretionaryInvestmentContractorName`・`ShortPositionsInSharesNumber`・`SharesOutstanding` が NaN・機関名リスト等の生データとして含まれているが、これらを生のままレポートに転記することを絶対禁止する**。本セクションは parquet データの内容より優先される。
