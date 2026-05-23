@@ -4,9 +4,107 @@
 
 ---
 
+## 🟢【最優先・必須・TARGET_MARKET 分岐】3 市場別の分割実行モード（PM 2026-05-23 確定）
+
+**本タスクは TARGET_MARKET 環境変数（`prime` / `standard` / `growth`）に応じて担当範囲が異なる**。3 つの Claude 実行に分割することで 32K 出力上限を回避する設計でございます。
+
+### TARGET_MARKET=prime（1/3 実行）
+
+**Write 先**: `${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}_weekly_prime.md`
+
+**担当セクション**:
+- **0. 週次サマリー**（週初〜週末の指数・地合い・主要イベント整理）
+- **1. セクター別フロー**（タイトルに「東証全市場・プライム/スタンダード/グロース合算・5 営業日累計」と明記・全 19 セクターを網羅）
+- **2. プライム 週間上昇率 Top 5**
+- **3. プライム 週間下落率 Bottom 5**
+- **8a. プライム 週間売買代金 Top 5**
+- **9. 来週のスイング戦略メモ**（全 3 市場を俯瞰した PM 行動指針）
+
+### TARGET_MARKET=standard（2/3 実行）
+
+**Write 先**: `${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}_weekly_standard.md`
+
+**担当セクション**:
+- **4. スタンダード 週間上昇率 Top 5**
+- **5. スタンダード 週間下落率 Bottom 5**
+- **8b. スタンダード 週間売買代金 Top 5**
+
+### TARGET_MARKET=growth（3/3 実行）
+
+**Write 先**: `${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}_weekly_growth.md`
+
+**担当セクション**:
+- **6. グロース 週間上昇率 Top 10**
+- **7. グロース 週間下落率 Bottom 5**
+- **8c. グロース 週間売買代金 Top 10**
+
+### 共通ルール（全 TARGET_MARKET で同一）
+
+- 担当範囲外のセクションは**書かない**（書こうとしない・例：standard 実行で Prime セクションを書かない）
+- 担当範囲内のセクションは**全銘柄について事業モデル + 材料 + スイング観点 + 需給 + バリュエーション**を書く（日次動意レポートと同じ粒度）
+- 機関名禁止・N/A 表示禁止・需給簡潔・動意理由 WebSearch 必須等の全ルール（後述 🚨 セクション）は変わらず適用
+- セクター別フロー（Section 1）は **prime 実行のみ**が担当・standard / growth では書かない
+- 週次サマリー（Section 0）・来週のスイング戦略（Section 9）も **prime 実行のみ**
+
+### 各実行の出力構造
+
+prime 実行の出力ファイル（{date}_weekly_prime.md）冒頭：
+
+```markdown
+# 動意銘柄レポート {date}（週次・全市場版）
+
+## 0. 週次サマリー
+...
+
+## 1. セクター別フロー
+...
+
+## 2. プライム 週間上昇率 Top 5
+...
+
+## 3. プライム 週間下落率 Bottom 5
+...
+
+## 8a. プライム 週間売買代金 Top 5
+...
+
+## 9. 来週のスイング戦略メモ
+...
+```
+
+standard 実行の出力ファイル（{date}_weekly_standard.md）冒頭：
+
+```markdown
+## 4. スタンダード 週間上昇率 Top 5
+...
+
+## 5. スタンダード 週間下落率 Bottom 5
+...
+
+## 8b. スタンダード 週間売買代金 Top 5
+...
+```
+
+growth 実行の出力ファイル（{date}_weekly_growth.md）冒頭：
+
+```markdown
+## 6. グロース 週間上昇率 Top 10
+...
+
+## 7. グロース 週間下落率 Bottom 5
+...
+
+## 8c. グロース 週間売買代金 Top 10
+...
+```
+
+3 ファイルは workflow yml 側で順番に cat されて `{date}_weekly.md` 統合ファイルに組み立てられます。**standard / growth 実行で `# 動意銘柄レポート ...` のタイトル見出しを書かない**（prime のものを使う）。
+
+---
+
 ## 🚨🚨🚨【最重要・絶対遵守・PM 2026-05-23 確定】既存ファイル存在判定の禁止（必ず一から再生成する）
 
-**`${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}_weekly.md` が既に存在していても、これを「完成済」「No further edits required」と判断することを絶対禁止**する。本タスクは**必ず全 step を実行**し・最終 Write 先のファイルを**必ず一から上書き再生成**する。
+**統合ファイル（`${TARGET_DATE}_weekly.md`）と 3 市場分割ファイル（`${TARGET_DATE}_weekly_prime.md` / `${TARGET_DATE}_weekly_standard.md` / `${TARGET_DATE}_weekly_growth.md`）のいずれかが既に存在していても、これを「完成済」「No further edits required」と判断することを絶対禁止**する。本タスクは**必ず全 step を実行**し・自分の TARGET_MARKET 担当範囲ファイルを**必ず一から上書き再生成**する。
 
 ### 禁止行為（実際の違反事例・run 26325536581）
 
@@ -14,7 +112,7 @@
 
 ### 強制行為（必ず実施）
 
-1. **既存 `${TARGET_DATE}_weekly.md` の Read を絶対禁止**：存在判定にも使わない・参考にもしない
+1. **既存 `${TARGET_DATE}_weekly*.md` ファイル群の Read を絶対禁止**：存在判定にも使わない・参考にもしない
 2. workflow_dispatch / cron による起動は**常に「完全再生成」モード**：前回ファイルの内容は一切参照しない
 3. Step 4-a 〜 5-d の Deep Research + WebSearch を**毎回必ず全実行**する（既存ファイルがあっても省略しない）
 4. レポート本体の生成も**毎回ゼロから Write**する（差分編集ではなく完全上書き）
@@ -24,7 +122,7 @@
 
 レポート生成終了時の確認は以下のみで行う：
 
-- Bash `wc -l ${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}_weekly.md` の出力が**今回 Write したファイル**であることを Step 6（make_sector_raw 後）の時刻ベースで判定
+- Bash `wc -l ${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}_weekly_${TARGET_MARKET}.md` の出力が**今回 Write したファイル**であることを Step 6（make_sector_raw 後）の時刻ベースで判定
 - **既存ファイルの行数・存在で判定しない**
 
 ---
@@ -80,16 +178,22 @@
 
 ---
 
-## 【最重要・誤認防止】本タスクで Write する最終ファイル
+## 【最重要・誤認防止】本タスクで Write する最終ファイル（TARGET_MARKET 別）
 
-**`${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}_weekly.md`** — これが本タスクのゴール。**この 1 つだけ**を最終 Write 対象とする。
+**TARGET_MARKET 環境変数の値によって Write 先が異なる**（PM 2026-05-23 確定・3 市場別分割実行モード）：
+
+- `TARGET_MARKET=prime` → **`${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}_weekly_prime.md`**
+- `TARGET_MARKET=standard` → **`${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}_weekly_standard.md`**
+- `TARGET_MARKET=growth` → **`${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}_weekly_growth.md`**
+
+これが本タスクのゴール。**TARGET_MARKET に対応する 1 つだけ**を最終 Write 対象とする。統合ファイル（`{date}_weekly.md` 接尾辞なし）は workflow yml 側で 3 ファイルを cat した結果が書かれるため、Claude タスクでは触らない。
 
 ### 混同禁止（他レポートとの誤認防止）
 
 - **セクター週次レポート（`market/daily/sector/{date}.md`）は本タスクの対象外**。別 workflow（sector_report_weekly.yml）が担当する。
 - **動意日次レポート（`market/daily/movers/{date}.md`・ファイル名末尾 `_weekly` なし）も本タスクの対象外**。別 workflow（mover_report_daily.yml）が担当する。
 - 本タスクの中で `make_sector_raw.py` を実行するのは parquet 生成のためだけ。**セクター分析レポート（`sector/{date}.md`）の Write は禁止**。
-- 本タスクで Write する markdown は `movers/${TARGET_DATE}_weekly.md` の **1 ファイルだけ**。それ以外の market/daily/ 配下への Write は禁止。
+- 本タスクで Write する markdown は **`movers/${TARGET_DATE}_weekly_${TARGET_MARKET}.md`** の 1 ファイルだけ（TARGET_MARKET=prime / standard / growth で接尾辞が変わる）。それ以外の market/daily/ 配下への Write は禁止。統合ファイル（`{date}_weekly.md` 接尾辞なし）への Write も禁止（workflow yml 側で cat 統合する設計）。
 
 **本レポートの集計軸**: 5 営業日累計売買代金・累計上昇率・累計下落率（日次フル版と同フォーマット）。Discord 送信は市場別画像 3 枚に分離（プライム・スタンダード・グロース）。
 
@@ -199,7 +303,7 @@ for market in ["プライム", "スタンダード", "グロース"]:
 
 ## レポート構成（出力セクション・日次フル版と同フォーマット）
 
-`${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}_weekly.md` に Write で保存。以下のセクションを **全て** 出力：
+**`${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}_weekly_${TARGET_MARKET}.md` に Write で保存**（TARGET_MARKET=prime / standard / growth で接尾辞が変わる）。**TARGET_MARKET 担当範囲のセクションのみ出力**（最上位 §🟢 セクション参照）。以下は全 9 セクションの一覧で、各 TARGET_MARKET の担当範囲は §🟢 で定義：
 
 - **0. 週次サマリー**（週初〜週末の指数・地合い・主要イベント整理）
 - **1. セクター別フロー**（タイトルに「東証全市場・プライム/スタンダード/グロース合算・5 営業日累計」と明記）
@@ -348,18 +452,21 @@ raw データの各銘柄について以下を機械的にチェックし、該�
 
 ## 完了条件（Write 直前自己検証）
 
-### 必須 Write 先確認（最重要）
+### 必須 Write 先確認（最重要・TARGET_MARKET 別）
 
-- **`${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}_weekly.md`** を必ず Write
+- **`${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}_weekly_${TARGET_MARKET}.md`** を必ず Write（TARGET_MARKET=prime / standard / growth）
+- 統合ファイル（`{date}_weekly.md` 接尾辞なし）への Write は禁止（workflow yml で cat 統合する設計）
 - ファイル名末尾 `_weekly` がない `movers/${TARGET_DATE}.md` への Write は禁止（日次フル版用）
 - セクターレポート `sector/${TARGET_DATE}.md` への Write は本タスク対象外・絶対禁止
 
-### 内容自己検証
+### 内容自己検証（TARGET_MARKET 別）
 
 - 生成ファイルが空でない
 - ETF/REIT/上場投信が 1 件も混入していない（grep で銘柄名キーワード検証）
-- 全銘柄の見出し行に「コード + 銘柄名 + 週間騰落率 + 金曜終値 + 週間売買代金 + 時価総額」が揃っている
-- プライム上昇/下落 5 件・スタンダード上昇/下落 5 件・グロース上昇 10 / 下落 5 件・売買代金 Top（プライム 5 / スタンダード 5 / グロース 10）が**個別株のみで件数充足**している
+- 担当範囲銘柄全てに「コード + 銘柄名 + 週間騰落率 + 金曜終値 + 週間売買代金 + 時価総額」が揃っている
+- TARGET_MARKET=prime: プライム上昇 5・下落 5・売買代金 5 件 + Section 0・1・9 全揃い
+- TARGET_MARKET=standard: スタンダード上昇 5・下落 5・売買代金 5 件のみ
+- TARGET_MARKET=growth: グロース上昇 10・下落 5・売買代金 10 件のみ
 - Deep Research 候補セクションが含まれていない
 
 ### Bash で存在確認
@@ -367,7 +474,7 @@ raw データの各銘柄について以下を機械的にチェックし、該�
 完了直前に以下を Bash で実行し、本タスクのゴールファイルが存在することを確認する：
 
 ```bash
-ls -la ${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}_weekly.md
+ls -la ${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}_weekly_${TARGET_MARKET}.md
 ```
 
 存在しなければ書き直してから処理を終了する。

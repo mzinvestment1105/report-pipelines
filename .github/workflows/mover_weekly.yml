@@ -97,41 +97,107 @@ jobs:
           print("PM 確定: 古くてもそのまま使う・更新は実行しない")
           PY
 
-      - name: 既存週次レポートファイルを削除（前回不良ファイル読込スキップ防止）
-        # PM 2026-05-23 確定: Claude が前回不良ファイル（commit 3a562b0 等）を読んで
-        # 「既に完成」と判定し全 step スキップする構造的失敗（run 26325536581）を防止。
-        # Workflow 起動毎に対象日のファイルを削除して Claude を必ずゼロから走らせる。
+      - name: 既存週次レポートファイル群を削除（前回不良ファイル読込スキップ防止）
+        # PM 2026-05-23 確定: Claude が前回不良ファイルを読んで「既に完成」と判定し
+        # 全 step スキップする構造的失敗（run 26325536581）を防止。
+        # 統合ファイル + 3 市場分割ファイルすべて削除して必ずゼロから走らせる。
         working-directory: ./private-repo
         env:
           TARGET_DATE: ${{ steps.date.outputs.value }}
         run: |
-          TARGET_FILE="market/daily/movers/${TARGET_DATE}_weekly.md"
-          if [ -f "$TARGET_FILE" ]; then
-            echo "Removing existing $TARGET_FILE before Claude run..."
-            rm -f "$TARGET_FILE"
-            echo "Done. Claude will generate from scratch."
-          else
-            echo "No existing $TARGET_FILE - Claude will generate fresh."
-          fi
+          for SUFFIX in "" "_prime" "_standard" "_growth"; do
+            TARGET_FILE="market/daily/movers/${TARGET_DATE}_weekly${SUFFIX}.md"
+            if [ -f "$TARGET_FILE" ]; then
+              echo "Removing existing $TARGET_FILE..."
+              rm -f "$TARGET_FILE"
+            fi
+          done
+          echo "All weekly files removed. Claude will generate from scratch (3-market split)."
 
-      - name: Generate mover weekly report via Claude Code (Opus 4.7 + max thinking・Deep Research 内包)
-        # PM 2026-05-23 確定: ローカルと全く同じ精度を担保する。Deep Research は GHA 内で
-        # Claude Code Action が WebSearch を使って実施 → make_sector_raw.py に --deep-research-file
-        # で渡す → メインレポート生成、までを 1 Action で完結する。
+      - name: Generate prime market section via Claude Code (1/3)
+        # PM 2026-05-23 確定: 出力 32K 上限超過の構造的失敗（run 26326122006）を防止するため
+        # プライム / スタンダード / グロースの 3 市場を別々の Claude 実行に分割。
+        # プライム run は Section 0 (週次サマリー) + Section 1 (セクター別フロー全 19) +
+        # プライム上昇 Top 5 + プライム下落 Bottom 5 + プライム売買代金 Top 5 + Section 9 (PM 行動指針) を担当。
         uses: anthropics/claude-code-base-action@beta
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           model: claude-opus-4-7
           prompt_file: report-pipelines/prompts/mover-weekly.md
           allowed_tools: "Read,Write,Edit,Bash,Grep,Glob,WebSearch,WebFetch"
-          timeout_minutes: "60"
+          timeout_minutes: "30"
           claude_env: |
             MAX_THINKING_TOKENS: 32000
-            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 64000
+            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
         env:
           TARGET_DATE: ${{ steps.date.outputs.value }}
+          TARGET_MARKET: prime
           PRIVATE_REPO_ROOT: private-repo
           JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
+          CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+
+      - name: Generate standard market section via Claude Code (2/3)
+        # スタンダード上昇 Top 5 + スタンダード下落 Bottom 5 + スタンダード売買代金 Top 5 を担当。
+        uses: anthropics/claude-code-base-action@beta
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          model: claude-opus-4-7
+          prompt_file: report-pipelines/prompts/mover-weekly.md
+          allowed_tools: "Read,Write,Edit,Bash,Grep,Glob,WebSearch,WebFetch"
+          timeout_minutes: "30"
+          claude_env: |
+            MAX_THINKING_TOKENS: 32000
+            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+          TARGET_MARKET: standard
+          PRIVATE_REPO_ROOT: private-repo
+          JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
+          CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+
+      - name: Generate growth market section via Claude Code (3/3)
+        # グロース上昇 Top 10 + グロース下落 Bottom 5 + グロース売買代金 Top 10 を担当。
+        uses: anthropics/claude-code-base-action@beta
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          model: claude-opus-4-7
+          prompt_file: report-pipelines/prompts/mover-weekly.md
+          allowed_tools: "Read,Write,Edit,Bash,Grep,Glob,WebSearch,WebFetch"
+          timeout_minutes: "30"
+          claude_env: |
+            MAX_THINKING_TOKENS: 32000
+            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+          TARGET_MARKET: growth
+          PRIVATE_REPO_ROOT: private-repo
+          JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
+          CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+
+      - name: 3 市場分割ファイルを統合して {date}_weekly.md を生成
+        # Discord 送信スクリプトが期待する統合ファイルを 3 市場ファイルから組み立てる。
+        working-directory: ./private-repo
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+        run: |
+          OUTPUT="market/daily/movers/${TARGET_DATE}_weekly.md"
+          PRIME_FILE="market/daily/movers/${TARGET_DATE}_weekly_prime.md"
+          STANDARD_FILE="market/daily/movers/${TARGET_DATE}_weekly_standard.md"
+          GROWTH_FILE="market/daily/movers/${TARGET_DATE}_weekly_growth.md"
+          for F in "$PRIME_FILE" "$STANDARD_FILE" "$GROWTH_FILE"; do
+            if [ ! -f "$F" ]; then
+              echo "ERROR: Missing required market file: $F"
+              exit 1
+            fi
+            echo "Found: $F ($(wc -l < "$F") lines)"
+          done
+          # Prime is the base (contains Section 0・1・9). Append Standard then Growth sections only.
+          cat "$PRIME_FILE" > "$OUTPUT"
+          echo "" >> "$OUTPUT"
+          cat "$STANDARD_FILE" >> "$OUTPUT"
+          echo "" >> "$OUTPUT"
+          cat "$GROWTH_FILE" >> "$OUTPUT"
+          echo "Merged into $OUTPUT ($(wc -l < "$OUTPUT") lines)"
 
       - name: Send Discord (JPEG・市場別 3 枚分割)
         working-directory: ./private-repo/bi/pipelines
