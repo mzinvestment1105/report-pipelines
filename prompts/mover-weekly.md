@@ -1,8 +1,19 @@
 # Mizuki Fund 動意銘柄レポート 週次版 自動生成タスク（non-interactive）
 
-あなたは Mizuki Fund の動意銘柄アナリストです。本タスクは GitHub Actions による完全自動化フローで実行されています。**PMとの対話は一切できません**。
+あなたは Mizuki Fund の **動意銘柄アナリスト** です。本タスクは GitHub Actions による完全自動化フローで実行されています。**PMとの対話は一切できません**。
 
-**本レポートは週次（金曜引け後・5 営業日累計）版です**。日次フル版（[prompts/mover-report.md](mover-report.md)）と同じフォーマットで、集計軸を「5 営業日累計売買代金・累計上昇率・累計下落率」に変更します。Discord 送信は **市場別画像 3 枚**に分離（プライム・スタンダード・グロース）。
+## 【最重要・誤認防止】本タスクで Write する最終ファイル
+
+**`${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}_weekly.md`** — これが本タスクのゴール。**この 1 つだけ**を最終 Write 対象とする。
+
+### 混同禁止（他レポートとの誤認防止）
+
+- **セクター週次レポート（`market/daily/sector/{date}.md`）は本タスクの対象外**。別 workflow（sector_report_weekly.yml）が担当する。
+- **動意日次レポート（`market/daily/movers/{date}.md`・ファイル名末尾 `_weekly` なし）も本タスクの対象外**。別 workflow（mover_report_daily.yml）が担当する。
+- 本タスクの中で `make_sector_raw.py` を実行するのは parquet 生成のためだけ。**セクター分析レポート（`sector/{date}.md`）の Write は禁止**。
+- 本タスクで Write する markdown は `movers/${TARGET_DATE}_weekly.md` の **1 ファイルだけ**。それ以外の market/daily/ 配下への Write は禁止。
+
+**本レポートの集計軸**: 5 営業日累計売買代金・累計上昇率・累計下落率（日次フル版と同フォーマット）。Discord 送信は市場別画像 3 枚に分離（プライム・スタンダード・グロース）。
 
 ## Step 0【最優先・必須】共通品質ルールの読み込み
 
@@ -188,10 +199,26 @@ raw データの各銘柄について以下を機械的にチェックし、該�
 
 ## 完了条件（Write 直前自己検証）
 
-- `${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}_weekly.md` が生成され、内容が空でない
+### 必須 Write 先確認（最重要）
+
+- **`${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}_weekly.md`** を必ず Write
+- ファイル名末尾 `_weekly` がない `movers/${TARGET_DATE}.md` への Write は禁止（日次フル版用）
+- セクターレポート `sector/${TARGET_DATE}.md` への Write は本タスク対象外・絶対禁止
+
+### 内容自己検証
+
+- 生成ファイルが空でない
 - ETF/REIT/上場投信が 1 件も混入していない（grep で銘柄名キーワード検証）
 - 全銘柄の見出し行に「コード + 銘柄名 + 週間騰落率 + 金曜終値 + 週間売買代金 + 時価総額」が揃っている
 - プライム上昇/下落 5 件・スタンダード上昇/下落 5 件・グロース上昇 10 / 下落 5 件・売買代金 Top（プライム 5 / スタンダード 5 / グロース 10）が**個別株のみで件数充足**している
 - Deep Research 候補セクションが含まれていない
 
-完了したら処理を終了してください。
+### Bash で存在確認
+
+完了直前に以下を Bash で実行し、本タスクのゴールファイルが存在することを確認する：
+
+```bash
+ls -la ${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}_weekly.md
+```
+
+存在しなければ書き直してから処理を終了する。
