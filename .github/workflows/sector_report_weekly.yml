@@ -111,6 +111,7 @@ jobs:
           timeout_minutes: "60"
           claude_env: |
             MAX_THINKING_TOKENS: 32000
+            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 64000
         env:
           TARGET_DATE: ${{ steps.date.outputs.value }}
           PRIVATE_REPO_ROOT: private-repo
