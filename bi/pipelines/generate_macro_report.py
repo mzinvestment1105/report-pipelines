@@ -200,6 +200,7 @@ def build_prompt(
     snapshot: str,
     target_date: str,
     finnhub_raw: str | None = None,
+    tachibana_raw: str | None = None,
 ) -> str:
     agent_spec = (AGENTS_DIR / "macro_analyst.md").read_text(encoding="utf-8")
 
@@ -228,6 +229,23 @@ def build_prompt(
 英語のニュース見出し・要約は内容を理解した上で日本語で分析に反映してください。
 
 {finnhub_raw}
+---
+"""
+
+    tachibana_section = ""
+    if tachibana_raw:
+        tachibana_section = f"""
+---
+## 立花証券 e支店 API ニュース速報（QUICK NQN / TDNet AI / AI 市況）
+以下は立花証券 e支店 API 経由で取得した日本株専門ニュース速報です。完全日本語・既に整理済。
+- **QUICK NQN**: 東証セッション速報・米国株市況・為替時系列・日経先物・日本株 ADR・QUICK レーティング更新・業績修正・銘柄ラウンドアップ
+- **AI 市況（ボード）**: 寄り前注文予想・材料発生・ストップ高/新高値/新安値・売買代金上位・寄付後上昇率/下落率
+- **TDNet/EDINET AI 速報**: 個別銘柄の決算/人事/公開買付け/自社株買い/大量保有報告/有価証券届出書 を AI 要約済
+このセクションは**マクロレポートの市況スナップショット・重要テーマ・構造的リスク**の分析素材として活用してください。
+- マクロ環境分析には QUICK NQN セクション（セッション速報・為替・米国株・先物）を最優先で参照
+- 個別銘柄の動意分析は TDNet AI 速報・QUICK 個別銘柄解説を参照
+
+{tachibana_raw}
 ---
 """
 
@@ -344,11 +362,20 @@ def main() -> None:
     else:
         print(f"Finnhub データなし（{finnhub_path.name}）- fetch_finnhub.py を先に実行するとグローバルニュースが追加されます")
 
+    # 立花証券 e支店 API ニュース raw データを読み込む（任意・存在しなくてもスキップ）
+    tachibana_path = MARKET_DIR / f"{target_date_str}_tachibana_news_raw.md"
+    tachibana_raw: str | None = None
+    if tachibana_path.exists():
+        tachibana_raw = tachibana_path.read_text(encoding="utf-8")
+        print(f"立花証券 e支店ニュースあり: {tachibana_path.name} ({len(tachibana_raw):,} 文字)")
+    else:
+        print(f"立花証券 e支店ニュースなし（{tachibana_path.name}）- fetch_tachibana_news.py を先に実行すると QUICK/TDNet AI 速報が追加されます")
+
     # 市況スナップショット取得（target_date を渡して取得日の整合性を保証）
     print(f"市況データ取得中 (yfinance) target_date={target_date_str}...")
     snapshot = get_market_snapshot(target_date_str)
 
-    prompt = build_prompt(today_raw, yesterday_report, snapshot, target_date_str, finnhub_raw)
+    prompt = build_prompt(today_raw, yesterday_report, snapshot, target_date_str, finnhub_raw, tachibana_raw)
 
     # rawファイルに保存（後続の Claude 分析用）
     raw_output_path = MARKET_DIR / f"{target_date_str}_macro_raw.md"
