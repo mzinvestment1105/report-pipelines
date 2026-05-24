@@ -32,6 +32,50 @@ from lib.md_to_jpeg import render_markdown_to_jpeg  # noqa: E402
 JST = timezone(timedelta(hours=9))
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
+# PM 2026-05-23 確定: Discord 8MB 上限超過時の自動再圧縮閾値（HTTP 413 防止）
+DISCORD_MAX_BYTES = 7_500_000  # 8MB の余裕分を取った保守的閾値
+
+
+def ensure_under_discord_limit(jpeg_path: Path, max_bytes: int = DISCORD_MAX_BYTES) -> None:
+    """JPEG が Discord 上限を超えていたら Pillow で段階的に画質を下げて再エンコードする。
+
+    各市場で render_markdown_to_jpeg が 17MB 等の大きな JPEG を出す場合があり
+    （Section 0+1+2+3+8a+9 を 1 枚にレンダリングすると Japanese 字体ヘビーで巨大化）、
+    Discord の 8MB ファイル上限で HTTP 413 エラーになるため自動圧縮で対処。
+    """
+    if not jpeg_path.exists():
+        return
+    size = jpeg_path.stat().st_size
+    if size <= max_bytes:
+        return
+    try:
+        from PIL import Image
+    except ImportError:
+        print(f"WARNING: PIL/Pillow 未インストール・JPEG 圧縮スキップ ({size:,} bytes)")
+        return
+    print(f"[compress] {jpeg_path.name} は {size:,} bytes (> {max_bytes:,})・段階的に画質再エンコード")
+    img = Image.open(jpeg_path)
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    # 画質を 80 → 70 → 60 → 50 → 40 → 30 と段階的に下げる
+    for q in (80, 70, 60, 50, 40, 30):
+        img.save(jpeg_path, "JPEG", quality=q, optimize=True)
+        new_size = jpeg_path.stat().st_size
+        print(f"  quality={q} → {new_size:,} bytes")
+        if new_size <= max_bytes:
+            return
+    # それでも大きい場合は解像度も下げる
+    for scale in (0.85, 0.70, 0.55):
+        w, h = img.size
+        nw, nh = int(w * scale), int(h * scale)
+        img_resized = img.resize((nw, nh), Image.LANCZOS)
+        img_resized.save(jpeg_path, "JPEG", quality=70, optimize=True)
+        new_size = jpeg_path.stat().st_size
+        print(f"  scale={scale} ({nw}x{nh}) quality=70 → {new_size:,} bytes")
+        if new_size <= max_bytes:
+            return
+    print(f"WARNING: 圧縮しても {jpeg_path.stat().st_size:,} bytes・Discord 送信で 413 になる可能性")
+
 
 KIND_CONFIG = {
     "macro": {
@@ -172,6 +216,7 @@ def main() -> int:
             print(f"[render] movers/{label} → {p.name}")
             render_markdown_to_jpeg(md_part, p, kind=args.kind, footer="@noctra_jp / Mizuki Fund")
             print(f"  saved: {p}  size={p.stat().st_size:,} bytes")
+            ensure_under_discord_limit(p)
 
             content = f"**{cfg['label']}（{label}）** {identifier}"
             payload = {
@@ -201,6 +246,8 @@ def main() -> int:
 
     if args.skip_send:
         return 0
+
+    ensure_under_discord_limit(out_path)
 
     if out_path.stat().st_size > 9_500_000:
         print(f"WARNING: JPEG exceeds 9.5MB ({out_path.stat().st_size:,} bytes). Discord may reject.")

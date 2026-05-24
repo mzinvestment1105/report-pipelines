@@ -23,3 +23,5 @@ pyyaml>=6.0.0
 # JPEG レポート画像化（send_report_jpeg_discord.py + lib/md_to_jpeg.py）
 markdown>=3.5
 playwright>=1.40.0
+# PM 2026-05-23 確定: Discord 8MB 上限超過時の自動再圧縮で使用（ensure_under_discord_limit）
+Pillow>=10.0.0
