@@ -10,11 +10,17 @@ name: 動意銘柄レポート日次
         required: false
         default: ''
 
-jobs:
-  generate:
-    runs-on: ubuntu-latest
-    timeout-minutes: 50
+# PM 2026-05-25 確定: weekly と同じく 3 並列構造に変更（32K 出力上限対策）。
+# setup-raw ジョブが raw データ生成 + artifact upload。
+# generate-market ジョブが matrix で prime / standard / growth を 3 並列実行。
+# merge-and-send ジョブが 3 ファイル統合 + Discord 送信 + commit。
 
+jobs:
+  setup-raw:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      target_date: ${{ steps.date.outputs.value }}
     steps:
       - name: Determine target date
         id: date
@@ -44,7 +50,93 @@ jobs:
           git clone git@github.com:mzinvestment1105/mizuki-fund.git private-repo
 
       - name: Copy pipelines and static files from Public into private working tree
-        # PMが Mizuki Fund 側への push を忘れても Public 側の最新で上書き
+        run: |
+          cp -f report-pipelines/bi/pipelines/*.py private-repo/bi/pipelines/
+          cp -f report-pipelines/bi/pipelines/requirements.txt private-repo/bi/pipelines/
+          mkdir -p private-repo/bi/pipelines/lib
+          cp -rf report-pipelines/bi/pipelines/lib/*.py private-repo/bi/pipelines/lib/ 2>/dev/null || true
+          mkdir -p private-repo/agents private-repo/playbook
+          cp -f report-pipelines/agents/*.md private-repo/agents/ 2>/dev/null || true
+          cp -f report-pipelines/playbook/*.md private-repo/playbook/ 2>/dev/null || true
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: report-pipelines/bi/pipelines/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r report-pipelines/bi/pipelines/requirements.txt
+
+      - name: Check screening_master parquet existence (no update・PM 2026-05-23 確定)
+        working-directory: ./private-repo/bi/pipelines
+        env:
+          PYTHONIOENCODING: utf-8
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+        run: |
+          python - <<'PY'
+          import os, sys
+          from pathlib import Path
+          import pandas as pd
+
+          parquet = Path("../outputs/screening_master.parquet")
+          if not parquet.exists():
+              print(f"[WARN] screening_master.parquet が見つかりません: {parquet}")
+              sys.exit(0)
+          df = pd.read_parquet(parquet)
+          latest = pd.to_datetime(df["DataDate"]).max().date().isoformat() if "DataDate" in df.columns else "unknown"
+          target = os.environ.get("TARGET_DATE", "")
+          print(f"screening_master DataDate: {latest} (target: {target})")
+          PY
+
+      - name: Generate movers raw (make_mover_report.py --no-pdf)
+        # PM 2026-05-25 確定: setup-raw ジョブで 1 回だけ実行・artifact 共有で
+        # 3 並列ジョブの JQuants API 過剰呼び出しを回避。
+        working-directory: ./private-repo/bi/pipelines
+        env:
+          JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
+          EDINETDB_API_KEYS: ${{ secrets.EDINETDB_API_KEYS }}
+          PYTHONIOENCODING: utf-8
+        run: |
+          python make_mover_report.py --date ${{ steps.date.outputs.value }} --no-pdf
+
+      - name: Upload movers raw as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: movers-raw-${{ steps.date.outputs.value }}
+          path: private-repo/market/daily/${{ steps.date.outputs.value }}_movers_raw.md
+          retention-days: 7
+          if-no-files-found: error
+
+  generate-market:
+    needs: setup-raw
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    strategy:
+      fail-fast: false
+      matrix:
+        market: [prime, standard, growth]
+    steps:
+      - name: Checkout report-pipelines
+        uses: actions/checkout@v4
+        with:
+          path: report-pipelines
+
+      - name: Setup SSH for private repo
+        env:
+          PRIVATE_REPO_DEPLOY_KEY: ${{ secrets.PRIVATE_REPO_DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$PRIVATE_REPO_DEPLOY_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+      - name: Clone private repo (mizuki-fund)
+        run: |
+          git clone git@github.com:mzinvestment1105/mizuki-fund.git private-repo
+
+      - name: Copy pipelines and static files from Public into private working tree
         run: |
           cp -f report-pipelines/bi/pipelines/*.py private-repo/bi/pipelines/
           cp -f report-pipelines/bi/pipelines/requirements.txt private-repo/bi/pipelines/
@@ -73,101 +165,187 @@ jobs:
         run: |
           playwright install chromium --with-deps
 
-      - name: Check screening_master parquet existence (no update・PM 2026-05-23 確定)
-        # PM 明示指示: screening_master 更新は 5 時間かかるため本 workflow 内で走らせない。
-        # screening_master.yml の cron (16:30 JST) で別途更新される設計に依存・存在確認のみ。
-        working-directory: ./private-repo/bi/pipelines
-        env:
-          PYTHONIOENCODING: utf-8
-          TARGET_DATE: ${{ steps.date.outputs.value }}
-        run: |
-          python - <<'PY'
-          import os, sys
-          from pathlib import Path
-          import pandas as pd
+      - name: Download movers raw artifact (from setup-raw)
+        # PM 2026-05-25 確定: setup-raw ジョブで生成した raw を全 generate-market 並列で共有
+        uses: actions/download-artifact@v4
+        with:
+          name: movers-raw-${{ needs.setup-raw.outputs.target_date }}
+          path: /tmp/movers-raw
 
-          parquet = Path("../outputs/screening_master.parquet")
-          if not parquet.exists():
-              print(f"[WARN] screening_master.parquet が見つかりません: {parquet}")
-              print("       本 workflow では更新しない設計のため、screening_master.yml が事前に走っている前提です")
-              sys.exit(0)
-          df = pd.read_parquet(parquet)
-          latest = pd.to_datetime(df["DataDate"]).max().date().isoformat() if "DataDate" in df.columns else "unknown"
-          target = os.environ.get("TARGET_DATE", "")
-          print(f"screening_master DataDate: {latest} (target: {target})")
-          print("PM 確定: 古くてもそのまま使う・更新は実行しない")
-          PY
-
-      - name: Generate movers raw (make_mover_report.py --no-pdf)
-        working-directory: ./private-repo/bi/pipelines
-        env:
-          JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
-          EDINETDB_API_KEYS: ${{ secrets.EDINETDB_API_KEYS }}
-          PYTHONIOENCODING: utf-8
-        run: |
-          python make_mover_report.py --date ${{ steps.date.outputs.value }} --no-pdf
-
-      - name: 既存日次レポートファイルを削除（前回不良ファイル読込スキップ防止）
-        # PM 2026-05-23 確定: Claude が前回ファイルを読んで「既に完成」と判定し
-        # 全 step スキップする構造的失敗を防止（mover_weekly run 26325536581 で発生）。
+      - name: Place movers raw into private working tree
         working-directory: ./private-repo
         env:
-          TARGET_DATE: ${{ steps.date.outputs.value }}
+          TARGET_DATE: ${{ needs.setup-raw.outputs.target_date }}
         run: |
-          TARGET_FILE="market/daily/movers/${TARGET_DATE}.md"
-          if [ -f "$TARGET_FILE" ]; then
-            echo "Removing existing $TARGET_FILE before Claude run..."
-            rm -f "$TARGET_FILE"
-          fi
+          mkdir -p market/daily
+          cp /tmp/movers-raw/${TARGET_DATE}_movers_raw.md market/daily/
+          echo "Placed market/daily/${TARGET_DATE}_movers_raw.md ($(wc -l < market/daily/${TARGET_DATE}_movers_raw.md) lines)"
 
-      - name: Generate mover report via Claude Code (Opus 4.7 + max thinking)
+      - name: 既存日次レポートファイル群を削除（前回不良ファイル読込スキップ防止）
+        working-directory: ./private-repo
+        env:
+          TARGET_DATE: ${{ needs.setup-raw.outputs.target_date }}
+          TARGET_MARKET: ${{ matrix.market }}
+        run: |
+          for SUFFIX in "" "_${TARGET_MARKET}"; do
+            TARGET_FILE="market/daily/movers/${TARGET_DATE}${SUFFIX}.md"
+            if [ -f "$TARGET_FILE" ]; then
+              echo "Removing existing $TARGET_FILE..."
+              rm -f "$TARGET_FILE"
+            fi
+          done
+
+      - name: Generate ${{ matrix.market }} market section via Claude Code (Opus 4.7 + max thinking)
         uses: anthropics/claude-code-base-action@beta
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           model: claude-opus-4-7
           prompt_file: report-pipelines/prompts/mover-report.md
           allowed_tools: "Read,Write,Edit,Bash,Grep,Glob,WebSearch,WebFetch"
-          timeout_minutes: "30"
+          timeout_minutes: "45"
           claude_env: |
             MAX_THINKING_TOKENS: 32000
-            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 64000
+            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
         env:
-          TARGET_DATE: ${{ steps.date.outputs.value }}
+          TARGET_DATE: ${{ needs.setup-raw.outputs.target_date }}
+          TARGET_MARKET: ${{ matrix.market }}
           PRIVATE_REPO_ROOT: private-repo
+          CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
 
-      - name: Send Discord (JPEG)
-        working-directory: ./private-repo/bi/pipelines
-        env:
-          DISCORD_WEBHOOK_MOVERS: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
-          PYTHONIOENCODING: utf-8
-        run: |
-          python send_report_jpeg_discord.py --kind movers --date ${{ steps.date.outputs.value }}
+      - name: Upload market section as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mover-daily-${{ matrix.market }}-${{ needs.setup-raw.outputs.target_date }}
+          path: private-repo/market/daily/movers/${{ needs.setup-raw.outputs.target_date }}_${{ matrix.market }}.md
+          retention-days: 7
+          if-no-files-found: error
 
-      - name: Commit and push to private repo
-        working-directory: ./private-repo
-        run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          # Public から overlay した一時コピーをすべて掃除
-          git checkout -- bi/pipelines/ agents/ playbook/ 2>/dev/null || true
-          git clean -fd bi/pipelines/ agents/ playbook/ 2>/dev/null || true
-          git add market/daily/
-          if ! git diff --staged --quiet; then
-            # 残りの未追跡・未ステージ変更を退避して rebase をクリーンに走らせる
-            git stash push --keep-index --include-untracked -m "ci-cleanup" 2>/dev/null || true
-            git commit -m "data: mover report ${{ steps.date.outputs.value }}"
-            git fetch origin master
-            git rebase origin/master || (git diff --name-only --diff-filter=U | xargs -I{} git checkout --theirs {}; git diff --name-only --diff-filter=U | xargs git add; git -c core.editor=true rebase --continue)
-            git push origin master
-            # 退避した一時変更は破棄（Public 側 overlay なので保存不要）
-            git stash drop 2>/dev/null || true
-          fi
-
-      - name: Discord 通知（失敗）
+      - name: Discord 通知（市場別失敗）
         if: failure()
         env:
           DISCORD_WEBHOOK_MOVERS: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
         run: |
           curl -s -X POST "$DISCORD_WEBHOOK_MOVERS" \
             -H "Content-Type: application/json" \
-            -d "{\"content\": \"❌ 動意レポート失敗\n${{ steps.date.outputs.value }}\nログ確認: https://github.com/${{ github.repository }}/actions\"}"
+            -d "{\"content\": \"❌ 動意レポート（${{ matrix.market }} 市場）失敗\n${{ needs.setup-raw.outputs.target_date }}\nログ確認: https://github.com/${{ github.repository }}/actions\"}"
+
+  merge-and-send:
+    needs: [setup-raw, generate-market]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout report-pipelines
+        uses: actions/checkout@v4
+        with:
+          path: report-pipelines
+
+      - name: Setup SSH for private repo
+        env:
+          PRIVATE_REPO_DEPLOY_KEY: ${{ secrets.PRIVATE_REPO_DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$PRIVATE_REPO_DEPLOY_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+      - name: Clone private repo (mizuki-fund)
+        run: |
+          git clone git@github.com:mzinvestment1105/mizuki-fund.git private-repo
+
+      - name: Copy pipelines from Public into private working tree
+        run: |
+          cp -f report-pipelines/bi/pipelines/*.py private-repo/bi/pipelines/
+          cp -f report-pipelines/bi/pipelines/requirements.txt private-repo/bi/pipelines/
+          mkdir -p private-repo/bi/pipelines/lib
+          cp -rf report-pipelines/bi/pipelines/lib/*.py private-repo/bi/pipelines/lib/ 2>/dev/null || true
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: report-pipelines/bi/pipelines/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r report-pipelines/bi/pipelines/requirements.txt
+
+      - name: Install Japanese fonts (Noto Sans CJK JP)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq fonts-noto-cjk fonts-noto-cjk-extra
+
+      - name: Install Playwright Chromium
+        run: |
+          playwright install chromium --with-deps
+
+      - name: Download all market artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: mover-daily-*-${{ needs.setup-raw.outputs.target_date }}
+          path: /tmp/market-artifacts
+          merge-multiple: true
+
+      - name: Place market files and merge into {date}.md
+        working-directory: ./private-repo
+        env:
+          TARGET_DATE: ${{ needs.setup-raw.outputs.target_date }}
+        run: |
+          MOVERS_DIR="market/daily/movers"
+          mkdir -p "$MOVERS_DIR"
+          rm -f "${MOVERS_DIR}/${TARGET_DATE}.md"
+          for MARKET in prime standard growth; do
+            SRC="/tmp/market-artifacts/${TARGET_DATE}_${MARKET}.md"
+            DST="${MOVERS_DIR}/${TARGET_DATE}_${MARKET}.md"
+            if [ ! -f "$SRC" ]; then
+              echo "ERROR: artifact not found: $SRC"
+              exit 1
+            fi
+            cp "$SRC" "$DST"
+            echo "Placed $DST ($(wc -l < "$DST") lines)"
+          done
+          OUTPUT="${MOVERS_DIR}/${TARGET_DATE}.md"
+          PRIME_FILE="${MOVERS_DIR}/${TARGET_DATE}_prime.md"
+          STANDARD_FILE="${MOVERS_DIR}/${TARGET_DATE}_standard.md"
+          GROWTH_FILE="${MOVERS_DIR}/${TARGET_DATE}_growth.md"
+          cat "$PRIME_FILE" > "$OUTPUT"
+          echo "" >> "$OUTPUT"
+          cat "$STANDARD_FILE" >> "$OUTPUT"
+          echo "" >> "$OUTPUT"
+          cat "$GROWTH_FILE" >> "$OUTPUT"
+          echo "Merged into $OUTPUT ($(wc -l < "$OUTPUT") lines)"
+
+      - name: Send Discord (JPEG・市場別 3 枚分割)
+        working-directory: ./private-repo/bi/pipelines
+        env:
+          DISCORD_WEBHOOK_MOVERS: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
+          PYTHONIOENCODING: utf-8
+        run: |
+          python send_report_jpeg_discord.py --kind movers --date ${{ needs.setup-raw.outputs.target_date }}
+
+      - name: Commit and push to private repo
+        working-directory: ./private-repo
+        env:
+          TARGET_DATE: ${{ needs.setup-raw.outputs.target_date }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -- bi/pipelines/ 2>/dev/null || true
+          git clean -fd bi/pipelines/ 2>/dev/null || true
+          git add market/daily/
+          if ! git diff --staged --quiet; then
+            git stash push --keep-index --include-untracked -m "ci-cleanup" 2>/dev/null || true
+            git commit -m "data: mover report ${TARGET_DATE}"
+            git fetch origin master
+            git rebase origin/master || (git diff --name-only --diff-filter=U | xargs -I{} git checkout --theirs {}; git diff --name-only --diff-filter=U | xargs git add; git -c core.editor=true rebase --continue)
+            git push origin master
+            git stash drop 2>/dev/null || true
+          fi
+
+      - name: Discord 通知（merge 失敗）
+        if: failure()
+        env:
+          DISCORD_WEBHOOK_MOVERS: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
+        run: |
+          curl -s -X POST "$DISCORD_WEBHOOK_MOVERS" \
+            -H "Content-Type: application/json" \
+            -d "{\"content\": \"❌ 動意レポート merge/送信失敗\n${{ needs.setup-raw.outputs.target_date }}\nログ確認: https://github.com/${{ github.repository }}/actions\"}"
