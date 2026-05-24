@@ -103,6 +103,11 @@ KIND_CONFIG = {
         "webhook_env": "DISCORD_WEBHOOK_IDEAS",
         "label": "投資アイデアレポート",
     },
+    "scout": {
+        "md_path": "market/daily/scout/{date}.md",
+        "webhook_env": "DISCORD_WEBHOOK_IDEAS",
+        "label": "Scout Radar（プロトタイプ）",
+    },
     "themes": {
         "md_path": "market/daily/theme/{date}_themes_summary.md",
         "webhook_env": "DISCORD_WEBHOOK_THEME",
