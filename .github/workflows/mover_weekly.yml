@@ -32,7 +32,7 @@ jobs:
   generate-market:
     needs: setup-date
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 55
     strategy:
       fail-fast: false
       matrix:
@@ -127,7 +127,7 @@ jobs:
           model: claude-opus-4-7
           prompt_file: report-pipelines/prompts/mover-weekly.md
           allowed_tools: "Read,Write,Edit,Bash,Grep,Glob,WebSearch,WebFetch"
-          timeout_minutes: "30"
+          timeout_minutes: "45"
           claude_env: |
             MAX_THINKING_TOKENS: 32000
             CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
