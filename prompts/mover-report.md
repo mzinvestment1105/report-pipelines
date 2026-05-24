@@ -4,6 +4,151 @@
 
 **重要**: 本自動化は **フル版**（プライム + スタンダード + グロース全市場対応・PM 2026-05-23 確定）です。市場別に必須セクションを全て出力します。Discord 送信は **市場別に画像を分離**して 3 セットに分けて送信します（プライム・スタンダード・グロース）。
 
+---
+
+## 🟢【最優先・必須・TARGET_MARKET 分岐】3 市場別の分割実行モード（PM 2026-05-25 確定）
+
+**本タスクは TARGET_MARKET 環境変数（`prime` / `standard` / `growth`）に応じて担当範囲が異なる**。3 つの Claude 実行に分割することで 32K 出力上限を回避する設計でございます。
+
+### TARGET_MARKET=prime（1/3 実行）
+
+**Write 先**: `${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}_prime.md`
+
+**担当セクション**:
+- **0. 地合いサマリー**
+- **1. セクター別フロー**（タイトルに「東証全市場・プライム/スタンダード/グロース合算」と明記）
+- **2. プライム 値上がり Top 5**
+- **3. プライム 値下がり Bottom 5**
+- **8a. プライム 売買代金 Top 5**
+- **9. 明日のスイング戦略メモ**（全 3 市場を俯瞰した PM 行動指針）
+
+### TARGET_MARKET=standard（2/3 実行）
+
+**Write 先**: `${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}_standard.md`
+
+**担当セクション**:
+- **4. スタンダード 値上がり Top 5**
+- **5. スタンダード 値下がり Bottom 5**
+- **8b. スタンダード 売買代金 Top 5**
+
+### TARGET_MARKET=growth（3/3 実行）
+
+**Write 先**: `${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}_growth.md`
+
+**担当セクション**:
+- **6. グロース 値上がり Top 10**
+- **7. グロース 値下がり Bottom 5**
+- **8c. グロース 売買代金 Top 10**
+
+### 共通ルール（全 TARGET_MARKET で同一）
+
+- 担当範囲外のセクションは**書かない**（書こうとしない・例：standard 実行で Prime セクションを書かない）
+- 担当範囲内のセクションは**全銘柄について事業モデル + 材料 + スイング観点 + 需給 + バリュエーション**を書く
+- 機関名禁止・N/A 表示禁止・需給簡潔・動意理由 WebSearch 必須等の全ルールは変わらず適用
+- セクター別フロー（Section 1）は **prime 実行のみ**が担当・standard / growth では書かない
+- 地合いサマリー（Section 0）・明日のスイング戦略（Section 9）も **prime 実行のみ**
+
+### 各実行の出力構造
+
+prime 実行の出力ファイル（{date}_prime.md）冒頭：
+
+```markdown
+# 動意銘柄レポート {date}（全市場版）
+
+## 0. 地合いサマリー
+...
+
+## 1. セクター別フロー
+...
+
+## 2. プライム 値上がり Top 5
+...
+
+## 3. プライム 値下がり Bottom 5
+...
+
+## 8a. プライム 売買代金 Top 5
+...
+
+## 9. 明日のスイング戦略メモ
+...
+```
+
+standard 実行の出力ファイル（{date}_standard.md）冒頭：
+
+```markdown
+## 4. スタンダード 値上がり Top 5
+...
+
+## 5. スタンダード 値下がり Bottom 5
+...
+
+## 8b. スタンダード 売買代金 Top 5
+...
+```
+
+growth 実行の出力ファイル（{date}_growth.md）冒頭：
+
+```markdown
+## 6. グロース 値上がり Top 10
+...
+
+## 7. グロース 値下がり Bottom 5
+...
+
+## 8c. グロース 売買代金 Top 10
+...
+```
+
+3 ファイルは workflow yml 側で順番に cat されて `{date}.md` 統合ファイルに組み立てられます。**standard / growth 実行で `# 動意銘柄レポート ...` のタイトル見出しを書かない**（prime のものを使う）。
+
+---
+
+## 🚨🚨🚨【最重要・絶対遵守・PM 2026-05-25 確定】既存ファイル存在判定の禁止（必ず一から再生成する）
+
+**統合ファイル（`${TARGET_DATE}.md`）と 3 市場分割ファイル（`${TARGET_DATE}_prime.md` / `${TARGET_DATE}_standard.md` / `${TARGET_DATE}_growth.md`）のいずれかが既に存在していても、これを「完成済」「No further edits required」と判断することを絶対禁止**する。本タスクは**必ず全 step を実行**し・自分の TARGET_MARKET 担当範囲ファイルを**必ず一から上書き再生成**する。
+
+### 強制行為（必ず実施）
+
+1. 既存 `${TARGET_DATE}*.md` ファイル群の Read を絶対禁止：存在判定にも使わない・参考にもしない
+2. workflow_dispatch / cron による起動は**常に「完全再生成」モード**：前回ファイルの内容は一切参照しない
+3. WebSearch / WebFetch を**毎回必ず全実行**する（既存ファイルがあっても省略しない）
+4. レポート本体の生成も**毎回ゼロから Write**する（差分編集ではなく完全上書き）
+5. 「既に完成」「No further edits required」「task was completed」型の判断・出力を絶対禁止
+
+---
+
+## 🚨【最重要・絶対遵守・PM 2026-05-23 確定】出力フォーマット強制（parquet データの生転記を上書き）
+
+**raw データには `DiscretionaryInvestmentContractorName`・`ShortPositionsInSharesNumber`・`SharesOutstanding` が NaN・機関名リスト等の生データとして含まれているが、これらを生のままレポートに転記することを絶対禁止する**。本セクションは raw データの内容より優先される。
+
+### parquet 生データの転記禁止リスト（絶対遵守）
+
+以下を**レポート本文に絶対書かない**：
+
+1. **機関空売りの証券会社名・機関名**：
+   - 「モルガン・スタンレー MUFG 証券株式会社」「GOLDMAN SACHS INTERNATIONAL」「Barclays Capital Securities Ltd」「Citigroup Global Markets Limited」「JPM Securities Japan Co Ltd.」「MERRILL LYNCH INTERNATIONAL」「Nomura International plc」「J.P. MORGAN SECURITIES PLC」「UBS AG」「BNP Paribas Financial Markets SNC」「大和証券株式会社」「野村證券株式会社」「三菱ＵＦＪモルガン・スタンレー証券株式会社」「Maple Rock Master Fund LP」「Arrowstreet Capital, Limited Partnership」「Diversified Select Opportunities, LLC」「Morgan Stanley & Co. International plc」等の**全機関名**
+   - **代わりに**：「機関空売り（5% 超報告制度）: 発行株数比 C.CC%」のトータル割合のみ書く
+2. **発行済株数 = N/A の表示**：
+   - 「信用買残 / 発行済株数: **N/A**」「**N/A**」「**データなし**」「**不明**」表示を絶対禁止
+   - **代わりに**：必ず raw → screening_master.parquet → WebFetch（株探・ヤフーファイナンス）→ EDINET の順で取得して数値を埋める
+   - それでも取得不能な場合のみ「**当該項目のみ取得失敗・調査要**」と明示し銘柄は除外しない
+3. **需給ブロックの冗長転記**：
+   - 信用残・信用買残比率・機関空売り・週次推移・MA25 乖離・60 日レンジを別々の行に長文で書かない
+   - **代わりに**：[prompts/_common_rules.md §2-B](_common_rules.md) の 3〜5 行圧縮フォーマットを厳守
+
+### 違反検知の保存前 grep 自己検証（必須）
+
+レポート Write 前に以下キーワードで grep し、**1 件でもヒットしたら書き直す**：
+
+```
+モルガン・スタンレー|GOLDMAN SACHS|Barclays|Nomura International|Citigroup Global|MERRILL LYNCH|J.P. MORGAN|JPM Securities|UBS AG|BNP Paribas|Maple Rock|Arrowstreet|Diversified Select|Morgan Stanley & Co|報告者:|発行済株数: N/A|発行株数: N/A|信用倍率 N/A|明確な開示なし|需給主導
+```
+
+ヒット箇所を本セクション §🚨 のルールに従って必ず修正してから Write。
+
+---
+
 ## Step 0【最優先・必須】共通品質ルールの読み込み
 
 **最初に必ず [prompts/_common_rules.md](_common_rules.md) を Read ツールで読み込む**。ETF/REIT 全除外・銘柄行フォーマット・JST 統一・英語禁止・専門用語注釈・Claude 記憶ベース発言禁止等、本レポート生成における全品質ルールが集約されています。**Step 0 を飛ばすことを禁止する**。
@@ -25,20 +170,22 @@
 
 ## レポート構成（出力セクション）
 
-`${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}.md` に Write で保存。以下のセクションを **全て** 出力：
+**`${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}_${TARGET_MARKET}.md` に Write で保存**（TARGET_MARKET=prime / standard / growth で接尾辞が変わる）。**TARGET_MARKET 担当範囲のセクションのみ出力**（最上位 §🟢 セクション参照）。以下は全 9 セクションの一覧で、各 TARGET_MARKET の担当範囲は §🟢 で定義：
 
-- **0. 地合いサマリー**
-- **1. セクター別フロー**（タイトルに「東証全市場・プライム/スタンダード/グロース合算」と明記）
-- **2. プライム 値上がり Top 5**（**個別株のみ・ETF/REIT 完全除外**）
-- **3. プライム 値下がり Bottom 5**（**個別株のみ・ETF/REIT 完全除外**）
-- **4. スタンダード 値上がり Top 5**（**個別株のみ・ETF/REIT 完全除外**）
-- **5. スタンダード 値下がり Bottom 5**（**個別株のみ・ETF/REIT 完全除外**）
-- **6. グロース 値上がり Top 10**（**個別株のみ・ETF/REIT 完全除外**）
-- **7. グロース 値下がり Bottom 5**（**個別株のみ・ETF/REIT 完全除外**）
-- **8. 売買代金**（プライム Top 5・スタンダード Top 5・グロース Top 10・各市場別個別株のみ）
-- **9. 明日のスイング戦略メモ**
+- **0. 地合いサマリー**（prime のみ）
+- **1. セクター別フロー**（prime のみ・タイトルに「東証全市場・プライム/スタンダード/グロース合算」と明記）
+- **2. プライム 値上がり Top 5**（prime のみ・**個別株のみ・ETF/REIT 完全除外**）
+- **3. プライム 値下がり Bottom 5**（prime のみ・**個別株のみ・ETF/REIT 完全除外**）
+- **4. スタンダード 値上がり Top 5**（standard のみ・**個別株のみ・ETF/REIT 完全除外**）
+- **5. スタンダード 値下がり Bottom 5**（standard のみ・**個別株のみ・ETF/REIT 完全除外**）
+- **6. グロース 値上がり Top 10**（growth のみ・**個別株のみ・ETF/REIT 完全除外**）
+- **7. グロース 値下がり Bottom 5**（growth のみ・**個別株のみ・ETF/REIT 完全除外**）
+- **8a. プライム 売買代金 Top 5**（prime のみ）
+- **8b. スタンダード 売買代金 Top 5**（standard のみ）
+- **8c. グロース 売買代金 Top 10**（growth のみ）
+- **9. 明日のスイング戦略メモ**（prime のみ）
 
-**画像分離処理（自動）**: レポート Markdown を Write した後、`send_report_jpeg_discord.py` が `## 2.` 〜 `## 3.` をプライム、`## 4.` 〜 `## 5.` をスタンダード、`## 6.` 〜 `## 8. 売買代金 グロース` をグロースの 3 セットに自動分割して JPEG 化・Discord に 3 通送信します。**セクション番号と見出し（プライム / スタンダード / グロース）を正確に守る**こと。
+**統合 + 画像分離処理（自動）**: 3 つの TARGET_MARKET 別 markdown を workflow yml が cat で統合して `${TARGET_DATE}.md` 統合ファイルを生成 → `send_report_jpeg_discord.py` が市場別 JPEG 3 セットに分割して Discord に送信。**セクション番号と見出し（プライム / スタンダード / グロース）を正確に守る**こと。
 
 **注意**: ETF/REIT/上場投信は raw データに「[グロース]」と記録されていても **完全除外**。raw 全件から ETF/REIT を除外した個別株リストで Top 10・Bottom 5 を構成する（raw の上位 10 銘柄に ETF が混ざっていたら**繰り上げて個別株のみで 10 銘柄を確保**）。
 
@@ -124,13 +271,13 @@ raw データの各銘柄について以下を機械的にチェックし、該�
 ### 不可逆操作禁止
 
 - `Remove-Item`・`rm`・`del`・`unlink` 等のファイル削除コマンドを Bash で実行しない
-- 既存ファイルの上書き Write は対象（`${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}.md`）のみ可
+- 既存ファイルの上書き Write は対象（`${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}_${TARGET_MARKET}.md`）のみ可・統合ファイル `${TARGET_DATE}.md`（接尾辞なし）への Write は禁止（workflow yml で cat 統合する設計）
 
 ## 完了条件（Write 直前自己検証）
 
 [prompts/_common_rules.md](_common_rules.md) の「レポート品質チェックリスト（Write 直前に全項目確認）」全 10 項目を機械的に確認してから Write する。特に：
 
-- `${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}.md` が生成され、内容が空でない
+- `${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}_${TARGET_MARKET}.md` が生成され、内容が空でない
 - **ETF/REIT/上場投信が 1 件も混入していない**（grep で銘柄名キーワード検証）
 - 全銘柄の見出し行に「コード + 銘柄名 + 前日比% + 終値 + 売買代金 + 時価総額」が揃っている
 - グロース 値上がり Top 10・値下がり Bottom 5・売買代金 Top 10 が**個別株のみで件数充足**している

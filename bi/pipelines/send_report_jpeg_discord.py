@@ -289,38 +289,45 @@ def split_movers_by_market(md_text: str) -> list[tuple[str, str]]:
     import re
 
     # トップタイトル + セクション 0・1 を抽出（共通ヘッダ）
-    header_match = re.search(r"^(.*?)(?=^## 2\.)", md_text, flags=re.DOTALL | re.MULTILINE)
+    header_match = re.search(r"^(.*?)(?=^## 2[a-z]?\.)", md_text, flags=re.DOTALL | re.MULTILINE)
     common_header = header_match.group(1).rstrip() if header_match else ""
 
     # セクション 9（明日のスイング戦略メモ）を抽出（共通フッタ）
-    footer_match = re.search(r"(^## 9\..*)", md_text, flags=re.DOTALL | re.MULTILINE)
+    footer_match = re.search(r"(^## 9\..*?)(?=^## \d+[a-z]?\.|\Z)", md_text, flags=re.DOTALL | re.MULTILINE)
     common_footer = footer_match.group(1).rstrip() if footer_match else ""
 
-    # セクション 2-8 を見出し単位で抽出
-    section_pattern = re.compile(r"^(## \d+\..*?)(?=^## \d+\.|\Z)", flags=re.DOTALL | re.MULTILINE)
+    # PM 2026-05-25 確定: section 番号は 8a/8b/8c のように英字接尾辞対応
+    # （3 並列 Claude 実行で市場別 8a/8b/8c に分かれるため）
+    section_pattern = re.compile(r"^(## \d+[a-z]?\..*?)(?=^## \d+[a-z]?\.|\Z)", flags=re.DOTALL | re.MULTILINE)
     sections = {m.group(1).split("\n", 1)[0].strip(): m.group(1).rstrip() for m in section_pattern.finditer(md_text)}
 
-    # 売買代金セクション内部を市場別に分割（セクション 8）
-    section_8 = next((v for k, v in sections.items() if k.startswith("## 8.")), "")
-
+    # 売買代金セクション 8 を市場別に取得（8a/8b/8c または単一 8）
     def _extract_market_in_section8(market_kw: str) -> str:
-        """セクション 8 内から特定市場部分を抽出する。"""
+        """セクション 8 (8a/8b/8c) から特定市場部分を抽出する。"""
+        # まず 8a/8b/8c の英字接尾辞付きで該当市場を直接探す
+        market_to_suffix = {"プライム": "a", "スタンダード": "b", "グロース": "c"}
+        suffix = market_to_suffix.get(market_kw, "")
+        if suffix:
+            for k, v in sections.items():
+                if k.startswith(f"## 8{suffix}."):
+                    return v.rstrip()
+        # 単一 `## 8. 売買代金` 内のサブヘッダで分割するレガシー形式
+        section_8 = next((v for k, v in sections.items() if k.startswith("## 8.")), "")
         if not section_8:
             return ""
-        # `### プライム` `### スタンダード` `### グロース` のようなサブヘッダで分割
         sub_pattern = re.compile(r"(^### .*?)(?=^### |\Z)", flags=re.DOTALL | re.MULTILINE)
         subs = sub_pattern.findall(section_8)
         for sub in subs:
             first_line = sub.split("\n", 1)[0]
             if market_kw in first_line:
                 return sub.rstrip()
-        # サブヘッダで分かれていない場合は元のまま含める（pre-split）
         return section_8
 
     def _find_section(prefix_num: int, market_kw: str | None = None) -> str:
         """セクション番号と任意のキーワードでセクションを検索する。"""
         for k, v in sections.items():
-            if k.startswith(f"## {prefix_num}."):
+            # 数字直後の英字接尾辞（8a/8b/8c）も許容
+            if re.match(rf"^## {prefix_num}[a-z]?\.", k):
                 if market_kw is None or market_kw in k:
                     return v
         return ""
