@@ -320,24 +320,25 @@ def build_supply_block(row: pd.Series, hist_df: pd.DataFrame | None) -> list[str
         f"／ 解消日数（信用買残 ÷ 5日平均出来高）: {vol_days_str}"
     )
 
-    # --- 信用買残 週次推移（直近 6 週） ---
-    wk_long = [row.get(f"LongMargin_WkSeq0{i}") for i in (3, 4, 5, 6, 7, 8)]
-    wk_long_clean = [v for v in wk_long if pd.notna(v)]
+    # --- 信用買残 週次推移（直近 6 週・Seq08=最古→Seq01=最新） ---
+    # WkSeq01=最新・WkSeq08=最古のため、逆順(8→1)で取得して古→新の数列を作る
+    wk_long_raw = [row.get(f"LongMargin_WkSeq0{i}") for i in range(8, 0, -1)]  # Seq08..Seq01
+    wk_long_clean = [v for v in wk_long_raw if pd.notna(v)]
     if len(wk_long_clean) >= 2:
         wk_str = " → ".join(f"{v/1e4:.0f}万" for v in wk_long_clean)
-        diff = wk_long_clean[-1] - wk_long_clean[0]
-        if wk_long_clean[0]:
-            chg_pct = diff / wk_long_clean[0] * 100
-            chg_label = "増加" if chg_pct > 5 else "減少" if chg_pct < -5 else "横ばい"
+        oldest, newest = wk_long_clean[0], wk_long_clean[-1]
+        if oldest:
+            chg_pct = (newest - oldest) / oldest * 100
+            chg_label = "増加" if chg_pct > 3 else "減少" if chg_pct < -3 else "横ばい"
             chg_str = f"{chg_label}（{chg_pct:+.1f}%）"
         else:
             chg_str = "判定不可"
-        lines.append(f"- 信用買残 週次推移（古→新・直近6週）: {wk_str}　判定: {chg_str}")
+        lines.append(f"- 信用買残 週次推移（古→新・直近{len(wk_long_clean)}週）: {wk_str}　判定: {chg_str}")
     else:
         lines.append("- 信用買残 週次推移: 過去データなし")
 
-    # --- 信用売残 週次推移（参考・短く） ---
-    wk_short = [row.get(f"ShortMargin_WkSeq0{i}") for i in (6, 7, 8)]
+    # --- 信用売残 週次推移（参考・直近3週・Seq03→Seq01=古→新） ---
+    wk_short = [row.get(f"ShortMargin_WkSeq0{i}") for i in (3, 2, 1)]  # 古→新
     wk_short_clean = [v for v in wk_short if pd.notna(v)]
     if len(wk_short_clean) >= 2:
         wk_short_str = " → ".join(f"{v/1e4:.1f}万" for v in wk_short_clean)
