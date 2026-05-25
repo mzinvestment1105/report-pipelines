@@ -86,6 +86,24 @@ jobs:
           python fetch_rss.py --category all
           python fetch_finnhub.py --date ${{ steps.date.outputs.value }}
 
+      - name: Fetch raw data (立花証券 e支店 API ニュース)
+        # 立花証券から QUICK NQN / TDNet AI / AI 市況 500件を取得して
+        # macro raw に統合する（generate_macro_report.py が自動で読み込む）。
+        # 認証情報未設定なら skip（後方互換）。
+        working-directory: ./private-repo/bi/pipelines
+        env:
+          TACHIBANA_DEMO_AUTH_ID: ${{ secrets.TACHIBANA_DEMO_AUTH_ID }}
+          TACHIBANA_DEMO_PRIVATE_KEY_PEM: ${{ secrets.TACHIBANA_DEMO_PRIVATE_KEY_PEM }}
+          TACHIBANA_DEMO_API_BASE: ${{ secrets.TACHIBANA_DEMO_API_BASE }}
+          PYTHONIOENCODING: utf-8
+        continue-on-error: true
+        run: |
+          if [ -z "$TACHIBANA_DEMO_AUTH_ID" ]; then
+            echo "[INFO] 立花証券 Secrets 未設定・skip"
+            exit 0
+          fi
+          python fetch_tachibana_news.py --date ${{ steps.date.outputs.value }} --limit 500
+
       - name: Build macro prompt (generate_macro_report.py)
         id: build_prompt
         working-directory: ./private-repo/bi/pipelines

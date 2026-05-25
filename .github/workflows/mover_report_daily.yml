@@ -101,6 +101,23 @@ jobs:
         run: |
           python make_mover_report.py --date ${{ steps.date.outputs.value }} --no-pdf
 
+      - name: Append 立花証券 e支店 API context to movers raw
+        # 動意銘柄 raw 末尾に QUICK 個別解説（動意理由）+ AI 市況 + 信用残・逆日歩を追記
+        # 認証情報未設定なら skip（後方互換）
+        working-directory: ./private-repo/bi/pipelines
+        env:
+          TACHIBANA_DEMO_AUTH_ID: ${{ secrets.TACHIBANA_DEMO_AUTH_ID }}
+          TACHIBANA_DEMO_PRIVATE_KEY_PEM: ${{ secrets.TACHIBANA_DEMO_PRIVATE_KEY_PEM }}
+          TACHIBANA_DEMO_API_BASE: ${{ secrets.TACHIBANA_DEMO_API_BASE }}
+          PYTHONIOENCODING: utf-8
+        continue-on-error: true
+        run: |
+          if [ -z "$TACHIBANA_DEMO_AUTH_ID" ]; then
+            echo "[INFO] 立花証券 Secrets 未設定・skip"
+            exit 0
+          fi
+          python fetch_tachibana_mover_context.py --date ${{ steps.date.outputs.value }}
+
       - name: Upload movers raw as artifact
         uses: actions/upload-artifact@v4
         with:

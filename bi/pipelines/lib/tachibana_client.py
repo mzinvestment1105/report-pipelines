@@ -58,21 +58,48 @@ class TachibanaClient:
 
     @classmethod
     def from_env(cls) -> "TachibanaClient":
-        """環境変数 TACHIBANA_DEMO_* または TACHIBANA_PROD_* から構築。"""
+        """環境変数 TACHIBANA_DEMO_* または TACHIBANA_PROD_* から構築。
+
+        秘密鍵の供給方法は 2 通り（GHA Secrets / ローカル .env のどちらでも動作）：
+        1. TACHIBANA_*_PRIVATE_KEY_PEM: PEM 文字列を直接環境変数で渡す（GHA Secrets 向け）
+        2. TACHIBANA_*_PRIVATE_KEY_PATH: PEM ファイルパス（ローカル開発向け）
+        """
         from dotenv import load_dotenv
         load_dotenv(Path(__file__).resolve().parent.parent / ".env")
-        # デモ優先・本番が設定されていればそちらを使う
         for prefix in ("TACHIBANA_PROD_", "TACHIBANA_DEMO_"):
             auth_id = os.getenv(f"{prefix}AUTH_ID")
-            key_path = os.getenv(f"{prefix}PRIVATE_KEY_PATH")
             api_base = os.getenv(f"{prefix}API_BASE")
-            if auth_id and key_path and api_base:
+            key_pem = os.getenv(f"{prefix}PRIVATE_KEY_PEM")
+            key_path = os.getenv(f"{prefix}PRIVATE_KEY_PATH")
+            if auth_id and api_base and (key_pem or key_path):
                 repo_root = Path(__file__).resolve().parent.parent.parent.parent
-                key_abs = repo_root / key_path if not Path(key_path).is_absolute() else Path(key_path)
-                return cls(auth_id=auth_id, private_key_path=key_abs, api_base=api_base)
-        raise RuntimeError("立花証券認証情報が .env に設定されていません（TACHIBANA_DEMO_* または TACHIBANA_PROD_*）")
+                inst = cls.__new__(cls)
+                inst.auth_id = auth_id
+                inst.api_base = api_base
+                inst._request_url = None
+                inst._master_url = None
+                inst._price_url = None
+                inst._request_no = 1
+                if key_pem:
+                    # PEM 文字列を直接読込（GHA Secrets 経由）
+                    inst.private_key_path = Path("__from_env_pem__")
+                    inst._private_key = serialization.load_pem_private_key(key_pem.encode("utf-8"), password=None)
+                else:
+                    key_abs = repo_root / key_path if not Path(key_path).is_absolute() else Path(key_path)
+                    inst.private_key_path = key_abs
+                    with open(key_abs, "rb") as f:
+                        inst._private_key = serialization.load_pem_private_key(f.read(), password=None)
+                return inst
+        raise RuntimeError(
+            "立花証券認証情報が設定されていません。"
+            "TACHIBANA_DEMO_AUTH_ID + TACHIBANA_DEMO_API_BASE + "
+            "(TACHIBANA_DEMO_PRIVATE_KEY_PEM または TACHIBANA_DEMO_PRIVATE_KEY_PATH) を設定してください。"
+        )
 
     def __post_init__(self) -> None:
+        # from_env 経由（__new__ ベース）の場合は _private_key 設定済でスキップ
+        if self._private_key is not None:
+            return
         with open(self.private_key_path, "rb") as f:
             self._private_key = serialization.load_pem_private_key(f.read(), password=None)
 
