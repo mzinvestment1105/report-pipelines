@@ -270,6 +270,15 @@ def build_supply_block(row: pd.Series, hist_df: pd.DataFrame | None) -> list[str
     lm_per_vol5d  = row.get("Scr_LongMargin_to_AvgVol5d")
     inst_short    = row.get("ShortPositionsToSharesOutstandingRatio")
     avg_vol5d     = row.get("AvgDailyVolume5d")
+    shares_out    = row.get("NumberOfIssuedAndOutstandingSharesAtTheEndOfFiscalYearIncludingTreasuryStock")
+    # ShortSale_WkSeq01=最新 → ShortSale_WkSeq08=最古（直近4週を使用）
+    inst_short_wk = []
+    for i in range(1, 5):
+        v = row.get(f"ShortSale_WkSeq0{i}")
+        if pd.notna(v) and pd.notna(shares_out) and shares_out > 0:
+            inst_short_wk.append(v / shares_out * 100)
+        else:
+            inst_short_wk.append(None)
 
     lines: list[str] = ["**需給（信用・株価水準）:**"]
 
@@ -335,8 +344,19 @@ def build_supply_block(row: pd.Series, hist_df: pd.DataFrame | None) -> list[str
         lines.append(f"- 信用売残 週次推移（直近3週）: {wk_short_str}")
 
     # --- 機関空売り（5% 超報告対象のみ） ---
-    if pd.notna(inst_short) and inst_short > 0:
-        lines.append(f"- 機関空売り比率（発行株比・5%超報告）: {inst_short*100:.2f}%")
+    # inst_short_wk[0] = Seq1 = 最新、inst_short_wk[-1] = 最古
+    latest_inst = inst_short_wk[0] if inst_short_wk and inst_short_wk[0] is not None else (
+        inst_short * 100 if pd.notna(inst_short) and inst_short > 0 else None
+    )
+    if latest_inst is not None and latest_inst > 0:
+        wk_vals = [v for v in inst_short_wk if v is not None]
+        if len(wk_vals) >= 2:
+            wk_str = " → ".join(f"{v:.2f}%" for v in reversed(wk_vals))  # 古→新の順で表示
+            delta = wk_vals[0] - wk_vals[-1]  # 最新 - 最古（直近4週での変化）
+            trend = f"▲+{delta:.2f}%" if delta > 0.1 else (f"▼{delta:.2f}%" if delta < -0.1 else "横ばい")
+            lines.append(f"- 機関空売り比率（発行株比・5%超報告）: {latest_inst:.2f}% | 直近4週推移: {wk_str}（{trend}）")
+        else:
+            lines.append(f"- 機関空売り比率（発行株比・5%超報告）: {latest_inst:.2f}%")
     else:
         lines.append("- 機関空売り比率: 5%超報告対象外（または報告なし）")
 
@@ -427,9 +447,11 @@ def build_full_table(
                 "連動型上場|レバレッジ|インバース"
             )
             company_name_str = df.get("CompanyName", pd.Series([None] * len(df))).astype(str)
+            cn_col = df.get("CompanyName", pd.Series([None] * len(df)))
+            is_new_ipo_a_mask = df["Code"].astype(str).str.endswith("A")
             is_etf_reit = (
-                # 銘柄名が取得できない（screening_master に登録されていない個別株 or ETF/REIT）
-                df.get("CompanyName", pd.Series([None] * len(df))).isna()
+                # 末尾Aでない銘柄かつ CompanyName 未取得（旧来コードで screening_master 未登録の場合）
+                (cn_col.isna() & ~is_new_ipo_a_mask)
                 # 銘柄名がコードと同じ（ETF/REIT の典型・200A 200A 等）
                 | (company_name_str == df["Code"].astype(str))
                 # 銘柄名に ETF/REIT 系キーワード
@@ -467,6 +489,10 @@ def build_full_table(
             "Scr_LongMargin_to_SharesOutstanding",
             "Scr_LongMargin_to_AvgVol5d",
             "ShortPositionsToSharesOutstandingRatio",
+            "ShortSale_WkSeq01",
+            "ShortSale_WkSeq02",
+            "ShortSale_WkSeq03",
+            "ShortSale_WkSeq04",
             "AvgDailyVolume5d",
             "AvgDailyValue5d",
             "NumberOfIssuedAndOutstandingSharesAtTheEndOfFiscalYearIncludingTreasuryStock",
@@ -491,9 +517,14 @@ def build_full_table(
             r"J-REIT|REIT|リート|不動産投資法人|投資法人|インフラファンド"
         )
         company_name_str = df["CompanyName"].astype(str)
+        # 末尾Aコードは新規IPO個別株（グロース市場）のため CompanyName=NaN でも除外しない
+        is_new_ipo_a = df["Code"].astype(str).str.endswith("A")
         is_etf_reit = (
-            df["CompanyName"].isna()
+            # CompanyName が NaN かつ末尾Aでない（旧来の数字4桁コードで未登録=ETF/REIT の可能性）
+            (df["CompanyName"].isna() & ~is_new_ipo_a)
+            # 銘柄名がコードと同じ（ETF/REIT の典型: 200A 200A 等）
             | (company_name_str == df["Code"].astype(str))
+            # 銘柄名に ETF/REIT 系キーワード
             | company_name_str.str.contains(etf_reit_keywords_full, na=False, regex=True)
         )
         excluded_count = int(is_etf_reit.sum())
