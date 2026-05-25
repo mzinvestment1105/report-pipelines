@@ -126,8 +126,24 @@ KIND_CONFIG = {
 }
 
 
-def _lookup_company_name(code: str) -> str:
-    """銘柄コードから会社名を返す。screening_master → Markdown 先頭行の順で試みる。"""
+def _lookup_company_name(code: str, md_path: "Path | None" = None) -> str:
+    """銘柄コードから会社名を返す。Markdown先頭行 → screening_master の順で試みる。
+
+    Markdown先頭行の形式: `# {コード} {銘柄名} Deep Dive レポート（...）`
+    screening_master は全角英字（ＰＫＳＨＡ等）が入るため2番目の手段とする。
+    """
+    import re as _re
+    # 1st: Markdown 先頭行からパース（最も正確な日本語銘柄名が取れる）
+    if md_path is not None and md_path.exists():
+        try:
+            first_line = md_path.read_text(encoding="utf-8").split("\n")[0]
+            # `# 3993 パークシャテクノロジー Deep Dive レポート` → 銘柄名部分を抽出
+            m = _re.match(r"^#\s+\S+\s+(.+?)(?:\s+Deep\s+Dive|\s+レポート|\s*（|\s*\()", first_line)
+            if m:
+                return m.group(1).strip()
+        except Exception:
+            pass
+    # 2nd: screening_master（全角英字になる場合があるが無いよりまし）
     try:
         import pandas as pd
         master_path = REPO_ROOT / "bi" / "outputs" / "screening_master.parquet"
@@ -278,7 +294,7 @@ def main() -> int:
     print(f"[2/3] sending to Discord ({cfg['webhook_env']})")
     # stock の場合は銘柄名をタイトルに追加
     if args.kind == "stock" and args.code:
-        company_name = _lookup_company_name(args.code)
+        company_name = _lookup_company_name(args.code, md_path)
         display_id = f"{args.code} {company_name}　{date_str}" if company_name else identifier
     else:
         display_id = identifier
