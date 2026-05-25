@@ -126,6 +126,24 @@ KIND_CONFIG = {
 }
 
 
+def _lookup_company_name(code: str) -> str:
+    """銘柄コードから会社名を返す。screening_master → Markdown 先頭行の順で試みる。"""
+    try:
+        import pandas as pd
+        master_path = REPO_ROOT / "bi" / "outputs" / "screening_master.parquet"
+        if master_path.exists():
+            master = pd.read_parquet(master_path, columns=["Code", "CompanyName"])
+            master["Code"] = master["Code"].astype(str).str[:4]
+            row = master[master["Code"] == str(code)[:4]]
+            if not row.empty:
+                name = row.iloc[0]["CompanyName"]
+                if isinstance(name, str) and name:
+                    return name
+    except Exception:
+        pass
+    return ""
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--kind", choices=list(KIND_CONFIG), required=True)
@@ -258,7 +276,13 @@ def main() -> int:
         print(f"WARNING: JPEG exceeds 9.5MB ({out_path.stat().st_size:,} bytes). Discord may reject.")
 
     print(f"[2/3] sending to Discord ({cfg['webhook_env']})")
-    content = f"**{cfg['label']}** {identifier}"
+    # stock の場合は銘柄名をタイトルに追加
+    if args.kind == "stock" and args.code:
+        company_name = _lookup_company_name(args.code)
+        display_id = f"{args.code} {company_name}　{date_str}" if company_name else identifier
+    else:
+        display_id = identifier
+    content = f"**{cfg['label']}** {display_id}"
     payload = {
         "content": content,
         "attachments": [{"id": 0, "filename": out_path.name}],
