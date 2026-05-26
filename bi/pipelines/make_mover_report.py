@@ -724,7 +724,16 @@ _YAHOO_BBS_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-    )
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "ja,en-US;q=0.7,en;q=0.3",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Referer": "https://finance.yahoo.co.jp/",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "same-origin",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
 }
 
 _BBS_UI_NOISE = re.compile(
@@ -733,56 +742,129 @@ _BBS_UI_NOISE = re.compile(
     r"東京証券取引所|情報提供会社|JASRAC|最近見た銘柄)"
 )
 
+# Yahoo セッション cookie 共有用（最初の 1 回だけトップページ訪問してセッション構築）
+_YAHOO_SESSION: requests.Session | None = None
+
+
+def _get_yahoo_session() -> requests.Session:
+    """Yahoo!ファイナンス用 requests.Session を構築・キャッシュ。
+
+    GHA Ubuntu runner からの bot 判定回避のため、最初にトップページにアクセスして
+    セッション cookie を取得し、それを以降のリクエストで使い回す。
+    """
+    global _YAHOO_SESSION
+    if _YAHOO_SESSION is not None:
+        return _YAHOO_SESSION
+    s = requests.Session()
+    s.headers.update(_YAHOO_BBS_HEADERS)
+    try:
+        s.get("https://finance.yahoo.co.jp/", timeout=15)
+    except Exception as e:
+        print(f"  [WARN] Yahoo top page session init failed: {e}")
+    _YAHOO_SESSION = s
+    return s
+
+
+def _parse_yahoo_bbs_html(html: str, max_posts: int) -> dict:
+    """Yahoo!ファイナンス掲示板 HTML を投稿リスト + sentiment にパース。"""
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(html, "html.parser")
+    sentiment = ""
+    for el in soup.find_all(string=re.compile(r"強く買いたい.*%")):
+        m = re.search(r"強く買いたい\s*([\d.]+)%.*?強く売りたい\s*([\d.]+)%", str(el))
+        if m:
+            sentiment = f"強く買いたい{m.group(1)}% / 強く売りたい{m.group(2)}%"
+        break
+    posts: list[dict] = []
+    seen_keys: set[str] = set()
+    for article in soup.find_all("article"):
+        text = article.get_text(" ", strip=True)
+        if not text or len(text) < 30:
+            continue
+        no_m = re.search(r"No\.\s*(\d+)", text)
+        date_m = re.search(r"(\d{4}/\d+/\d+\s+\d+:\d+)", text)
+        body_m = re.search(r"報告\s+(.+?)\s+(?:返信|投資の参考)", text)
+        yes_m = re.search(r"はい\s+(\d+)", text)
+        no_v_m = re.search(r"いいえ\s+(\d+)", text)
+        body = body_m.group(1).strip() if body_m else text[:200]
+        if len(body) < 10:
+            continue
+        key = (no_m.group(1) if no_m else body[:50])
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        posts.append({
+            "no": no_m.group(1) if no_m else "",
+            "date": date_m.group(1) if date_m else "",
+            "body": body,
+            "yes": int(yes_m.group(1)) if yes_m else 0,
+            "no_count": int(no_v_m.group(1)) if no_v_m else 0,
+        })
+        if len(posts) >= max_posts:
+            break
+    return {"sentiment": sentiment, "posts": posts}
+
+
+def _fetch_yahoo_bbs_playwright(code4: str, max_posts: int) -> dict:
+    """Playwright（headless Chromium）経由で Yahoo!ファイナンス掲示板を取得。
+
+    PM 2026-05-26 確定: requests + Cookie セッション方式が GHA でも失敗する場合の
+    最終手段。本物のブラウザフィンガープリントで bot 判定を回避。
+    フォールバックは「Yahoo 内での取得手段切替」のみ・他サイトへの切替は禁止。
+    """
+    url = f"https://finance.yahoo.co.jp/quote/{code4}.T/forum"
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print(f"  [WARN] {code4} playwright not installed, skip")
+        return {"sentiment": "", "posts": []}
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            ctx = browser.new_context(
+                user_agent=_YAHOO_BBS_HEADERS["User-Agent"],
+                locale="ja-JP",
+                timezone_id="Asia/Tokyo",
+            )
+            page = ctx.new_page()
+            page.goto(url, wait_until="domcontentloaded", timeout=20000)
+            try:
+                page.wait_for_selector("article", timeout=8000)
+            except Exception:
+                pass
+            html = page.content()
+            browser.close()
+        return _parse_yahoo_bbs_html(html, max_posts)
+    except Exception as e:
+        print(f"  [WARN] {code4} playwright yahoo bbs fetch failed: {e}")
+        return {"sentiment": "", "posts": []}
+
 
 def fetch_yahoo_bbs(code4: str, max_posts: int = 30) -> dict:
     """Yahoo!ファイナンス掲示板から投稿を取得する。
 
-    HTML構造（2026-05時点）:
+    手順（PM 2026-05-26 確定・フォールバックは Yahoo 内手段切替のみ）：
+    1. requests + Cookie セッション + Referer ヘッダで取得試行
+    2. 投稿 0 件なら Playwright（headless Chromium）で再試行
+    3. それでも 0 件なら空配列を返す（他サイトへのフォールバック禁止）
+
+    HTML 構造（2026-05 時点）:
       <article> ユーザー名 No.XXXXX 日付 報告 本文 返信 投資の参考になりましたか？ はいN いいえN </article>
     """
-    from bs4 import BeautifulSoup
     url = f"https://finance.yahoo.co.jp/quote/{code4}.T/forum"
+    # Step 1: requests + Cookie セッション
     try:
-        r = requests.get(url, headers=_YAHOO_BBS_HEADERS, timeout=15)
+        s = _get_yahoo_session()
+        r = s.get(url, timeout=15)
         r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-        sentiment = ""
-        for el in soup.find_all(string=re.compile(r"強く買いたい.*%")):
-            m = re.search(r"強く買いたい\s*([\d.]+)%.*?強く売りたい\s*([\d.]+)%", str(el))
-            if m:
-                sentiment = f"強く買いたい{m.group(1)}% / 強く売りたい{m.group(2)}%"
-            break
-        posts: list[dict] = []
-        seen_keys: set[str] = set()
-        for article in soup.find_all("article"):
-            text = article.get_text(" ", strip=True)
-            if not text or len(text) < 30:
-                continue
-            no_m = re.search(r"No\.\s*(\d+)", text)
-            date_m = re.search(r"(\d{4}/\d+/\d+\s+\d+:\d+)", text)
-            body_m = re.search(r"報告\s+(.+?)\s+(?:返信|投資の参考)", text)
-            yes_m = re.search(r"はい\s+(\d+)", text)
-            no_v_m = re.search(r"いいえ\s+(\d+)", text)
-            body = body_m.group(1).strip() if body_m else text[:200]
-            if len(body) < 10:
-                continue
-            key = (no_m.group(1) if no_m else body[:50])
-            if key in seen_keys:
-                continue
-            seen_keys.add(key)
-            posts.append({
-                "no": no_m.group(1) if no_m else "",
-                "date": date_m.group(1) if date_m else "",
-                "body": body,
-                "yes": int(yes_m.group(1)) if yes_m else 0,
-                "no_count": int(no_v_m.group(1)) if no_v_m else 0,
-            })
-            if len(posts) >= max_posts:
-                break
-        return {"sentiment": sentiment, "posts": posts}
+        result = _parse_yahoo_bbs_html(r.text, max_posts)
+        if result["posts"]:
+            return result
+        print(f"  [INFO] {code4} requests yielded 0 posts (likely GHA blocked), retry with Playwright")
     except Exception as e:
-        print(f"  [WARN] {code4} yahoo bbs fetch failed: {e}")
-        return {"sentiment": "", "posts": []}
+        print(f"  [WARN] {code4} requests yahoo bbs fetch failed: {e}, retry with Playwright")
+    # Step 2: Playwright フォールバック
+    return _fetch_yahoo_bbs_playwright(code4, max_posts)
 
 
 def fetch_yahoo_batch(codes: list[str]) -> dict[str, dict]:
