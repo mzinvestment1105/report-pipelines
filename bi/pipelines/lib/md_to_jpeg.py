@@ -227,6 +227,8 @@ def render_markdown_to_jpeg_paged(
             page.screenshot(path=str(out_path), full_page=True, type="jpeg", quality=quality)
             paths.append(out_path)
         else:
+            # clip パラメータは viewport ベースなので、コンテンツ全体を viewport に収める必要がある
+            page.set_viewport_size({"width": 1080, "height": int(total_height)})
             num_pages = (total_height + max_page_height - 1) // max_page_height
             for i in range(num_pages):
                 y = i * max_page_height

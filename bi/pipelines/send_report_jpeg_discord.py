@@ -326,7 +326,7 @@ def main() -> int:
         if p.stat().st_size > 9_500_000:
             print(f"WARNING: {p.name} exceeds 9.5MB ({p.stat().st_size:,} bytes). Discord may reject.")
 
-    print(f"[2/3] sending to Discord ({cfg['webhook_env']}) — {len(paths)} page(s)")
+    print(f"[2/3] sending to Discord ({cfg['webhook_env']}) - {len(paths)} page(s)")
     for i, p in enumerate(paths, start=1):
         page_suffix = f"（{i}/{len(paths)}）" if len(paths) > 1 else ""
         content = f"**{cfg['label']}{page_suffix}** {display_id}"
