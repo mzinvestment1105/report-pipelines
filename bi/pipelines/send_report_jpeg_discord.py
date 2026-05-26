@@ -167,6 +167,7 @@ def main() -> int:
     parser.add_argument("--month", help="YYYY-MM（月次レポート用・earnings 等）")
     parser.add_argument("--code", help="銘柄コード（stock 用）")
     parser.add_argument("--skip-send", action="store_true")
+    parser.add_argument("--force", action="store_true", help="フォールバック表記検証をスキップして強制送信")
     args = parser.parse_args()
 
     cfg = KIND_CONFIG[args.kind]
@@ -192,9 +193,9 @@ def main() -> int:
         print(f"ERROR: report not found: {md_path}")
         return 1
 
-    # PM 2026-05-22 確定: 動意レポートは「需給（信用・株価水準）」セクションが
-    # 全銘柄エントリに含まれていなければ送信中止する（不完全レポートの発信防止）。
-    # [prompts/_common_rules.md §2-B] [memory feedback_mover_supply_required.md]
+    # PM 2026-05-25 確定: データなしの銘柄では需給セクション全体を省略可（フォールバック表記禁止）
+    # PM 2026-05-26 確定: 検証ロジックは「フォールバック表記が混入していたら NG」に変更
+    # データなしで需給セクションを省略するのは正しい挙動・送信中止しない
     if args.kind == "movers":
         md_text_pre = md_path.read_text(encoding="utf-8")
         import re as _re
@@ -207,22 +208,39 @@ def main() -> int:
                             label=cfg["label"], identifier=identifier,
                             reason="銘柄エントリ 0 件")
             return 1
-        # 各銘柄エントリの本文範囲を取得し、需給ブロックが含まれているか検証
-        missing: list[str] = []
+        # フォールバック表記の混入を検出（PM 2026-05-25 明示禁止パターン）
+        forbidden_patterns = [
+            "取得失敗・調査要",
+            "raw データに直近数値なし",
+            "raw データに該当数値なし",
+            "信用倍率 N/A",
+            "発行株数: N/A",
+            "発行済株数: N/A",
+            "信用残: 買 ─ / 売 ─",
+        ]
+        violations: list[tuple[str, str]] = []
         for i, m in enumerate(entry_matches):
             start = m.start()
             end = entry_matches[i + 1].start() if i + 1 < len(entry_matches) else len(md_text_pre)
             body = md_text_pre[start:end]
             header_line = body.split("\n", 1)[0].strip("# ").strip()
-            if "需給" not in body:
-                missing.append(header_line)
-        if missing:
-            print(f"ERROR: 需給セクション欠落 {len(missing)} 件: {missing[:5]}")
-            _notify_failure(webhook_env=cfg["webhook_env"],
-                            label=cfg["label"], identifier=identifier,
-                            reason=f"需給セクション欠落 {len(missing)} 件 / 全 {len(entry_matches)} 銘柄")
-            return 1
-        print(f"[guard] 動意レポート需給セクション検証 OK（{len(entry_matches)} 銘柄）")
+            for pat in forbidden_patterns:
+                if pat in body:
+                    violations.append((header_line, pat))
+                    break
+        if violations:
+            if args.force:
+                print(f"WARNING: フォールバック表記が {len(violations)} 件混入していますが --force のため送信続行")
+            else:
+                print(f"ERROR: フォールバック表記が {len(violations)} 件混入: {violations[:5]}")
+                _notify_failure(webhook_env=cfg["webhook_env"],
+                                label=cfg["label"], identifier=identifier,
+                                reason=f"フォールバック表記 {len(violations)} 件混入 / 全 {len(entry_matches)} 銘柄")
+                return 1
+        # 需給セクション集計（参考情報・送信中止しない）
+        with_supply = sum(1 for m in entry_matches
+                          if "需給" in md_text_pre[m.start():(entry_matches[entry_matches.index(m) + 1].start() if entry_matches.index(m) + 1 < len(entry_matches) else len(md_text_pre))])
+        print(f"[guard] 動意レポート検証 OK（全 {len(entry_matches)} 銘柄・需給ありデータ {with_supply} 銘柄・データなし省略 {len(entry_matches) - with_supply} 銘柄）")
 
     # Webhook
     webhook = os.getenv(cfg["webhook_env"])

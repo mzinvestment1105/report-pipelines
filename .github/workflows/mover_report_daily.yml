@@ -1,9 +1,12 @@
 name: 動意銘柄レポート日次
 
 "on":
-  # PM 2026-05-26 確定: GHA ネイティブ cron が高負荷時間帯（08:30 UTC = 17:30 JST）で
-  # 2-3 時間遅延する事象が継続したため、schedule を撤去して cron-job.org 経由の
-  # workflow_dispatch に一本化。重複発火防止のため schedule は復活させない。
+  # PM 2026-05-26 確定: 17:30 JST 設定（08:30 UTC・キリ番）が 2-3 時間遅延継続のため、
+  # 16:33 JST（07:33 UTC・素数 + 非 5 倍数）に前倒し。JQuants 当日 daily データ取得可能な
+  # 最早タイミング + GHA cron キュー競合の少ない時刻を狙う設計。
+  # 着信目標: 17:05〜17:15 JST（17:30 JST より 15〜25 分早い）。
+  schedule:
+    - cron: '33 7 * * 1-5'   # 月-金 16:33 JST
   workflow_dispatch:
     inputs:
       target_date:
