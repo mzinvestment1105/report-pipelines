@@ -167,6 +167,84 @@ def markdown_to_html(text: str) -> str:
     return html
 
 
+def render_markdown_to_jpeg_paged(
+    md_text: str,
+    out_dir: Path,
+    basename: str,
+    kind: str = "macro",
+    quality: int = 88,
+    footer: str | None = None,
+    max_page_height: int = 6000,
+) -> list[Path]:
+    """Markdown を JPEG 複数ページに変換して保存（長尺レポート対応）。
+
+    コンテンツ高さが max_page_height を超える場合は自動的に複数ページ JPEG に分割。
+    PM 2026-05-26 確定: 個別銘柄レポート（stock）等の長尺レポートを「前と同じような縦長表示」で
+    Discord で正しく表示するために導入。単一の極端な縦長画像（10000px+）は Discord プレビューで
+    縦横比保持表示の結果「左寄せ細長」に見えるため、6000px 程度の適切な比率で分割する。
+
+    Args:
+        md_text: Markdown 全文
+        out_dir: 出力ディレクトリ
+        basename: 出力ファイル名のベース（例: stock_280A_2026-05-26）。複数ページの場合は basename_p1.jpg, basename_p2.jpg ... で出力
+        kind: レポート種別
+        quality: JPEG 品質
+        footer: フッター（ブランド表示・None なら非表示）
+        max_page_height: 1 ページあたりの最大高さ（px・デフォルト 6000）
+
+    Returns:
+        生成された JPEG ファイルパスのリスト（順序保持・1〜N ページ）
+    """
+    accent = ACCENT_BY_KIND.get(kind, "#FFD700")
+    custom_css = CSS.replace("border-bottom: 5px solid #FFD700;", f"border-bottom: 5px solid {accent};")
+
+    html_body = markdown_to_html(md_text)
+    footer_html = f'<div class="footer-brand">{footer}</div>' if footer else ""
+    full_html = f"""<!DOCTYPE html>
+<html lang=\"ja\">
+<head>
+<meta charset=\"utf-8\" />
+<style>{custom_css}</style>
+</head>
+<body>
+{html_body}
+{footer_html}
+</body>
+</html>"""
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    paths: list[Path] = []
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        ctx = browser.new_context(viewport={"width": 1080, "height": 1920}, device_scale_factor=1)
+        page = ctx.new_page()
+        page.set_content(full_html, wait_until="load")
+        total_height = page.evaluate("document.body.scrollHeight")
+
+        if total_height <= max_page_height:
+            out_path = out_dir / f"{basename}.jpg"
+            page.screenshot(path=str(out_path), full_page=True, type="jpeg", quality=quality)
+            paths.append(out_path)
+        else:
+            num_pages = (total_height + max_page_height - 1) // max_page_height
+            for i in range(num_pages):
+                y = i * max_page_height
+                h = min(max_page_height, total_height - y)
+                out_path = out_dir / f"{basename}_p{i+1}.jpg"
+                page.screenshot(
+                    path=str(out_path),
+                    clip={"x": 0, "y": y, "width": 1080, "height": h},
+                    type="jpeg",
+                    quality=quality,
+                )
+                paths.append(out_path)
+
+        browser.close()
+
+    return paths
+
+
 def render_markdown_to_jpeg(md_text: str, out_path: Path, kind: str = "macro", quality: int = 88, footer: str | None = None) -> Path:
     """Markdown を JPEG に変換して保存。
 

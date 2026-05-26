@@ -27,7 +27,7 @@ from dotenv import load_dotenv
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from lib.md_to_jpeg import render_markdown_to_jpeg  # noqa: E402
+from lib.md_to_jpeg import render_markdown_to_jpeg, render_markdown_to_jpeg_paged  # noqa: E402
 
 JST = timezone(timedelta(hours=9))
 load_dotenv(Path(__file__).resolve().parent / ".env")
@@ -298,44 +298,52 @@ def main() -> int:
         print("DONE")
         return 0
 
-    out_path = out_dir / f"{args.kind}_{identifier}.jpg"
+    basename = f"{args.kind}_{identifier}"
 
-    print(f"[1/3] rendering {args.kind} → JPEG")
-    # Discord 送信は PM 個人閲覧のみ・ブランド表示 OK
-    # SNS 用画像生成時は md_to_jpeg.render_markdown_to_jpeg を直接呼び出し footer=None を指定すること
-    render_markdown_to_jpeg(md_text, out_path, kind=args.kind, footer="@noctra_jp / Mizuki Fund")
-    print(f"  saved: {out_path}  size={out_path.stat().st_size:,} bytes")
-
-    if args.skip_send:
-        return 0
-
-    ensure_under_discord_limit(out_path)
-
-    if out_path.stat().st_size > 9_500_000:
-        print(f"WARNING: JPEG exceeds 9.5MB ({out_path.stat().st_size:,} bytes). Discord may reject.")
-
-    print(f"[2/3] sending to Discord ({cfg['webhook_env']})")
     # stock の場合は銘柄名をタイトルに追加
     if args.kind == "stock" and args.code:
         company_name = _lookup_company_name(args.code, md_path)
         display_id = f"{args.code} {company_name}　{date_str}" if company_name else identifier
     else:
         display_id = identifier
-    content = f"**{cfg['label']}** {display_id}"
-    payload = {
-        "content": content,
-        "attachments": [{"id": 0, "filename": out_path.name}],
-    }
-    with out_path.open("rb") as f:
-        files = {
-            "payload_json": (None, json.dumps(payload), "application/json"),
-            "files[0]": (out_path.name, f, "image/jpeg"),
+
+    # PM 2026-05-26 確定: stock 等の長尺レポートは複数ページ自動分割
+    # 単一極端縦長画像が Discord プレビューで「左寄せ細長」に見えるのを防ぐ
+    print(f"[1/3] rendering {args.kind} → JPEG (paged)")
+    paths = render_markdown_to_jpeg_paged(
+        md_text, out_dir, basename,
+        kind=args.kind, footer="@noctra_jp / Mizuki Fund",
+        max_page_height=6000,
+    )
+    for p in paths:
+        print(f"  saved: {p}  size={p.stat().st_size:,} bytes")
+
+    if args.skip_send:
+        return 0
+
+    for p in paths:
+        ensure_under_discord_limit(p)
+        if p.stat().st_size > 9_500_000:
+            print(f"WARNING: {p.name} exceeds 9.5MB ({p.stat().st_size:,} bytes). Discord may reject.")
+
+    print(f"[2/3] sending to Discord ({cfg['webhook_env']}) — {len(paths)} page(s)")
+    for i, p in enumerate(paths, start=1):
+        page_suffix = f"（{i}/{len(paths)}）" if len(paths) > 1 else ""
+        content = f"**{cfg['label']}{page_suffix}** {display_id}"
+        payload = {
+            "content": content,
+            "attachments": [{"id": 0, "filename": p.name}],
         }
-        r = requests.post(webhook, files=files)
-    print(f"[3/3] status: {r.status_code}  bytes={out_path.stat().st_size:,}")
-    if r.status_code >= 400:
-        print(f"  body: {r.text[:500]}")
-        return 1
+        with p.open("rb") as f:
+            files = {
+                "payload_json": (None, json.dumps(payload), "application/json"),
+                "files[0]": (p.name, f, "image/jpeg"),
+            }
+            r = requests.post(webhook, files=files)
+        print(f"  [{i}/{len(paths)}] status: {r.status_code}  bytes={p.stat().st_size:,}")
+        if r.status_code >= 400:
+            print(f"    body: {r.text[:500]}")
+            return 1
     print("DONE")
     return 0
 
