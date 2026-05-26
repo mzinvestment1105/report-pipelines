@@ -266,6 +266,13 @@ def build_supply_block(row: pd.Series, hist_df: pd.DataFrame | None) -> list[str
 
     long_m  = row.get("LongMarginTradeVolume")
     short_m = row.get("ShortMarginTradeVolume")
+    # PM 2026-05-26 確定: spot 信用残（LongMarginTradeVolume / ShortMarginTradeVolume）が NaN なのに
+    # 週次 Seq01（=最新値・同データ別ソース）には値がある事象が発生する。Seq01 を最新値として
+    # フォールバックすることで「信用残 ─ なのに週次推移 1,583 万」型の構造的矛盾を解消する。
+    if pd.isna(long_m):
+        long_m = row.get("LongMargin_WkSeq01")
+    if pd.isna(short_m):
+        short_m = row.get("ShortMargin_WkSeq01")
     lm_per_shares = row.get("Scr_LongMargin_to_SharesOutstanding")
     lm_per_vol5d  = row.get("Scr_LongMargin_to_AvgVol5d")
     inst_short    = row.get("ShortPositionsToSharesOutstandingRatio")
