@@ -1,12 +1,12 @@
-name: セクター日次レポート（短縮版）
+name: セクター週次レポート（フルバージョン）
 
 "on":
   schedule:
-    - cron: '13 7 * * 1-5'   # 月-金 16:13 JST (= 07:13 UTC・素数キュー・引け 15:00 後 + JQuants 当日 daily 揃ったタイミング・PM 2026-05-26 確定)
+    - cron: '37 7 * * 5'   # 金曜 16:37 JST (= 07:37 UTC・素数キュー・短縮版 16:13 と被らないようずらし・PM 2026-05-26 新設)
   workflow_dispatch:
     inputs:
       target_date:
-        description: '対象日付 (YYYY-MM-DD・空欄で当日)'
+        description: '対象日付 (YYYY-MM-DD・空欄で当日の金曜)'
         required: false
         default: ''
 
@@ -98,28 +98,23 @@ jobs:
           print("PM 確定: 古くてもそのまま使う・更新は実行しない")
           PY
 
-      - name: 既存セクター週次レポートファイルを削除（前回不良ファイル読込スキップ防止）
-        # PM 2026-05-23 確定: Claude が前回ファイルを読んで「既に完成」と判定する
-        # 構造的失敗を防止（mover_weekly run 26325536581 で発生）。
+      - name: 既存セクター週次フルレポートファイルを削除（前回不良ファイル読込スキップ防止）
         working-directory: ./private-repo
         env:
           TARGET_DATE: ${{ steps.date.outputs.value }}
         run: |
-          TARGET_FILE="market/daily/sector/${TARGET_DATE}.md"
+          TARGET_FILE="market/daily/sector/${TARGET_DATE}_full.md"
           if [ -f "$TARGET_FILE" ]; then
             echo "Removing existing $TARGET_FILE before Claude run..."
             rm -f "$TARGET_FILE"
           fi
 
-      - name: Generate sector report via Claude Code (Opus 4.7 + max thinking・Deep Research 内包)
-        # PM 2026-05-23 確定: ローカルと全く同じ精度を担保する。Deep Research は GHA 内で
-        # Claude Code Action が WebSearch を使って実施 → make_sector_raw.py に --deep-research-file
-        # で渡す → メインレポート生成、までを 1 Action で完結する。
+      - name: Generate sector full report via Claude Code (Opus 4.7 + max thinking・Deep Research 内包)
         uses: anthropics/claude-code-base-action@beta
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           model: claude-opus-4-7
-          prompt_file: report-pipelines/prompts/sector-report.md
+          prompt_file: report-pipelines/prompts/sector-report-full.md
           allowed_tools: "Read,Write,Edit,Bash,Grep,Glob,WebSearch,WebFetch"
           timeout_minutes: "60"
           claude_env: |
@@ -129,6 +124,7 @@ jobs:
           TARGET_DATE: ${{ steps.date.outputs.value }}
           PRIVATE_REPO_ROOT: private-repo
           JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
+          REPORT_EDITION: full
 
       - name: Send Discord (JPEG)
         working-directory: ./private-repo/bi/pipelines
@@ -136,7 +132,7 @@ jobs:
           DISCORD_WEBHOOK_SECTOR: ${{ secrets.DISCORD_WEBHOOK_SECTOR }}
           PYTHONIOENCODING: utf-8
         run: |
-          python send_report_jpeg_discord.py --kind sector --date ${{ steps.date.outputs.value }}
+          python send_report_jpeg_discord.py --kind sector_full --date ${{ steps.date.outputs.value }}
 
       - name: Commit and push to private repo
         working-directory: ./private-repo
@@ -148,7 +144,7 @@ jobs:
           git add market/daily/ bi/outputs/sector_weekly.parquet bi/outputs/sector_stock_weekly.parquet 2>/dev/null || git add market/daily/
           if ! git diff --staged --quiet; then
             git stash push --keep-index --include-untracked -m "ci-cleanup" 2>/dev/null || true
-            git commit -m "data: sector weekly ${{ steps.date.outputs.value }}"
+            git commit -m "data: sector weekly full ${{ steps.date.outputs.value }}"
             git fetch origin master
             git rebase origin/master || (git diff --name-only --diff-filter=U | xargs -I{} git checkout --theirs {}; git diff --name-only --diff-filter=U | xargs git add; git -c core.editor=true rebase --continue)
             git push origin master
@@ -162,4 +158,4 @@ jobs:
         run: |
           curl -s -X POST "$DISCORD_WEBHOOK_SECTOR" \
             -H "Content-Type: application/json" \
-            -d "{\"content\": \"❌ セクター日次レポート（短縮版）失敗\n${{ steps.date.outputs.value }}\nログ確認: https://github.com/${{ github.repository }}/actions\"}"
+            -d "{\"content\": \"❌ セクター週次レポート（フルバージョン）失敗\n${{ steps.date.outputs.value }}\nログ確認: https://github.com/${{ github.repository }}/actions\"}"

@@ -91,7 +91,12 @@ KIND_CONFIG = {
     "sector": {
         "md_path": "market/daily/sector/{date}.md",
         "webhook_env": "DISCORD_WEBHOOK_SECTOR",
-        "label": "セクター週次レポート",
+        "label": "セクター日次レポート（短縮版）",
+    },
+    "sector_full": {
+        "md_path": "market/daily/sector/{date}_full.md",
+        "webhook_env": "DISCORD_WEBHOOK_SECTOR",
+        "label": "セクター週次レポート（フルバージョン）",
     },
     "movers": {
         "md_path": "market/daily/movers/{date}.md",
