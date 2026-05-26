@@ -81,7 +81,12 @@ KIND_CONFIG = {
     "macro": {
         "md_path": "market/daily/macro/{date}.md",
         "webhook_env": "DISCORD_WEBHOOK_MACRO",
-        "label": "マクロ経済レポート",
+        "label": "マクロ経済レポート（朝刊）",
+    },
+    "macro_evening": {
+        "md_path": "market/daily/macro/{date}_evening.md",
+        "webhook_env": "DISCORD_WEBHOOK_MACRO",
+        "label": "マクロ経済レポート（夕刊）",
     },
     "sector": {
         "md_path": "market/daily/sector/{date}.md",
