@@ -1,8 +1,9 @@
 name: 動意銘柄レポート日次
 
 "on":
-  schedule:
-    - cron: '30 8 * * 1-5'   # 月-金 17:30 JST (= 同日 08:30 UTC・screening_master 16:30 更新後 + TDNet 反映完了)
+  # PM 2026-05-26 確定: GHA ネイティブ cron が高負荷時間帯（08:30 UTC = 17:30 JST）で
+  # 2-3 時間遅延する事象が継続したため、schedule を撤去して cron-job.org 経由の
+  # workflow_dispatch に一本化。重複発火防止のため schedule は復活させない。
   workflow_dispatch:
     inputs:
       target_date:
