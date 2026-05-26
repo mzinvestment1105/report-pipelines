@@ -2,7 +2,7 @@ name: セクター週次レポート
 
 "on":
   schedule:
-    - cron: '0 12 * * 5'   # 金曜 21:00 JST (= 12:00 UTC・東京引け 15:00 後・週末入り前)
+    - cron: '13 7 * * 5'   # 金曜 16:13 JST (= 07:13 UTC・素数キュー・引け 15:00 後 + JQuants 当日 daily 揃ったタイミング・PM 2026-05-26 前倒し)
   workflow_dispatch:
     inputs:
       target_date:
