@@ -1,9 +1,7 @@
 name: マクロレポート夕刊
 
 "on":
-  schedule:
-    - cron: '33 8 * * 1-5'   # 月-金 17:33 JST (= 同日 08:33 UTC・素数キュー)
-    # PM 2026-05-26 確定: 日本市場引け後 + 欧州オープン + 米先物動意を見て翌日ポジショニング判断材料を提供
+  # PM 2026-05-27 確定: Cloudflare Worker (mizuki-fund-scheduler-1) からの workflow_dispatch に一本化。
   workflow_dispatch:
     inputs:
       target_date:

@@ -1,8 +1,7 @@
 name: セクター週次レポート（フルバージョン）
 
 "on":
-  schedule:
-    - cron: '37 7 * * 5'   # 金曜 16:37 JST (= 07:37 UTC・素数キュー・短縮版 16:13 と被らないようずらし・PM 2026-05-26 新設)
+  # PM 2026-05-27 確定: Cloudflare Worker (mizuki-fund-scheduler-1) からの workflow_dispatch に一本化。
   workflow_dispatch:
     inputs:
       target_date:

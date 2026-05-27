@@ -1,8 +1,7 @@
 name: スクリーニングマスター更新
 
 "on":
-  schedule:
-    - cron: '13 7 * * 1-5'   # 月-金 16:13 JST (引け 15:00 後・素数キューで GHA cron 遅延回避・PM 2026-05-26 前倒し)
+  # PM 2026-05-27 確定: Cloudflare Worker (mizuki-fund-scheduler-1) からの workflow_dispatch に一本化。
   workflow_dispatch:
 
 jobs:

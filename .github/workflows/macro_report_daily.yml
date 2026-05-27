@@ -1,9 +1,9 @@
 name: マクロレポート日次
 
 "on":
-  schedule:
-    - cron: '23 21 * * *'   # 毎日 06:23 JST (= 前日 21:23 UTC・素数キュー・PM 2026-05-26 改訂・土日含む)
-    # PM 2026-05-23 確定: 土日も発行する。理由 = 土日の重要ニュース反応・来週のイベント準備
+  # PM 2026-05-27 確定: GHA cron 遅延・ドロップ問題を回避するため、schedule を撤去して
+  # Cloudflare Worker (mizuki-fund-scheduler-1) からの workflow_dispatch に一本化。
+  # 重複発火防止のため schedule は復活させない。発火時刻管理は cloudflare/wrangler.toml で実施。
   workflow_dispatch:
     inputs:
       target_date:

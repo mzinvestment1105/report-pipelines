@@ -1,8 +1,7 @@
 name: テーマ動意レポート日次
 
 "on":
-  schedule:
-    - cron: '43 8 * * 1-5'   # 月-金 17:43 JST (= 08:43 UTC・素数キュー・PM 2026-05-26 改訂・GHA cron 遅延回避)
+  # PM 2026-05-27 確定: Cloudflare Worker (mizuki-fund-scheduler-1) からの workflow_dispatch に一本化。
   workflow_dispatch:
     inputs:
       target_date:
