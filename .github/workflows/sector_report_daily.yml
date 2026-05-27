@@ -2,7 +2,7 @@ name: セクター日次レポート（短縮版）
 
 "on":
   schedule:
-    - cron: '13 7 * * 1-5'   # 月-金 16:13 JST (= 07:13 UTC・素数キュー・引け 15:00 後 + JQuants 当日 daily 揃ったタイミング・PM 2026-05-26 確定)
+    - cron: '17 7 * * 1-5'   # 月-金 16:17 JST (= 07:17 UTC・素数キュー・screening_master との競合回避・PM 2026-05-26 改訂)
   workflow_dispatch:
     inputs:
       target_date:

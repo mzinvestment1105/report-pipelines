@@ -2,7 +2,7 @@ name: 動意銘柄レポート週次
 
 "on":
   schedule:
-    - cron: '0 13 * * 5'   # 金曜 22:00 JST (= 13:00 UTC・日次フル版 17:30 JST の後・週末入り前)
+    - cron: '43 13 * * 5'   # 金曜 22:43 JST (= 13:43 UTC・素数キュー・PM 2026-05-26 改訂・日次フル版 17:30 JST の後・週末入り前)
   workflow_dispatch:
     inputs:
       target_date:
