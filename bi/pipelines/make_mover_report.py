@@ -141,11 +141,13 @@ def fetch_daily_all(client, target_date: date) -> pd.DataFrame:
         elif cl in ("close", "c"):        col_map[col] = "Close"
         elif cl in ("volume", "v", "vo"): col_map[col] = "Volume"
         elif cl in ("va",):               col_map[col] = "TurnoverJQ"  # JQuants実績売買代金
+        elif cl == "adjfactor":           col_map[col] = "AdjFactor"
+        elif cl == "adjc":                col_map[col] = "AdjClose"
         elif cl == "code":                col_map[col] = "Code"
         elif cl == "date":                col_map[col] = "Date"
     df = df.rename(columns=col_map)
     df["Code"] = df["Code"].astype(str).str[:4]
-    for col in ("Close", "Volume", "Open", "High", "Low", "TurnoverJQ"):
+    for col in ("Close", "Volume", "Open", "High", "Low", "TurnoverJQ", "AdjFactor", "AdjClose"):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
@@ -428,11 +430,24 @@ def build_full_table(
     keep_cols = ["Code", "Close", "Volume"]
     if "TurnoverJQ" in today_df.columns:
         keep_cols.append("TurnoverJQ")
+    if "AdjFactor" in today_df.columns:
+        keep_cols.append("AdjFactor")
     t = today_df[keep_cols].rename(columns={"Close": "Close_T", "Volume": "Volume_T"})
     p = prev_df[["Code", "Close"]].rename(columns={"Close": "Close_P"})
     # left join: IPO初日など前日価格なし銘柄も売買代金ランキングに含める
     df = t.merge(p, on="Code", how="left")
-    df["DailyReturn"] = (df["Close_T"] / df["Close_P"] - 1) * 100
+
+    # PM 2026-05-28 確定: 株式分割等の権利落ち日は AdjFactor を反映して真のリターンを算出する。
+    # AdjFactor は当日の調整係数（1.0=コーポレートアクションなし・0.333=1:3 分割等）。
+    # 過去終値に AdjFactor を掛けることで分割後スケールに揃え、見かけ上の -80% 大幅安を防ぐ。
+    # 1:5 分割（5/28 485A 等）でランキング Bottom が分割組で埋まる事故の再発防止。
+    if "AdjFactor" in df.columns:
+        adj = df["AdjFactor"].fillna(1.0)
+    else:
+        adj = pd.Series(1.0, index=df.index)
+    df["AdjFactor"] = adj
+    df["HasCorporateAction"] = (adj != 1.0) & adj.notna()
+    df["DailyReturn"] = (df["Close_T"] / (df["Close_P"] * adj) - 1) * 100
     df = df.dropna(subset=["Close_T"])
 
     meta_cols = [c for c in ["Code", "CompanyName", "Sector17CodeName",
@@ -557,10 +572,17 @@ def build_full_table(
 # ---------------------------------------------------------------------------
 
 def extract_detail_stocks(full_df: pd.DataFrame) -> pd.DataFrame:
-    """市場区分ごとに注目銘柄（TDNet+Yahoo対象）を抽出して返す。"""
+    """市場区分ごとに注目銘柄（TDNet+Yahoo対象）を抽出して返す。
+
+    PM 2026-05-28 確定: 値上がり/値下がり ランキングから権利落ち（株式分割等・AdjFactor != 1.0）
+    銘柄を完全除外する。生 Close 比較の -80% 等の見かけ上の急落で実際の動意銘柄が
+    弾き飛ばされる事故の再発防止。売買代金ランキングには分割組も残す（出来高は本物の動意のため）。
+    """
     frames = []
     # IPO初日など前日価格なし銘柄はリターン計算不可のため値動きランキングから除外
     df = full_df.dropna(subset=["DailyReturn"])
+    if "HasCorporateAction" in df.columns:
+        df = df[~df["HasCorporateAction"].fillna(False)]
     for market, cfg in DETAIL_CONFIG.items():
         mdf = df[df["MarketCodeName"] == market]
         top    = mdf.nlargest(cfg["top"],    "DailyReturn")
@@ -576,8 +598,10 @@ def extract_detail_stocks(full_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def extract_all_movers(full_df: pd.DataFrame, top_n: int = ALL_MOVERS_TOP_N) -> pd.DataFrame:
-    """全市場から値動き上位N銘柄（絶対値順）を返す。"""
+    """全市場から値動き上位N銘柄（絶対値順）を返す。権利落ち銘柄は除外。"""
     df = full_df.dropna(subset=["DailyReturn"]).copy()
+    if "HasCorporateAction" in df.columns:
+        df = df[~df["HasCorporateAction"].fillna(False)]
     df["AbsReturn"] = df["DailyReturn"].abs()
     return df.nlargest(top_n, "AbsReturn").reset_index(drop=True)
 
@@ -601,10 +625,13 @@ def extract_turnover_ranking(full_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def extract_sector_flow(full_df: pd.DataFrame) -> pd.DataFrame:
-    """セクター別の平均リターン・銘柄数集計を返す。"""
+    """セクター別の平均リターン・銘柄数集計を返す。権利落ち銘柄は集計から除外。"""
     if "Sector17CodeName" not in full_df.columns:
         return pd.DataFrame()
-    g = full_df.groupby("Sector17CodeName").agg(
+    df = full_df
+    if "HasCorporateAction" in df.columns:
+        df = df[~df["HasCorporateAction"].fillna(False)]
+    g = df.groupby("Sector17CodeName").agg(
         AvgReturn=("DailyReturn", "mean"),
         CountUp=("DailyReturn", lambda x: (x > 0).sum()),
         CountDown=("DailyReturn", lambda x: (x < 0).sum()),
@@ -1096,6 +1123,9 @@ def pick_valuation_candidates(
     重複は除去して返す（同一銘柄が複数カテゴリに入る場合は最初の出現のみ）。
     """
     growth = full_df[full_df["MarketCodeName"] == MARKET_GROWTH].copy()
+    # PM 2026-05-28: バリュエーション候補からも権利落ち銘柄を除外（値上がり/値下がり選定対象）
+    if "HasCorporateAction" in growth.columns:
+        growth = growth[~growth["HasCorporateAction"].fillna(False)]
 
     def pick(df: pd.DataFrame, ascending: bool, key: str) -> list[str]:
         sorted_df = df.sort_values(key, ascending=ascending)
