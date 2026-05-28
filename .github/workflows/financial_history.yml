@@ -1,0 +1,114 @@
+name: Financial History Daily Update
+
+"on":
+  # 手動実行: 初回フル取得（initial）または日次差分（daily）を input で選択
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "実行モード: initial (全銘柄 × 過去 10 年・数時間) / daily (最新営業日差分・数分)"
+        required: true
+        default: "daily"
+        type: choice
+        options:
+          - daily
+          - initial
+  # 毎日 UTC 08:00 = JST 17:00（price_history の 1 時間後・並列回避）
+  schedule:
+    - cron: "0 8 * * *"
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    # 業績は四半期粒度のため日次更新は数件のみ・通常 60 分で十分
+    # initial 実行時は workflow_dispatch から手動起動し timeout を超える想定（360 分相当）。
+    # 安全のため initial 時は最大 360 分・daily 時は 60 分を明示的に切り替える。
+    timeout-minutes: ${{ github.event.inputs.mode == 'initial' && 360 || 60 }}
+
+    steps:
+      - name: Checkout report-pipelines
+        uses: actions/checkout@v4
+        with:
+          path: report-pipelines
+
+      - name: Setup SSH for private repo
+        env:
+          PRIVATE_REPO_DEPLOY_KEY: ${{ secrets.PRIVATE_REPO_DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$PRIVATE_REPO_DEPLOY_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+      - name: Clone private repo (mizuki-fund)
+        run: |
+          git clone git@github.com:mzinvestment1105/mizuki-fund.git private-repo
+
+      - name: Copy pipelines into private working tree
+        run: |
+          cp -f report-pipelines/bi/pipelines/*.py private-repo/bi/pipelines/
+          cp -f report-pipelines/bi/pipelines/requirements.txt private-repo/bi/pipelines/
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: report-pipelines/bi/pipelines/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r report-pipelines/bi/pipelines/requirements.txt
+
+      - name: Determine mode
+        id: mode
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "mode=${{ github.event.inputs.mode }}" >> $GITHUB_OUTPUT
+          else
+            echo "mode=daily" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run ETL (${{ steps.mode.outputs.mode }})
+        working-directory: ./private-repo/bi/pipelines
+        env:
+          JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
+          PYTHONIOENCODING: utf-8
+        run: |
+          set -o pipefail
+          python make_financial_history_master.py ${{ steps.mode.outputs.mode }} 2>&1 | tee /tmp/etl.log
+
+      - name: Commit and push to private repo
+        working-directory: ./private-repo
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # 一時コピーしたスクリプトは戻す（Private 側の履歴を汚さない）
+          git checkout -- bi/pipelines/ 2>/dev/null || true
+          git add bi/outputs/financial_history_master.parquet
+          if ! git diff --staged --quiet; then
+            git commit -m "data: financial_history $(date +'%Y-%m-%d') (${{ steps.mode.outputs.mode }})"
+            git fetch origin master
+            if ! git rebase origin/master; then
+              git diff --name-only --diff-filter=U | xargs -I{} git checkout --theirs {}
+              git diff --name-only --diff-filter=U | xargs git add
+              git -c core.editor=true rebase --continue
+            fi
+            git push origin master
+          fi
+
+      - name: Discord 通知（成功）
+        if: success()
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          curl -s -X POST "$DISCORD_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "{\"content\": \"✅ financial_history 更新完了 (${{ steps.mode.outputs.mode }})\n$(date +'%Y-%m-%d %H:%M') JST\"}"
+
+      - name: Discord 通知（失敗）
+        if: failure()
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          curl -s -X POST "$DISCORD_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "{\"content\": \"❌ financial_history 失敗 (${{ steps.mode.outputs.mode }})\n$(date +'%Y-%m-%d %H:%M') JST\nログ確認: https://github.com/${{ github.repository }}/actions\"}"
