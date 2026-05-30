@@ -1,16 +1,13 @@
 name: セクター日次レポート（短縮版）
 
 "on":
-  # PM 2026-05-30 確定: Cloudflare Worker 停止時の配信事故防止のため、
-  # schedule cron を直接追加（Worker 依存解消）。Worker 経由の workflow_dispatch も維持。
+  # PM 2026-05-27 確定: Cloudflare Worker (mizuki-fund-scheduler-1) からの workflow_dispatch に一本化。
   workflow_dispatch:
     inputs:
       target_date:
         description: '対象日付 (YYYY-MM-DD・空欄で当日)'
         required: false
         default: ''
-  schedule:
-    - cron: '45 7 * * 1-5'  # 平日 16:45 JST
 
 jobs:
   generate:

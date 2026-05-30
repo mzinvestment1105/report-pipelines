@@ -1,16 +1,14 @@
 name: 動意銘柄レポート日次
 
 "on":
-  # PM 2026-05-30 確定: Cloudflare Worker 停止時の配信事故防止のため、
-  # schedule cron を直接追加（Worker 依存解消）。Worker 経由の workflow_dispatch も維持。
+  # PM 2026-05-27 確定: GHA cron 遅延・ドロップ問題のため、Cloudflare Worker
+  # (mizuki-fund-scheduler-1) からの workflow_dispatch に一本化。
   workflow_dispatch:
     inputs:
       target_date:
         description: '対象日付 (YYYY-MM-DD・空欄で当日)'
         required: false
         default: ''
-  schedule:
-    - cron: '30 7 * * 1-5'  # 平日 16:30 JST
 
 # PM 2026-05-25 確定: weekly と同じく 3 並列構造に変更（32K 出力上限対策）。
 # setup-raw ジョブが raw データ生成 + artifact upload。
