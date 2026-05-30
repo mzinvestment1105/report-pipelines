@@ -208,10 +208,12 @@ def normalize_summary_df(rows: list[dict]) -> pd.DataFrame:
     # Code を 4 桁に正規化（/fins/summary は 5 桁 "41800" を返すことがある）
     out["Code"] = out["Code"].astype(str).map(normalize_code_4)
 
-    # 数値変換（空文字 → NaN）
+    # 数値変換（空文字 → NaN）— pd.to_numeric で必ず float dtype に固定する。
+    # 全 None の列は object dtype になると後段の .abs() で TypeError になるため、
+    # _to_num で None/空文字を None 化 → pd.to_numeric で float64 に正規化する。
     for c in NUMERIC_COLS:
         if c in out.columns:
-            out[c] = out[c].map(_to_num)
+            out[c] = pd.to_numeric(out[c].map(_to_num), errors="coerce")
 
     # 日付変換
     out["AnnouncementDate"] = pd.to_datetime(out["AnnouncementDate"], errors="coerce")
@@ -223,7 +225,10 @@ def normalize_summary_df(rows: list[dict]) -> pd.DataFrame:
         ("Profit", "Profit_NonCons"),
     ]:
         if cons in out.columns and nc in out.columns:
-            out[cons] = out[cons].where(out[cons].notna(), out[nc])
+            out[cons] = pd.to_numeric(
+                out[cons].where(out[cons].notna(), out[nc]),
+                errors="coerce",
+            )
 
     return out
 
@@ -251,8 +256,10 @@ def _enrich_yoy(df: pd.DataFrame) -> pd.DataFrame:
     df = df.sort_values(["Code", "FiscalQuarter", "FiscalYear"]).reset_index(drop=True)
 
     def _yoy(group: pd.DataFrame, col: str) -> pd.Series:
-        prev = group[col].shift(1)
-        return ((group[col] - prev) / prev.abs() * 100).round(2)
+        # 念のため float に強制変換（object dtype/None 混入で .abs() が失敗する事故を防ぐ）
+        cur = pd.to_numeric(group[col], errors="coerce")
+        prev = cur.shift(1)
+        return ((cur - prev) / prev.abs() * 100).round(2)
 
     out_frames: list[pd.DataFrame] = []
     for (code, fq), g in df.groupby(["Code", "FiscalQuarter"], sort=False):
