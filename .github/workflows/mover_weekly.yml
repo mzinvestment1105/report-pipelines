@@ -14,10 +14,15 @@ name: 動意銘柄レポート週次
 # generate-market ジョブが matrix で 3 並列、merge-and-send ジョブが needs で 3 ジョブ完了を待つ。
 
 jobs:
-  setup-date:
+  setup-raw:
+    # PM 2026-05-30 確定: 週次 workflow にも raw 生成 step を追加。日次 workflow と同様、
+    # 週次実行時に make_mover_report.py で当週分の raw を新規生成し artifact 共有する。
+    # これ以前は raw 生成 step がなく、private リポに commit 済の最新 raw（2026-05-22）を
+    # 流用してレポートを生成していたため、5/29 週次が 5/22 内容の使い回しになる事故が発生。
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     outputs:
-      value: ${{ steps.date.outputs.value }}
+      target_date: ${{ steps.date.outputs.value }}
     steps:
       - name: Determine target date
         id: date
@@ -28,8 +33,79 @@ jobs:
             echo "value=$(TZ=Asia/Tokyo date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
           fi
 
+      - name: Checkout report-pipelines
+        uses: actions/checkout@v4
+        with:
+          path: report-pipelines
+
+      - name: Setup SSH for private repo
+        env:
+          PRIVATE_REPO_DEPLOY_KEY: ${{ secrets.PRIVATE_REPO_DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$PRIVATE_REPO_DEPLOY_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+      - name: Clone private repo (mizuki-fund)
+        run: |
+          git clone git@github.com:mzinvestment1105/mizuki-fund.git private-repo
+
+      - name: Copy pipelines and static files from Public into private working tree
+        run: |
+          cp -f report-pipelines/bi/pipelines/*.py private-repo/bi/pipelines/
+          cp -f report-pipelines/bi/pipelines/requirements.txt private-repo/bi/pipelines/
+          mkdir -p private-repo/bi/pipelines/lib
+          cp -rf report-pipelines/bi/pipelines/lib/*.py private-repo/bi/pipelines/lib/ 2>/dev/null || true
+          mkdir -p private-repo/agents private-repo/playbook
+          cp -f report-pipelines/agents/*.md private-repo/agents/ 2>/dev/null || true
+          cp -f report-pipelines/playbook/*.md private-repo/playbook/ 2>/dev/null || true
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: report-pipelines/bi/pipelines/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r report-pipelines/bi/pipelines/requirements.txt
+
+      - name: Generate movers raw (make_mover_report.py --no-pdf)
+        # 週次 workflow が当週分の raw を新規生成。3 並列の generate-market が artifact 経由で共有。
+        working-directory: ./private-repo/bi/pipelines
+        env:
+          JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
+          EDINETDB_API_KEYS: ${{ secrets.EDINETDB_API_KEYS }}
+          PYTHONIOENCODING: utf-8
+        run: |
+          python make_mover_report.py --date ${{ steps.date.outputs.value }} --no-pdf
+
+      - name: Append 立花証券 e支店 API context to movers raw
+        working-directory: ./private-repo/bi/pipelines
+        env:
+          TACHIBANA_DEMO_AUTH_ID: ${{ secrets.TACHIBANA_DEMO_AUTH_ID }}
+          TACHIBANA_DEMO_PRIVATE_KEY_PEM: ${{ secrets.TACHIBANA_DEMO_PRIVATE_KEY_PEM }}
+          TACHIBANA_DEMO_API_BASE: ${{ secrets.TACHIBANA_DEMO_API_BASE }}
+          PYTHONIOENCODING: utf-8
+        continue-on-error: true
+        run: |
+          if [ -z "$TACHIBANA_DEMO_AUTH_ID" ]; then
+            echo "[INFO] 立花証券 Secrets 未設定・skip"
+            exit 0
+          fi
+          python fetch_tachibana_mover_context.py --date ${{ steps.date.outputs.value }}
+
+      - name: Upload movers raw as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: movers-raw-${{ steps.date.outputs.value }}
+          path: private-repo/market/daily/${{ steps.date.outputs.value }}_movers_raw.md
+          retention-days: 7
+          if-no-files-found: error
+
   generate-market:
-    needs: setup-date
+    needs: setup-raw
     runs-on: ubuntu-latest
     timeout-minutes: 55
     strategy:
@@ -84,11 +160,26 @@ jobs:
         run: |
           playwright install chromium --with-deps
 
+      - name: Download movers raw artifact (from setup-raw)
+        uses: actions/download-artifact@v4
+        with:
+          name: movers-raw-${{ needs.setup-raw.outputs.target_date }}
+          path: /tmp/movers-raw
+
+      - name: Place movers raw into private working tree
+        working-directory: ./private-repo
+        env:
+          TARGET_DATE: ${{ needs.setup-raw.outputs.target_date }}
+        run: |
+          mkdir -p market/daily
+          cp /tmp/movers-raw/${TARGET_DATE}_movers_raw.md market/daily/
+          echo "Placed market/daily/${TARGET_DATE}_movers_raw.md ($(wc -l < market/daily/${TARGET_DATE}_movers_raw.md) lines)"
+
       - name: Check screening_master parquet existence (no update・PM 2026-05-23 確定)
         working-directory: ./private-repo/bi/pipelines
         env:
           PYTHONIOENCODING: utf-8
-          TARGET_DATE: ${{ needs.setup-date.outputs.value }}
+          TARGET_DATE: ${{ needs.setup-raw.outputs.target_date }}
         run: |
           python - <<'PY'
           import os, sys
@@ -108,7 +199,7 @@ jobs:
       - name: 既存週次レポートファイルを削除（前回不良ファイル読込スキップ防止）
         working-directory: ./private-repo
         env:
-          TARGET_DATE: ${{ needs.setup-date.outputs.value }}
+          TARGET_DATE: ${{ needs.setup-raw.outputs.target_date }}
           TARGET_MARKET: ${{ matrix.market }}
         run: |
           for SUFFIX in "" "_${TARGET_MARKET}"; do
@@ -131,7 +222,7 @@ jobs:
             MAX_THINKING_TOKENS: 32000
             CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
         env:
-          TARGET_DATE: ${{ needs.setup-date.outputs.value }}
+          TARGET_DATE: ${{ needs.setup-raw.outputs.target_date }}
           TARGET_MARKET: ${{ matrix.market }}
           PRIVATE_REPO_ROOT: private-repo
           JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
@@ -140,8 +231,8 @@ jobs:
       - name: Upload market section as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mover-weekly-${{ matrix.market }}-${{ needs.setup-date.outputs.value }}
-          path: private-repo/market/daily/movers/${{ needs.setup-date.outputs.value }}_weekly_${{ matrix.market }}.md
+          name: mover-weekly-${{ matrix.market }}-${{ needs.setup-raw.outputs.target_date }}
+          path: private-repo/market/daily/movers/${{ needs.setup-raw.outputs.target_date }}_weekly_${{ matrix.market }}.md
           retention-days: 7
           if-no-files-found: error
 
@@ -152,10 +243,10 @@ jobs:
         run: |
           curl -s -X POST "$DISCORD_WEBHOOK_MOVERS" \
             -H "Content-Type: application/json" \
-            -d "{\"content\": \"❌ 動意週次レポート（${{ matrix.market }} 市場）失敗\n${{ needs.setup-date.outputs.value }}\nログ確認: https://github.com/${{ github.repository }}/actions\"}"
+            -d "{\"content\": \"❌ 動意週次レポート（${{ matrix.market }} 市場）失敗\n${{ needs.setup-raw.outputs.target_date }}\nログ確認: https://github.com/${{ github.repository }}/actions\"}"
 
   merge-and-send:
-    needs: [setup-date, generate-market]
+    needs: [setup-raw, generate-market]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -206,14 +297,14 @@ jobs:
       - name: Download all market artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: mover-weekly-*-${{ needs.setup-date.outputs.value }}
+          pattern: mover-weekly-*-${{ needs.setup-raw.outputs.target_date }}
           path: /tmp/market-artifacts
           merge-multiple: true
 
       - name: Place market files and merge into {date}_weekly.md
         working-directory: ./private-repo
         env:
-          TARGET_DATE: ${{ needs.setup-date.outputs.value }}
+          TARGET_DATE: ${{ needs.setup-raw.outputs.target_date }}
         run: |
           MOVERS_DIR="market/daily/movers"
           mkdir -p "$MOVERS_DIR"
@@ -248,12 +339,12 @@ jobs:
           DISCORD_WEBHOOK_MOVERS: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
           PYTHONIOENCODING: utf-8
         run: |
-          python send_report_jpeg_discord.py --kind movers_weekly --date ${{ needs.setup-date.outputs.value }}
+          python send_report_jpeg_discord.py --kind movers_weekly --date ${{ needs.setup-raw.outputs.target_date }}
 
       - name: Commit and push to private repo
         working-directory: ./private-repo
         env:
-          TARGET_DATE: ${{ needs.setup-date.outputs.value }}
+          TARGET_DATE: ${{ needs.setup-raw.outputs.target_date }}
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -276,4 +367,4 @@ jobs:
         run: |
           curl -s -X POST "$DISCORD_WEBHOOK_MOVERS" \
             -H "Content-Type: application/json" \
-            -d "{\"content\": \"❌ 動意週次レポート merge/送信失敗\n${{ needs.setup-date.outputs.value }}\nログ確認: https://github.com/${{ github.repository }}/actions\"}"
+            -d "{\"content\": \"❌ 動意週次レポート merge/送信失敗\n${{ needs.setup-raw.outputs.target_date }}\nログ確認: https://github.com/${{ github.repository }}/actions\"}"

@@ -97,6 +97,18 @@ jobs:
           print("PM 確定: 古くてもそのまま使う・更新は実行しない")
           PY
 
+      - name: Refresh sector_weekly.parquet (make_sector_report.py --anchor friday)
+        # PM 2026-05-30 確定: 週次セクターレポートに stale な sector_weekly.parquet（5/22 AsOf）が使われる事故が
+        # 発生したため、Claude 実行前に必ず当週分のセクター集計を再生成する step を追加。
+        # screening_master.parquet（commit 済の最新版）を universe として JQuants から週次価格を取得・集計。
+        # 所要時間 5-15 分（screening_master.parquet 自体は更新しない）。
+        working-directory: ./private-repo/bi/pipelines
+        env:
+          JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
+          PYTHONIOENCODING: utf-8
+        run: |
+          python make_sector_report.py --anchor friday
+
       - name: 既存セクター週次フルレポートファイルを削除（前回不良ファイル読込スキップ防止）
         working-directory: ./private-repo
         env:

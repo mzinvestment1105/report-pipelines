@@ -310,11 +310,10 @@ def build_supply_block(row: pd.Series, hist_df: pd.DataFrame | None) -> list[str
             ratio_str = "0.00 倍"
     lines.append(f"- 信用残: 買 {long_str} / 売 {short_str}（信用倍率 {ratio_str}）")
 
-    # --- 時価総額比・5日平均出来高比 ---
-    mcap_pct_str = "─"
-    if pd.notna(long_m) and pd.notna(close_today) and pd.notna(mcap_yen) and mcap_yen > 0:
-        mcap_pct = long_m * close_today / mcap_yen * 100
-        mcap_pct_str = f"{mcap_pct:.2f}%"
+    # --- 発行済株数比・5日平均出来高比 ---
+    # PM 2026-05-30: 信用買残/時価総額 は信用残報告日（過去）の株数に当日終値を掛けるため、
+    # 急騰銘柄では分子が過大評価され実態と乖離するbugがあるため削除。
+    # 発行済株数比（株数ベース・株価非依存）のみ採用。
     vol_days_str = "─"
     if pd.notna(lm_per_vol5d) and lm_per_vol5d > 0:
         vol_days_str = f"{lm_per_vol5d:.1f} 日分"
@@ -324,8 +323,7 @@ def build_supply_block(row: pd.Series, hist_df: pd.DataFrame | None) -> list[str
     if pd.notna(lm_per_shares):
         lm_per_shares_str = f"{lm_per_shares*100:.2f}%"
     lines.append(
-        f"- 信用買残 / 時価総額: {mcap_pct_str} "
-        f"／ 信用買残 / 発行済株数: {lm_per_shares_str} "
+        f"- 信用買残 / 発行済株数: {lm_per_shares_str} "
         f"／ 解消日数（信用買残 ÷ 5日平均出来高）: {vol_days_str}"
     )
 
