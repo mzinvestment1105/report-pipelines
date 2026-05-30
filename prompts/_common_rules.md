@@ -419,9 +419,11 @@ PDF・一次情報の取得が失敗・文字化け・パスワード保護等�
 
 ---
 
-## 13. Deep Research は廃止
+## 13. Deep Research は全廃（PM 2026-05-30 確定・例外なし）
 
-`## 📌 Deep Research 候補` セクションを出力しない。Perplexity 等の外部調査プロンプトも生成しない（2026-05-19 PM 確定）。個別銘柄レポート（[/stock-report](../.claude/commands/stock-report.md) 等）のみ Deep Research 候補出力可だが、自動化 GHA レポートでは全種別で出力禁止。
+**全レポート種別で Deep Research 候補セクションの出力を完全禁止する**。`## 📌 Deep Research 候補` の見出しを書かない・候補リストを書かない・「Deep Research 候補なし」のような注記も書かない・Perplexity 等の外部調査プロンプトも生成しない。
+
+旧ルール「個別銘柄レポートのみ Deep Research 候補出力可」は **2026-05-30 PM 確定で無効化**。マクロ・動意（日次・週次）・セクター・テーマ・個別銘柄・決算・アイデア等すべてのレポートで一切出力不可。
 
 ---
 
