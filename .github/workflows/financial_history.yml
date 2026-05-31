@@ -83,7 +83,8 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           # 一時コピーしたスクリプトは戻す（Private 側の履歴を汚さない）
           git checkout -- bi/pipelines/ 2>/dev/null || true
-          git add bi/outputs/financial_history_master.parquet
+          # bi/outputs/*.parquet は private repo の .gitignore で除外されているため -f で強制追加
+          git add -f bi/outputs/financial_history_master.parquet
           if ! git diff --staged --quiet; then
             git commit -m "data: financial_history $(date +'%Y-%m-%d') (${{ steps.mode.outputs.mode }})"
             git fetch origin master
