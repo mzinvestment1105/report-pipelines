@@ -26,13 +26,6 @@ PMから指定された銘柄を深掘りし、エントリー・見送りの判
 - `market/daily/sector/` 配下の `YYYY-MM-DD.md` を**直近1件**
 - `market/daily/ideas/` 配下の `YYYY-MM-DD.md` を**直近1件**
 
-### Step 3: Deep Research（鮮度ルール付き・Claude が WebSearch で直接実施）
-- `market/daily/macro/*_deep_research.md` / `movers` / `sector` / `ideas` の直近1件を参照する
-- 上記の直近 Deep Research が **7日以内**なら参照のみで可
-- いずれかが **7日超で古い**、または存在しない場合は、該当テーマの Deep Research を新規実行して当日ファイルを作成してから分析を続行する（スキップ不可）
-- **Deep Research の実行主体は Claude**（WebSearch を並列実行して直接調査・保存）。**外部ツール（Perplexity 等）への PM 依頼は禁止**（2026-05-18 PM 確定・[CLAUDE.md](../CLAUDE.md) §Web調査のルール準拠）
-- 個別銘柄レポートにおける Deep Research は、ツールで取れない領域（競合比較・市場シェア・アナリストレーティング・業界紙取材・直近報道・相手方戦略意図）に限定する。論点は最大3つ
-
 ### Step 4: 当銘柄の過去レポート（全件）
 - `research/stocks/{コード}/` 配下のファイルを全て読む（日付順）。初回分析の場合はスキップ。
 
@@ -448,14 +441,6 @@ PMから指定された銘柄を深掘りし、エントリー・見送りの判
 | 損切りライン | 円 |
 
 ---
-
-### 13. （廃止）Deep Research 候補セクション
-
-**【🔴 廃止・PM 2026-05-26 明示指示】**
-
-- **本セクションは個別銘柄レポートから廃止**
-- 末尾に Deep Research 候補・出典・References 等の付録セクションを一切付けない
-- 旧ルール「個別銘柄レポートのみ Deep Research 候補出力可」は無効化
 
 ---
 
