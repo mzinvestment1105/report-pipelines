@@ -12,7 +12,7 @@ name: セクター週次レポート（フルバージョン）
 jobs:
   generate:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 90  # PM 2026-05-31: 40 -> 90 拡張（JQuants 429 リトライ + Deep Research 含むフル版で 55+ 分実績あり）
 
     steps:
       - name: Determine target date
