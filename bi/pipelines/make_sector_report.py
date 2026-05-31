@@ -94,7 +94,15 @@ def _save_price_cache(df: pd.DataFrame) -> None:
 
 
 def fetch_price_history(codes: list[str], *, limit_codes: int = 0) -> pd.DataFrame:
-    """全銘柄の価格履歴を get_eq_bars_daily_range で一括取得する。"""
+    """
+    全銘柄の価格履歴を取得する。
+
+    jquantsapi.ClientV2.get_eq_bars_daily_range は MAX_WORKERS=5 で日付単位を
+    並列リクエストするが、内部の get_eq_bars_daily に 429 リトライがなく
+    urllib3 の MaxRetryError で落ちる。そのため日付単位の逐次ループ +
+    jq_client_utils.fetch_paginated_v2（指数バックオフ 429 リトライ実装済み）
+    に置き換える。並列度 1 + リクエスト間 sleep で 429 を構造的に回避する。
+    """
     import jquantsapi
 
     api_key = os.environ.get("JQUANTS_API_KEY", "").strip()
@@ -114,16 +122,45 @@ def fetch_price_history(codes: list[str], *, limit_codes: int = 0) -> pd.DataFra
         print(f"価格キャッシュは最新（{fetch_from} > {today}）、スキップ")
         return cache
 
-    print(f"価格一括取得: {fetch_from} 〜 {today}（全銘柄）")
-    df = client.get_eq_bars_daily_range(
-        start_dt=fetch_from.strftime("%Y%m%d"),
-        end_dt=today.strftime("%Y%m%d"),
-    )
-    print(f"取得完了: {len(df)} 行")
+    print(f"価格一括取得: {fetch_from} 〜 {today}（全銘柄・日付逐次・429バックオフ）")
+    # 日付単位で逐次取得（並列度 1）。土日祝は空レスポンスで即終了するため軽量。
+    all_rows: list[dict] = []
+    fetch_dates = pd.date_range(fetch_from, today, freq="D")
+    total_dates = len(fetch_dates)
+    fetched_days = 0
+    empty_days = 0
+    for idx, d in enumerate(fetch_dates, 1):
+        d_str = d.strftime("%Y-%m-%d")
+        try:
+            rows = fetch_paginated_v2(
+                client,
+                "/equities/bars/daily",
+                params={"date": d_str},
+                sleep_seconds=REQUEST_SLEEP,
+            )
+        except Exception as e:
+            print(f"  {d_str}: 取得失敗（スキップ）: {type(e).__name__}: {e}")
+            continue
 
-    if df.empty:
+        if rows:
+            all_rows.extend(rows)
+            fetched_days += 1
+        else:
+            empty_days += 1
+
+        if idx % 30 == 0 or idx == total_dates:
+            print(
+                f"  価格取得: {idx}/{total_dates} 日処理 "
+                f"(データあり {fetched_days} 日 / 空 {empty_days} 日 / 累計 {len(all_rows)} 行)"
+            )
+
+    print(f"取得完了: {len(all_rows)} 行（{fetched_days} 営業日）")
+
+    if not all_rows:
         print("新規価格データなし、キャッシュをそのまま使用")
         return cache
+
+    df = pd.DataFrame(all_rows)
 
     # カラム正規化
     col_map = {}
