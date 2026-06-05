@@ -247,6 +247,39 @@ def main() -> int:
                                 label=cfg["label"], identifier=identifier,
                                 reason=f"フォールバック表記 {len(violations)} 件混入 / 全 {len(entry_matches)} 銘柄")
                 return 1
+        # PM 2026-06-06 追加: 数値カバレッジ品質ゲート
+        # 「省略統一」（取れない項目を行から削除）により、上流データ全断時に
+        # 「銘柄行だけ並んで数値が全部空」のレポートが forbidden_patterns を回避して
+        # 発行される劣化モードを構造的に防止する。終値 80% 以上・売買代金/時価総額 50%
+        # 以上を必須化。違反時は送信中止＆ PM 通知。
+        header_with_price = 0
+        header_with_value = 0
+        for i, m in enumerate(entry_matches):
+            start = m.start()
+            end = entry_matches[i + 1].start() if i + 1 < len(entry_matches) else len(md_text_pre)
+            body = md_text_pre[start:end]
+            header_line = body.split("\n", 1)[0]
+            if "終値" in header_line:
+                header_with_price += 1
+            if "売買代金" in header_line or "時価総額" in header_line:
+                header_with_value += 1
+        total = len(entry_matches)
+        price_ratio = header_with_price / total if total > 0 else 0.0
+        value_ratio = header_with_value / total if total > 0 else 0.0
+        print(f"[quality_gate] 終値カバレッジ: {header_with_price}/{total} ({price_ratio:.0%})・売買代金/時価総額カバレッジ: {header_with_value}/{total} ({value_ratio:.0%})")
+        if not args.force:
+            if price_ratio < 0.80:
+                print(f"ERROR: 終値カバレッジ低下 {price_ratio:.0%} < 80%・空数値レポート疑い")
+                _notify_failure(webhook_env=cfg["webhook_env"],
+                                label=cfg["label"], identifier=identifier,
+                                reason=f"終値カバレッジ {header_with_price}/{total} ({price_ratio:.0%}) < 80%・上流データ全断疑いのため発行停止")
+                return 1
+            if value_ratio < 0.50:
+                print(f"ERROR: 売買代金/時価総額カバレッジ低下 {value_ratio:.0%} < 50%・空数値レポート疑い")
+                _notify_failure(webhook_env=cfg["webhook_env"],
+                                label=cfg["label"], identifier=identifier,
+                                reason=f"売買代金/時価総額カバレッジ {header_with_value}/{total} ({value_ratio:.0%}) < 50%・上流データ全断疑いのため発行停止")
+                return 1
         # 需給セクション集計（参考情報・送信中止しない）
         with_supply = sum(1 for m in entry_matches
                           if "需給" in md_text_pre[m.start():(entry_matches[entry_matches.index(m) + 1].start() if entry_matches.index(m) + 1 < len(entry_matches) else len(md_text_pre))])

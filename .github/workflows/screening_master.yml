@@ -1,11 +1,64 @@
 name: スクリーニングマスター更新
 
 "on":
-  # PM 2026-05-27 確定: Cloudflare Worker (mizuki-fund-scheduler-1) からの workflow_dispatch に一本化。
+  # PM 2026-05-27 確定: Cloudflare Worker (mizuki-fund-scheduler-1) からの workflow_dispatch がメイン経路。
+  # PM 2026-06-06: 重量級 ETL（5h・JQuants クォータ使用）のため GHA cron による二重起動は実装せず、
+  # guard ジョブによる重複防止のみ実装。Worker 落ち時のフェイルセーフは daily_healthcheck workflow で検知。
   workflow_dispatch:
 
+concurrency:
+  group: screening_master-daily
+  cancel-in-progress: false
+
 jobs:
+  guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      proceed: ${{ steps.check.outputs.proceed }}
+      reason: ${{ steps.check.outputs.reason }}
+    steps:
+      - name: Check today's runs
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TODAY_JST=$(TZ=Asia/Tokyo date +%Y-%m-%d)
+          TODAY_START="${TODAY_JST}T00:00:00+09:00"
+          MY_RUN_ID=${{ github.run_id }}
+
+          RUNS=$(gh api -X GET \
+            "repos/${{ github.repository }}/actions/workflows/screening_master.yml/runs" \
+            -f "created=>=${TODAY_START}" \
+            --jq "[.workflow_runs[] | select(.id != ${MY_RUN_ID})]")
+
+          ACTIVE=$(echo "$RUNS" | jq '[.[] | select(.status=="in_progress" or .status=="queued" or .status=="waiting" or .status=="action_required" or .status=="pending")] | length')
+          DONE_OK=$(echo "$RUNS" | jq '[.[] | select(.conclusion=="success" or .conclusion=="neutral")] | length')
+
+          echo "Today (${TODAY_JST}): active=${ACTIVE} done_ok=${DONE_OK}"
+
+          if [ "$DONE_OK" -gt 0 ]; then
+            echo "proceed=false" >> $GITHUB_OUTPUT
+            echo "reason=skip (already succeeded today: done_ok=${DONE_OK})" >> $GITHUB_OUTPUT
+          elif [ "$ACTIVE" -gt 0 ]; then
+            echo "proceed=false" >> $GITHUB_OUTPUT
+            echo "reason=skip (active run exists: active=${ACTIVE})" >> $GITHUB_OUTPUT
+          else
+            echo "proceed=true" >> $GITHUB_OUTPUT
+            echo "reason=initial" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Discord notification on skip
+        if: steps.check.outputs.proceed == 'false'
+        env:
+          WH: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          curl -s -X POST "$WH" -H "Content-Type: application/json" \
+            -d "{\"content\":\"🔵 スクリーニングマスター更新 skip: ${{ steps.check.outputs.reason }}\"}"
+
   update:
+    needs: guard
+    if: needs.guard.outputs.proceed == 'true'
     runs-on: ubuntu-latest
 
     steps:

@@ -1,0 +1,85 @@
+name: Daily Healthcheck (dead-man switch)
+
+"on":
+  # PM 2026-06-06 新設: Worker と GHA cron が両方落ちて完全無音失敗する事故を検知。
+  # 朝刊チェック: 09:00 JST = UTC 00:00（マクロ朝刊 06:23 の 2.5h 後・cron 07:30 の 1.5h 後）
+  # 夕方チェック: 19:00 JST = UTC 10:00（夕方 4 レポート想定完了の 15-30 分後）
+  workflow_dispatch: {}
+  schedule:
+    - cron: '0 0 * * 1-5'
+    - cron: '0 10 * * 1-5'
+
+# PM 2026-06-06: 同時起動排除（cron 2 つが同時に走ることはないが念のため）
+concurrency:
+  group: daily_healthcheck-${{ github.event.schedule || 'manual' }}
+  cancel-in-progress: false
+
+jobs:
+  healthcheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Determine check scope (morning / evening)
+        id: scope
+        run: |
+          HOUR_JST=$(TZ=Asia/Tokyo date +%H)
+          if [ "$HOUR_JST" -lt 12 ]; then
+            echo "scope=morning" >> $GITHUB_OUTPUT
+            echo "workflows=macro_report_daily.yml" >> $GITHUB_OUTPUT
+            echo "label=朝刊" >> $GITHUB_OUTPUT
+          else
+            echo "scope=evening" >> $GITHUB_OUTPUT
+            echo "workflows=sector_report_daily.yml,mover_report_daily.yml,macro_report_evening.yml,theme_report_daily.yml" >> $GITHUB_OUTPUT
+            echo "label=夕方 4 本" >> $GITHUB_OUTPUT
+          fi
+          echo "today_jst=$(TZ=Asia/Tokyo date +%Y-%m-%d)" >> $GITHUB_OUTPUT
+          echo "hour_jst=${HOUR_JST}" >> $GITHUB_OUTPUT
+
+      - name: Check today's report success
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TODAY_START="${{ steps.scope.outputs.today_jst }}T00:00:00+09:00"
+          MISSING=""
+          IFS=',' read -ra WORKFLOWS <<< "${{ steps.scope.outputs.workflows }}"
+          for wf in "${WORKFLOWS[@]}"; do
+            wf=$(echo "$wf" | tr -d ' ')
+            SUCCESS=$(gh api -X GET \
+              "repos/${{ github.repository }}/actions/workflows/${wf}/runs" \
+              -f "created=>=${TODAY_START}" \
+              --jq '[.workflow_runs[] | select(.conclusion=="success")] | length')
+            ACTIVE=$(gh api -X GET \
+              "repos/${{ github.repository }}/actions/workflows/${wf}/runs" \
+              -f "created=>=${TODAY_START}" \
+              --jq '[.workflow_runs[] | select(.status=="in_progress" or .status=="queued" or .status=="waiting" or .status=="pending")] | length')
+            echo "${wf}: success=${SUCCESS} active=${ACTIVE}"
+            if [ "$SUCCESS" -eq 0 ] && [ "$ACTIVE" -eq 0 ]; then
+              MISSING="${MISSING} ${wf}"
+            fi
+          done
+          MISSING=$(echo "$MISSING" | xargs)
+          if [ -n "$MISSING" ]; then
+            echo "alert=true" >> $GITHUB_OUTPUT
+            echo "missing=${MISSING}" >> $GITHUB_OUTPUT
+          else
+            echo "alert=false" >> $GITHUB_OUTPUT
+            echo "missing=" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Alert PM if any workflow missing
+        if: steps.check.outputs.alert == 'true'
+        env:
+          WH: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          TODAY=${{ steps.scope.outputs.today_jst }}
+          LABEL="${{ steps.scope.outputs.label }}"
+          MISSING="${{ steps.check.outputs.missing }}"
+          MSG="🚨 **Healthcheck Alert** (${TODAY}): ${LABEL}レポート未発行検知\\n未起動 workflow: ${MISSING}\\n手動 dispatch で復旧: https://github.com/${{ github.repository }}/actions"
+          curl -s -X POST "$WH" -H "Content-Type: application/json" \
+            -d "{\"content\":\"${MSG}\"}"
+
+      - name: Healthy heartbeat (when all OK)
+        if: steps.check.outputs.alert == 'false'
+        run: |
+          echo "✅ ${{ steps.scope.outputs.label }}レポートすべて発行済（${{ steps.scope.outputs.today_jst }}）"

@@ -15,15 +15,19 @@ name: テーマ動意レポート日次
     - cron: '45 9 * * 1-5'
 
 # PM 2026-06-05: 同一 workflow の二重実行を GHA 内部ロックで防ぐ。
+# PM 2026-06-06 修正: target_date による group 分裂を防ぐため固定 group へ変更。
+# Worker と cron が target_date 引数の違いで別 group に入る race window を排除。
 concurrency:
-  group: theme_report_daily-${{ github.event.inputs.target_date || 'auto' }}
+  group: theme_report_daily-daily
   cancel-in-progress: false
 
 jobs:
   guard:
-    # PM 2026-06-05: 当日 0:00 JST 以降の同 workflow の run を集計し、
-    # success または in_progress/queued/waiting が 1 件でもあれば skip。
-    # failure のみ存在、または run なしの時のみ proceed。
+    # PM 2026-06-05/06: 当日 0:00 JST 以降の同 workflow の run を集計し、
+    # status 全種類（cancelled / startup_failure / timed_out / stale 等）を漏れなく分類。
+    # 判定: (1) DONE_OK >= 1 → skip / (2) ACTIVE >= 1 → skip
+    #       (3) cron 起動かつ DONE_FAIL >= 2 → skip（連続失敗の課金暴走防止）
+    #       (4) それ以外 → proceed（initial or recovery）
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -38,39 +42,53 @@ jobs:
           TODAY_JST=$(TZ=Asia/Tokyo date +%Y-%m-%d)
           TODAY_START="${TODAY_JST}T00:00:00+09:00"
           MY_RUN_ID=${{ github.run_id }}
+          EVENT="${{ github.event_name }}"
 
           RUNS=$(gh api -X GET \
             "repos/${{ github.repository }}/actions/workflows/theme_report_daily.yml/runs" \
             -f "created=>=${TODAY_START}" \
             --jq "[.workflow_runs[] | select(.id != ${MY_RUN_ID})]")
 
-          SUCCESS=$(echo "$RUNS" | jq '[.[] | select(.conclusion=="success")] | length')
-          ACTIVE=$(echo "$RUNS" | jq '[.[] | select(.status=="in_progress" or .status=="queued" or .status=="waiting")] | length')
-          FAILURE=$(echo "$RUNS" | jq '[.[] | select(.conclusion=="failure")] | length')
+          # ACTIVE: 実行中・キュー・待機・承認待ち
+          ACTIVE=$(echo "$RUNS" | jq '[.[] | select(.status=="in_progress" or .status=="queued" or .status=="waiting" or .status=="action_required" or .status=="pending")] | length')
+          # DONE_OK: success / neutral（成功扱い）
+          DONE_OK=$(echo "$RUNS" | jq '[.[] | select(.conclusion=="success" or .conclusion=="neutral")] | length')
+          # DONE_FAIL: failure / cancelled / startup_failure / timed_out / stale / action_required
+          DONE_FAIL=$(echo "$RUNS" | jq '[.[] | select(.conclusion=="failure" or .conclusion=="cancelled" or .conclusion=="startup_failure" or .conclusion=="timed_out" or .conclusion=="stale" or .conclusion=="action_required")] | length')
 
-          echo "Today (${TODAY_JST}): success=${SUCCESS} active=${ACTIVE} failure=${FAILURE} (excluding self ${MY_RUN_ID})"
+          echo "Today (${TODAY_JST}): active=${ACTIVE} done_ok=${DONE_OK} done_fail=${DONE_FAIL} event=${EVENT} (excluding self ${MY_RUN_ID})"
 
-          if [ "$SUCCESS" -eq 0 ] && [ "$ACTIVE" -eq 0 ]; then
+          if [ "$DONE_OK" -gt 0 ]; then
+            echo "proceed=false" >> $GITHUB_OUTPUT
+            echo "reason=skip (already succeeded today: done_ok=${DONE_OK})" >> $GITHUB_OUTPUT
+          elif [ "$ACTIVE" -gt 0 ]; then
+            echo "proceed=false" >> $GITHUB_OUTPUT
+            echo "reason=skip (active run exists: active=${ACTIVE})" >> $GITHUB_OUTPUT
+          elif [ "$EVENT" = "schedule" ] && [ "$DONE_FAIL" -ge 2 ]; then
+            echo "proceed=false" >> $GITHUB_OUTPUT
+            echo "reason=retry_cap (cron stopped: done_fail=${DONE_FAIL} >= 2)" >> $GITHUB_OUTPUT
+          else
             echo "proceed=true" >> $GITHUB_OUTPUT
-            if [ "$FAILURE" -gt 0 ]; then
-              echo "reason=recovery (failure=${FAILURE})" >> $GITHUB_OUTPUT
+            if [ "$DONE_FAIL" -gt 0 ]; then
+              echo "reason=recovery (done_fail=${DONE_FAIL})" >> $GITHUB_OUTPUT
             else
               echo "reason=initial" >> $GITHUB_OUTPUT
             fi
-          else
-            echo "proceed=false" >> $GITHUB_OUTPUT
-            echo "reason=skip (success=${SUCCESS} active=${ACTIVE})" >> $GITHUB_OUTPUT
           fi
 
-      - name: Discord notification (cron event only)
-        if: github.event_name == 'schedule'
+      - name: Discord notification (cron or skip event)
+        if: github.event_name == 'schedule' || steps.check.outputs.proceed == 'false'
         env:
           WH: ${{ secrets.DISCORD_WEBHOOK_THEME }}
         run: |
-          if [ "${{ steps.check.outputs.proceed }}" = "true" ]; then
-            MSG="🔶 GHA cron フェイルセーフ起動: テーマ動意レポート (${{ steps.check.outputs.reason }})"
+          REASON="${{ steps.check.outputs.reason }}"
+          PROCEED="${{ steps.check.outputs.proceed }}"
+          if [ "$PROCEED" = "true" ]; then
+            MSG="🔶 GHA cron フェイルセーフ起動: テーマ動意レポート (${REASON})"
+          elif echo "$REASON" | grep -q "retry_cap"; then
+            MSG="🚨 GHA cron 連続失敗で停止: テーマ動意レポート (${REASON}) - 手動 dispatch で復旧してください"
           else
-            MSG="🔵 GHA cron skip: テーマ動意レポート (${{ steps.check.outputs.reason }})"
+            MSG="🔵 ${{ github.event_name }} skip: テーマ動意レポート (${REASON})"
           fi
           curl -s -X POST "$WH" -H "Content-Type: application/json" \
             -d "{\"content\":\"${MSG}\"}"

@@ -16,8 +16,57 @@ name: Financial History Daily Update
   schedule:
     - cron: "0 8 * * *"
 
+# PM 2026-06-06 追加: 二重発火を GHA 内部ロックで防ぐ。
+concurrency:
+  group: financial_history-daily
+  cancel-in-progress: false
+
 jobs:
+  guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      proceed: ${{ steps.check.outputs.proceed }}
+      reason: ${{ steps.check.outputs.reason }}
+    steps:
+      - name: Check today's runs
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TODAY_JST=$(TZ=Asia/Tokyo date +%Y-%m-%d)
+          TODAY_START="${TODAY_JST}T00:00:00+09:00"
+          MY_RUN_ID=${{ github.run_id }}
+          EVENT="${{ github.event_name }}"
+
+          RUNS=$(gh api -X GET \
+            "repos/${{ github.repository }}/actions/workflows/financial_history.yml/runs" \
+            -f "created=>=${TODAY_START}" \
+            --jq "[.workflow_runs[] | select(.id != ${MY_RUN_ID})]")
+
+          ACTIVE=$(echo "$RUNS" | jq '[.[] | select(.status=="in_progress" or .status=="queued" or .status=="waiting" or .status=="action_required" or .status=="pending")] | length')
+          DONE_OK=$(echo "$RUNS" | jq '[.[] | select(.conclusion=="success" or .conclusion=="neutral")] | length')
+          DONE_FAIL=$(echo "$RUNS" | jq '[.[] | select(.conclusion=="failure" or .conclusion=="cancelled" or .conclusion=="startup_failure" or .conclusion=="timed_out" or .conclusion=="stale")] | length')
+
+          echo "Today (${TODAY_JST}): active=${ACTIVE} done_ok=${DONE_OK} done_fail=${DONE_FAIL} event=${EVENT}"
+
+          if [ "$DONE_OK" -gt 0 ]; then
+            echo "proceed=false" >> $GITHUB_OUTPUT
+            echo "reason=skip (already succeeded today)" >> $GITHUB_OUTPUT
+          elif [ "$ACTIVE" -gt 0 ]; then
+            echo "proceed=false" >> $GITHUB_OUTPUT
+            echo "reason=skip (active run exists)" >> $GITHUB_OUTPUT
+          elif [ "$EVENT" = "schedule" ] && [ "$DONE_FAIL" -ge 2 ]; then
+            echo "proceed=false" >> $GITHUB_OUTPUT
+            echo "reason=retry_cap (cron stopped: done_fail=${DONE_FAIL})" >> $GITHUB_OUTPUT
+          else
+            echo "proceed=true" >> $GITHUB_OUTPUT
+            echo "reason=proceed" >> $GITHUB_OUTPUT
+          fi
+
   update:
+    needs: guard
+    if: needs.guard.outputs.proceed == 'true'
     runs-on: ubuntu-latest
     # 業績は四半期粒度のため日次更新は数件のみ・通常 60 分で十分
     # initial 実行時は workflow_dispatch から手動起動し timeout を超える想定（360 分相当）。

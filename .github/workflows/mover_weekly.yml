@@ -1,20 +1,96 @@
 name: 動意銘柄レポート週次
 
 "on":
-  # PM 2026-05-27 確定: Cloudflare Worker (mizuki-fund-scheduler-1) からの workflow_dispatch に一本化。
+  # PM 2026-05-27 確定: Cloudflare Worker (mizuki-fund-scheduler-1) からの workflow_dispatch がメイン経路。
+  # PM 2026-06-06 追加: Worker SPOF 回避のため GHA cron をフェイルセーフ併用。
+  # 仮設定: 金曜 21:00 JST = UTC 12:00（Worker 想定 17-19 時 JST の数時間後）。
+  # 正確な Worker 時刻が判明したら本値を Worker + 1h 程度に調整する。
+  # guard ジョブが当日既存 run を検知して重複発火を防止。
   workflow_dispatch:
     inputs:
       target_date:
         description: '対象日付 (YYYY-MM-DD・空欄で当日の金曜)'
         required: false
         default: ''
+  schedule:
+    - cron: '0 12 * * 5'
 
 # PM 2026-05-23 確定: プライム / スタンダード / グロースの 3 市場を並列ジョブで実行。
 # 直列実行 (~50 分) を並列化することで全体 ~22 分に短縮。
 # generate-market ジョブが matrix で 3 並列、merge-and-send ジョブが needs で 3 ジョブ完了を待つ。
 
+# PM 2026-06-06 追加: 二重発火を GHA 内部ロックで防ぐ。
+concurrency:
+  group: mover_weekly-weekly
+  cancel-in-progress: false
+
 jobs:
+  guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      proceed: ${{ steps.check.outputs.proceed }}
+      reason: ${{ steps.check.outputs.reason }}
+    steps:
+      - name: Check today's runs
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TODAY_JST=$(TZ=Asia/Tokyo date +%Y-%m-%d)
+          TODAY_START="${TODAY_JST}T00:00:00+09:00"
+          MY_RUN_ID=${{ github.run_id }}
+          EVENT="${{ github.event_name }}"
+
+          RUNS=$(gh api -X GET \
+            "repos/${{ github.repository }}/actions/workflows/mover_weekly.yml/runs" \
+            -f "created=>=${TODAY_START}" \
+            --jq "[.workflow_runs[] | select(.id != ${MY_RUN_ID})]")
+
+          ACTIVE=$(echo "$RUNS" | jq '[.[] | select(.status=="in_progress" or .status=="queued" or .status=="waiting" or .status=="action_required" or .status=="pending")] | length')
+          DONE_OK=$(echo "$RUNS" | jq '[.[] | select(.conclusion=="success" or .conclusion=="neutral")] | length')
+          DONE_FAIL=$(echo "$RUNS" | jq '[.[] | select(.conclusion=="failure" or .conclusion=="cancelled" or .conclusion=="startup_failure" or .conclusion=="timed_out" or .conclusion=="stale" or .conclusion=="action_required")] | length')
+
+          echo "Today (${TODAY_JST}): active=${ACTIVE} done_ok=${DONE_OK} done_fail=${DONE_FAIL} event=${EVENT}"
+
+          if [ "$DONE_OK" -gt 0 ]; then
+            echo "proceed=false" >> $GITHUB_OUTPUT
+            echo "reason=skip (already succeeded today: done_ok=${DONE_OK})" >> $GITHUB_OUTPUT
+          elif [ "$ACTIVE" -gt 0 ]; then
+            echo "proceed=false" >> $GITHUB_OUTPUT
+            echo "reason=skip (active run exists: active=${ACTIVE})" >> $GITHUB_OUTPUT
+          elif [ "$EVENT" = "schedule" ] && [ "$DONE_FAIL" -ge 2 ]; then
+            echo "proceed=false" >> $GITHUB_OUTPUT
+            echo "reason=retry_cap (cron stopped: done_fail=${DONE_FAIL} >= 2)" >> $GITHUB_OUTPUT
+          else
+            echo "proceed=true" >> $GITHUB_OUTPUT
+            if [ "$DONE_FAIL" -gt 0 ]; then
+              echo "reason=recovery (done_fail=${DONE_FAIL})" >> $GITHUB_OUTPUT
+            else
+              echo "reason=initial" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: Discord notification (cron or skip event)
+        if: github.event_name == 'schedule' || steps.check.outputs.proceed == 'false'
+        env:
+          WH: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
+        run: |
+          REASON="${{ steps.check.outputs.reason }}"
+          PROCEED="${{ steps.check.outputs.proceed }}"
+          if [ "$PROCEED" = "true" ]; then
+            MSG="🔶 GHA cron フェイルセーフ起動: 動意銘柄レポート週次 (${REASON})"
+          elif echo "$REASON" | grep -q "retry_cap"; then
+            MSG="🚨 GHA cron 連続失敗で停止: 動意銘柄レポート週次 (${REASON}) - 手動 dispatch で復旧してください"
+          else
+            MSG="🔵 ${{ github.event_name }} skip: 動意銘柄レポート週次 (${REASON})"
+          fi
+          curl -s -X POST "$WH" -H "Content-Type: application/json" \
+            -d "{\"content\":\"${MSG}\"}"
+
   setup-raw:
+    needs: guard
+    if: needs.guard.outputs.proceed == 'true'
     # PM 2026-05-30 確定: 週次 workflow にも raw 生成 step を追加。日次 workflow と同様、
     # 週次実行時に make_mover_report.py で当週分の raw を新規生成し artifact 共有する。
     # これ以前は raw 生成 step がなく、private リポに commit 済の最新 raw（2026-05-22）を
