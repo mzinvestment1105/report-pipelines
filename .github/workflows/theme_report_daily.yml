@@ -1,16 +1,83 @@
 name: テーマ動意レポート日次
 
 "on":
-  # PM 2026-05-27 確定: Cloudflare Worker (mizuki-fund-scheduler-1) からの workflow_dispatch に一本化。
+  # PM 2026-05-27 確定: Cloudflare Worker (mizuki-fund-scheduler-1) からの workflow_dispatch がメイン経路。
+  # PM 2026-06-05 追加: Worker 単一経路の SPOF 回避のため、Worker (17:43 JST) の約 1 時間後に
+  # GHA cron をフェイルセーフとして併用。平日のみ（UTC 月-金 = 09:45）。
+  # guard ジョブで当日既存 run を検知して重複発火を防ぐ。
   workflow_dispatch:
     inputs:
       target_date:
         description: '対象日付 (YYYY-MM-DD・空欄で当日)'
         required: false
         default: ''
+  schedule:
+    - cron: '45 9 * * 1-5'
+
+# PM 2026-06-05: 同一 workflow の二重実行を GHA 内部ロックで防ぐ。
+concurrency:
+  group: theme_report_daily-${{ github.event.inputs.target_date || 'auto' }}
+  cancel-in-progress: false
 
 jobs:
+  guard:
+    # PM 2026-06-05: 当日 0:00 JST 以降の同 workflow の run を集計し、
+    # success または in_progress/queued/waiting が 1 件でもあれば skip。
+    # failure のみ存在、または run なしの時のみ proceed。
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      proceed: ${{ steps.check.outputs.proceed }}
+      reason: ${{ steps.check.outputs.reason }}
+    steps:
+      - name: Check today's runs
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TODAY_JST=$(TZ=Asia/Tokyo date +%Y-%m-%d)
+          TODAY_START="${TODAY_JST}T00:00:00+09:00"
+          MY_RUN_ID=${{ github.run_id }}
+
+          RUNS=$(gh api -X GET \
+            "repos/${{ github.repository }}/actions/workflows/theme_report_daily.yml/runs" \
+            -f "created=>=${TODAY_START}" \
+            --jq "[.workflow_runs[] | select(.id != ${MY_RUN_ID})]")
+
+          SUCCESS=$(echo "$RUNS" | jq '[.[] | select(.conclusion=="success")] | length')
+          ACTIVE=$(echo "$RUNS" | jq '[.[] | select(.status=="in_progress" or .status=="queued" or .status=="waiting")] | length')
+          FAILURE=$(echo "$RUNS" | jq '[.[] | select(.conclusion=="failure")] | length')
+
+          echo "Today (${TODAY_JST}): success=${SUCCESS} active=${ACTIVE} failure=${FAILURE} (excluding self ${MY_RUN_ID})"
+
+          if [ "$SUCCESS" -eq 0 ] && [ "$ACTIVE" -eq 0 ]; then
+            echo "proceed=true" >> $GITHUB_OUTPUT
+            if [ "$FAILURE" -gt 0 ]; then
+              echo "reason=recovery (failure=${FAILURE})" >> $GITHUB_OUTPUT
+            else
+              echo "reason=initial" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "proceed=false" >> $GITHUB_OUTPUT
+            echo "reason=skip (success=${SUCCESS} active=${ACTIVE})" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Discord notification (cron event only)
+        if: github.event_name == 'schedule'
+        env:
+          WH: ${{ secrets.DISCORD_WEBHOOK_THEME }}
+        run: |
+          if [ "${{ steps.check.outputs.proceed }}" = "true" ]; then
+            MSG="🔶 GHA cron フェイルセーフ起動: テーマ動意レポート (${{ steps.check.outputs.reason }})"
+          else
+            MSG="🔵 GHA cron skip: テーマ動意レポート (${{ steps.check.outputs.reason }})"
+          fi
+          curl -s -X POST "$WH" -H "Content-Type: application/json" \
+            -d "{\"content\":\"${MSG}\"}"
+
   generate:
+    needs: guard
+    if: needs.guard.outputs.proceed == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
