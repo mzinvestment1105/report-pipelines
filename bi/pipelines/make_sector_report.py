@@ -93,6 +93,37 @@ def _save_price_cache(df: pd.DataFrame) -> None:
     df.to_parquet(PRICE_CACHE_PATH, index=False)
 
 
+def load_price_from_history(*, lookback_years: int = LOOKBACK_YEARS) -> pd.DataFrame:
+    """price_history/{YYYY}.parquet（price_history.yml が毎日更新・commit する OHLCV マスタ）から
+    直近 lookback_years 年分を読み込み、セクター ETL が期待する [Date, Code, O, H, L, C, V] で返す。
+
+    旧実装は JQuants から 3 年分を日付逐次でコールド取得していたが、gitignore 済みの
+    sector_prices.parquet が clone 毎に空のため毎回 full backfill（約89分）→ 90分タイムアウトで
+    cancelled する慢性障害だった。既に daily で温まっている price_history を入力源にすることで
+    数分に短縮する（PM 2026-06-14 確定）。OHLCV は旧コールドフェッチと同じ raw 値（調整前）を用い、
+    レポート数値の意味を変えない。
+    """
+    hist_dir = OUTPUTS_DIR / "price_history"
+    today = date.today()
+    cols = ["Date", "Code", "Open", "High", "Low", "Close", "Volume"]
+    frames: list[pd.DataFrame] = []
+    for year in range(today.year - lookback_years, today.year + 1):
+        p = hist_dir / f"{year}.parquet"
+        if p.exists():
+            frames.append(pd.read_parquet(p, columns=cols))
+    if not frames:
+        return pd.DataFrame(columns=["Date", "Code", "O", "H", "L", "C", "V"])
+    out = pd.concat(frames, ignore_index=True).rename(
+        columns={"Open": "O", "High": "H", "Low": "L", "Close": "C", "Volume": "V"}
+    )
+    out["Date"] = pd.to_datetime(out["Date"])
+    out["Code"] = out["Code"].astype("string").str.strip().str[:4]
+    cutoff = pd.Timestamp(today - timedelta(days=lookback_years * 365 + 30))
+    out = out[out["Date"] >= cutoff]
+    keep = ["Date", "Code", "O", "H", "L", "C", "V"]
+    return out[keep].sort_values(["Code", "Date"]).reset_index(drop=True)
+
+
 def fetch_price_history(codes: list[str], *, limit_codes: int = 0) -> pd.DataFrame:
     """
     全銘柄の価格履歴を取得する。
@@ -555,12 +586,17 @@ def main() -> None:
     codes = master_df["Code"].dropna().unique().tolist()
     print(f"ユニバース: {len(codes)} 銘柄（全市場）")
 
-    # 価格キャッシュ
+    # 価格データ: daily 更新済の price_history を入力源に使用（PM 2026-06-14 確定・旧 JQuants コールドフェッチ廃止）
     if args.skip_price_fetch:
-        print("価格取得スキップ")
+        print("価格取得スキップ（既存 sector_prices.parquet を使用）")
         prices = _load_price_cache()
     else:
-        prices = fetch_price_history(codes, limit_codes=args.limit_codes)
+        prices = load_price_from_history()
+        if prices.empty:
+            print("price_history が見つからないため JQuants コールドフェッチにフォールバック（低速）")
+            prices = fetch_price_history(codes, limit_codes=args.limit_codes)
+        else:
+            print(f"price_history から読込: {len(prices)} 行、{prices['Code'].nunique()} 銘柄（直近{LOOKBACK_YEARS}年）")
 
     if prices.empty:
         raise RuntimeError(
