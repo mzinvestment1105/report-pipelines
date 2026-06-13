@@ -299,7 +299,8 @@ for market in ["プライム", "スタンダード", "グロース"]:
    - グロース: 上昇率 Top 10・下落率 Bottom 5・売買代金 Top 10
 
 7. **TDNet 週間サマリーの取得**（任意・存在する場合）：
-   - `${PRIVATE_REPO_ROOT}/market/daily/${TARGET_DATE}_movers_raw.md` から本日分の TDNet 情報を補完用に参照
+   - `${PRIVATE_REPO_ROOT}/market/daily/${TARGET_DATE}_movers_raw.md` から本日分の TDNet 情報を補完用に参照（**このファイルは setup 段階で担当市場の節のみに絞り込み済み**・standard / growth は他市場を含まない・prime のみ全市場）
+   - **読み方（トークン浪費・再読込ループの禁止・PM 2026-06-13 確定）**: 必要な銘柄エントリは Grep で行番号を 1 回取得 → 各銘柄を offset 指定で **1 回ずつ** Read。**一度読んだ offset の再読込を禁止**する（同一 offset 再読込はトークン空費とコスト超過の直接原因）。
 
 ## レポート構成（出力セクション・日次フル版と同フォーマット）
 

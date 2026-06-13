@@ -246,10 +246,31 @@ jobs:
         working-directory: ./private-repo
         env:
           TARGET_DATE: ${{ needs.setup-raw.outputs.target_date }}
+          TARGET_MARKET: ${{ matrix.market }}
         run: |
           mkdir -p market/daily
-          cp /tmp/movers-raw/${TARGET_DATE}_movers_raw.md market/daily/
-          echo "Placed market/daily/${TARGET_DATE}_movers_raw.md ($(wc -l < market/daily/${TARGET_DATE}_movers_raw.md) lines)"
+          SRC=/tmp/movers-raw/${TARGET_DATE}_movers_raw.md
+          DST=market/daily/${TARGET_DATE}_movers_raw.md
+          # PM 2026-06-13 確定: standard / growth ジョブには担当市場の節のみ渡し、
+          # 担当外市場の無駄読み・同一 offset 再読込ループを構造的に防ぐ（トークン・コスト削減）。
+          # prime は Section 9 が全市場横断のため全 raw を保持する。
+          case "$TARGET_MARKET" in
+            growth)
+              awk '/^## グロース/{f=1} f' "$SRC" > "$DST"
+              ;;
+            standard)
+              awk '/^## スタンダード/{f=1} /^## グロース/{f=0} f' "$SRC" > "$DST"
+              ;;
+            *)
+              cp "$SRC" "$DST"
+              ;;
+          esac
+          # 抽出失敗（見出し不一致等）の保険: 極端に短ければ全 raw にフォールバック
+          if [ "$(wc -l < "$DST")" -lt 20 ]; then
+            echo "Sliced raw too short for market=$TARGET_MARKET; falling back to full raw"
+            cp "$SRC" "$DST"
+          fi
+          echo "Placed $DST for market=$TARGET_MARKET ($(wc -l < "$DST") lines / source $(wc -l < "$SRC") lines)"
 
       - name: Check screening_master parquet existence (no update・PM 2026-05-23 確定)
         working-directory: ./private-repo/bi/pipelines

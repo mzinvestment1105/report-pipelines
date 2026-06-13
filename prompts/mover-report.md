@@ -338,8 +338,8 @@ growth 実行の出力ファイル（{date}_growth.md）冒頭：
    - `${PRIVATE_REPO_ROOT}/market/daily/macro/` 配下の直近 1〜2 件（地合い把握）
    - `${PRIVATE_REPO_ROOT}/market/daily/movers/` 配下の直近 1〜2 件（前日継続銘柄追跡）
 5. `${PRIVATE_REPO_ROOT}/market/daily/${TARGET_DATE}_movers_raw.md` を Read で読み込んでください。
-   - **raw データ全件読み込み（必須）**: ファイル本体は 500〜700KB / 3,000〜4,000 行ある場合があります。引数なしの Read は禁止です。
-   - **正しい読み方**: まず Grep で `^### \d+[A-Z]?\s` パターンで全銘柄エントリ行番号取得 → 各銘柄について `Read(file, offset={行番号}, limit=70)` で個別読み込み
+   - **このファイルは setup 段階で担当市場（TARGET_MARKET）の節のみに絞り込み済み**です（standard / growth 実行では他市場の節は含まれません・prime のみ全市場 raw を受け取る）。**担当外市場のデータを探して読む必要はありません**。
+   - **読み方（トークン浪費・再読込ループの禁止・PM 2026-06-13 確定）**: まず Grep で `^### \d+[A-Z]?\s` パターンで担当市場の全銘柄エントリ行番号を **1 回だけ**取得し、各銘柄を `Read(file, offset={行番号}, limit=70)` で **1 回ずつ**読む。**一度読んだ offset を再度 Read し直すことを禁止**する（同一 offset の再読込はトークンの空費とタイムアウトの直接原因）。各銘柄の必要情報は最初の 1 回で把握し、メモして次の銘柄へ進む。引数なしの Read は禁止です。
 
 ## レポート構成（出力セクション）
 
