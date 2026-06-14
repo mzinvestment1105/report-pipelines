@@ -211,7 +211,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        market: [prime, standard, growth]
+        # PM 2026-06-14 確定: 銘柄数最多の growth を growth_a(6,7) / growth_b(8c) に2分割し
+        # 1実行あたりのコンテキスト負荷を下げ、文脈喪失による raw 再読ループ・コスト枠超過を防ぐ。
+        market: [prime, standard, growth_a, growth_b]
     steps:
       - name: Checkout report-pipelines
         uses: actions/checkout@v4
@@ -280,7 +282,7 @@ jobs:
           # 担当外市場（プライム/スタンダード ~1,960 行）の無駄読み・同一 offset 再読込ループを構造的に防ぐ。
           # prime は Section 9 が全市場横断のため全 raw を保持する。
           case "$TARGET_MARKET" in
-            growth)
+            growth_a|growth_b)
               awk '/^## グロース/{f=1} f' "$SRC" > "$DST"
               ;;
             standard)
@@ -409,7 +411,7 @@ jobs:
           MOVERS_DIR="market/daily/movers"
           mkdir -p "$MOVERS_DIR"
           rm -f "${MOVERS_DIR}/${TARGET_DATE}.md"
-          for MARKET in prime standard growth; do
+          for MARKET in prime standard growth_a growth_b; do
             SRC="/tmp/market-artifacts/${TARGET_DATE}_${MARKET}.md"
             DST="${MOVERS_DIR}/${TARGET_DATE}_${MARKET}.md"
             if [ ! -f "$SRC" ]; then
@@ -419,15 +421,17 @@ jobs:
             cp "$SRC" "$DST"
             echo "Placed $DST ($(wc -l < "$DST") lines)"
           done
+          # マージ順: prime(0,2,3,8a,9) → standard(4,5,8b) → growth_a(6,7) → growth_b(8c)
+          # send_report_jpeg_discord.py はマージ後 {date}.md からセクション6/7/8cを集めて
+          # グロース画像を生成するため、growth_a/growth_b を分割しても送信は透過的。
           OUTPUT="${MOVERS_DIR}/${TARGET_DATE}.md"
-          PRIME_FILE="${MOVERS_DIR}/${TARGET_DATE}_prime.md"
-          STANDARD_FILE="${MOVERS_DIR}/${TARGET_DATE}_standard.md"
-          GROWTH_FILE="${MOVERS_DIR}/${TARGET_DATE}_growth.md"
-          cat "$PRIME_FILE" > "$OUTPUT"
+          cat "${MOVERS_DIR}/${TARGET_DATE}_prime.md" > "$OUTPUT"
           echo "" >> "$OUTPUT"
-          cat "$STANDARD_FILE" >> "$OUTPUT"
+          cat "${MOVERS_DIR}/${TARGET_DATE}_standard.md" >> "$OUTPUT"
           echo "" >> "$OUTPUT"
-          cat "$GROWTH_FILE" >> "$OUTPUT"
+          cat "${MOVERS_DIR}/${TARGET_DATE}_growth_a.md" >> "$OUTPUT"
+          echo "" >> "$OUTPUT"
+          cat "${MOVERS_DIR}/${TARGET_DATE}_growth_b.md" >> "$OUTPUT"
           echo "Merged into $OUTPUT ($(wc -l < "$OUTPUT") lines)"
 
       - name: Send Discord (JPEG・市場別 3 枚分割)
