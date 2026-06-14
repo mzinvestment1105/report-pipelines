@@ -181,7 +181,7 @@ growth_b 実行の出力ファイル（{date}_weekly_growth_b.md）冒頭：
 レポート Write 前に以下キーワードで grep し、**1 件でもヒットしたら書き直す**：
 
 ```
-モルガン・スタンレー|GOLDMAN SACHS|Barclays|Nomura International|Citigroup Global|MERRILL LYNCH|J.P. MORGAN|JPM Securities|UBS AG|BNP Paribas|Maple Rock|Arrowstreet|Diversified Select|Morgan Stanley & Co|報告者:|発行済株数: N/A|発行株数: N/A|信用倍率 N/A|明確な開示なし|需給主導
+モルガン・スタンレー|GOLDMAN SACHS|Barclays|Nomura International|Citigroup Global|MERRILL LYNCH|J.P. MORGAN|JPM Securities|UBS AG|BNP Paribas|Maple Rock|Arrowstreet|Diversified Select|Morgan Stanley & Co|報告者:|発行済株数: N/A|発行株数: N/A|明確な開示なし|需給主導
 ```
 
 ヒット箇所を本セクション §🚨 のルールに従って必ず修正してから Write。
@@ -372,8 +372,8 @@ for market in ["プライム", "スタンダード", "グロース"]:
 - 判定: {割安 / 適正 / 割高} — {一言理由}
 
 **需給（信用・株価水準）**: {以下を 3〜5 行に圧縮。冗長な転記を禁止}
-- 信用残: 買 X 万株 / 売 Y 万株（信用倍率 Z.ZZ 倍）
-- 信用買残 / 時価総額: A.AA%　信用買残 / 発行済株数: B.BB%
+- 信用残: 買 X 万株（発行株数比 B.BB%） / 売 Y 万株（発行株数比 D.DD%）
+- 解消日数（信用買残 ÷ 5日平均出来高）: ○日分
 - 機関空売り（5% 超報告制度）: 発行済株数比 C.CC%（**証券会社名・機関名は記載禁止**・トータル割合のみ）
 - 信用買残 週次推移（6 週・古→新）: a → b → c → d → e → f　判定: 増加 / 横ばい / 減少（変化率 ±X%）
 - 直近 60 日レンジ位置: レンジ下から ○%・MA25 乖離率 ±○%

@@ -87,7 +87,6 @@ def format_credit_section(cli: TachibanaClient, code: str) -> str:
         lines.append(f"- **信用残日付**: {m.get('pMBD', '-')}")
         lines.append(f"- **信用残買残**: 一般 {m.get('pMBB3', '-')} / 制度 {m.get('pMBB6', '-')} / 合算 **{m.get('pMBBQ', '-')}**")
         lines.append(f"- **信用残売残**: 一般 {m.get('pMBS3', '-')} / 制度 {m.get('pMBS6', '-')} / 合算 **{m.get('pMBSQ', '-')}**")
-        lines.append(f"- **信用倍率**: 一般 {m.get('pMBR3', '-')} / 制度 {m.get('pMBR6', '-')} / 合算 **{m.get('pMBRQ', '-')}**")
         lines.append(f"- **買残前週比（合算）**: {m.get('pMBNQ', '-')}")
         lines.append(f"- **売残前週比（合算）**: {m.get('pMBCQ', '-')}")
         lines.append("")

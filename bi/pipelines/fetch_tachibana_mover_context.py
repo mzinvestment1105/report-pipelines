@@ -100,18 +100,17 @@ def format_credit_section(cli: TachibanaClient, codes: list[str]) -> str:
 
     lines.append(f"### 信用残・逆日歩スナップショット  （{len(codes)} 銘柄）")
     lines.append("")
-    lines.append("| 銘柄 | 信用残買残(合算) | 売残(合算) | 信用倍率(合算) | 前週比買残 | 逆日歩 | 更新日 |")
-    lines.append("|---|---|---|---|---|---|---|")
+    lines.append("| 銘柄 | 信用残買残(合算) | 売残(合算) | 前週比買残 | 逆日歩 | 更新日 |")
+    lines.append("|---|---|---|---|---|---|")
     for code in codes:
         m = margin_by_code.get(code, {})
         h = hibu_by_code.get(code, {})
         bbq = m.get("pMBBQ", "-")
         bsq = m.get("pMBSQ", "-")
-        brq = m.get("pMBRQ", "-")
         bnq = m.get("pMBNQ", "-")
         hibu = h.get("pBWRQ", "") or "なし"
         d = m.get("pMBD", "-")
-        lines.append(f"| {code} | {bbq} | {bsq} | {brq} | {bnq} | {hibu} | {d} |")
+        lines.append(f"| {code} | {bbq} | {bsq} | {bnq} | {hibu} | {d} |")
     return "\n".join(lines)
 
 

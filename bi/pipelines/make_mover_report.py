@@ -291,7 +291,7 @@ def build_supply_block(row: pd.Series, hist_df: pd.DataFrame | None) -> list[str
 
     lines: list[str] = ["**需給（信用・株価水準）:**"]
 
-    # --- 信用残（最新） ---
+    # --- 信用残（最新・発行済株数比併記） ---
     if pd.notna(long_m):
         long_str = f"{long_m/1e4:.1f}万株"
     else:
@@ -300,31 +300,33 @@ def build_supply_block(row: pd.Series, hist_df: pd.DataFrame | None) -> list[str
         short_str = f"{short_m/1e4:.1f}万株"
     else:
         short_str = "─"
-    ratio_str = "─"
-    if pd.notna(long_m) and pd.notna(short_m):
-        if short_m and short_m > 0:
-            ratio_str = f"{long_m/short_m:.2f} 倍"
-        elif long_m and long_m > 0:
-            ratio_str = "∞（売り残ゼロ）"
-        else:
-            ratio_str = "0.00 倍"
-    lines.append(f"- 信用残: 買 {long_str} / 売 {short_str}（信用倍率 {ratio_str}）")
+    # PM 2026-06-14 確定: 買残÷売残の比率は需給の重さを表さない無価値指標のため一切出力しない。
+    # 信用残は「発行株数に対する割合」（株価非依存）で評価する。
+    if pd.notna(lm_per_shares):
+        lm_per_shares_str = f"{lm_per_shares*100:.2f}%"
+    elif pd.notna(long_m) and pd.notna(shares_out) and shares_out > 0:
+        lm_per_shares_str = f"{long_m/shares_out*100:.2f}%"
+    else:
+        lm_per_shares_str = "─"
+    if pd.notna(short_m) and pd.notna(shares_out) and shares_out > 0:
+        sm_per_shares_str = f"{short_m/shares_out*100:.2f}%"
+    else:
+        sm_per_shares_str = "─"
+    lines.append(
+        f"- 信用残: 買 {long_str}（発行株数比 {lm_per_shares_str}） "
+        f"/ 売 {short_str}（発行株数比 {sm_per_shares_str}）"
+    )
 
-    # --- 発行済株数比・5日平均出来高比 ---
+    # --- 解消日数（信用買残 ÷ 5日平均出来高・株価非依存） ---
     # PM 2026-05-30: 信用買残/時価総額 は信用残報告日（過去）の株数に当日終値を掛けるため、
-    # 急騰銘柄では分子が過大評価され実態と乖離するbugがあるため削除。
-    # 発行済株数比（株数ベース・株価非依存）のみ採用。
+    # 急騰銘柄では分子が過大評価され実態と乖離するbugがあるため削除。発行株数比のみ採用。
     vol_days_str = "─"
     if pd.notna(lm_per_vol5d) and lm_per_vol5d > 0:
         vol_days_str = f"{lm_per_vol5d:.1f} 日分"
     elif pd.notna(long_m) and pd.notna(avg_vol5d) and avg_vol5d > 0:
         vol_days_str = f"{long_m / avg_vol5d:.1f} 日分"
-    lm_per_shares_str = "─"
-    if pd.notna(lm_per_shares):
-        lm_per_shares_str = f"{lm_per_shares*100:.2f}%"
     lines.append(
-        f"- 信用買残 / 発行済株数: {lm_per_shares_str} "
-        f"／ 解消日数（信用買残 ÷ 5日平均出来高）: {vol_days_str}"
+        f"- 解消日数（信用買残 ÷ 5日平均出来高）: {vol_days_str}"
     )
 
     # --- 信用買残 週次推移（直近 6 週・Seq08=最古→Seq01=最新） ---

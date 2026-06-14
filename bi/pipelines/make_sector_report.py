@@ -440,12 +440,11 @@ def build_stock_table(
     sector_mcap = merged.groupby("Sector17CodeName")["MarketCap"].transform("sum")
     merged["MarketCap_Weight"] = merged["MarketCap"] / sector_mcap
 
-    # 信用倍率
+    # 信用残（最新・発行株数比は下流で算出。買残÷売残の比率は不採用・PM 2026-06-14）
     long_latest = pd.to_numeric(merged.get("LongMargin_WkSeq01", pd.Series(dtype=float)), errors="coerce")
     short_latest = pd.to_numeric(merged.get("ShortMargin_WkSeq01", pd.Series(dtype=float)), errors="coerce")
     merged["ShortMargin_Latest"] = short_latest
     merged["LongMargin_Latest"] = long_latest
-    merged["MarginRatio"] = long_latest / short_latest.replace(0, float("nan"))
 
     # セクター内リターン順位
     merged["Return_Rank_InSector"] = (
