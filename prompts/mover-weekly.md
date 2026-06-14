@@ -6,7 +6,7 @@
 
 ## 🟢【最優先・必須・TARGET_MARKET 分岐】3 市場別の分割実行モード（PM 2026-05-23 確定）
 
-**本タスクは TARGET_MARKET 環境変数（`prime` / `standard` / `growth`）に応じて担当範囲が異なる**。3 つの Claude 実行に分割することで 32K 出力上限を回避する設計でございます。
+**本タスクは TARGET_MARKET 環境変数（`prime` / `standard` / `growth_a` / `growth_b`）に応じて担当範囲が異なる**。4 つの Claude 実行に分割することで 32K 出力上限の回避に加え、**銘柄数が最多のグロースを 2 分割して 1 実行あたりのコンテキスト負荷を下げ、文脈喪失による再読ループ・コスト枠超過を予防**する設計（PM 2026-06-14 確定）。
 
 ### TARGET_MARKET=prime（1/3 実行）
 
@@ -29,13 +29,19 @@
 - **5. スタンダード 週間下落率 Bottom 5**
 - **8b. スタンダード 週間売買代金 Top 5**
 
-### TARGET_MARKET=growth（3/3 実行）
+### TARGET_MARKET=growth_a（3/4 実行・グロース値動き担当）
 
-**Write 先**: `${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}_weekly_growth.md`
+**Write 先**: `${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}_weekly_growth_a.md`
 
 **担当セクション**:
 - **6. グロース 週間上昇率 Top 10**
 - **7. グロース 週間下落率 Bottom 5**
+
+### TARGET_MARKET=growth_b（4/4 実行・グロース週間売買代金担当）
+
+**Write 先**: `${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}_weekly_growth_b.md`
+
+**担当セクション**:
 - **8c. グロース 週間売買代金 Top 10**
 
 ### 共通ルール（全 TARGET_MARKET で同一）
@@ -85,7 +91,7 @@ standard 実行の出力ファイル（{date}_weekly_standard.md）冒頭：
 ...
 ```
 
-growth 実行の出力ファイル（{date}_weekly_growth.md）冒頭：
+growth_a 実行の出力ファイル（{date}_weekly_growth_a.md）冒頭：
 
 ```markdown
 ## 6. グロース 週間上昇率 Top 10
@@ -93,18 +99,22 @@ growth 実行の出力ファイル（{date}_weekly_growth.md）冒頭：
 
 ## 7. グロース 週間下落率 Bottom 5
 ...
+```
 
+growth_b 実行の出力ファイル（{date}_weekly_growth_b.md）冒頭：
+
+```markdown
 ## 8c. グロース 週間売買代金 Top 10
 ...
 ```
 
-3 ファイルは workflow yml 側で順番に cat されて `{date}_weekly.md` 統合ファイルに組み立てられます。**standard / growth 実行で `# 動意銘柄レポート ...` のタイトル見出しを書かない**（prime のものを使う）。
+4 ファイルは workflow yml 側で順番に cat されて `{date}_weekly.md` 統合ファイルに組み立てられます。**standard / growth_a / growth_b 実行で `# 動意銘柄レポート ...` のタイトル見出しを書かない**（prime のものを使う）。**growth_a は 6・7 のみ、growth_b は 8c のみを書き、互いの担当外セクションを重複生成しない**。
 
 ---
 
 ## 🚨🚨🚨【最重要・絶対遵守・PM 2026-05-23 確定】既存ファイル存在判定の禁止（必ず一から再生成する）
 
-**統合ファイル（`${TARGET_DATE}_weekly.md`）と 3 市場分割ファイル（`${TARGET_DATE}_weekly_prime.md` / `${TARGET_DATE}_weekly_standard.md` / `${TARGET_DATE}_weekly_growth.md`）のいずれかが既に存在していても、これを「完成済」「No further edits required」と判断することを絶対禁止**する。本タスクは**必ず全 step を実行**し・自分の TARGET_MARKET 担当範囲ファイルを**必ず一から上書き再生成**する。
+**統合ファイル（`${TARGET_DATE}_weekly.md`）と市場分割ファイル（`${TARGET_DATE}_weekly_prime.md` / `${TARGET_DATE}_weekly_standard.md` / `${TARGET_DATE}_weekly_growth_a.md` / `${TARGET_DATE}_weekly_growth_b.md`）のいずれかが既に存在していても、これを「完成済」「No further edits required」と判断することを絶対禁止**する。本タスクは**必ず全 step を実行**し・自分の TARGET_MARKET 担当範囲ファイルを**必ず一から上書き再生成**する。
 
 ### 禁止行為（実際の違反事例・run 26325536581）
 
@@ -180,13 +190,14 @@ growth 実行の出力ファイル（{date}_weekly_growth.md）冒頭：
 
 ## 【最重要・誤認防止】本タスクで Write する最終ファイル（TARGET_MARKET 別）
 
-**TARGET_MARKET 環境変数の値によって Write 先が異なる**（PM 2026-05-23 確定・3 市場別分割実行モード）：
+**TARGET_MARKET 環境変数の値によって Write 先が異なる**（PM 2026-06-14 確定・4 分割実行モード）：
 
 - `TARGET_MARKET=prime` → **`${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}_weekly_prime.md`**
 - `TARGET_MARKET=standard` → **`${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}_weekly_standard.md`**
-- `TARGET_MARKET=growth` → **`${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}_weekly_growth.md`**
+- `TARGET_MARKET=growth_a` → **`${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}_weekly_growth_a.md`**（6・7 のみ）
+- `TARGET_MARKET=growth_b` → **`${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}_weekly_growth_b.md`**（8c のみ）
 
-これが本タスクのゴール。**TARGET_MARKET に対応する 1 つだけ**を最終 Write 対象とする。統合ファイル（`{date}_weekly.md` 接尾辞なし）は workflow yml 側で 3 ファイルを cat した結果が書かれるため、Claude タスクでは触らない。
+これが本タスクのゴール。**TARGET_MARKET に対応する 1 つだけ**を最終 Write 対象とする。統合ファイル（`{date}_weekly.md` 接尾辞なし）は workflow yml 側で 4 ファイルを cat した結果が書かれるため、Claude タスクでは触らない。
 
 ### 混同禁止（他レポートとの誤認防止）
 
@@ -466,7 +477,8 @@ raw データの各銘柄について以下を機械的にチェックし、該�
 - 担当範囲銘柄全てに「コード + 銘柄名 + 週間騰落率 + 金曜終値 + 週間売買代金 + 時価総額」が揃っている
 - TARGET_MARKET=prime: プライム上昇 5・下落 5・売買代金 5 件 + Section 0・1・9 全揃い
 - TARGET_MARKET=standard: スタンダード上昇 5・下落 5・売買代金 5 件のみ
-- TARGET_MARKET=growth: グロース上昇 10・下落 5・売買代金 10 件のみ
+- TARGET_MARKET=growth_a: グロース上昇 10・下落 5 件のみ（6・7。8c は書かない）
+- TARGET_MARKET=growth_b: グロース週間売買代金 10 件のみ（8c。6・7 は書かない）
 - Deep Research 候補セクションが含まれていない
 
 ### Bash で存在確認
