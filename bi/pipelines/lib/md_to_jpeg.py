@@ -122,6 +122,7 @@ hr {
 }
 ul, ol { padding-left: 30px; margin: 10px 0 14px; }
 li { margin: 5px 0; }
+.subhead { font-weight: 700; color: #2C3E50; font-size: 25px; margin: 16px 0 4px; }
 .footer-brand {
     margin-top: 40px;
     padding-top: 18px;
@@ -144,8 +145,27 @@ ACCENT_BY_KIND = {
 }
 
 
+_EMPTY_LABEL_BULLET_RE = re.compile(r"^\s*-\s+\*\*([^*]+?)\*\*\s*[:：]\s*$")
+
+
+def _promote_empty_label_bullets(text: str) -> str:
+    """中身が直下の子箇条書きにある『空の親ラベル箇条書き』（例: ``- **材料**:`` /
+    ``- **資金流入の文脈…**:`` / ``- **需給…**:``）を、空の • 箇条書きではなく
+    太字サブ見出しに変換する。子箇条書きは後続でトップレベル list として描画される。
+    PM 2026-06-16: 空ラベルの • が並ぶレイアウト崩れ対策。"""
+    out: list[str] = []
+    for ln in text.split("\n"):
+        m = _EMPTY_LABEL_BULLET_RE.match(ln)
+        if m:
+            out.extend(["", f'<p class="subhead">{m.group(1).strip()}</p>', ""])
+        else:
+            out.append(ln)
+    return "\n".join(out)
+
+
 def markdown_to_html(text: str) -> str:
     """Markdown → HTML 変換。h2 にクラス付与（人気/急上昇/Part）。"""
+    text = _promote_empty_label_bullets(text)
     html = md.markdown(text, extensions=["tables", "fenced_code", "sane_lists"])
 
     def rewrite_h2(m: re.Match) -> str:
