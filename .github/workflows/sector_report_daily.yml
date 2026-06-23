@@ -82,7 +82,8 @@ jobs:
           elif echo "$REASON" | grep -q "retry_cap"; then
             MSG="🚨 GHA cron 連続失敗で停止: セクター日次レポート (${REASON}) - 手動 dispatch で復旧してください"
           else
-            MSG="🔵 ${{ github.event_name }} skip: セクター日次レポート (${REASON})"
+            echo "skip 通知は抑制（ノイズ削減）: ${{ github.event_name }} skip (${REASON})"
+            exit 0
           fi
           curl -s -X POST "$WH" -H "Content-Type: application/json" \
             -d "{\"content\":\"${MSG}\"}"
