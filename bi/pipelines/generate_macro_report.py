@@ -52,6 +52,75 @@ SNAPSHOT_TICKERS = {
     "日経VI":          "^N225VI",
 }
 
+def _yahoo_chart_pairs(ticker: str) -> list[tuple]:
+    """Yahoo Finance chart API を直叩きして (date, close) のリスト（昇順）を取得する。失敗時は空リスト。
+
+    PM 2026-06-23: yfinance は内部の crumb/cookie 認証が Yahoo にブロックされやすく、
+    日経平均(^N225) 等が古い終値で止まる事象が頻発する。chart API はその認証フローを介さず
+    ブラウザ相当の UA で素直に JSON を返すため、yfinance が当日値を返せない時の二次ソースとして用いる。
+    対象シンボルは yfinance と同一（^N225 / NIY=F / USDJPY=X 等）。日経VI(^N225VI) は Yahoo 側に
+    存在せず 404 になるため空リストが返る（その場合は yfinance のみが情報源）。
+    """
+    import json as _json
+    import urllib.parse as _up
+    import urllib.request as _ur
+
+    sym = _up.quote(ticker, safe="")
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}?range=14d&interval=1d"
+    try:
+        req = _ur.Request(
+            url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+                )
+            },
+        )
+        with _ur.urlopen(req, timeout=20) as resp:
+            data = _json.loads(resp.read().decode("utf-8", "replace"))
+        res = data["chart"]["result"][0]
+        ts = res["timestamp"]
+        closes = res["indicators"]["quote"][0]["close"]
+        pairs = [
+            (datetime.fromtimestamp(t, tz=timezone.utc).date(), float(c))
+            for t, c in zip(ts, closes)
+            if c is not None
+        ]
+        pairs.sort(key=lambda p: p[0])
+        return pairs
+    except Exception:
+        return []
+
+
+def _yf_pairs(ticker: str) -> list[tuple]:
+    """yfinance の 14 日履歴から (date, close) のリスト（昇順）を取得する。失敗時は空リスト。"""
+    try:
+        hist = yf.Ticker(ticker).history(period="14d", auto_adjust=False)
+        if hist is None or hist.empty:
+            return []
+        hist = hist.dropna(subset=["Close"])
+        return [(idx.date(), float(c)) for idx, c in zip(hist.index, hist["Close"])]
+    except Exception:
+        return []
+
+
+def _extract_close_prev(pairs: list[tuple], target) -> tuple | None:
+    """(date, close) 昇順リストから「当日終値・前日終値・取得日」を返す。
+    target 指定時は target 以下の最新営業日を当日とする（届かなければ全期間でフォールバック）。"""
+    if target is not None:
+        filtered = [p for p in pairs if p[0] <= target]
+        if len(filtered) >= 2:
+            pairs = filtered
+    if len(pairs) < 2:
+        return None
+    close = float(pairs[-1][1])
+    prev = float(pairs[-2][1])
+    latest = pairs[-1][0]
+    if prev == 0:
+        return None
+    return close, prev, latest
+
 
 def _is_stale(path: Path, target_date: date, max_age_minutes: int) -> bool:
     """
@@ -114,53 +183,40 @@ def get_market_snapshot(target_date: str | None = None) -> str:
             target = None
 
     for name, ticker in SNAPSHOT_TICKERS.items():
-        try:
-            # 14 日分取得（営業日 10 日程度カバー・週末や休場を吸収）
-            hist = yf.Ticker(ticker).history(period="14d", auto_adjust=False)
-            if hist.empty:
-                lines.append(f"| {name} | 取得不可 | ─ | 履歴データなし |")
-                continue
+        # 1) yfinance（一次ソース・14 日分で週末/休場を吸収）
+        snap = _extract_close_prev(_yf_pairs(ticker), target)
+        source = "yfinance"
 
-            # Close が NaN の行（FX 週末等）は除外
-            hist = hist.dropna(subset=["Close"])
-            if len(hist) < 2:
-                lines.append(f"| {name} | 取得不可 | ─ | 有効な Close 行が 2 件未満 |")
-                continue
+        # 2) Yahoo chart API フォールバック: yfinance が失敗、または target 指定時に当日値へ届いて
+        #    いない場合のみ。取得日が yfinance と同等以上に新しい時だけ採用する（古い値での後退を防ぐ）。
+        need_fallback = snap is None or (target is not None and snap[2] < target)
+        if need_fallback:
+            fb = _extract_close_prev(_yahoo_chart_pairs(ticker), target)
+            if fb is not None and (snap is None or fb[2] >= snap[2]):
+                snap = fb
+                source = "yahoo_chart"
 
-            # target_date 以下の最新営業日を「当日」とする
-            if target is not None:
-                hist_filtered = hist[hist.index.date <= target]
-                if hist_filtered.empty or len(hist_filtered) < 2:
-                    hist_filtered = hist  # フォールバック: 最新確定値
-            else:
-                hist_filtered = hist
+        if snap is None:
+            lines.append(f"| {name} | 取得不可 | ─ | 全ソース取得失敗 |")
+            continue
 
-            close = float(hist_filtered["Close"].iloc[-1])
-            prev = float(hist_filtered["Close"].iloc[-2])
-            latest_date = hist_filtered.index[-1].date()
+        close, prev, latest_date = snap
+        chg = close - prev
+        pct = chg / prev * 100
 
-            if prev == 0:
-                lines.append(f"| {name} | 取得不可 | ─ | prev_close=0 |")
-                continue
+        comment_parts: list[str] = [f"close={latest_date.isoformat()}", f"src={source}"]
+        if target is not None and latest_date != target:
+            # 取得日と対象日が乖離している場合は警告マーク
+            comment_parts.append(f"⚠️ target={target.isoformat()} と乖離")
+        if name == "米VIX":
+            if close >= 30:
+                comment_parts.append("⚠️ 恐怖ゾーン")
+            elif close <= 15:
+                comment_parts.append("楽観ゾーン")
 
-            chg = close - prev
-            pct = chg / prev * 100
-
-            comment_parts: list[str] = [f"close={latest_date.isoformat()}"]
-            if target is not None and latest_date != target:
-                # 取得日と対象日が乖離している場合は警告マーク
-                comment_parts.append(f"⚠️ target={target.isoformat()} と乖離")
-            if name == "VIX":
-                if close >= 30:
-                    comment_parts.append("⚠️ 恐怖ゾーン")
-                elif close <= 15:
-                    comment_parts.append("楽観ゾーン")
-
-            lines.append(
-                f"| {name} | {close:,.2f} | {chg:+,.2f} ({pct:+.2f}%) | {' / '.join(comment_parts)} |"
-            )
-        except Exception as e:
-            lines.append(f"| {name} | 取得不可 | ─ | {e} |")
+        lines.append(
+            f"| {name} | {close:,.2f} | {chg:+,.2f} ({pct:+.2f}%) | {' / '.join(comment_parts)} |"
+        )
     return "\n".join(lines)
 
 

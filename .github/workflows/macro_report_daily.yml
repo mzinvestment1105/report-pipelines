@@ -52,7 +52,15 @@ jobs:
 
           echo "Today (${TODAY_JST}): active=${ACTIVE} done_ok=${DONE_OK} done_fail=${DONE_FAIL} event=${EVENT} (excluding self ${MY_RUN_ID})"
 
-          if [ "$DONE_OK" -gt 0 ]; then
+          # PM 2026-06-23: GitHub cron は数時間遅延し、想定外時間帯に着火すると当日枠を誤消費して
+          # 正規便（Worker 06:23）を skip させる事故源になる。schedule(cron) 起動のみ時間帯ゲートで無害化する。
+          # workflow_dispatch（Worker・PM 手動）は常に通す。朝刊の妥当な発行帯 = JST 5〜13 時。
+          HOUR_JST=$((10#$(TZ=Asia/Tokyo date +%H)))
+
+          if [ "$EVENT" = "schedule" ] && { [ "$HOUR_JST" -lt 5 ] || [ "$HOUR_JST" -gt 13 ]; }; then
+            echo "proceed=false" >> $GITHUB_OUTPUT
+            echo "reason=skip (cron outside morning window: ${HOUR_JST}h JST)" >> $GITHUB_OUTPUT
+          elif [ "$DONE_OK" -gt 0 ]; then
             echo "proceed=false" >> $GITHUB_OUTPUT
             echo "reason=skip (already succeeded today: done_ok=${DONE_OK})" >> $GITHUB_OUTPUT
           elif [ "$ACTIVE" -gt 0 ]; then
