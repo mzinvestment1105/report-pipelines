@@ -1103,6 +1103,13 @@ def main() -> None:
     # 累積分割比率を算出し、ShOutFY と MarketCap を補正する。
     # 公式ソース（JQuants v2）のため yfinance より精度・信頼性が高い。
     if getattr(args, "check_splits", False):
+        # 旧 --check-splits（一律補正）は JQuants /fins/summary が分割反映済みの ShOutFY を
+        # 返す仕様に対し二重補正を起こすため封印。条件付き補正版を使うこと。
+        # design.md: dev/review/2026-05-09_split_double_correction/
+        raise RuntimeError(
+            "--check-splits（一律補正）は二重補正バグのため使用禁止です。"
+            " --check-splits-conditional を使用してください。"
+        )
         split_lookback = int(os.environ.get("SPLIT_LOOKBACK_DAYS", "250"))
         split_threshold = float(os.environ.get("SPLIT_RATIO_THRESHOLD", "1.05"))
         print(
