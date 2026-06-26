@@ -14,6 +14,32 @@ import pandas as pd
 
 QUERY_DISC_DATE_COL = "_QueryDiscDate"
 
+# 0.5% = 空売り残高報告の発生 / 消失ライン。最新比率がこれ未満の開示者は
+# 「報告義務消失（カバー）」とみなし残高合計から除外する（消失分の古い残高を
+# 足し続けてカバー＝減少を映せない誤集計を防ぐ）。
+DISCLOSURE_THRESHOLD = 0.005
+
+
+def _active_disclosure_mask(
+    df: pd.DataFrame,
+    ratio_col: str = "ShortPositionsToSharesOutstandingRatio",
+    *,
+    threshold: float = DISCLOSURE_THRESHOLD,
+) -> pd.Series:
+    """報告義務消失（最新比率が0.5%未満）の行を落とす True/False マスク。
+
+    比率列の単位（小数 0.0228 か パーセント 2.28 か）は母集団（全市場プール）の
+    最大値から自動判定する。空売り比率が 1.0=100% を超えることはないため、
+    max>1.5 ならパーセント表記とみなして 1/100 する。比率欠損の行は True（残す）。
+    """
+    if ratio_col not in df.columns:
+        return pd.Series(True, index=df.index)
+    r = pd.to_numeric(df[ratio_col], errors="coerce")
+    pool_max = r.max(skipna=True)
+    div = 100.0 if pd.notna(pool_max) and pool_max > 1.5 else 1.0
+    frac = r / div
+    return frac.isna() | (frac >= threshold)
+
 
 def _as_str_series(df: pd.DataFrame, col: str) -> pd.Series:
     if col not in df.columns:
@@ -79,6 +105,8 @@ def aggregate_short_sale_monthly_pool(
     work = fix_degenerate_inst_keys(work)
     inst_dedup = work.groupby(["Code", "inst_key"], as_index=False).tail(1)
     inst_dedup = inst_dedup.drop(columns=["_short_sale_qd_ord"], errors="ignore")
+    # 報告義務消失（最新比率<0.5%）の開示者を除外（カバー済みを残高に足し続けない）
+    inst_dedup = inst_dedup[_active_disclosure_mask(inst_dedup, ratio_col)]
 
     total_shares = (
         inst_dedup.groupby("Code")[shares_col]
@@ -100,6 +128,7 @@ def aggregate_short_sale_weekly_snapshots(
     fridays: list,
     *,
     shares_col: str = "ShortPositionsInSharesNumber",
+    ratio_col: str = "ShortPositionsToSharesOutstandingRatio",
     query_disc_col: str = QUERY_DISC_DATE_COL,
     n_weeks: int = 8,
 ) -> pd.DataFrame:
@@ -140,6 +169,9 @@ def aggregate_short_sale_weekly_snapshots(
     if sort_keys:
         work = work.sort_values(sort_keys, kind="mergesort")
 
+    # 報告義務消失（最新比率<0.5%）判定用フラグ（dedup 後にこの行が残れば集計対象）
+    work["_active"] = _active_disclosure_mask(work, ratio_col)
+
     # 各週アンカー時点のスナップショットを計算
     # fridays[0] = 直近（WkSeqNN）、fridays[-1] = 最古（WkSeq01）
     snap_cols: dict[str, "pd.Series"] = {}
@@ -154,8 +186,9 @@ def aggregate_short_sale_weekly_snapshots(
             snap_cols[col] = pd.Series(dtype=float)
             continue
 
-        # (Code, inst_key) ごとに最新行 → 銘柄合算
+        # (Code, inst_key) ごとに最新行 → 報告義務消失(0.5%割れ)を除外 → 銘柄合算
         deduped = sub.groupby(["Code", "inst_key"], as_index=False).tail(1)
+        deduped = deduped[deduped["_active"]]
         totals = (
             deduped.groupby("Code")[shares_col]
             .sum(min_count=1)

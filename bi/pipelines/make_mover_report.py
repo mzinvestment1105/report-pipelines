@@ -280,10 +280,11 @@ def build_supply_block(row: pd.Series, hist_df: pd.DataFrame | None) -> list[str
     inst_short    = row.get("ShortPositionsToSharesOutstandingRatio")
     avg_vol5d     = row.get("AvgDailyVolume5d")
     shares_out    = row.get("NumberOfIssuedAndOutstandingSharesAtTheEndOfFiscalYearIncludingTreasuryStock")
-    # ShortSale_WkSeq01=最新 → ShortSale_WkSeq08=最古（直近4週を使用）
+    # 正準: ShortSale_WkSeq01=最古 → WkSeqNN=最新（short_sale_utils.aggregate_short_sale_weekly_snapshots）。
+    # 直近4週を「新しい順」で並べ inst_short_wk[0]=最新 にする（下流の latest/delta/表示が index0=最新 前提）。
     inst_short_wk = []
-    for i in range(1, 5):
-        v = row.get(f"ShortSale_WkSeq0{i}")
+    for i in (8, 7, 6, 5):
+        v = row.get(f"ShortSale_WkSeq{i:02d}")
         if pd.notna(v) and pd.notna(shares_out) and shares_out > 0:
             inst_short_wk.append(v / shares_out * 100)
         else:
@@ -354,7 +355,7 @@ def build_supply_block(row: pd.Series, hist_df: pd.DataFrame | None) -> list[str
         lines.append(f"- 信用売残 週次推移（直近3週）: {wk_short_str}")
 
     # --- 機関空売り（5% 超報告対象のみ） ---
-    # inst_short_wk[0] = Seq1 = 最新、inst_short_wk[-1] = 最古
+    # inst_short_wk[0] = WkSeq08 = 最新、inst_short_wk[-1] = WkSeq05 = 最古（直近4週）
     latest_inst = inst_short_wk[0] if inst_short_wk and inst_short_wk[0] is not None else (
         inst_short * 100 if pd.notna(inst_short) and inst_short > 0 else None
     )
@@ -512,10 +513,10 @@ def build_full_table(
             "Scr_LongMargin_to_SharesOutstanding",
             "Scr_LongMargin_to_AvgVol5d",
             "ShortPositionsToSharesOutstandingRatio",
-            "ShortSale_WkSeq01",
-            "ShortSale_WkSeq02",
-            "ShortSale_WkSeq03",
-            "ShortSale_WkSeq04",
+            "ShortSale_WkSeq05",
+            "ShortSale_WkSeq06",
+            "ShortSale_WkSeq07",
+            "ShortSale_WkSeq08",
             "AvgDailyVolume5d",
             "AvgDailyValue5d",
             "NumberOfIssuedAndOutstandingSharesAtTheEndOfFiscalYearIncludingTreasuryStock",
