@@ -215,6 +215,17 @@ def render_markdown_to_pdf(
             title = m.group(1).strip()
             del lines[i]
             break
+
+    # 行全体が太字だけの段落（**…**）= テーマ内の小見出し。GHA 生成 Claude が `#####` でなく
+    # `**太字**` で書くため、ここで確定的に h5 へ昇格し、本文中のインライン強調太字と体裁を明確に
+    # 分ける（PM 指示・LLM 出力に依存せず renderer 側で保証する）。
+    _bold_only = re.compile(r"^\*\*([^*]+)\*\*$")
+    promoted = []
+    for ln in lines:
+        m2 = _bold_only.match(ln.strip())
+        promoted.append(f"##### {m2.group(1).strip()}" if m2 else ln)
+    lines = promoted
+
     body_md = "\n".join(lines).strip()
 
     html_body = md.markdown(body_md, extensions=["tables", "fenced_code", "sane_lists"])
