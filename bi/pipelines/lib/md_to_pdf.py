@@ -131,9 +131,10 @@ h3 {{
 h4 {{ font-size:12pt; font-weight:700; color:#3C4A63; margin:13px 0 5px; text-align:left; }}
 /* ── h5 = テーマ内の小見出し（「何が起きたか」等）。色付き＋左バーでインライン太字と明確に区別 ── */
 h5 {{
-  font-size:10.5pt; font-weight:700; color:#2B3A52;
-  margin:15px 0 5px; padding:3px 0 3px 9px;
-  border-left:3pt solid {accent}; letter-spacing:.1em; text-align:left;
+  font-size:11pt; font-weight:700; color:{accent};
+  margin:17px 0 6px; padding:5px 11px;
+  background:#EEF3FA; border-left:4.5pt solid {accent};
+  letter-spacing:.06em; text-align:left;
 }}
 
 p {{ margin:9px 0 11px; }}
@@ -227,6 +228,8 @@ def render_markdown_to_pdf(
     lines = promoted
 
     body_md = "\n".join(lines).strip()
+    # 内部メタ表現の確定除去（PM 2026-06-27・LLM が本文に書いても renderer 側で必ず削除する）
+    body_md = re.sub(r"（記事ベース[^）]*）", "", body_md)
 
     html_body = md.markdown(body_md, extensions=["tables", "fenced_code", "sane_lists"])
 

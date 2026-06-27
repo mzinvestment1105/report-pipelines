@@ -118,14 +118,21 @@ def get_market_snapshot(target_date: str | None = None) -> str:
         except ValueError:
             target = None
 
-    for name, ticker in SNAPSHOT_TICKERS.items():
-        q = get_latest_close(ticker, target)
+    quotes = {nm: get_latest_close(tk, target) for nm, tk in SNAPSHOT_TICKERS.items()}
+    cash = quotes.get("日経平均")
+    for name, q in quotes.items():
         if q is None or q.close is None:
             lines.append(f"| {name} | 取得不可 | ─ | 全ソース取得失敗 |")
             continue
 
         decimal = name in _DECIMAL_NAMES
-        if q.prev in (None, 0) or q.change is None:
+        # 先物の前日比（夜間セッション自前基準）は現物の前日比（前営業日終値基準）と基準日が
+        # 異なり並べると矛盾に見えるため、月曜寄りに直結する「現物比」を表示する（PM 2026-06-27）。
+        if name == "日経先物" and cash is not None and cash.close:
+            basis = q.close - cash.close
+            bpct = (q.close / cash.close - 1) * 100
+            chg_txt = f"{basis:+,.0f} / {bpct:+.1f}%（現物比）"
+        elif q.prev in (None, 0) or q.change is None:
             chg_txt = "─"
         elif decimal:
             chg_txt = f"{q.change:+,.2f} / {q.pct:+.2f}%"      # 為替・金利: 小数2桁維持
