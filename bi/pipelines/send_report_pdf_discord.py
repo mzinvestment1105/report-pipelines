@@ -25,7 +25,11 @@ from dotenv import load_dotenv
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lib.md_to_pdf import render_markdown_to_pdf  # noqa: E402
-from lib.quality_gate import find_duplication  # noqa: E402
+from lib.quality_gate import (  # noqa: E402
+    find_duplication,
+    strip_repeated_annotations,
+    strip_vix_rows,
+)
 from send_report_jpeg_discord import (  # noqa: E402
     KIND_CONFIG,
     _lookup_company_name,
@@ -103,14 +107,20 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     md_text = md_path.read_text(encoding="utf-8")
 
-    # 品質モニタ（非ブロッキング・PM 2026-06-28）: 「配信を止めない・token を使わない」を最優先
-    # するため、重複を検出しても送信は止めず配信する。ここは GHA ログへの監視出力のみで、失敗
-    # （非ゼロ終了）も再生成もしない。重複は生成側の源流対策（リード短縮・備考の数値限定・1 材料
-    # 1 セクション）で減らす方針。残重複の検知用にログだけ残す。
+    # 品質確定処理（非ブロッキング・PM 2026-06-28）: 「配信を止めない・token を使わない」を最優先
+    # するため、送信のブロック（失敗）も自動再生成（token 増）も行わない。生成 LLM が無視する
+    # ソフト指示に頼らず、Python で必ず効く確定除去のみで品質を担保する:
+    #   (1) VIX / 日経 VI の表行を機械除去（PM: 出力に不要・両方外す。LLM が ─ 行を再追加するため）
+    #   (2) 同一注釈 （…） の 2 回目以降を機械除去（注釈は一度で十分・反復は重複説明。語は残す）
+    # 除去結果は GHA ログに残す。除去後の残重複は find_duplication で監視のみ（配信は継続）。
     if args.kind in ("macro", "macro_evening"):
-        dups = find_duplication(md_text)
-        if dups:
-            print("QUALITY MONITOR WARNING (配信は継続・ブロックしない):", dups)
+        md_text = strip_vix_rows(md_text)
+        md_text, removed = strip_repeated_annotations(md_text)
+        if removed:
+            print("QUALITY: 重複注釈を確定除去（配信は継続）:", removed)
+        residual = find_duplication(md_text)
+        if residual:
+            print("QUALITY MONITOR WARNING (残注釈重複・配信は継続):", residual)
 
     # 動意は市場別（プライム/スタンダード/グロース）に分割して 3 PDF 送信
     if args.kind in ("movers", "movers_weekly"):

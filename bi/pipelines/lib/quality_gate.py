@@ -1,62 +1,72 @@
-"""レポート品質ゲート（確定処理）。同一材料の重複説明を機械検出し、送信前にブロックする。
+"""レポート品質ゲート（確定処理・非ブロッキング）。
 
-PM 2026-06-27: 「同一材料を複数セクションで重複説明しない」というソフトな指示は生成 LLM に
-無視される実績があるため（マクロ朝刊で Apple/Oracle 等が 4〜5 セクションに重複）、生成物に
-依存しない確定処理として、同一の固有名詞材料が説明されるセクション数を数え、閾値以上なら
-「重複あり」と判定する。呼び出し側はこれを使って自動送信を保留し、重複レポートが PM に届く
-ことを構造的に防ぐ。
+PM 2026-06-28: 「配信を止めない・token を使わない」を最優先とするため、品質処理は
+(1) 生成物に依存しない確定除去（Python で機械的に必ず効く）と (2) 非ブロッキング監視
+のみで構成する。送信のブロック（失敗）・自動再生成（token 増）は一切行わない。
+
+確定除去:
+- strip_vix_rows         : 市況スナップショット表から VIX / 日経 VI 行を機械除去
+                           （PM: VIX は出力に不要・両方外す。生成 LLM が ─ 行を再追加するため）
+- strip_repeated_annotations : 同一の注釈 （…） が2回以上出る場合、初出のみ残し2回目以降の
+                           注釈だけを確定除去（中学生注釈は一度で十分・反復は重複説明）。語は残す。
+
+監視（非ブロッキング）:
+- find_duplication       : 同一注釈の反復を検出して文字列で返す（PM 2026-06-28 で基準変更。
+                           旧「固有名詞のセクション横断数」は中心材料で誤検出するため廃止）。
 """
 from __future__ import annotations
 
 import re
 from collections import Counter
 
-# 注釈対象・一般語で誤検出しやすい略語・指数名は材料から除外する
-_STOP = {
-    "FOMC", "FRB", "GDP", "CPI", "PCE", "VIX", "ETF", "REIT", "IPO", "PER",
-    "PBR", "ROE", "ROIC", "NQN", "TDNet", "EDINET", "QUICK", "JST", "ADR",
-    "PMI", "BOJ", "ECB", "WTI", "OPEC",
-}
+# VIX / 日経 VI の表行（先頭セルが当該指標の行）を丸ごと除去する。先頭セル限定なので
+# 本文中の VIX 言及は消さず、スナップショット表のプレースホルダ行のみを対象とする。
+_VIX_ROW_RE = re.compile(
+    r"^\s*\|\s*(?:米\s*VIX|日経\s*VI|VIX|VI)\s*\|.*\n?",
+    re.MULTILINE,
+)
 
-_SECTION_RE = re.compile(r"^#{2,3}\s")
-_LATIN_RE = re.compile(r"[A-Z][A-Za-z]{2,}")
-_KATA_RE = re.compile(r"[ァ-ヴ]{4,}ー?")
-
-
-def _prose_sections(md_text: str) -> list[str]:
-    """## / ### 見出しで本文を分割する。表（| 始まり）行・イベントカレンダー（★ 含む）行は
-    数値の併記であって重複説明ではないため、判定対象から除外する。"""
-    sections: list[list[str]] = []
-    buf: list[str] = []
-    for ln in md_text.split("\n"):
-        if _SECTION_RE.match(ln):
-            if buf:
-                sections.append("\n".join(buf))
-                buf = []
-        elif ln.lstrip().startswith("|") or "★" in ln:
-            continue
-        else:
-            buf.append(ln)
-    if buf:
-        sections.append("\n".join(buf))
-    return sections
+# 実体のある注釈（中学生向け用語説明）を対象にする。短い数値・日付括弧（（5月）（現物比）
+# （+1.2%）等）は対象外にするため内側 6 文字以上に限定する。
+_ANNOT_RE = re.compile(r"（[^（）]{6,}）")
 
 
-def _materials(text: str) -> set[str]:
-    """固有名詞らしい材料（英字大文字始まり 3 字以上・カタカナ 4 字以上）を抽出する。"""
-    ents = set(_LATIN_RE.findall(text)) | set(_KATA_RE.findall(text))
-    return {e for e in ents if e not in _STOP}
+def strip_vix_rows(md_text: str) -> str:
+    """市況スナップショット表から VIX / 日経 VI の行を確定除去する。"""
+    return _VIX_ROW_RE.sub("", md_text)
 
 
-def find_duplication(md_text: str, max_section_spread: int = 4) -> list[str]:
-    """同一材料が説明されるセクション数が max_section_spread 以上のものを違反文字列で返す。
-    空リストなら重複なし（送信可）。"""
-    spread: Counter[str] = Counter()
-    for body in _prose_sections(md_text):
-        for e in _materials(body):
-            spread[e] += 1
+def strip_repeated_annotations(md_text: str) -> tuple[str, list[str]]:
+    """同一の注釈 （…） が2回以上出る場合、初出を残し2回目以降の注釈だけを確定除去する。
+    語そのものは本文に残す（注釈括弧だけ消える）。
+
+    returns (cleaned_text, removed) — removed は ["（…注釈…） を N 回除去（初出のみ保持）", ...]。
+    """
+    seen: set[str] = set()
+    removed_counts: Counter[str] = Counter()
+
+    def repl(m: re.Match[str]) -> str:
+        ann = m.group(0)
+        if ann in seen:
+            removed_counts[ann] += 1
+            return ""  # 2回目以降は注釈括弧を削除（直前の語は残る）
+        seen.add(ann)
+        return ann
+
+    cleaned = _ANNOT_RE.sub(repl, md_text)
+    removed = [
+        f"{ann} を {c} 回除去（初出のみ保持）"
+        for ann, c in removed_counts.most_common()
+    ]
+    return cleaned, removed
+
+
+def find_duplication(md_text: str) -> list[str]:
+    """同一の注釈 （…） が2回以上出現するものを違反文字列で返す（非ブロッキング監視）。
+    strip_repeated_annotations 後に呼べば残注釈重複の検証になり、通常は空リストになる。"""
+    counts = Counter(_ANNOT_RE.findall(md_text))
     return [
-        f"「{e}」が {n} セクションで重複説明"
-        for e, n in spread.most_common()
-        if n >= max_section_spread
+        f"{ann} が {n} 回重複注釈"
+        for ann, n in counts.most_common()
+        if n >= 2
     ]
