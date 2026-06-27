@@ -83,7 +83,8 @@ def build_statement_dict_from_yfinance(code4: str) -> dict[str, Any] | None:
         inc = t.income_stmt
         if inc is None or inc.empty:
             inc = t.financials
-    except Exception:
+    except Exception as e:
+        print(f"[WARN] yfinance income_stmt fetch failed ({sym}): {type(e).__name__}: {e}")
         return None
 
     if inc is None or inc.empty or len(inc.columns) < 2:
@@ -142,7 +143,8 @@ def build_statement_dict_from_yfinance(code4: str) -> dict[str, Any] | None:
         out["Profit_TwoYearsPrior_Actual"] = _v(c2, ni_key)
 
     # c0 の会計年度末日を記録（merge でアライメント判定に使う）
-    out["_yf_fy_date_0"] = pd.Timestamp(cols[0]) if pd.notna(cols[0]) else pd.NaT
+    # 非日付ラベルでも raise せず NaT に倒す（ticker 全体の中断を防ぐ）
+    out["_yf_fy_date_0"] = pd.to_datetime(cols[0], errors="coerce")
 
     # 貸借対照表: 自己資本比率（最新期）
     try:
@@ -176,8 +178,8 @@ def build_statement_dict_from_yfinance(code4: str) -> dict[str, Any] | None:
                 cash_v = pd.to_numeric(bc.loc[cash_key], errors="coerce")
                 if pd.notna(cash_v):
                     out["CashAndEquivalents_LatestFY"] = float(cash_v)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[WARN] yfinance balance_sheet fetch failed ({sym}): {type(e).__name__}: {e}")
 
     # 発行済株式数（概算）
     try:
@@ -187,8 +189,8 @@ def build_statement_dict_from_yfinance(code4: str) -> dict[str, Any] | None:
             n = pd.to_numeric(sh, errors="coerce")
             if pd.notna(n):
                 out["NumberOfIssuedAndOutstandingSharesAtTheEndOfFiscalYearIncludingTreasuryStock"] = int(n)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[WARN] yfinance info fetch failed ({sym}): {type(e).__name__}: {e}")
 
     # 予想は Yahoo 年次には無いことが多い → 触らない（呼び出し側で J-Quants をマージ）
 

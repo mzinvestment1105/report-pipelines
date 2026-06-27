@@ -73,6 +73,12 @@ def get_json_with_429_backoff(
             return resp.json()
         except requests.exceptions.RequestException as e:
             last_err = e
+            # 認証・リクエスト不備（400/401/403/404）は再試行しても直らないため即時 raise。
+            # 5xx・ネットワーク系（response 無し or 5xx）は従来どおりバックオフ再試行する。
+            resp_obj = getattr(e, "response", None)
+            status = getattr(resp_obj, "status_code", None)
+            if status in (400, 401, 403, 404):
+                raise
             if attempt >= max_attempts - 1:
                 break
             d = delays_sec[min(attempt, len(delays_sec) - 1)]
@@ -97,6 +103,7 @@ def fetch_paginated_v2(
     url = f"{client.JQUANTS_API_BASE}{endpoint_path}"
     all_data: list[dict[str, Any]] = []
     pagination_key = ""
+    prev_key: str | None = None
     query = dict(params or {})
     wait = 1.0 if sleep_seconds is None else float(sleep_seconds)
 
@@ -116,6 +123,13 @@ def fetch_paginated_v2(
         pagination_key = payload.get("pagination_key") or ""
         if not pagination_key:
             break
+        # 同じ pagination_key が返り続けると無限ループになるため検知して打ち切る。
+        if pagination_key == prev_key:
+            raise RuntimeError(
+                f"fetch_paginated_v2: pagination_key が変化せず無限ループの恐れ "
+                f"(endpoint={endpoint_path}, key={pagination_key!r})"
+            )
+        prev_key = pagination_key
 
     return all_data
 
@@ -131,7 +145,10 @@ def latest_trading_day_date_v2(client: jquantsapi.ClientV2, max_back_days: int =
         )
         if rows:
             return d
-    return today
+    raise RuntimeError(
+        f"latest_trading_day_date_v2: {max_back_days} 日さかのぼっても bars/daily が見つかりません "
+        f"(today={today})"
+    )
 
 
 def previous_trading_day_date_v2(

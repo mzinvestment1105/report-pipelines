@@ -51,7 +51,8 @@ class EdinetDBClient:
 
     def _call(self, tool_name: str, arguments: dict | None = None) -> dict | list:
         """MCP over HTTP でツールを呼び出す。result の JSON を返す。
-        429 (Too Many Requests) は全キー試行までリトライする。"""
+        429 (Too Many Requests)・5xx・ネットワークエラーは次のキーへ全キー試行までリトライする。
+        4xx クライアントエラー (400/401/403/404 等) は即座に raise する。"""
         self._call_id += 1
         payload = {
             "jsonrpc": "2.0",
@@ -67,12 +68,24 @@ class EdinetDBClient:
                 "Content-Type": "application/json",
             }
             time.sleep(SLEEP)
-            resp = requests.post(MCP_URL, headers=headers, json=payload, timeout=TIMEOUT)
+            try:
+                resp = requests.post(MCP_URL, headers=headers, json=payload, timeout=TIMEOUT)
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                # ネットワーク断・読み取りタイムアウトは次のキーで再試行
+                last_err = e
+                continue
             if resp.status_code == 429:
                 last_err = requests.exceptions.HTTPError(
                     f"429 on key #{attempt + 1}/{len(self._keys)}", response=resp
                 )
                 continue
+            if resp.status_code >= 500:
+                # サーバ側エラーは一過性のことが多いため次のキーで再試行
+                last_err = requests.exceptions.HTTPError(
+                    f"{resp.status_code} on key #{attempt + 1}/{len(self._keys)}", response=resp
+                )
+                continue
+            # 4xx クライアントエラー (認証・不正リクエスト等) は再試行せず即 raise
             resp.raise_for_status()
             rpc = resp.json()
             if "error" in rpc:
@@ -80,9 +93,19 @@ class EdinetDBClient:
             content = rpc.get("result", {}).get("content", [])
             if not content:
                 return {}
-            return json.loads(content[0]["text"])
+            first = content[0]
+            if not isinstance(first, dict) or "text" not in first:
+                raise RuntimeError(
+                    f"EDINET DB: 予期しない MCP レスポンス形式 (content[0]={first!r})"
+                )
+            try:
+                return json.loads(first["text"])
+            except (json.JSONDecodeError, TypeError) as e:
+                raise RuntimeError(
+                    f"EDINET DB: MCP レスポンスの JSON パースに失敗: {type(e).__name__}: {e}"
+                ) from e
         raise RuntimeError(
-            f"EDINET DB: 全{len(self._keys)}キーが 429。上限到達の可能性あり"
+            f"EDINET DB: 全{len(self._keys)}キーが 429／5xx／ネットワークエラー。上限到達の可能性あり"
         ) from last_err
 
     # ------------------------------------------------------------------ #
