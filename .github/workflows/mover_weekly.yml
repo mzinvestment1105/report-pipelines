@@ -134,6 +134,9 @@ jobs:
           cp -f report-pipelines/bi/pipelines/requirements.txt private-repo/bi/pipelines/
           mkdir -p private-repo/bi/pipelines/lib
           cp -rf report-pipelines/bi/pipelines/lib/*.py private-repo/bi/pipelines/lib/ 2>/dev/null || true
+          # PDF 配信用の埋め込みフォント（assets/fonts/*.woff2）を Public から overlay
+          mkdir -p private-repo/bi/pipelines/assets/fonts
+          cp -rf report-pipelines/bi/pipelines/assets/fonts/* private-repo/bi/pipelines/assets/fonts/ 2>/dev/null || true
           mkdir -p private-repo/agents private-repo/playbook
           cp -f report-pipelines/agents/*.md private-repo/agents/ 2>/dev/null || true
           cp -f report-pipelines/playbook/*.md private-repo/playbook/ 2>/dev/null || true
@@ -216,6 +219,9 @@ jobs:
           cp -f report-pipelines/bi/pipelines/requirements.txt private-repo/bi/pipelines/
           mkdir -p private-repo/bi/pipelines/lib
           cp -rf report-pipelines/bi/pipelines/lib/*.py private-repo/bi/pipelines/lib/ 2>/dev/null || true
+          # PDF 配信用の埋め込みフォント（assets/fonts/*.woff2）を Public から overlay
+          mkdir -p private-repo/bi/pipelines/assets/fonts
+          cp -rf report-pipelines/bi/pipelines/assets/fonts/* private-repo/bi/pipelines/assets/fonts/ 2>/dev/null || true
           mkdir -p private-repo/agents private-repo/playbook
           cp -f report-pipelines/agents/*.md private-repo/agents/ 2>/dev/null || true
           cp -f report-pipelines/playbook/*.md private-repo/playbook/ 2>/dev/null || true
@@ -374,6 +380,9 @@ jobs:
           cp -f report-pipelines/bi/pipelines/requirements.txt private-repo/bi/pipelines/
           mkdir -p private-repo/bi/pipelines/lib
           cp -rf report-pipelines/bi/pipelines/lib/*.py private-repo/bi/pipelines/lib/ 2>/dev/null || true
+          # PDF 配信用の埋め込みフォント（assets/fonts/*.woff2）を Public から overlay
+          mkdir -p private-repo/bi/pipelines/assets/fonts
+          cp -rf report-pipelines/bi/pipelines/assets/fonts/* private-repo/bi/pipelines/assets/fonts/ 2>/dev/null || true
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -422,8 +431,8 @@ jobs:
             echo "Placed $DST ($(wc -l < "$DST") lines)"
           done
           # 統合: prime(0,1,2,3,8a,9) → standard(4,5,8b) → growth_a(6,7) → growth_b(8c)
-          # send_report_jpeg_discord.py(--kind movers_weekly)はマージ後ファイルから6/7/8cを
-          # 集約してグロース画像を生成するため、growth_a/growth_b 分割は送信に透過的。
+          # send_report_pdf_discord.py(--kind movers_weekly)はマージ後ファイルから6/7/8cを
+          # 集約してグロース PDF を生成するため、growth_a/growth_b 分割は送信に透過的。
           OUTPUT="${MOVERS_DIR}/${TARGET_DATE}_weekly.md"
           cat "${MOVERS_DIR}/${TARGET_DATE}_weekly_prime.md" > "$OUTPUT"
           echo "" >> "$OUTPUT"
@@ -434,13 +443,13 @@ jobs:
           cat "${MOVERS_DIR}/${TARGET_DATE}_weekly_growth_b.md" >> "$OUTPUT"
           echo "Merged into $OUTPUT ($(wc -l < "$OUTPUT") lines)"
 
-      - name: Send Discord (JPEG・市場別 3 枚分割)
+      - name: Send Discord (PDF・市場別 3 枚分割)
         working-directory: ./private-repo/bi/pipelines
         env:
           DISCORD_WEBHOOK_MOVERS: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
           PYTHONIOENCODING: utf-8
         run: |
-          python send_report_jpeg_discord.py --kind movers_weekly --date ${{ needs.setup-raw.outputs.target_date }}
+          python send_report_pdf_discord.py --kind movers_weekly --date ${{ needs.setup-raw.outputs.target_date }}
 
       - name: Commit and push to private repo
         working-directory: ./private-repo

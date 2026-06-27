@@ -123,6 +123,9 @@ jobs:
           cp -f report-pipelines/bi/pipelines/requirements.txt private-repo/bi/pipelines/
           mkdir -p private-repo/bi/pipelines/lib
           cp -rf report-pipelines/bi/pipelines/lib/*.py private-repo/bi/pipelines/lib/ 2>/dev/null || true
+          # PDF 配信用の埋め込みフォント（assets/fonts/*.woff2）を Public から overlay
+          mkdir -p private-repo/bi/pipelines/assets/fonts
+          cp -rf report-pipelines/bi/pipelines/assets/fonts/* private-repo/bi/pipelines/assets/fonts/ 2>/dev/null || true
           mkdir -p private-repo/agents private-repo/playbook
           cp -f report-pipelines/agents/*.md private-repo/agents/ 2>/dev/null || true
           cp -f report-pipelines/playbook/*.md private-repo/playbook/ 2>/dev/null || true
@@ -212,13 +215,13 @@ jobs:
           JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
           REPORT_EDITION: full
 
-      - name: Send Discord (JPEG)
+      - name: Send Discord (PDF)
         working-directory: ./private-repo/bi/pipelines
         env:
           DISCORD_WEBHOOK_SECTOR: ${{ secrets.DISCORD_WEBHOOK_SECTOR }}
           PYTHONIOENCODING: utf-8
         run: |
-          python send_report_jpeg_discord.py --kind sector_full --date ${{ steps.date.outputs.value }}
+          python send_report_pdf_discord.py --kind sector_full --date ${{ steps.date.outputs.value }}
 
       - name: Commit and push to private repo
         working-directory: ./private-repo
