@@ -25,6 +25,7 @@ from dotenv import load_dotenv
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lib.md_to_pdf import render_markdown_to_pdf  # noqa: E402
+from lib.quality_gate import find_duplication  # noqa: E402
 from send_report_jpeg_discord import (  # noqa: E402
     KIND_CONFIG,
     _lookup_company_name,
@@ -101,6 +102,22 @@ def main() -> int:
     out_dir = REPO_ROOT / "bi" / "outputs" / "report_pdfs"
     out_dir.mkdir(parents=True, exist_ok=True)
     md_text = md_path.read_text(encoding="utf-8")
+
+    # 品質ゲート（確定処理・PM 2026-06-27）: マクロは同一材料の重複説明を機械検出し、基準超なら
+    # 自動送信を保留する。ソフトな「重複禁止」指示が生成 LLM に無視される実績への構造的対策で、
+    # 重複レポートが PM に届くことを防ぐ。保留時は webhook に理由を通知し非ゼロ終了する。
+    if args.kind in ("macro", "macro_evening") and not args.skip_send:
+        dups = find_duplication(md_text)
+        if dups:
+            alert = (
+                "⚠️ 品質ゲート: 重複検出のため自動送信を保留しました（"
+                + "・".join(dups[:5])
+                + "）。テンプレ厳格化または再生成が必要です。"
+            )
+            if webhook:
+                requests.post(webhook, json={"content": alert})
+            print("QUALITY GATE BLOCKED:", dups)
+            return 1
 
     # 動意は市場別（プライム/スタンダード/グロース）に分割して 3 PDF 送信
     if args.kind in ("movers", "movers_weekly"):
