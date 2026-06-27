@@ -46,15 +46,18 @@ EXIT_SKIP = 2
 # yfinance ティッカー
 SNAPSHOT_TICKERS = {
     "日経平均":         "^N225",
-    "日経225先物(夜間)": "NIY=F",
+    "日経先物":         "NIY=F",
     "S&P500":          "^GSPC",
     "ドル円":           "USDJPY=X",
     "金(Gold)":        "GC=F",
     "BTC":             "BTC-USD",
     "米10年債":         "^TNX",
-    "米VIX":           "^VIX",
-    "日経VI":          "^N225VI",
 }
+
+# 小数2桁を維持する銘柄（為替・金利）。それ以外（指数・株価指数・コモディティ・暗号資産）は
+# 整数表示（PM 2026-06-27 指示：指数の小数は不要・読みづらいだけ）。前日比は「円整数 / %小数1桁」、
+# 区切りはスラッシュで統一する。
+_DECIMAL_NAMES = {"ドル円", "米10年債"}
 
 def _is_stale(path: Path, target_date: date, max_age_minutes: int) -> bool:
     """
@@ -121,10 +124,13 @@ def get_market_snapshot(target_date: str | None = None) -> str:
             lines.append(f"| {name} | 取得不可 | ─ | 全ソース取得失敗 |")
             continue
 
+        decimal = name in _DECIMAL_NAMES
         if q.prev in (None, 0) or q.change is None:
             chg_txt = "─"
+        elif decimal:
+            chg_txt = f"{q.change:+,.2f} / {q.pct:+.2f}%"      # 為替・金利: 小数2桁維持
         else:
-            chg_txt = f"{q.change:+,.2f} ({q.pct:+.2f}%)"
+            chg_txt = f"{q.change:+,.0f} / {q.pct:+.1f}%"      # 指数等: 円整数・%小数1桁
 
         comment_parts: list[str] = [f"close={q.date.isoformat()}", f"src={q.source}"]
         if q.market_state == "REGULAR":
@@ -133,14 +139,9 @@ def get_market_snapshot(target_date: str | None = None) -> str:
         # 最新営業日の実値を取得済のため通常は発火しないが、両系統が落ちた最終保険として明示する。
         if target is not None and is_stale_close(q.date, target):
             comment_parts.append(f"⚠️ 営業日基準で陳腐化（最新営業日の値が未取得・{q.date.isoformat()}）")
-        if name == "米VIX":
-            if q.close >= 30:
-                comment_parts.append("⚠️ 恐怖ゾーン")
-            elif q.close <= 15:
-                comment_parts.append("楽観ゾーン")
-
+        level_txt = f"{q.close:,.2f}" if decimal else f"{q.close:,.0f}"
         lines.append(
-            f"| {name} | {q.close:,.2f} | {chg_txt} | {' / '.join(comment_parts)} |"
+            f"| {name} | {level_txt} | {chg_txt} | {' / '.join(comment_parts)} |"
         )
     return "\n".join(lines)
 

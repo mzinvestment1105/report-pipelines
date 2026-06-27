@@ -129,6 +129,12 @@ h3 {{
   letter-spacing:.02em; text-align:left;
 }}
 h4 {{ font-size:12pt; font-weight:700; color:#3C4A63; margin:13px 0 5px; text-align:left; }}
+/* ── h5 = テーマ内の小見出し（「何が起きたか」等）。色付き＋左バーでインライン太字と明確に区別 ── */
+h5 {{
+  font-size:10.5pt; font-weight:700; color:#2B3A52;
+  margin:15px 0 5px; padding:3px 0 3px 9px;
+  border-left:3pt solid {accent}; letter-spacing:.1em; text-align:left;
+}}
 
 p {{ margin:9px 0 11px; }}
 strong, b {{ color:#1A1A1A; font-weight:700; }}
@@ -175,7 +181,7 @@ hr {{ border:0; border-top:0.8pt solid #DBE1E9; margin:20px 0; }}
   table {{ break-inside:auto; }}
   thead {{ display:table-header-group; }}
   tr, img {{ break-inside:avoid; }}
-  h2, h3, h4 {{ break-after:avoid; break-inside:avoid; }}
+  h2, h3, h4, h5 {{ break-after:avoid; break-inside:avoid; }}
   p, li {{ orphans:2; widows:2; }}
   blockquote {{ break-inside:auto; }}
   .masthead {{ break-inside:avoid; break-after:avoid; }}
