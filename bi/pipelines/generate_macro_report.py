@@ -35,6 +35,10 @@ AGENTS_DIR = REPO_ROOT / "agents"
 _ENV_PATH  = Path(__file__).resolve().parent / ".env"
 JST = timezone(timedelta(hours=9))
 
+# 最新終値の取得は全レポート共通の lib/snapshot_utils に集約（stale 事故を一元的に防ぐ）
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from lib.snapshot_utils import get_latest_close  # noqa: E402
+
 EXIT_OK   = 0
 EXIT_ERR  = 1
 EXIT_SKIP = 2
@@ -51,76 +55,6 @@ SNAPSHOT_TICKERS = {
     "米VIX":           "^VIX",
     "日経VI":          "^N225VI",
 }
-
-def _yahoo_chart_pairs(ticker: str) -> list[tuple]:
-    """Yahoo Finance chart API を直叩きして (date, close) のリスト（昇順）を取得する。失敗時は空リスト。
-
-    PM 2026-06-23: yfinance は内部の crumb/cookie 認証が Yahoo にブロックされやすく、
-    日経平均(^N225) 等が古い終値で止まる事象が頻発する。chart API はその認証フローを介さず
-    ブラウザ相当の UA で素直に JSON を返すため、yfinance が当日値を返せない時の二次ソースとして用いる。
-    対象シンボルは yfinance と同一（^N225 / NIY=F / USDJPY=X 等）。日経VI(^N225VI) は Yahoo 側に
-    存在せず 404 になるため空リストが返る（その場合は yfinance のみが情報源）。
-    """
-    import json as _json
-    import urllib.parse as _up
-    import urllib.request as _ur
-
-    sym = _up.quote(ticker, safe="")
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}?range=14d&interval=1d"
-    try:
-        req = _ur.Request(
-            url,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-                )
-            },
-        )
-        with _ur.urlopen(req, timeout=20) as resp:
-            data = _json.loads(resp.read().decode("utf-8", "replace"))
-        res = data["chart"]["result"][0]
-        ts = res["timestamp"]
-        closes = res["indicators"]["quote"][0]["close"]
-        pairs = [
-            (datetime.fromtimestamp(t, tz=timezone.utc).date(), float(c))
-            for t, c in zip(ts, closes)
-            if c is not None
-        ]
-        pairs.sort(key=lambda p: p[0])
-        return pairs
-    except Exception:
-        return []
-
-
-def _yf_pairs(ticker: str) -> list[tuple]:
-    """yfinance の 14 日履歴から (date, close) のリスト（昇順）を取得する。失敗時は空リスト。"""
-    try:
-        hist = yf.Ticker(ticker).history(period="14d", auto_adjust=False)
-        if hist is None or hist.empty:
-            return []
-        hist = hist.dropna(subset=["Close"])
-        return [(idx.date(), float(c)) for idx, c in zip(hist.index, hist["Close"])]
-    except Exception:
-        return []
-
-
-def _extract_close_prev(pairs: list[tuple], target) -> tuple | None:
-    """(date, close) 昇順リストから「当日終値・前日終値・取得日」を返す。
-    target 指定時は target 以下の最新営業日を当日とする（届かなければ全期間でフォールバック）。"""
-    if target is not None:
-        filtered = [p for p in pairs if p[0] <= target]
-        if len(filtered) >= 2:
-            pairs = filtered
-    if len(pairs) < 2:
-        return None
-    close = float(pairs[-1][1])
-    prev = float(pairs[-2][1])
-    latest = pairs[-1][0]
-    if prev == 0:
-        return None
-    return close, prev, latest
-
 
 def _is_stale(path: Path, target_date: date, max_age_minutes: int) -> bool:
     """
@@ -161,16 +95,15 @@ def _refresh_inputs(target_date: date) -> None:
 # ---------------------------------------------------------------------------
 
 def get_market_snapshot(target_date: str | None = None) -> str:
-    """yfinance から市況スナップショットを取得する。
+    """市況スナップショットを取得する（取得は lib/snapshot_utils.get_latest_close に集約）。
 
-    fast_info は実行時刻依存（東京市場閉鎖中は前日値・米国市場開場中は前日終値）で
-    レポート対象日と取得日がズレる重大事故が発生したため、history() ベースに改修。
+    各銘柄について「Yahoo chart 日足 + meta.regularMarketPrice(遅延しない最新セッション確定値)
+    + yfinance(backup)」の中から最も新しい確定終値を採用する。日足配列の最終要素しか見ず
+    古い終値で止まる旧実装の事故（PM 2026-06-27・日経平均の最高値誤掲）を構造的に防ぐ。
 
-    target_date が指定された場合: その日付以下の最新確定終値を「当日」とする
-    指定なしの場合: 最新確定終値を使う
-
-    各行に「取得日（YYYY-MM-DD）」を必ず備考欄に明記し、target_date と乖離がある
-    場合は ⚠️ で警告表示する。
+    target_date 指定時は target_date 以下の最新営業日を「当日」とする。各行に取得日を明記し、
+    取得日が対象日から大きく(4 日以上)遅れている場合のみ滞留警告を出す（週末・連休の正常な
+    日付差で誤警告を出さないため）。
     """
     from datetime import date as date_cls
     lines = ["| 指標 | 水準 | 前日比 | 取得日 / 備考 |", "|------|------|--------|------|"]
@@ -183,39 +116,29 @@ def get_market_snapshot(target_date: str | None = None) -> str:
             target = None
 
     for name, ticker in SNAPSHOT_TICKERS.items():
-        # 1) yfinance（一次ソース・14 日分で週末/休場を吸収）
-        snap = _extract_close_prev(_yf_pairs(ticker), target)
-        source = "yfinance"
-
-        # 2) Yahoo chart API フォールバック: yfinance が失敗、または target 指定時に当日値へ届いて
-        #    いない場合のみ。取得日が yfinance と同等以上に新しい時だけ採用する（古い値での後退を防ぐ）。
-        need_fallback = snap is None or (target is not None and snap[2] < target)
-        if need_fallback:
-            fb = _extract_close_prev(_yahoo_chart_pairs(ticker), target)
-            if fb is not None and (snap is None or fb[2] >= snap[2]):
-                snap = fb
-                source = "yahoo_chart"
-
-        if snap is None:
+        q = get_latest_close(ticker, target)
+        if q is None or q.close is None:
             lines.append(f"| {name} | 取得不可 | ─ | 全ソース取得失敗 |")
             continue
 
-        close, prev, latest_date = snap
-        chg = close - prev
-        pct = chg / prev * 100
+        if q.prev in (None, 0) or q.change is None:
+            chg_txt = "─"
+        else:
+            chg_txt = f"{q.change:+,.2f} ({q.pct:+.2f}%)"
 
-        comment_parts: list[str] = [f"close={latest_date.isoformat()}", f"src={source}"]
-        if target is not None and latest_date != target:
-            # 取得日と対象日が乖離している場合は警告マーク
-            comment_parts.append(f"⚠️ target={target.isoformat()} と乖離")
+        comment_parts: list[str] = [f"close={q.date.isoformat()}", f"src={q.source}"]
+        if q.market_state == "REGULAR":
+            comment_parts.append("場中速報")
+        if target is not None and (target - q.date).days >= 4:
+            comment_parts.append("⚠️ データ滞留の可能性")
         if name == "米VIX":
-            if close >= 30:
+            if q.close >= 30:
                 comment_parts.append("⚠️ 恐怖ゾーン")
-            elif close <= 15:
+            elif q.close <= 15:
                 comment_parts.append("楽観ゾーン")
 
         lines.append(
-            f"| {name} | {close:,.2f} | {chg:+,.2f} ({pct:+.2f}%) | {' / '.join(comment_parts)} |"
+            f"| {name} | {q.close:,.2f} | {chg_txt} | {' / '.join(comment_parts)} |"
         )
     return "\n".join(lines)
 
