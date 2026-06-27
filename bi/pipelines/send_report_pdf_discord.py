@@ -103,21 +103,14 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     md_text = md_path.read_text(encoding="utf-8")
 
-    # 品質ゲート（確定処理・PM 2026-06-27）: マクロは同一材料の重複説明を機械検出し、基準超なら
-    # 自動送信を保留する。ソフトな「重複禁止」指示が生成 LLM に無視される実績への構造的対策で、
-    # 重複レポートが PM に届くことを防ぐ。保留時は webhook に理由を通知し非ゼロ終了する。
-    if args.kind in ("macro", "macro_evening") and not args.skip_send:
+    # 品質モニタ（非ブロッキング・PM 2026-06-28）: 「配信を止めない・token を使わない」を最優先
+    # するため、重複を検出しても送信は止めず配信する。ここは GHA ログへの監視出力のみで、失敗
+    # （非ゼロ終了）も再生成もしない。重複は生成側の源流対策（リード短縮・備考の数値限定・1 材料
+    # 1 セクション）で減らす方針。残重複の検知用にログだけ残す。
+    if args.kind in ("macro", "macro_evening"):
         dups = find_duplication(md_text)
         if dups:
-            alert = (
-                "⚠️ 品質ゲート: 重複検出のため自動送信を保留しました（"
-                + "・".join(dups[:5])
-                + "）。テンプレ厳格化または再生成が必要です。"
-            )
-            if webhook:
-                requests.post(webhook, json={"content": alert})
-            print("QUALITY GATE BLOCKED:", dups)
-            return 1
+            print("QUALITY MONITOR WARNING (配信は継続・ブロックしない):", dups)
 
     # 動意は市場別（プライム/スタンダード/グロース）に分割して 3 PDF 送信
     if args.kind in ("movers", "movers_weekly"):
