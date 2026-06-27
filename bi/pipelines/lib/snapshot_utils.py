@@ -121,9 +121,11 @@ def _yf_pairs(ticker: str) -> list[tuple]:
 
 # Yahoo ティッカー → CNBC シンボル。CNBC は last / previous_day_closing / last_time を返すため
 # Yahoo の日足配列が遅延していても最新営業日の確定値を独立に取得できる。
-# 日経先物(NIY=F)・日経VI(^N225VI) は CNBC 安定マッピングがないため Yahoo に委ねる。
+# 日経先物(NIY=F)は CNBC の @NK.1（CME Nikkei Futures 先限）で代替取得する。日経VI(^N225VI)
+# のみ Yahoo・CNBC とも無料 API に存在せず（取得不可表示）、別途スクレイピングが必要。
 _CNBC_MAP = {
     "^N225": ".N225",
+    "NIY=F": "@NK.1",
     "^GSPC": ".SPX",
     "USDJPY=X": "JPY=",
     "^VIX": ".VIX",
@@ -210,23 +212,37 @@ def business_days_after(data_date: _date, ref_date: _date) -> int:
     return n
 
 
-def is_stale_close(data_date: _date, ref_date: _date, max_lag_trading_days: int = 1) -> bool:
-    """data_date が ref_date 基準で陳腐化しているか（営業日判定）。
+def previous_business_day(ref_date: _date) -> _date:
+    """ref_date の直前営業日（土日 + 日本の祝日を除外）。"""
+    d = ref_date - _timedelta(days=1)
+    while d.weekday() >= 5 or _is_jp_holiday(d):
+        d -= _timedelta(days=1)
+    return d
 
-    朝刊は寄り付き前に「前営業日の確定終値」を出すため 1 営業日のズレは許容する。
-    それを超えて営業日が飛んでいたら陳腐化（例: 水曜なのに火曜が抜けて月曜値 = 2 営業日 → True）。
-    祝日は jpholiday で除外するので 3 連休明け等で誤検知しない。
+
+def is_stale_close(data_date: _date, ref_date: _date) -> bool:
+    """data_date が ref_date 基準で陳腐化しているか（営業日判定・カレンダー日数では判定しない）。
+
+    期待する最新確定日 = ref_date の「直前営業日」。data_date がそれより古ければ陳腐化とみなす。
+      - 朝刊（寄り付き前）が直前営業日の確定終値を出す → 直前営業日 = data → 陳腐化なし
+      - 土曜版が金曜終値を出す → 直前営業日=金曜 = data → 陳腐化なし
+      - 水曜に月曜値（火曜が抜け） → data=月曜 < 直前営業日=火曜 → 陳腐化
+      - 土曜に木曜値（金曜が抜け） → data=木曜 < 直前営業日=金曜 → 陳腐化（元事故を検知）
+    祝日は jpholiday で除外するため 3 連休明け等で誤検知しない。
     """
-    return business_days_after(data_date, ref_date) > max_lag_trading_days
+    return data_date < previous_business_day(ref_date)
 
 
 def get_latest_close(ticker: str, target_date=None) -> Quote | None:
     """ticker の「当日終値・前日終値・取得日」を最も新しい確定値で返す。取得不能なら None。
 
     優先順:
-      1. Yahoo chart API の日足 + meta.regularMarketPrice(遅延しない最新セッション確定値)
-      2. chart API が全滅した場合のみ yfinance 日足(backup)
-    target_date 指定時は target_date 以下の最新営業日を「当日」とする。
+      1. Yahoo（chart 日足 + meta.regularMarketPrice / chart 全滅時のみ yfinance backup）を主とする。
+         meta は日足配列が遅延しても直近セッションの確定値を持つため、通常はこれで最新営業日に届く。
+      2. Yahoo が取得不能、または「直前営業日より古い（営業日基準で陳腐化）」場合のみ、独立ベンダー
+         CNBC から実値を取得してフォールバックする（＝ズレたら必ず別ソースで取りに行く・送付は止めない）。
+    通常時は Yahoo を主に保つことで、24h 取引銘柄（為替・金・先物等）の前日比を CNBC の週末基準 prev で
+    薄めない。target_date 指定時は target_date 以下の最新営業日を「当日」とする。
     例外は内部で握りつぶし None を返す(呼び出し側レポートを 1 銘柄の失敗で止めない)。
     """
     if isinstance(target_date, str):
@@ -255,41 +271,39 @@ def get_latest_close(ticker: str, target_date=None) -> Quote | None:
             merged[md] = mp  # meta は自セッションの確定値として採用
             meta_date = md
 
-    # 独立ベンダー CNBC: Yahoo（日足配列も meta も）が遅延しても、最新営業日の確定値を別系統で
-    # 取得する第二ソース。同一日付では CNBC を採用（独立確認）。Yahoo 全滅時に前日比が出せるよう
-    # previous_day_closing も保険として挿入する。これにより「ズレたら別ソースで実値を取りに行く」。
-    cnbc_date = None
-    cnbc = _cnbc_point(ticker)
-    if cnbc is not None:
-        cd, c_last, c_prev = cnbc
-        if target_date is None or cd <= target_date:
-            merged[cd] = c_last
-            cnbc_date = cd
-            if c_prev is not None:
-                merged.setdefault(cd - _timedelta(days=1), c_prev)
+    # --- 主ソース: Yahoo 側の最新確定値を確定 ---
+    yahoo_quote: Quote | None = None
+    if merged:
+        pairs = sorted(merged.items(), key=lambda p: p[0])
+        if target_date is not None:
+            filtered = [p for p in pairs if p[0] <= target_date]
+            if filtered:
+                pairs = filtered
+        if pairs:
+            close_date, close = pairs[-1]
+            prev = pairs[-2][1] if len(pairs) >= 2 else None
+            if close_date == meta_date:
+                source = "yahoo_meta"
+            elif close_date in chart_dates:
+                source = "yahoo_chart"
+            else:
+                source = "yfinance"
+            market_state = meta_pt[2] if (source == "yahoo_meta" and meta_pt) else None
+            yahoo_quote = Quote(
+                close=close, prev=prev, date=close_date, source=source, market_state=market_state
+            )
 
-    if not merged:
-        return None
+    # --- フォールバック: Yahoo が取得不能 or 直前営業日より古い時だけ CNBC で実値を取りに行く ---
+    need_fallback = (yahoo_quote is None) or (
+        target_date is not None and is_stale_close(yahoo_quote.date, target_date)
+    )
+    if need_fallback:
+        cnbc = _cnbc_point(ticker)
+        if cnbc is not None:
+            cd, c_last, c_prev = cnbc
+            if (target_date is None or cd <= target_date) and (
+                yahoo_quote is None or cd > yahoo_quote.date
+            ):
+                return Quote(close=c_last, prev=c_prev, date=cd, source="cnbc", market_state=None)
 
-    pairs = sorted(merged.items(), key=lambda p: p[0])
-    if target_date is not None:
-        filtered = [p for p in pairs if p[0] <= target_date]
-        if filtered:
-            pairs = filtered
-    if not pairs:
-        return None
-
-    close_date, close = pairs[-1]
-    prev = pairs[-2][1] if len(pairs) >= 2 else None
-
-    if cnbc_date is not None and close_date == cnbc_date:
-        source = "cnbc"
-    elif meta_date is not None and close_date == meta_date:
-        source = "yahoo_meta"
-    elif close_date in chart_dates:
-        source = "yahoo_chart"
-    else:
-        source = "yfinance"
-    market_state = meta_pt[2] if (source == "yahoo_meta" and meta_pt) else None
-
-    return Quote(close=close, prev=prev, date=close_date, source=source, market_state=market_state)
+    return yahoo_quote
