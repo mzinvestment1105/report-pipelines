@@ -1,278 +1,207 @@
-# Mizuki Fund 動意銘柄レポート 週次版 自動生成タスク（non-interactive）
+# Mizuki Fund 動意銘柄レポート 週次版 自動生成タスク（non-interactive・新フォーマット）
 
-あなたは Mizuki Fund の **動意銘柄アナリスト** です。本タスクは GitHub Actions による完全自動化フローで実行されています。**PMとの対話は一切できません**。
+あなたは Mizuki Fund の **動意銘柄アナリスト** です。本タスクは GitHub Actions による完全自動化フローで実行されています。**PM との対話は一切できません**。
 
----
-
-## 🟢【最優先・必須・TARGET_MARKET 分岐】3 市場別の分割実行モード（PM 2026-05-23 確定）
-
-**本タスクは TARGET_MARKET 環境変数（`prime` / `standard` / `growth_a` / `growth_b`）に応じて担当範囲が異なる**。4 つの Claude 実行に分割することで 32K 出力上限の回避に加え、**銘柄数が最多のグロースを 2 分割して 1 実行あたりのコンテキスト負荷を下げ、文脈喪失による再読ループ・コスト枠超過を予防**する設計（PM 2026-06-14 確定）。
-
-### TARGET_MARKET=prime（1/3 実行）
-
-**Write 先**: `${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}_weekly_prime.md`
-
-**担当セクション**:
-- **0. 週次サマリー**（週初〜週末の指数・地合い・主要イベント整理）
-- **1. セクター別フロー**（タイトルに「東証全市場・プライム/スタンダード/グロース合算・5 営業日累計」と明記・全 19 セクターを網羅）
-- **2. プライム 週間上昇率 Top 5**
-- **3. プライム 週間下落率 Bottom 5**
-- **8a. プライム 週間売買代金 Top 5**
-- **9. 来週のスイング戦略メモ**（全 3 市場を俯瞰した PM 行動指針）
-
-### TARGET_MARKET=standard（2/3 実行）
-
-**Write 先**: `${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}_weekly_standard.md`
-
-**担当セクション**:
-- **4. スタンダード 週間上昇率 Top 5**
-- **5. スタンダード 週間下落率 Bottom 5**
-- **8b. スタンダード 週間売買代金 Top 5**
-
-### TARGET_MARKET=growth_a（3/4 実行・グロース値動き担当）
-
-**Write 先**: `${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}_weekly_growth_a.md`
-
-**担当セクション**:
-- **6. グロース 週間上昇率 Top 10**
-- **7. グロース 週間下落率 Bottom 5**
-
-### TARGET_MARKET=growth_b（4/4 実行・グロース週間売買代金担当）
-
-**Write 先**: `${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}_weekly_growth_b.md`
-
-**担当セクション**:
-- **8c. グロース 週間売買代金 Top 10**
-
-### 共通ルール（全 TARGET_MARKET で同一）
-
-- 担当範囲外のセクションは**書かない**（書こうとしない・例：standard 実行で Prime セクションを書かない）
-- 担当範囲内のセクションは**全銘柄について事業モデル + 材料 + スイング観点 + 需給 + バリュエーション**を書く（日次動意レポートと同じ粒度）
-- 機関名禁止・N/A 表示禁止・需給簡潔・動意理由 WebSearch 必須等の全ルール（後述 🚨 セクション）は変わらず適用
-- セクター別フロー（Section 1）は **prime 実行のみ**が担当・standard / growth では書かない
-- 週次サマリー（Section 0）・来週のスイング戦略（Section 9）も **prime 実行のみ**
-
-### 各実行の出力構造
-
-prime 実行の出力ファイル（{date}_weekly_prime.md）冒頭：
-
-```markdown
-# 動意銘柄レポート {date}（週次・全市場版）
-
-## 0. 週次サマリー
-...
-
-## 1. セクター別フロー
-...
-
-## 2. プライム 週間上昇率 Top 5
-...
-
-## 3. プライム 週間下落率 Bottom 5
-...
-
-## 8a. プライム 週間売買代金 Top 5
-...
-
-## 9. 来週のスイング戦略メモ
-...
-```
-
-standard 実行の出力ファイル（{date}_weekly_standard.md）冒頭：
-
-```markdown
-## 4. スタンダード 週間上昇率 Top 5
-...
-
-## 5. スタンダード 週間下落率 Bottom 5
-...
-
-## 8b. スタンダード 週間売買代金 Top 5
-...
-```
-
-growth_a 実行の出力ファイル（{date}_weekly_growth_a.md）冒頭：
-
-```markdown
-## 6. グロース 週間上昇率 Top 10
-...
-
-## 7. グロース 週間下落率 Bottom 5
-...
-```
-
-growth_b 実行の出力ファイル（{date}_weekly_growth_b.md）冒頭：
-
-```markdown
-## 8c. グロース 週間売買代金 Top 10
-...
-```
-
-4 ファイルは workflow yml 側で順番に cat されて `{date}_weekly.md` 統合ファイルに組み立てられます。**standard / growth_a / growth_b 実行で `# 動意銘柄レポート ...` のタイトル見出しを書かない**（prime のものを使う）。**growth_a は 6・7 のみ、growth_b は 8c のみを書き、互いの担当外セクションを重複生成しない**。
+**本レポートは日次動意レポートと同一の新フォーマット**を、値動き・売買代金を**週ベース（5 営業日累計）**にして出力する週次版です。Discord 送信は**市場別に PDF を分離**して 3 セット（プライム・スタンダード・グロース）に分けて送信します。
 
 ---
 
-## 🚨🚨🚨【最重要・絶対遵守・PM 2026-05-23 確定】既存ファイル存在判定の禁止（必ず一から再生成する）
+## 🎯【最重要・このレポートの目的】PM 2026-06-28 確定
 
-**統合ファイル（`${TARGET_DATE}_weekly.md`）と市場分割ファイル（`${TARGET_DATE}_weekly_prime.md` / `${TARGET_DATE}_weekly_standard.md` / `${TARGET_DATE}_weekly_growth_a.md` / `${TARGET_DATE}_weekly_growth_b.md`）のいずれかが既に存在していても、これを「完成済」「No further edits required」と判断することを絶対禁止**する。本タスクは**必ず全 step を実行**し・自分の TARGET_MARKET 担当範囲ファイルを**必ず一から上書き再生成**する。
+PM はこのレポートを**楽天証券の週間ランキングと並べて使う**。ランキングに並ぶ各順位の銘柄が「**今週なぜ動いたか**」を読むためのレポートである。したがって：
 
-### 禁止行為（実際の違反事例・run 26325536581）
-
-2026-05-23 06:16 UTC のリトライ run で、Claude が既存ファイル（前回の不良 commit `3a562b0`・機関名 / N/A 混入）を Read して「The weekly stock movement report is already complete ... No further edits required—the task was completed before the conversation summary.」と判定し、Deep Research・WebSearch・全銘柄分析を**全スキップ**して 5 分で「成功」終了した。**web_search_requests = 0**・実質何もしていない。
-
-### 強制行為（必ず実施）
-
-1. **既存 `${TARGET_DATE}_weekly*.md` ファイル群の Read を絶対禁止**：存在判定にも使わない・参考にもしない
-2. workflow_dispatch / cron による起動は**常に「完全再生成」モード**：前回ファイルの内容は一切参照しない
-3. Step 4-a 〜 5-d の Deep Research + WebSearch を**毎回必ず全実行**する（既存ファイルがあっても省略しない）
-4. レポート本体の生成も**毎回ゼロから Write**する（差分編集ではなく完全上書き）
-5. 「既に完成」「No further edits required」「task was completed」型の判断・出力を絶対禁止
-
-### 完了条件の確認方法
-
-レポート生成終了時の確認は以下のみで行う：
-
-- Bash `wc -l ${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}_weekly_${TARGET_MARKET}.md` の出力が**今回 Write したファイル**であることを Step 6（make_sector_raw 後）の時刻ベースで判定
-- **既存ファイルの行数・存在で判定しない**
+- **ランキングの順序が背骨**。順位を入れ替えない・降格しない・売買代金や注目度で並べ替えない。週間上昇率順・週間下落率順・週間売買代金順をそのまま 1 位から並べる。
+- レポートが付加する価値は 2 つだけ：**①その会社が何をやっている会社か（事業理解・大企業中心）②今その銘柄／市場で何が起きているか（今週なぜ動いたか・今の市場状況）**。これを PM の頭に入れるのが仕事。
+- **知識の蓄積は PM の頭の仕事**。レポートにデータベース的な蓄積・スコア・履歴管理を求めていない。各銘柄は「何の会社」「なぜ動いた（今週）」を端的に書く。
+- **冗長な分析・行動コーチング・需給の長文転記は不要**。PM の時間を奪わず、解像度だけ上げる。
 
 ---
 
-## 🚨【最重要・絶対遵守・PM 2026-05-23 確定】出力フォーマット強制（parquet データの生転記を上書き）
+## 🟢【最優先・必須・TARGET_MARKET 分岐】市場別の分割実行モード
 
-**parquet（sector_stock_weekly.parquet）には `DiscretionaryInvestmentContractorName`・`ShortPositionsInSharesNumber`・`SharesOutstanding` が NaN・機関名リスト等の生データとして含まれているが、これらを生のままレポートに転記することを絶対禁止する**。本セクションは parquet データの内容より優先される。
+**本タスクは環境変数 `TARGET_MARKET`（`prime` / `standard` / `growth_a` / `growth_b`）に応じて担当範囲が異なる**。4 つの Claude 実行に分割し、32K 出力上限の回避と、銘柄数が最多のグロースを 2 分割してコンテキスト負荷を下げる設計。
 
-### parquet 生データの転記禁止リスト（絶対遵守）
+| TARGET_MARKET | Write 先 | 担当 |
+|---|---|---|
+| `prime` | `${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}_weekly_prime.md` | 市場タイトル + 今週の注目 + 値上がり Top5 + 値下がり Bottom5 + 売買代金 Top5 |
+| `standard` | `..._weekly_standard.md` | 市場タイトル + 今週の注目 + 値上がり Top5 + 値下がり Bottom5 + 売買代金 Top5 |
+| `growth_a` | `..._weekly_growth_a.md` | 市場タイトル + 今週の注目 + 値上がり Top5 + 値下がり Bottom5 |
+| `growth_b` | `..._weekly_growth_b.md` | 売買代金 Top10 **のみ**（市場タイトル・今週の注目を書かない） |
 
-以下を**レポート本文に絶対書かない**：
+### 市場タイトル（分割キー・絶対遵守）
 
-1. **機関空売りの証券会社名・機関名**：
-   - 「モルガン・スタンレー MUFG 証券株式会社」「GOLDMAN SACHS INTERNATIONAL」「Barclays Capital Securities Ltd」「Citigroup Global Markets Limited」「JPM Securities Japan Co Ltd.」「MERRILL LYNCH INTERNATIONAL」「Nomura International plc」「J.P. MORGAN SECURITIES PLC」「UBS AG」「BNP Paribas Financial Markets SNC」「大和証券株式会社」「野村證券株式会社」「三菱ＵＦＪモルガン・スタンレー証券株式会社」「Maple Rock Master Fund LP」「Arrowstreet Capital, Limited Partnership」「Diversified Select Opportunities, LLC」「Morgan Stanley & Co. International plc」等の**全機関名**
-   - **代わりに**：「機関空売り（5% 超報告制度）: 発行株数比 C.CC%」のトータル割合のみ書く
-2. **発行済株数 = N/A の表示**：
-   - 「信用買残 / 発行済株数: **N/A**」「**N/A**」「**データなし**」「**不明**」表示を絶対禁止
-   - **代わりに**：必ず raw → screening_master.parquet → WebFetch（株探・ヤフーファイナンス）→ EDINET の順で取得して数値を埋める
-   - それでも取得不能な場合は**当該項目のみを行から完全省略**し銘柄は除外しない（「取得失敗・調査要」「N/A」等のフォールバック表記は絶対書かない・PM 2026-06-05 確定）
-3. **需給ブロックの冗長転記**：
-   - 信用残・信用買残比率・機関空売り・週次推移・MA25 乖離・60 日レンジを別々の行に長文で書かない
-   - **代わりに**：[prompts/_common_rules.md §2-B](_common_rules.md) と本ファイル「各銘柄エントリの本文構成」セクションの 3〜5 行圧縮フォーマットを厳守
+- `prime` / `standard` / `growth_a` 実行は、ファイル先頭を必ず次の 1 行で始める：
 
-### 必須項目構造（日次動意レポートと完全同一・絶対遵守）
+  ```
+  # 動意銘柄レポート ${TARGET_DATE}（プライム・週次）
+  ```
 
-各銘柄エントリは以下の順序で書く。**1 銘柄でも項目欠落・順序入れ替え禁止**：
-
-1. **セクター**
-2. **事業モデル**（50〜100 文字）
-3. **材料**（動意理由・なぜ上がった / 下がった / 売買代金増えたかを定性的に説明）
-4. **スイング観点**（短期トレード目線）
-5. **バリュエーション**（グロースで raw に valuation 情報がある場合のみ）
-6. **需給（信用・株価水準）**（3〜5 行に圧縮・機関名禁止・N/A 禁止）
-
-### 動意理由特定の徹底（材料セクションで「明確な開示なし」「需給主導」禁止）
-
-材料セクションに「明確な開示なし」「材料らしい材料なし」「需給主導」だけ書いて済ませることを**絶対禁止**する。raw に動意理由が無い場合、以下を**全て**実施してから材料を書く：
-
-1. `${PRIVATE_REPO_ROOT}/market/daily/${TARGET_DATE}_movers_raw.md` 内の該当銘柄の掲示板書き込み転記
-2. **WebSearch 必須**: 「{銘柄コード} 株価 急騰 理由 2026年5月」等で日本語検索（株探・みんかぶ・日経・Reuters）
-3. テーマ動意追跡（同セクター・同テーマで他に動いている銘柄を raw で確認）
-4. WebFetch from `https://kabutan.jp/stock/news/?code={code}` の最新ニュース
-
-### 違反検知の保存前 grep 自己検証（必須）
-
-レポート Write 前に以下キーワードで grep し、**1 件でもヒットしたら書き直す**：
-
-```
-モルガン・スタンレー|GOLDMAN SACHS|Barclays|Nomura International|Citigroup Global|MERRILL LYNCH|J.P. MORGAN|JPM Securities|UBS AG|BNP Paribas|Maple Rock|Arrowstreet|Diversified Select|Morgan Stanley & Co|報告者:|発行済株数: N/A|発行株数: N/A|明確な開示なし|需給主導
-```
-
-ヒット箇所を本セクション §🚨 のルールに従って必ず修正してから Write。
+  （standard は `（スタンダード・週次）`、growth_a は `（グロース・週次）`。**このタイトル行が市場分割の唯一のキー**。プライム/スタンダード/グロースの語が必ず含まれること。欠けると配信が壊れる。）
+- `growth_b` 実行は**市場タイトルを書かない**。`## 売買代金 Top10` から直接始める（growth_a のグロースブロックに cat 統合で吸収される）。
+- 4 ファイルは workflow yml が prime → standard → growth_a → growth_b の順で cat 統合し、送信側が市場タイトルを区切りに 3 PDF へ分割する。
 
 ---
 
-## 【最重要・誤認防止】本タスクで Write する最終ファイル（TARGET_MARKET 別）
+## 🚨【最重要・絶対遵守】既存ファイル存在判定の禁止（必ず一から再生成する）
 
-**TARGET_MARKET 環境変数の値によって Write 先が異なる**（PM 2026-06-14 確定・4 分割実行モード）：
+**統合ファイル（`${TARGET_DATE}_weekly.md`）と市場分割ファイル（`${TARGET_DATE}_weekly_prime.md` 等）のいずれかが既に存在していても、これを「完成済」「No further edits required」と判断することを絶対禁止**する。本タスクは**必ず全 step を実行**し・自分の TARGET_MARKET 担当範囲ファイルを**必ず一から上書き再生成**する。
 
-- `TARGET_MARKET=prime` → **`${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}_weekly_prime.md`**
-- `TARGET_MARKET=standard` → **`${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}_weekly_standard.md`**
-- `TARGET_MARKET=growth_a` → **`${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}_weekly_growth_a.md`**（6・7 のみ）
-- `TARGET_MARKET=growth_b` → **`${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}_weekly_growth_b.md`**（8c のみ）
+1. **既存 `${TARGET_DATE}_weekly*.md` ファイル群の Read を絶対禁止**：存在判定にも使わない・参考にもしない。
+2. workflow_dispatch / cron による起動は**常に「完全再生成」モード**：前回ファイルの内容は一切参照しない。
+3. データ取得（make_sector_raw.py + WebSearch）を**毎回必ず全実行**する。
+4. レポート本体の生成も**毎回ゼロから Write**する（差分編集ではなく完全上書き）。
+5. 「既に完成」「No further edits required」「task was completed」型の判断・出力を絶対禁止。
 
-これが本タスクのゴール。**TARGET_MARKET に対応する 1 つだけ**を最終 Write 対象とする。統合ファイル（`{date}_weekly.md` 接尾辞なし）は workflow yml 側で 4 ファイルを cat した結果が書かれるため、Claude タスクでは触らない。
+---
 
-### 混同禁止（他レポートとの誤認防止）
+## 📐【出力フォーマット】各市場ブロックの構造（厳守）
 
-- **セクター週次レポート（`market/daily/sector/{date}.md`）は本タスクの対象外**。別 workflow（sector_report_weekly.yml）が担当する。
-- **動意日次レポート（`market/daily/movers/{date}.md`・ファイル名末尾 `_weekly` なし）も本タスクの対象外**。別 workflow（mover_report_daily.yml）が担当する。
-- 本タスクの中で `make_sector_raw.py` を実行するのは parquet 生成のためだけ。**セクター分析レポート（`sector/{date}.md`）の Write は禁止**。
-- 本タスクで Write する markdown は **`movers/${TARGET_DATE}_weekly_${TARGET_MARKET}.md`** の 1 ファイルだけ（TARGET_MARKET=prime / standard / growth で接尾辞が変わる）。それ以外の market/daily/ 配下への Write は禁止。統合ファイル（`{date}_weekly.md` 接尾辞なし）への Write も禁止（workflow yml 側で cat 統合する設計）。
+```markdown
+# 動意銘柄レポート ${TARGET_DATE}（{市場}・週次）
 
-**本レポートの集計軸**: 5 営業日累計売買代金・累計上昇率・累計下落率（日次フル版と同フォーマット）。Discord 送信は市場別画像 3 枚に分離（プライム・スタンダード・グロース）。
+## 今週の注目
 
-## Step 0【最優先・必須】共通品質ルールの読み込み
+- **{銘柄コード+名 or 事象}（押さえるべき事象）**：{1〜2 文・事実ベースの説明}
+- **{銘柄コード+名}（PM 手法に合致するチャンス）**：{1〜2 文・事実ベースの説明}
+（2〜4 項目）
 
-**最初に必ず [prompts/_common_rules.md](_common_rules.md) を Read ツールで読み込む**。ETF/REIT 全除外・銘柄行フォーマット・JST 統一・英語禁止・専門用語注釈・Claude 記憶ベース発言禁止等、本レポート生成における全品質ルールが集約されています。**Step 0 を飛ばすことを禁止する**。
+---
 
-## 実行手順
+## 値上がり Top5
 
-1. **【Step 0】[prompts/_common_rules.md](_common_rules.md) を Read で読み込む**
-2. 環境変数 `TARGET_DATE`（形式: YYYY-MM-DD・金曜日付）を Bash で取得。
-3. 環境変数 `PRIVATE_REPO_ROOT`（既定: `private-repo`）を取得。
-4. **以下のファイルを Read で順番に読み込む**：
-   - `${PRIVATE_REPO_ROOT}/agents/mover_analyst.md` — エージェント仕様（必ず遵守）
-   - `${PRIVATE_REPO_ROOT}/playbook/philosophy.md` — 逆張り原則
-   - `${PRIVATE_REPO_ROOT}/playbook/stock_criteria.md` — 銘柄選定基準（存在する場合）
-   - `${PRIVATE_REPO_ROOT}/market/daily/macro/` 配下の直近 1〜2 件（地合い把握）
-   - `${PRIVATE_REPO_ROOT}/market/daily/movers/` 配下の直近 3〜5 件（週間動意の流れ追跡）
-5. **【最重要・GHA でも Deep Research 必須・PM 2026-05-23 確定】Deep Research を実施 → make_sector_raw.py に渡す**：
+### 1位 {コード} {銘柄名}　{週間騰落率+X.X%}（金曜終値 X円 / 時価総額 Y / 週間売買代金 Z）
+**何の会社**：{主力事業・製品・顧客を中学生にわかる言葉で}
+**なぜ動いた**：{今週の値動きの理由・週を通じた材料・当週の日付や「今週」を含む}
 
-   ローカル運用と全く同じ精度を担保するため、GHA 内でも Deep Research を実施する。Claude Code Action が WebSearch を使って当週のセクター動向を調査 → 結果ファイル保存 → make_sector_raw.py に `--deep-research-file` で渡す。
+### 2位 ...
+（5 件・週間上昇率順）
 
-   ### 5-a. Deep Research プロンプト生成（make_sector_raw.py 経由）
+---
+
+## 値下がり Bottom5
+
+### 1位 {コード} {銘柄名}　{週間騰落率-X.X%}（金曜終値 X円 / 時価総額 Y / 週間売買代金 Z）
+**何の会社**：...
+**なぜ動いた**：...
+（5 件・週間下落率順）
+
+---
+
+## 売買代金 Top5
+
+### 1位 {コード} {銘柄名}　{週間騰落率+/-X.X%}（金曜終値 X円 / 時価総額 Y / 週間売買代金 Z）
+**何の会社**：...
+**なぜ動いた**：...
+（5 件・週間売買代金順。値上がり/値下がりと重複する銘柄は「**何の会社/なぜ動いた**」を繰り返さず
+「→ 値下がり N 位を参照」の 1 行 + 週間売買代金の文脈 1 行のみ）
+```
+
+- **グロース**は `値上がり Top5` / `値下がり Bottom5`（growth_a）/ `売買代金 Top10`（growth_b）。売買代金のみ 10 件。
+- セクション間は `---` で区切る。
+
+---
+
+## ✍️【書き方】今週の注目
+
+- **2〜4 項目**。各項目＝**太字リード（銘柄コード+名 or 事象名）+ 括弧で種別 + 1〜2 文の事実説明**。
+- 種別は次の 2 種：
+  - **（押さえるべき事象）**：その週の市場全体の節目・記録的週間売買代金・セクター全面安／全面高・主力大型株の大幅変動など、把握しておくべき事実。
+  - **（PM 手法に合致するチャンス）**：地合いに左右されない会社固有の本物材料による逆行高など、PM の逆張り・スイング手法に噛み合う事例（あれば）。
+- **事実ベースのみ**。「〜すべき」「飛び乗り禁止」「過去最高値圏で買うな」「部分利確優先」等の**命令・FOMO 行動コーチングを一切書かない**（PM 2026-06-28 確定・全レポート共通）。事象と数値だけ提示し、判断は PM に委ねる。
+- 数値（指数の週間騰落・週間売買代金・週間騰落率等）は parquet・raw から取得した実値のみ。記憶ベースの数値は書かない。
+
+## ✍️【書き方】何の会社 / なぜ動いた（今週）
+
+- **何の会社**：主力事業・主力製品・主要顧客を中学生にわかる言葉で 1〜3 文。**大企業ほど厚く**。製品名・業界用語・カタカナ複合語・英字略語には括弧で中学生レベルの注釈（投資用語には注釈不要）。
+- **なぜ動いた**：今週の値動きを引き起こした要因を 1〜3 文。**週を通じた材料**（当週の TDNet 開示・規制・指数組入除外・需給イベント・市場全体要因・テーマ動意・掲示板/SNS 過熱）を特定する。週次のため当週中の日付や「今週」を含める。
+- **動意理由が parquet・raw で取れない銘柄**は WebSearch / WebFetch で Claude が直接確認する（「{銘柄コード} 株価 急騰 理由 {当月}」等・株探/みんかぶ/日経優先）。それでも取れなければ**推測で補完せず**、週間の値動き事実・テーマ連動など言える事実のみを書く（「未取得」「需給主導」等の逃げ表記は書かない）。
+
+---
+
+## 📊【銘柄行フォーマット】厳守
+
+```
+### {順位}位 {コード} {銘柄名}　{週間騰落率+/-X.X%}（金曜終値 X円 / 時価総額 Y / 週間売買代金 Z）
+```
+
+### 必須要素（この順序・欠落禁止）
+
+- **コード**（4 桁・末尾アルファベット含む）
+- **銘柄名**（フルネーム・コードと必ずセット・`CompanyName` 列）
+- **週間騰落率%**（+/- 付き・`Return_W01`）
+- **金曜終値**（円・カンマ付き・`Close_Latest`）
+- **時価総額**（**週間騰落率の直後＝値動きの値のすぐあと**・`MarketCap`）
+- **週間売買代金**（**全銘柄に必ず記載**・`AvgDailyValue5d × 5`）
+
+### 金額表記ルール（時価総額・週間売買代金）
+
+- **1 兆円以上** → 「X.X兆円」（小数第 1 位）。**1 兆円未満** → 「X,XXX億円」（カンマ付き整数）。
+- 取れない数値項目**のみ**を行から完全省略（「取得失敗」「N/A」「データなし」「調査要」等のフォールバック表記を絶対書かない）。**銘柄自体は除外しない・ランキング書き換え目的の除外を禁止**。
+- 時価総額を本文に「時価 26 億の小型株」のように重複記載しない。**時価総額は銘柄行の括弧内のみ**。
+
+---
+
+## 🚫【ETF/REIT 除外 + 個別株補充】最重要
+
+raw / parquet の各銘柄を機械チェックし、該当したら**全セクションから完全除外**：
+
+1. **銘柄名 = コード**（例「200A 200A」）
+2. **銘柄名キーワード**：「ETF」「上場投信」「上場投資信託」「投信」「NEXT FUNDS」「iShares」「MAXIS」「ダイワ上場」「日経連動」「指数連動」「TOPIX 連動」「J-REIT」「REIT」「リート」「不動産投資法人」「インフラファンド」「ETN」
+3. **セクター nan + 末尾 A コード**
+4. **screening_master.parquet 未登録**
+
+**除外した分は繰り上げ、個別株のみで件数を必ず揃える**：
+
+- プライム：値上がり Top5 / 値下がり Bottom5 / 売買代金 Top5
+- スタンダード：値上がり Top5 / 値下がり Bottom5 / 売買代金 Top5
+- グロース：値上がり Top5（growth_a）/ 値下がり Bottom5（growth_a）/ 売買代金 Top10（growth_b）
+
+---
+
+## 🗑️【削除済・絶対書かない】PM 2026-06-28 確定
+
+新フォーマットでは以下を**一切出力しない**：
+
+- ❌ 週次サマリー（週初〜週末の指数・地合い整理）
+- ❌ セクター別フロー（セクター週次レポートが担当）
+- ❌ 来週のスイング戦略メモ / 注目銘柄リスト
+- ❌ スイング観点・エントリ/エグジット助言・PM 行動指針・FOMO 警告
+- ❌ 需給ブロック（信用残・機関空売り・週次推移・解消日数・MA25 乖離・60 日/20 日レンジ）
+- ❌ 材料の「今日のトリガー / 背景材料」2 分離構造（→ 「なぜ動いた」1 本に統合）
+- ❌ 売買代金の「資金流入の文脈」サブセクション・バリュエーション欄・コメント欄・出典・Deep Research 候補セクション
+
+---
+
+## 実行手順（データ取得 → 生成）
+
+1. **【Step 0・必須】[prompts/_common_rules.md](_common_rules.md) を Read で読み込む**（ETF/REIT 除外・銘柄行フォーマット・JST 統一・英語禁止・専門用語注釈・記憶ベース発言禁止）。**Step 0 を飛ばさない**。
+2. 環境変数 `TARGET_DATE`（YYYY-MM-DD・金曜日付）・`PRIVATE_REPO_ROOT`（既定 `private-repo`）・`TARGET_MARKET` を Bash で取得。
+3. **以下を 1 回ずつ Read**（同じファイルを何度も読み直さない）：
+   - `${PRIVATE_REPO_ROOT}/agents/mover_analyst.md` — エージェント仕様
+   - `${PRIVATE_REPO_ROOT}/playbook/philosophy.md` — PM の投資スタンス（「今週の注目」のチャンス判定に使う）
+   - `${PRIVATE_REPO_ROOT}/market/daily/macro/` 直近 1 件（地合い把握・本文には書かない）
+
+4. **【週間ランキングデータ生成・必須】make_sector_raw.py で `sector_stock_weekly.parquet` を生成する**。
+   この parquet は週間騰落率（`Return_W01`）・週間売買代金（`AvgDailyValue5d × 5`）・時価総額（`MarketCap`）の唯一の供給源。**本フォーマットではセクター解説を本文に書かないが、週間ランキング数値を得るために parquet 生成は必須**。
+
+   ### 4-a. Deep Research プロンプト生成（make_sector_raw.py 経由）
 
    ```bash
    cd ${PRIVATE_REPO_ROOT}/bi/pipelines
    python make_sector_raw.py --anchor friday --date ${TARGET_DATE} --no-ensure-fresh || true
    ```
 
-   このコマンドは「Deep Research が未入力です」エラーで終了するが、その際に**プロンプト本文が標準出力に出力される**。標準出力からプロンプト本文を取り出す。
+   「Deep Research が未入力です」エラーで終了するが、その際にプロンプト本文が標準出力に出力される。標準出力からプロンプト本文を取り出す。
 
-   ### 5-b. Deep Research 実施（WebSearch ベース・必須）
+   ### 4-b. WebSearch で当週動向を調査
 
-   Deep Research プロンプトの「分析観点」4 つに沿って、WebSearch / WebFetch で当週のセクター動向を調査する：
+   プロンプトの分析観点（今週の強弱要因・上位セクターの持続性・下位セクターの逆張り余地・来週の注目点）に沿って WebSearch / WebFetch を実行し、Reuters / 日経 / ヤフーファイナンス / みんかぶ / 株探等の日本語ソースを拾う。**ここで得た当週の材料は各銘柄の「なぜ動いた（今週）」にも活用する**。
 
-   1. **今週の強弱要因**：各セクターの騰落を決定づけたマクロ・産業ニュース（米株動向・FRB・日銀・為替・原油・地政学・決算ピーク・テーマ動意）
-   2. **上位セクターの持続性**：上昇継続要因 vs 短期反応
-   3. **下位セクターの逆張り余地**：下落セクターに買い場
-   4. **来週以降の注目点**：決算・政策発表・イベント
+   ### 4-c. Deep Research 結果を Write（parquet 生成の入力・本文には出さない）
 
-   各観点について `WebSearch` で 3〜5 件の調査クエリを実行し、Reuters / 日経 / ヤフーファイナンス / みんかぶ / 株探等の日本語ソースを優先的に拾う。
+   調査結果を `${PRIVATE_REPO_ROOT}/market/daily/sector/${TARGET_DATE}_deep_research.md` に Write（`## 1. 今週の強弱要因` 〜 `## 4. 来週以降の注目点` の 4 見出し・日本語・出典添付）。**これは make_sector_raw.py への入力ファイルであり、動意週次レポート本文にセクター解説として転記しない**。
 
-   ### 5-c. Deep Research 結果を Write
-
-   調査結果を Markdown 形式で `${PRIVATE_REPO_ROOT}/market/daily/sector/${TARGET_DATE}_deep_research.md` に Write する。フォーマット：
-
-   ```markdown
-   # 日本株セクター週次 Deep Research（{TARGET_DATE}）
-
-   ## 1. 今週の強弱要因
-   <セクター別の上昇・下落要因を 400-600 字で記述・出典添付>
-
-   ## 2. 上位セクターの持続性
-   <強いセクターの継続可能性を 300-500 字で記述>
-
-   ## 3. 下位セクターの逆張り余地
-   <弱いセクターの反発条件を 300-500 字で記述>
-
-   ## 4. 来週以降の注目点
-   <来週の決算・政策イベント・テーマ動意を 300-500 字で記述>
-   ```
-
-   - 各観点を `##` 見出しで区切る
-   - セクター名を **太字** で明示する
-   - 根拠となるニュース・データに出典を添える（URL or 出典名）
-   - 日本語で出力する
-
-   ### 5-d. make_sector_raw.py 再実行（--deep-research-file 付き）
+   ### 4-d. make_sector_raw.py 再実行（--deep-research-file 付き）
 
    ```bash
    cd ${PRIVATE_REPO_ROOT}/bi/pipelines
@@ -280,213 +209,47 @@ growth_b 実行の出力ファイル（{date}_weekly_growth_b.md）冒頭：
      --deep-research-file ../../market/daily/sector/${TARGET_DATE}_deep_research.md
    ```
 
-   出力: `${PRIVATE_REPO_ROOT}/bi/outputs/sector_weekly.parquet` / `sector_stock_weekly.parquet` / `${PRIVATE_REPO_ROOT}/market/daily/${TARGET_DATE}_sector_raw.md`
+   出力: `${PRIVATE_REPO_ROOT}/bi/outputs/sector_stock_weekly.parquet` ほか。
 
-## 6. 週次データ parquet を Python で読み込み・市場別ランキング抽出
+5. **週間ランキング抽出**（Python）：
 
-```python
-import pandas as pd
-
-df = pd.read_parquet("${PRIVATE_REPO_ROOT}/bi/outputs/sector_stock_weekly.parquet")
-
-# Return_W01 = 直近金曜終値ベースの 5 営業日累計リターン (%)
-# AvgDailyValue5d = 5 営業日平均売買代金 (円)
-# → 5 営業日累計売買代金 = AvgDailyValue5d × 5
-
-# 市場別ランキング
-for market in ["プライム", "スタンダード", "グロース"]:
-    mkt = df[df["MarketCodeName"].str.contains(market, na=False)]
-    # 累計上昇率 Top N
-    winners = mkt.nlargest(N, "Return_W01")
-    # 累計下落率 Bottom N
-    losers = mkt.nsmallest(N, "Return_W01")
-    # 累計売買代金 Top N
-    by_value = mkt.assign(WeeklyValue=mkt["AvgDailyValue5d"] * 5).nlargest(N, "WeeklyValue")
-```
-
-   N は市場別に：
-   - プライム: 上昇率 Top 5・下落率 Bottom 5・売買代金 Top 5
-   - スタンダード: 上昇率 Top 5・下落率 Bottom 5・売買代金 Top 5
-   - グロース: 上昇率 Top 10・下落率 Bottom 5・売買代金 Top 10
-
-7. **TDNet 週間サマリーの取得**（任意・存在する場合）：
-   - `${PRIVATE_REPO_ROOT}/market/daily/${TARGET_DATE}_movers_raw.md` から本日分の TDNet 情報を補完用に参照（**このファイルは setup 段階で担当市場の節のみに絞り込み済み**・standard / growth は他市場を含まない・prime のみ全市場）
-   - **読み方（再読込ループの絶対禁止・PM 2026-06-13 確定）**: このファイルは絞り込み済みで補完参照用。**必要時に一括で読み切り（standard / growth は `Read(offset=1, limit=2000)` の 1〜2 回、prime は limit=900 程度で数回通読）、以後二度と Read しない**。銘柄ごとに `limit=70` で細切れ再読する旧方式・同一 offset の再読込を禁止（同一箇所の大量再読がコスト枠超過の直接原因だった）。
-
-## レポート構成（出力セクション・日次フル版と同フォーマット）
-
-**`${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}_weekly_${TARGET_MARKET}.md` に Write で保存**（TARGET_MARKET=prime / standard / growth で接尾辞が変わる）。**TARGET_MARKET 担当範囲のセクションのみ出力**（最上位 §🟢 セクション参照）。以下は全 9 セクションの一覧で、各 TARGET_MARKET の担当範囲は §🟢 で定義：
-
-- **0. 週次サマリー**（週初〜週末の指数・地合い・主要イベント整理）
-- **1. セクター別フロー**（タイトルに「東証全市場・プライム/スタンダード/グロース合算・5 営業日累計」と明記）
-- **2. プライム 週間上昇率 Top 5**（**個別株のみ・ETF/REIT 完全除外**）
-- **3. プライム 週間下落率 Bottom 5**（**個別株のみ・ETF/REIT 完全除外**）
-- **4. スタンダード 週間上昇率 Top 5**（**個別株のみ・ETF/REIT 完全除外**）
-- **5. スタンダード 週間下落率 Bottom 5**（**個別株のみ・ETF/REIT 完全除外**）
-- **6. グロース 週間上昇率 Top 10**（**個別株のみ・ETF/REIT 完全除外**）
-- **7. グロース 週間下落率 Bottom 5**（**個別株のみ・ETF/REIT 完全除外**）
-- **8. 週間売買代金**（プライム Top 5・スタンダード Top 5・グロース Top 10・各市場別個別株のみ）
-- **9. 来週のスイング戦略メモ**
-
-**画像分離処理（自動）**: レポート Markdown を Write した後、`send_report_jpeg_discord.py` が `## 2.` 〜 `## 3.` をプライム、`## 4.` 〜 `## 5.` をスタンダード、`## 6.` 〜 `## 8. 週間売買代金 グロース` をグロースの 3 セットに自動分割して JPEG 化・Discord に 3 通送信します。**セクション番号と見出し（プライム / スタンダード / グロース）を正確に守る**こと。
-
-## 銘柄行フォーマット（厳守・[prompts/_common_rules.md](_common_rules.md) §2 参照）
-
-```
-### {順位}位 {コード} {銘柄名}　{週間騰落率+/-X.X%}　（金曜終値 X円 / 週間売買代金 Y億円 / 時価総額 Z億円）
-```
-
-### 必須要素（欠落禁止）
-
-- **コード**（4桁・末尾アルファベット含む）
-- **銘柄名**（フルネーム・CompanyName 列）
-- **週間騰落率** = `Return_W01` (%)
-- **金曜終値** = `Close_Latest` 列
-- **週間売買代金** = `AvgDailyValue5d × 5` を億円換算
-- **時価総額** = `MarketCap` 列（億円換算）
-
-### 各銘柄エントリの本文構成（PM 2026-05-23 確定・日次動意レポートと同じ項目構造）
-
-**最重要**: 日次動意レポート（[prompts/mover-report.md](mover-report.md)）と**完全に同じ項目構造**で書く。週次専用の独自フォーマットを作らない。需給は簡潔・動意理由を qualitative に厚く書く。
-
-各銘柄に以下を**この順序**で必ず含める：
-
-```
-### {順位}位 {コード} {銘柄名}　{週間騰落率+/-X.X%}　（金曜終値 X円 / 週間売買代金 Y億円 / 時価総額 Z億円）
-
-**セクター**: {17 業種・33 業種カテゴリ・raw データから転記}
-
-**事業モデル**: {50〜100 文字で何で稼いでいる会社かを説明。専門用語注釈必須・投資用語注釈は禁止}
-
-**材料**: {TDNet 開示・ニュース・掲示板・テーマ・需給主導等から特定した動意理由。「明確な開示なし」の場合は掲示板・WebSearch で必ず追加調査する}
-
-{材料の詳細・なぜ上がった/下がった/売買代金増えたかを定性的に説明。前週比・前月比・前年比の数値があれば必ず添える}
-
-**スイング観点**: {短期トレード目線での見方。来週への継続性・次の節目・リスク}
-
-**バリュエーション**: {グロース銘柄で raw データに valuation 情報がある場合のみ}
-- 株価水準: {PBR・年間レンジに対する現在位置}
-- PER 推移: {直近 3 期の推移}
-- 予想 PER: {会社予想ベース・赤字なら N/A}
-- 自己資本比率: {財務健全性の一言}
-- 判定: {割安 / 適正 / 割高} — {一言理由}
-
-**需給（信用・株価水準）**: {以下を 3〜5 行に圧縮。冗長な転記を禁止}
-- 信用残: 買 X 万株（発行株数比 B.BB%） / 売 Y 万株（発行株数比 D.DD%）
-- 解消日数（信用買残 ÷ 5日平均出来高）: ○日分
-- 機関空売り（5% 超報告制度）: 発行済株数比 C.CC%（**証券会社名・機関名は記載禁止**・トータル割合のみ）
-- 信用買残 週次推移（6 週・古→新）: a → b → c → d → e → f　判定: 増加 / 横ばい / 減少（変化率 ±X%）
-- 直近 60 日レンジ位置: レンジ下から ○%・MA25 乖離率 ±○%
-- **コメント**: 信用過熱度・株価水準・逆張り警戒等の総合判断を 1 行
-```
-
-### 機関空売りの記載ルール（PM 2026-05-23 確定）
-
-機関空売り（5% 超報告制度）は **発行済株数比のトータル割合のみ**書く。以下は記載禁止：
-
-- **証券会社名・機関名**: モルガン・スタンレー MUFG / Goldman Sachs / JPMorgan / Barclays Capital / Nomura International 等の個別機関名（誰が空売りしているかは PM が必要としていない情報）
-- **個別ポジション数値**: 個別機関ごとの空売り残数・残高比率
-- **過去の報告履歴**: 各機関の報告日・前回報告との差分
-
-### 動意理由特定の徹底（PM 2026-05-23 確定・最重要）
-
-「明確な開示なし」「材料らしい材料なし」「需給主導」だけで終わらせることを**絶対禁止**する。動意理由が raw データに見つからない場合、以下を**全て**実施：
-
-1. **掲示板スクレイピング**: `${PRIVATE_REPO_ROOT}/market/daily/${TARGET_DATE}_movers_raw.md` 内に該当銘柄の掲示板書き込みがあれば転記
-2. **WebSearch 必須**: 「{銘柄コード} 株価 急騰 理由 {YYYY年MM月}」「{銘柄名} 材料 ニュース」等で日本語検索し、株探・みんかぶ・日経・Reuters の記事を確認
-3. **テーマ動意追跡**: 同セクター・同テーマで他に動いている銘柄がないか raw データで確認・テーマ全体が動いているなら「○○テーマ全体への買い・主導銘柄は△△」と記載
-4. **取得失敗時**: 動意理由・材料セクションを完全省略する（「未取得」「需給主導」で逃げず、書けない時は書かない・PM 2026-06-06 確定）
-
-### 全数値は必ず取得して出す・記憶ベースで埋めることも除外も絶対禁止（PM 2026-05-23 確定）
-
-発行済株数・信用買残・時価総額・機関空売り比率等の**全数値は必ず複数ソースで取得して出す**。以下を**絶対禁止**：
-
-1. **データ欠落を理由に銘柄を除外**（Top 5/10 のランキングを書き換える）
-2. **Claude の記憶ベースで数値を埋める**（「通常 5% 以下と推定」「だいたい○○億株」等）
-3. **「N/A」「データなし」「不明」を表示してレポート出力**
-4. **「取得失敗」「未取得」と書いて済ませる**
-
-### 数値取得手順（必ず順番に実施・GHA 環境でも全試行）
-
-データが欠落していたら、以下を**順番に全て試行**してから値を確定する：
-
-1. **raw データ確認**: `${PRIVATE_REPO_ROOT}/market/daily/${TARGET_DATE}_movers_raw.md` 内の該当銘柄エントリ
-2. **sector_stock_weekly.parquet 確認**: 週次 raw データ parquet 内に `SharesOutstanding` 等の数値があるか確認
-3. **screening_master.parquet 確認**: Bash + Python ワンライナーで `${PRIVATE_REPO_ROOT}/bi/outputs/screening_master.parquet` を query
-   ```bash
-   python -c "import pandas as pd; df=pd.read_parquet('${PRIVATE_REPO_ROOT}/bi/outputs/screening_master.parquet'); print(df[df['Code']=='XXXX'][['SharesOutstanding','MarketCap','LongMargin_Latest','ShortMargin_Latest','InstShortRatio_to_SharesOutstanding']].to_dict('records'))"
+   ```python
+   import pandas as pd
+   df = pd.read_parquet("${PRIVATE_REPO_ROOT}/bi/outputs/sector_stock_weekly.parquet")
+   # Return_W01 = 5 営業日累計リターン(%) / AvgDailyValue5d = 5 営業日平均売買代金(円)
+   # 週間売買代金 = AvgDailyValue5d × 5 / Close_Latest = 金曜終値 / MarketCap = 時価総額
+   for market in ["プライム", "スタンダード", "グロース"]:
+       mkt = df[df["MarketCodeName"].str.contains(market, na=False)]
+       winners  = mkt.nlargest(N, "Return_W01")     # 週間上昇率 Top
+       losers   = mkt.nsmallest(N, "Return_W01")    # 週間下落率 Bottom
+       by_value = mkt.assign(WeeklyValue=mkt["AvgDailyValue5d"] * 5).nlargest(N, "WeeklyValue")  # 週間売買代金 Top
    ```
-4. **WebFetch from 株探**: `https://kabutan.jp/stock/?code={code}` → 「発行済株式数」「時価総額」「信用残」セクション
-5. **WebFetch from ヤフーファイナンス**: `https://finance.yahoo.co.jp/quote/{code}.T/profile` → 「発行済株式数」
-6. **WebFetch from EDINET 直接**: 有報・四半期報告書の発行済株式数を確認（最終手段）
 
-### 数値取得失敗時の最終手段
+   N は市場別に：プライム 上昇 5・下落 5・代金 5 / スタンダード 上昇 5・下落 5・代金 5 / グロース 上昇 5・下落 5・代金 10。**ETF/REIT を除外した個別株のみで件数を揃える**。
 
-上記 1〜6 を全て試行しても取得不能な場合（実際にはまず発生しない）：
+6. **当日 TDNet の補完参照**（任意）：`${PRIVATE_REPO_ROOT}/market/daily/${TARGET_DATE}_movers_raw.md`（担当市場の節に絞り込み済み）を 1〜2 回で読み切り、各銘柄の「なぜ動いた（今週）」の材料補完に使う。再読込ループ禁止・引数なし Read 禁止。
 
-- 当該**項目（例：信用買残/発行済株数比）のみを需給ブロックから完全省略**する（他の取得済項目は記載）
-- 銘柄自体は**絶対除外しない**（ランキングを保全）
-- 「取得失敗・調査要」「N/A」「不明」「データなし」「未取得」等のフォールバック表記を書くことは全面禁止（PM 2026-06-05 確定）
-- **Claude の記憶ベースで「だいたい○○」「通常○○程度」と書くことを絶対禁止**（PM 2026-05-23 確定）
+7. 担当範囲のセクションを新フォーマットで生成し、`${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}_weekly_${TARGET_MARKET}.md` に Write。
 
-## ETF/REIT 検知（最重要・[prompts/_common_rules.md §1](_common_rules.md)）
-
-raw データの各銘柄について以下を機械的にチェックし、該当したら**全セクションから完全除外**：
-1. 銘柄名 = コード（例：「200A 200A」「490A 490A」）
-2. 銘柄名キーワード: ETF・上場投信・上場投資信託・投信・NEXT FUNDS・iShares・MAXIS・ダイワ上場・日経連動・指数連動・指数連動型・TOPIX 連動・J-REIT・REIT・リート・不動産投資法人・インフラファンド・ETN
-3. セクター nan + 末尾 A コード
-4. screening_master.parquet 未登録
-
-除外した分は繰り上げて個別株のみで件数を埋める。
+---
 
 ## 必須ルール（絶対遵守）
 
-### 自動化モード固有
+- **PM に質問しない**。判断に迷う点は最も保守的な解釈で進める。
+- **担当範囲外のセクションを書かない**（standard 実行で prime を書かない・growth_b で値上がりを書かない）。
+- **Claude の記憶ベースの数値・事実・固有名詞を書かない**。parquet・raw・一次情報の実値のみ。
+- 出力言語：**日本語**。マークダウン（全体をコードブロックで囲まない）。
+- **英語原文の転記を完全禁止**（[_common_rules.md](_common_rules.md) §4）。**時刻表記は JST 統一**（§3）。**専門用語に中学生注釈・投資用語は注釈不要**（§5）。
+- **不可逆削除禁止**：`Remove-Item`・`rm`・`del`・`unlink` を Bash で実行しない。
+- Write 先は `${TARGET_DATE}_weekly_${TARGET_MARKET}.md` のみ。統合ファイル `${TARGET_DATE}_weekly.md`（接尾辞なし）・日次ファイル `${TARGET_DATE}.md`・セクターレポート `sector/${TARGET_DATE}.md` への Write は禁止。
 
-- **PMに質問しない**。判断に迷う点は最も保守的な解釈で進める。
-- **Deep Research 候補セクション出力は禁止**（個別銘柄レポート以外では `## 📌 Deep Research 候補` を出力しない・PM 2026-05-19 確定）。ただし **Deep Research 実施そのものは必須**（5-a〜5-d の WebSearch ベース調査）
-- **WebSearch / WebFetch は動意理由特定・セクター Deep Research・銘柄個別調査に積極使用**（PM 2026-05-23 確定・ローカル動意レポートと品質同等担保）：
-  - 銘柄個別の「なぜ上がった/下がった/売買代金増えたか」が raw データで特定できない場合、**WebSearch 必須**（株探・みんかぶ・日経・Reuters 等の日本語ソース優先）
-  - 「明確な開示なし」「需給主導」で済ませることを絶対禁止・必ず WebSearch で追加調査する
-- プライム・スタンダード・グロース全市場のセクションを全て出力する（週次フル版）。
+## 完了条件（Write 直前の自己検証）
 
-### レポート品質（[prompts/_common_rules.md](_common_rules.md) 全項目遵守）
+- prime / standard / growth_a は先頭行が `# 動意銘柄レポート ${TARGET_DATE}（{市場}・週次）` になっている（growth_b は市場タイトルなし）。
+- 全銘柄の見出し行に「コード + 銘柄名 + 週間騰落率% + 金曜終値 + 時価総額 + 週間売買代金」がこの順で揃っている。
+- 各銘柄に「**何の会社**」「**なぜ動いた**」が揃っている。
+- ETF/REIT/上場投信が 1 件も混入していない（個別株のみで件数充足：プライム 5/5/5・スタンダード 5/5/5・グロース 5/5/10）。
+- 命令・FOMO 行動コーチング・需給ブロック・週次サマリー・セクター別フロー等の削除済セクションを書いていない。
+- `ls -la ${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}_weekly_${TARGET_MARKET}.md` で本タスクが生成したファイルの存在を確認。内容が空でない。
 
-- 出力言語: **日本語**
-- 形式: マークダウン（コードブロックで囲まない）
-- 英語原文の転記は完全禁止
-- 時刻表記は JST 統一
-- 専門用語に中学生レベル注釈必須
-- Claude の記憶ベース発言禁止
-- 全数値は parquet から忠実転記・Claude 記憶ベース禁止
-- PM の逆張り原則を踏まえ、週間で過熱した銘柄には逆張り警戒フラグを付ける
-
-## 完了条件（Write 直前自己検証）
-
-### 必須 Write 先確認（最重要・TARGET_MARKET 別）
-
-- **`${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}_weekly_${TARGET_MARKET}.md`** を必ず Write（TARGET_MARKET=prime / standard / growth）
-- 統合ファイル（`{date}_weekly.md` 接尾辞なし）への Write は禁止（workflow yml で cat 統合する設計）
-- ファイル名末尾 `_weekly` がない `movers/${TARGET_DATE}.md` への Write は禁止（日次フル版用）
-- セクターレポート `sector/${TARGET_DATE}.md` への Write は本タスク対象外・絶対禁止
-
-### 内容自己検証（TARGET_MARKET 別）
-
-- 生成ファイルが空でない
-- ETF/REIT/上場投信が 1 件も混入していない（grep で銘柄名キーワード検証）
-- 担当範囲銘柄全てに「コード + 銘柄名 + 週間騰落率 + 金曜終値 + 週間売買代金 + 時価総額」が揃っている
-- TARGET_MARKET=prime: プライム上昇 5・下落 5・売買代金 5 件 + Section 0・1・9 全揃い
-- TARGET_MARKET=standard: スタンダード上昇 5・下落 5・売買代金 5 件のみ
-- TARGET_MARKET=growth_a: グロース上昇 10・下落 5 件のみ（6・7。8c は書かない）
-- TARGET_MARKET=growth_b: グロース週間売買代金 10 件のみ（8c。6・7 は書かない）
-- Deep Research 候補セクションが含まれていない
-
-### Bash で存在確認
-
-完了直前に以下を Bash で実行し、本タスクのゴールファイルが存在することを確認する：
-
-```bash
-ls -la ${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}_weekly_${TARGET_MARKET}.md
-```
-
-存在しなければ書き直してから処理を終了する。
+完了したら処理を終了してください。

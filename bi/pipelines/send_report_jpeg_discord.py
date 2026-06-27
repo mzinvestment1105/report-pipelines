@@ -378,93 +378,35 @@ def main() -> int:
 def split_movers_by_market(md_text: str) -> list[tuple[str, str]]:
     """動意レポート Markdown を市場別（プライム / スタンダード / グロース）に分割する。
 
-    各市場用 Markdown には以下を含める：
-    - 共通ヘッダ（タイトル + セクション 0 地合いサマリー + セクション 1 セクター別フロー）
-    - 市場固有セクション（値上がり Top・値下がり Bottom）
-    - 売買代金（市場別部分のみ）
-    - セクション 9 明日のスイング戦略メモ（共通フッタ）
+    新フォーマット（PM 2026-06-28 確定）では各市場ブロックが自己完結し、市場別タイトル
+    `# 動意銘柄レポート {date}（{市場}）` を先頭に持つ（市場別の「今日の注目」を含む）。
+    cat 統合された統合 md を、この市場タイトルを区切りに 3 ブロックへ分割する。
+    グロースの売買代金（growth_b）はタイトルを持たないため、直前のグロースブロックに
+    自動で吸収される（次のタイトル or 文末までを 1 ブロックとして拾うため）。
 
-    セクション番号と見出しに含まれる「プライム」「スタンダード」「グロース」キーワードで判定。
+    旧フォーマットの §0 共通ヘッダ・§9 共通フッタ・§2/§4/§6 番号分割・8a/8b/8c 抽出は廃止。
 
     Returns:
-        [(市場ラベル, 該当 Markdown), ...] 形式・3 件
+        [(市場ラベル, 該当 Markdown), ...] 形式（最大 3 件）
     """
     import re
 
-    # トップタイトル + セクション 0・1 を抽出（共通ヘッダ）
-    header_match = re.search(r"^(.*?)(?=^## 2[a-z]?\.)", md_text, flags=re.DOTALL | re.MULTILINE)
-    common_header = header_match.group(1).rstrip() if header_match else ""
-
-    # セクション 9（明日のスイング戦略メモ）を抽出（共通フッタ）
-    footer_match = re.search(r"(^## 9\..*?)(?=^## \d+[a-z]?\.|\Z)", md_text, flags=re.DOTALL | re.MULTILINE)
-    common_footer = footer_match.group(1).rstrip() if footer_match else ""
-
-    # PM 2026-05-25 確定: section 番号は 8a/8b/8c のように英字接尾辞対応
-    # （3 並列 Claude 実行で市場別 8a/8b/8c に分かれるため）
-    section_pattern = re.compile(r"^(## \d+[a-z]?\..*?)(?=^## \d+[a-z]?\.|\Z)", flags=re.DOTALL | re.MULTILINE)
-    sections = {m.group(1).split("\n", 1)[0].strip(): m.group(1).rstrip() for m in section_pattern.finditer(md_text)}
-
-    # 売買代金セクション 8 を市場別に取得（8a/8b/8c または単一 8）
-    def _extract_market_in_section8(market_kw: str) -> str:
-        """セクション 8 (8a/8b/8c) から特定市場部分を抽出する。"""
-        # まず 8a/8b/8c の英字接尾辞付きで該当市場を直接探す
-        market_to_suffix = {"プライム": "a", "スタンダード": "b", "グロース": "c"}
-        suffix = market_to_suffix.get(market_kw, "")
-        if suffix:
-            for k, v in sections.items():
-                if k.startswith(f"## 8{suffix}."):
-                    return v.rstrip()
-        # 単一 `## 8. 売買代金` 内のサブヘッダで分割するレガシー形式
-        section_8 = next((v for k, v in sections.items() if k.startswith("## 8.")), "")
-        if not section_8:
-            return ""
-        sub_pattern = re.compile(r"(^### .*?)(?=^### |\Z)", flags=re.DOTALL | re.MULTILINE)
-        subs = sub_pattern.findall(section_8)
-        for sub in subs:
-            first_line = sub.split("\n", 1)[0]
-            if market_kw in first_line:
-                return sub.rstrip()
-        return section_8
-
-    def _find_section(prefix_num: int, market_kw: str | None = None) -> str:
-        """セクション番号と任意のキーワードでセクションを検索する。"""
-        for k, v in sections.items():
-            # 数字直後の英字接尾辞（8a/8b/8c）も許容
-            if re.match(rf"^## {prefix_num}[a-z]?\.", k):
-                if market_kw is None or market_kw in k:
-                    return v
-        return ""
-
-    # 市場別構成（セクション番号と該当市場キーワード）
-    market_setup: list[tuple[str, list[str]]] = [
-        ("プライム", [
-            _find_section(2),  # 2. プライム 値上がり Top 5
-            _find_section(3),  # 3. プライム 値下がり Bottom 5
-            _extract_market_in_section8("プライム"),
-        ]),
-        ("スタンダード", [
-            _find_section(4),  # 4. スタンダード 値上がり Top 5
-            _find_section(5),  # 5. スタンダード 値下がり Bottom 5
-            _extract_market_in_section8("スタンダード"),
-        ]),
-        ("グロース", [
-            _find_section(6),  # 6. グロース 値上がり Top 10
-            _find_section(7),  # 7. グロース 値下がり Bottom 5
-            _extract_market_in_section8("グロース"),
-        ]),
-    ]
+    block_pattern = re.compile(
+        r"(^#\s*動意銘柄レポート.*?)(?=^#\s*動意銘柄レポート|\Z)",
+        flags=re.DOTALL | re.MULTILINE,
+    )
+    blocks = [m.group(1).rstrip() for m in block_pattern.finditer(md_text)]
+    if not blocks:
+        return []
 
     result: list[tuple[str, str]] = []
-    for market_label, body_parts in market_setup:
-        body_parts_clean = [p for p in body_parts if p]
-        if not body_parts_clean:
-            continue
-        # セクション 8 を含む場合は「## 8. 売買代金（{市場}）」見出しとして付与
-        # （pre-split の場合は元の見出しがそのまま残るのでスキップ）
-        body_text = "\n\n".join(body_parts_clean)
-        md_part = f"{common_header}\n\n{body_text}\n\n{common_footer}".strip()
-        result.append((market_label, md_part))
-
+    for block in blocks:
+        title_line = block.split("\n", 1)[0]
+        label = next(
+            (kw for kw in ("プライム", "スタンダード", "グロース") if kw in title_line),
+            "ALL",
+        )
+        result.append((label, block))
     return result
 
 
