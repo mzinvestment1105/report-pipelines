@@ -115,6 +115,111 @@ def _yf_pairs(ticker: str) -> list[tuple]:
         return []
 
 
+# ---------------------------------------------------------------------------
+# 独立ベンダー（CNBC）: Yahoo がズレた時に実値を取得する第二ソース（無料・キー不要・トークンゼロ）
+# ---------------------------------------------------------------------------
+
+# Yahoo ティッカー → CNBC シンボル。CNBC は last / previous_day_closing / last_time を返すため
+# Yahoo の日足配列が遅延していても最新営業日の確定値を独立に取得できる。
+# 日経先物(NIY=F)・日経VI(^N225VI) は CNBC 安定マッピングがないため Yahoo に委ねる。
+_CNBC_MAP = {
+    "^N225": ".N225",
+    "^GSPC": ".SPX",
+    "USDJPY=X": "JPY=",
+    "^VIX": ".VIX",
+    "GC=F": "@GC.1",
+    "BTC-USD": "BTC.CM=",
+    "^TNX": "US10Y",
+}
+
+
+def _to_float(v) -> float | None:
+    """CNBC の "69,360.88" / "4.376%" / "N/A" 等を float へ。失敗時 None。"""
+    if v is None:
+        return None
+    s = str(v).strip().replace(",", "").rstrip("%")
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _cnbc_point(yahoo_ticker: str):
+    """CNBC quote API から (date, last, prev) を返す。マッピングなし/失敗時 None。
+
+    last_time は指数で "YYYY-MM-DD"、為替等で ISO("...T..-0400") のため先頭 10 文字を取引日とする。
+    """
+    sym = _CNBC_MAP.get(yahoo_ticker)
+    if not sym:
+        return None
+    base = "https://quote.cnbc.com/quote-html-webservice/restQuote/symbolType/symbol"
+    q = _up.urlencode(
+        {
+            "symbols": sym,
+            "requestMethod": "itv",
+            "noform": "1",
+            "partnerId": "2",
+            "fund": "1",
+            "exthrs": "1",
+            "output": "json",
+            "events": "1",
+        }
+    )
+    try:
+        req = _ur.Request(f"{base}?{q}", headers={"User-Agent": _UA})
+        with _ur.urlopen(req, timeout=20) as resp:
+            data = _json.loads(resp.read().decode("utf-8", "replace"))
+        quotes = (data.get("FormattedQuoteResult") or {}).get("FormattedQuote") or []
+        if not quotes:
+            return None
+        d = quotes[0]
+        last = _to_float(d.get("last"))
+        prev = _to_float(d.get("previous_day_closing"))
+        lt = d.get("last_time") or d.get("last_time_msec")
+        if last is None or not lt:
+            return None
+        trade_date = _date.fromisoformat(str(lt)[:10])
+        return trade_date, last, prev
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# 営業日ベースの陳腐化判定（カレンダー日数ではなく営業日で判定する）
+# ---------------------------------------------------------------------------
+
+def _is_jp_holiday(d: _date) -> bool:
+    try:
+        import jpholiday
+
+        return bool(jpholiday.is_holiday(d))
+    except Exception:
+        return False
+
+
+def business_days_after(data_date: _date, ref_date: _date) -> int:
+    """data_date(排他) 〜 ref_date(包含) の営業日数（土日 + 日本の祝日を除外）。ref<=data なら 0。"""
+    if ref_date <= data_date:
+        return 0
+    n = 0
+    d = data_date + _timedelta(days=1)
+    while d <= ref_date:
+        if d.weekday() < 5 and not _is_jp_holiday(d):
+            n += 1
+        d += _timedelta(days=1)
+    return n
+
+
+def is_stale_close(data_date: _date, ref_date: _date, max_lag_trading_days: int = 1) -> bool:
+    """data_date が ref_date 基準で陳腐化しているか（営業日判定）。
+
+    朝刊は寄り付き前に「前営業日の確定終値」を出すため 1 営業日のズレは許容する。
+    それを超えて営業日が飛んでいたら陳腐化（例: 水曜なのに火曜が抜けて月曜値 = 2 営業日 → True）。
+    祝日は jpholiday で除外するので 3 連休明け等で誤検知しない。
+    """
+    return business_days_after(data_date, ref_date) > max_lag_trading_days
+
+
 def get_latest_close(ticker: str, target_date=None) -> Quote | None:
     """ticker の「当日終値・前日終値・取得日」を最も新しい確定値で返す。取得不能なら None。
 
@@ -147,8 +252,21 @@ def get_latest_close(ticker: str, target_date=None) -> Quote | None:
     if meta_pt is not None:
         md, mp, _state = meta_pt
         if target_date is None or md <= target_date:
-            merged[md] = mp  # meta は自セッションの確定値として最優先で採用
+            merged[md] = mp  # meta は自セッションの確定値として採用
             meta_date = md
+
+    # 独立ベンダー CNBC: Yahoo（日足配列も meta も）が遅延しても、最新営業日の確定値を別系統で
+    # 取得する第二ソース。同一日付では CNBC を採用（独立確認）。Yahoo 全滅時に前日比が出せるよう
+    # previous_day_closing も保険として挿入する。これにより「ズレたら別ソースで実値を取りに行く」。
+    cnbc_date = None
+    cnbc = _cnbc_point(ticker)
+    if cnbc is not None:
+        cd, c_last, c_prev = cnbc
+        if target_date is None or cd <= target_date:
+            merged[cd] = c_last
+            cnbc_date = cd
+            if c_prev is not None:
+                merged.setdefault(cd - _timedelta(days=1), c_prev)
 
     if not merged:
         return None
@@ -164,12 +282,14 @@ def get_latest_close(ticker: str, target_date=None) -> Quote | None:
     close_date, close = pairs[-1]
     prev = pairs[-2][1] if len(pairs) >= 2 else None
 
-    if meta_date is not None and close_date == meta_date:
+    if cnbc_date is not None and close_date == cnbc_date:
+        source = "cnbc"
+    elif meta_date is not None and close_date == meta_date:
         source = "yahoo_meta"
     elif close_date in chart_dates:
         source = "yahoo_chart"
     else:
         source = "yfinance"
-    market_state = meta_pt[2] if (meta_pt and close_date == meta_pt[0]) else None
+    market_state = meta_pt[2] if (source == "yahoo_meta" and meta_pt) else None
 
     return Quote(close=close, prev=prev, date=close_date, source=source, market_state=market_state)

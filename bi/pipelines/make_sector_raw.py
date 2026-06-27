@@ -38,6 +38,11 @@ RESEARCH_DIR    = BASE_DIR / ".." / ".." / "research"
 SECTOR_PATH             = OUTPUTS_DIR / "sector_weekly.parquet"
 SCREENING_MASTER_PATH   = OUTPUTS_DIR / "screening_master.parquet"
 
+# 営業日ベースの陳腐化判定は全レポート共通ロジックを共有（カレンダー日数では判定しない）
+import sys  # noqa: E402
+sys.path.insert(0, str(BASE_DIR))
+from lib.snapshot_utils import business_days_after, is_stale_close  # noqa: E402
+
 JST = timezone(timedelta(hours=9))
 
 RESEARCH_MARKETS_KEEP = 3   # 直近何件のマクロレポートを参照するか
@@ -424,6 +429,24 @@ def main() -> None:
     as_of = df["AsOf"].iloc[0] if "AsOf" in df.columns else target_date
     print(f"セクターデータ読み込み: {len(df)} セクター (AsOf: {as_of})")
 
+    # 価格マスター鮮度（PM 2026-06-27）: 実行日(as_of)とは別に「実際の価格データ最新日」を
+    # ヘッダーに明記し、古い場合は ⚠️ 警告を出してレポートに stale を可視化する。
+    price_data_asof = df["PriceDataAsOf"].iloc[0] if "PriceDataAsOf" in df.columns else None
+    price_freshness_line = f"- **価格データ最新日**: {price_data_asof}" if price_data_asof else ""
+    price_stale_note = ""
+    if price_data_asof:
+        try:
+            _pdate = date.fromisoformat(str(price_data_asof)[:10])
+            _rdate = date.fromisoformat(str(as_of)[:10])
+            if is_stale_close(_pdate, _rdate):
+                _gap = business_days_after(_pdate, _rdate)
+                price_stale_note = (
+                    f"- ⚠️ **価格データ鮮度警告**: 価格マスターが営業日基準で陳腐化（最新 {price_data_asof}・"
+                    f"約 {_gap} 営業日前）。週次リターン等は古い終値ベースの可能性があるため要確認。"
+                )
+        except ValueError:
+            pass
+
     # 定量セクション
     sector_table = build_sector_table_md(df)
     top_bottom    = build_top_bottom_md(df)
@@ -479,7 +502,9 @@ def main() -> None:
         "",
         f"> sector_weekly.parquet + 過去 research から自動生成。Claude が統合分析を行う。",
         f"- **生成日時**: {now_jst}",
-        f"- **データ基準日**: {as_of}",
+        f"- **データ基準日（実行日）**: {as_of}",
+        *([price_freshness_line] if price_freshness_line else []),
+        *([price_stale_note] if price_stale_note else []),
         f"- **セクター数**: {len(df)}",
         "",
         sector_table,

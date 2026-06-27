@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import io
 import os
+import sys
 import time
 import uuid
 from datetime import date, datetime, timedelta, timezone
@@ -48,6 +49,10 @@ PRICE_CACHE_PATH = DATA_RAW_DIR / "sector_prices.parquet"
 INVESTOR_CACHE_PATH = DATA_RAW_DIR / "tse_investor_trading.parquet"
 OUT_STOCK_PATH = OUTPUTS_DIR / "sector_stock_weekly.parquet"
 OUT_SECTOR_PATH = OUTPUTS_DIR / "sector_weekly.parquet"
+
+# 営業日ベースの陳腐化判定は全レポート共通ロジックを共有（カレンダー日数では判定しない）
+sys.path.insert(0, str(BASE_DIR.resolve()))
+from lib.snapshot_utils import is_stale_close  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # 定数
@@ -425,6 +430,7 @@ def build_stock_table(
     today: date,
     etl_run_id: str,
     etl_started_jst: str,
+    price_data_asof: str,
 ) -> pd.DataFrame:
     metrics_df["Code"] = metrics_df["Code"].astype("string")
     master_df = master_df.copy()
@@ -462,6 +468,7 @@ def build_stock_table(
         merged["TSE_Week"] = latest_inv["Week"]
 
     merged["AsOf"] = today.isoformat()
+    merged["PriceDataAsOf"] = price_data_asof
     merged["ETLRunId"] = etl_run_id
     merged["ETLStartedAtJST"] = etl_started_jst
 
@@ -477,6 +484,7 @@ def build_sector_table(
     today: date,
     etl_run_id: str,
     etl_started_jst: str,
+    price_data_asof: str,
 ) -> pd.DataFrame:
     sectors = stock_df["Sector17CodeName"].dropna().unique()
     rows: list[dict] = []
@@ -547,6 +555,7 @@ def build_sector_table(
         row["MarketCap_Ratio_Top5"] = top5_sum / row["MarketCap_Total"] if row["MarketCap_Total"] > 0 else float("nan")
 
         row["AsOf"] = today.isoformat()
+        row["PriceDataAsOf"] = price_data_asof
         row["ETLRunId"] = etl_run_id
         row["ETLStartedAtJST"] = etl_started_jst
         rows.append(row)
@@ -606,6 +615,43 @@ def main() -> None:
     prices["Code"] = prices["Code"].astype("string").str.strip().str[:4]
     print(f"価格データ: {len(prices)} 行、銘柄 {prices['Code'].nunique()} 件")
 
+    # 価格マスター鮮度ガード（PM 2026-06-27）: AsOf(実行日)とは別に「実際の価格データ最新日」を
+    # 算出し、営業日ベース（jpholiday で祝日除外・カレンダー日数では判定しない）で陳腐化を見る。
+    # 古ければ「警告して古い値のまま」にはせず、JQuants で直近営業日を取得して補完する（＝何とかして
+    # 最新値を取りに行く）。それでも届かない場合のみ警告を残すが、送付は止めない。
+    if is_stale_close(prices["Date"].max().date(), today) and not args.skip_price_fetch:
+        print(
+            f"[INFO] 価格マスターが営業日基準で陳腐化（最新 {prices['Date'].max().date()}）"
+            " → JQuants で直近営業日を取得して補完します（週末・祝日は即空で返るため無駄打ちなし）"
+        )
+        try:
+            topup = fetch_price_history(codes, limit_codes=args.limit_codes)
+            if topup is not None and not topup.empty:
+                topup = topup.copy()
+                topup["Code"] = topup["Code"].astype("string").str.strip().str[:4]
+                topup["Date"] = pd.to_datetime(topup["Date"])
+                prices = (
+                    pd.concat([prices, topup], ignore_index=True)
+                    .drop_duplicates(subset=["Date", "Code"], keep="last")
+                    .sort_values(["Code", "Date"])
+                    .reset_index(drop=True)
+                )
+        except Exception as e:
+            print(f"[WARN] JQuants 補完に失敗（既存マスターで続行・送付は止めない）: {type(e).__name__}: {e}")
+
+    price_data_asof_ts = prices["Date"].max()
+    price_data_asof = price_data_asof_ts.date().isoformat()
+    still_stale = is_stale_close(price_data_asof_ts.date(), today)
+    print(
+        f"価格データ最新日: {price_data_asof}（実行日 {today.isoformat()}・"
+        f"営業日陳腐化={'あり' if still_stale else 'なし'}）"
+    )
+    if still_stale:
+        print(
+            f"[WARN] 価格マスターが営業日基準で陳腐化: 最新 {price_data_asof} / 実行日 {today.isoformat()}。"
+            "price_history.yml の更新状況を確認してください（古い終値で週次リターンを算出する恐れ）。"
+        )
+
     # 投資主体別売買
     investor_df = fetch_investor_trading(skip=args.skip_investor_fetch)
 
@@ -616,7 +662,7 @@ def main() -> None:
 
     # 結合
     print("銘柄テーブル構築中...")
-    stock_df = build_stock_table(metrics_df, master_df, investor_df, today, etl_run_id, etl_started_jst)
+    stock_df = build_stock_table(metrics_df, master_df, investor_df, today, etl_run_id, etl_started_jst, price_data_asof)
 
     OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
     stock_df.to_parquet(OUT_STOCK_PATH, index=False)
@@ -624,7 +670,7 @@ def main() -> None:
 
     # セクター集計
     print("セクター集計中...")
-    sector_df = build_sector_table(stock_df, today, etl_run_id, etl_started_jst)
+    sector_df = build_sector_table(stock_df, today, etl_run_id, etl_started_jst, price_data_asof)
     sector_df.to_parquet(OUT_SECTOR_PATH, index=False)
     print(f"保存: {OUT_SECTOR_PATH} ({len(sector_df)} 行, {len(sector_df.columns)} カラム)")
 

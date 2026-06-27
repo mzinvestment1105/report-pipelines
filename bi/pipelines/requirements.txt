@@ -14,6 +14,9 @@ openpyxl>=3.1.0
 requests>=2.31.0
 python-dotenv>=1.0.0
 pdfminer.six>=20221105
+# 営業日ベースの陳腐化判定（市況スナップショット・セクター鮮度ガード / lib/snapshot_utils.py）。
+# 未導入でも weekday のみで動くが、祝日を除外できず連休明けに誤検知し得るため必須扱い。
+jpholiday>=0.1.0
 
 # ダッシュボード（Streamlit）
 streamlit>=1.33.0

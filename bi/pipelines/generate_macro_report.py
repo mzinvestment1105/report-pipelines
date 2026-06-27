@@ -37,7 +37,7 @@ JST = timezone(timedelta(hours=9))
 
 # 最新終値の取得は全レポート共通の lib/snapshot_utils に集約（stale 事故を一元的に防ぐ）
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from lib.snapshot_utils import get_latest_close  # noqa: E402
+from lib.snapshot_utils import get_latest_close, is_stale_close  # noqa: E402
 
 EXIT_OK   = 0
 EXIT_ERR  = 1
@@ -102,8 +102,8 @@ def get_market_snapshot(target_date: str | None = None) -> str:
     古い終値で止まる旧実装の事故（PM 2026-06-27・日経平均の最高値誤掲）を構造的に防ぐ。
 
     target_date 指定時は target_date 以下の最新営業日を「当日」とする。各行に取得日を明記し、
-    取得日が対象日から大きく(4 日以上)遅れている場合のみ滞留警告を出す（週末・連休の正常な
-    日付差で誤警告を出さないため）。
+    陳腐化は営業日ベース（jpholiday で祝日除外）で判定する。朝刊が前営業日を出す 1 営業日の
+    ズレは許容し、それを超えて営業日が飛んでいる場合のみ警告する（カレンダー日数では判定しない）。
     """
     from datetime import date as date_cls
     lines = ["| 指標 | 水準 | 前日比 | 取得日 / 備考 |", "|------|------|--------|------|"]
@@ -129,8 +129,10 @@ def get_market_snapshot(target_date: str | None = None) -> str:
         comment_parts: list[str] = [f"close={q.date.isoformat()}", f"src={q.source}"]
         if q.market_state == "REGULAR":
             comment_parts.append("場中速報")
-        if target is not None and (target - q.date).days >= 4:
-            comment_parts.append("⚠️ データ滞留の可能性")
+        # 営業日ベースで陳腐化判定（カレンダー日数では判定しない）。Yahoo+CNBC のクロスソースで
+        # 最新営業日の実値を取得済のため通常は発火しないが、両系統が落ちた最終保険として明示する。
+        if target is not None and is_stale_close(q.date, target):
+            comment_parts.append(f"⚠️ 営業日基準で陳腐化（最新営業日の値が未取得・{q.date.isoformat()}）")
         if name == "米VIX":
             if q.close >= 30:
                 comment_parts.append("⚠️ 恐怖ゾーン")
