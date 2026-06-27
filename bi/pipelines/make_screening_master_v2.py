@@ -12,6 +12,7 @@ from jq_client_utils import (
     fetch_paginated_v2 as _fetch_paginated_v2,
     latest_trading_day_date_v2 as _latest_trading_day_date_v2,
     previous_trading_day_date_v2 as _previous_trading_day_date_v2,
+    recent_trading_days_v2 as _recent_trading_days_v2,
     normalize_code_4 as _normalize_code_4,
 )
 from short_sale_utils import (
@@ -594,9 +595,13 @@ def main() -> None:
     stmt_failures: list[tuple[str, str]] = []
     stmt_field_issues: list[tuple[str, str]] = []
     yf_audit_rows: list[dict] = []  # Yahoo Finance 補完監査ログ
-    _fins_sleep = float(os.environ.get("FINS_SUMMARY_FALLBACK_SLEEP", "1.2"))
+    # 成功時の固定 sleep は小さな floor のみ（0.3s 既定）。実 429 は
+    # get_json_with_429_backoff の 60〜3600s エスケレート待ちが処理するため、
+    # 全 ~4,000 銘柄に一律 1.2s を払う支配的コストを除去する（5h ETL 短縮）。
+    # 429 が増える環境では FINS_SUMMARY_FALLBACK_SLEEP を上げて従来挙動に戻せる。
+    _fins_sleep = float(os.environ.get("FINS_SUMMARY_FALLBACK_SLEEP", "0.3"))
     print(
-        "fins/summary: code のみ取得（日付さかのぼりなし）"
+        f"fins/summary: code のみ取得（日付さかのぼりなし / sleep={_fins_sleep}s・429時はバックオフ）"
         + (
             " | 薄い銘柄→Yahoo年次損益で補完（要 yfinance / YFINANCE_STATEMENT_FALLBACK=0 で無効）"
             if use_yfinance_statement_fallback
@@ -924,15 +929,14 @@ def main() -> None:
                 )
 
     # 6) daily_quotes (v2: equities/bars/daily)
-    trading_day_latest = _latest_trading_day_date_v2(client)
     # 出来高ブロック数（5日×N）: デフォルト8ブロック=40営業日
     vol_blocks = max(1, int(os.environ.get("VOLUME_BLOCK_WEEKS", "8")))
     vol_days_total = vol_blocks * 5  # 5営業日×ブロック数
-    trading_days: list[date] = [trading_day_latest]
-    d_prev = trading_day_latest
-    for _ in range(vol_days_total - 1):
-        d_prev = _previous_trading_day_date_v2(client, before=d_prev, max_back_days=14)
-        trading_days.append(d_prev)
+    # /markets/calendar を1回引いて直近 vol_days_total 営業日を新しい順で取得（高速版）。
+    # 旧ブルートフォース（日ごとに全市場 bars/daily を再取得して営業日を探索）と
+    # 同一の日付リストを返すことを実機検証済み。
+    trading_days: list[date] = _recent_trading_days_v2(client, vol_days_total)
+    trading_day_latest = trading_days[0]
 
     # latest day: Close 用（従来どおり 1日分のみ）
     trading_str_latest = trading_day_latest.strftime("%Y-%m-%d")
