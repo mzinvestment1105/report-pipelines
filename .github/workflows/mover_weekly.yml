@@ -455,6 +455,14 @@ jobs:
           cat "${MOVERS_DIR}/${TARGET_DATE}_weekly_growth_b.md" >> "$OUTPUT"
           echo "Merged into $OUTPUT ($(wc -l < "$OUTPUT") lines)"
 
+      - name: 件数ゲート（売買代金/値上がり/値下がり・不足なら送信中止）
+        working-directory: ./private-repo
+        env:
+          TARGET_DATE: ${{ needs.setup-raw.outputs.target_date }}
+          PYTHONIOENCODING: utf-8
+        run: |
+          python bi/pipelines/check_mover_counts.py --file market/daily/movers/${TARGET_DATE}_weekly.md
+
       - name: Send Discord (PDF・市場別 3 枚分割)
         working-directory: ./private-repo/bi/pipelines
         env:
