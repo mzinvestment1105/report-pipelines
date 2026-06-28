@@ -239,7 +239,9 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           model: claude-opus-4-7
           prompt_file: report-pipelines/prompts/macro-report.md
-          allowed_tools: "Read,Write,Edit,Bash,Grep,Glob,WebSearch,WebFetch"
+          # PM 2026-06-28: WebSearch/WebFetch は GHA で 404（補助モデル解決不可）のため除去。
+          # 市況・数値・イベント解釈は raw（news/finnhub/立花）＋市況スナップショット（VIX/VI含む）で完結。
+          allowed_tools: "Read,Write,Edit,Bash,Grep,Glob"
           timeout_minutes: "30"
           claude_env: |
             MAX_THINKING_TOKENS: 32000

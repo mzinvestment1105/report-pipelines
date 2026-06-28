@@ -70,12 +70,11 @@
 
 - **PMに質問しない**。判断に迷う点は最も保守的な解釈で進める。
 - **Deep Research は廃止**（2026-05-19 PM 確定）。Deep Research 候補セクションを出力しない。`## 📌 Deep Research 候補` の見出しも書かない。Perplexity 等の外部調査プロンプトも生成しない。
-- **WebSearch / WebFetch を市況補完・数値補完・イベント解釈の全用途で積極使用**（PM 2026-05-23 確定・ローカル品質と同等担保・「raw に無い数値は使わない」制約を撤廃）：
-  - news_raw / finnhub_raw に該当ニュースが無い・解釈に不足がある場合、Claude が WebSearch で当該イベントを補完調査
-  - **市況スナップショット数値が yfinance で取得できない・stale 等の場合、株探・ヤフーファイナンス・Bloomberg JP・Reuters JP を WebFetch して最新値を取得**（PM 2026-05-23 確定・「raw に無い数値の追加取得には使わない」制約を明示撤廃）
-  - 「なぜそのイベントが起きたか・市況への波及」「具体的な数値」「定量的な背景」の全ての用途で使用
-  - 外部ツール（Perplexity 等）への依存は禁止・Claude が WebSearch / WebFetch で直接実施
-  - Deep Research プロンプト発行・`{date}_deep_research.md` ファイル作成は禁止（2026-05-19 PM 確定・マクロは対象外）
+- **市況補完・数値補完・イベント解釈は raw（news_raw / finnhub_raw / 立花 raw）と市況スナップショットで完結させる**。市況スナップショットは generate_macro_report.py が yfinance＋CNBC＋日経公式から確定整形済（**米VIX・日経VI を含む**）。GHA では WebSearch / WebFetch が補助モデル 404 で機能しないため Web に依存しない（呼んでも空振りしトークンを消費するだけ・[prompts/_common_rules.md](_common_rules.md) §14）：
+  - news_raw / finnhub_raw に該当ニュースが無い・解釈に不足がある場合は、raw 内の関連記事・前日レポート・立花 AI 市況コメントを突き合わせて解釈する。raw に無い事象は「raw 未取得のため言及せず」とし、記憶ベースで補完しない（§8）。
+  - 市況スナップショットの数値は generate_macro_report.py が確定整形した値をそのまま転記する（§21-A）。取得不能な指標は当該行を「取得不可」とし、Web で取りに行かない（GHA で 404）。
+  - 外部ツール（Perplexity 等）への依存は禁止。
+  - Deep Research プロンプト発行・`{date}_deep_research.md` ファイル作成は禁止（[prompts/_common_rules.md](_common_rules.md) §13）。
 - 既存の `${PRIVATE_REPO_ROOT}/market/daily/macro/` 配下の他ファイルを編集・削除しない。
 
 ### マクロレポート特有の重要ルール

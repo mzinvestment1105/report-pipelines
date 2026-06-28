@@ -34,13 +34,11 @@
 6. **raw データ読み込み**：
    - `${PRIVATE_REPO_ROOT}/market/daily/${TARGET_DATE}_macro_raw.md`（朝に生成された raw が夕刊実行前の Fetch raw data ステップで上書き再生成されている）
    - `${PRIVATE_REPO_ROOT}/market/daily/${TARGET_DATE}_finnhub_raw.md`
-7. **WebFetch で当日 17:30 JST 時点の最新数値を補完取得**：
-   - 日本市場引け後の主要指数確定値（日経平均・TOPIX・グロース 250・JPX 400）
-   - 欧州市場オープン後の動き（独 DAX・英 FTSE・仏 CAC・STOXX 600）
-   - 米国先物（ダウ・S&P500・ナスダック 100 mini）
-   - ドル円・ユーロドル・10 年米国債利回り・10 年日本国債利回り
-8. **WebSearch で当日の日本市場主要動意を取得**：
-   - 大型材料・決算サプライズ・セクター動意・テーマ動意
+7. **市況スナップショット（generate_macro_report.py が yfinance＋CNBC＋日経公式から確定整形・米VIX/日経VI 含む）から当日の最新値を転記する**（GHA では WebFetch が 404 のため Web 取得は使わない・[prompts/_common_rules.md](_common_rules.md) §14）：
+   - スナップショットに含まれる指標（日経平均・日経先物・S&P500・ドル円・金・BTC・米10年債・米VIX・日経VI）を §21-A の表記でそのまま記載する。
+   - スナップショットに無い指標（欧州指数・他の米先物等）は、raw（finnhub_raw 等）に値があればそれを使い、無ければ当該指標は省略する（記憶ベースで補完しない・§8）。
+8. **当日の日本市場主要動意は raw から取得する**（WebSearch は GHA で 404 のため使わない）：
+   - `${PRIVATE_REPO_ROOT}/market/daily/` の動意 raw（`{date}_movers_raw.md`）・`market/daily/theme/` のテーマ raw・finnhub_raw を読み、大型材料・決算サプライズ・セクター/テーマ動意を特定する。raw に無い事象は「raw 未取得のため言及せず」とする。
 9. **夕刊本体を生成**して以下に Write 保存：
    - `${PRIVATE_REPO_ROOT}/market/daily/macro/${TARGET_DATE}_evening.md`
 
@@ -92,7 +90,7 @@
 
 - **PMに質問しない**。判断に迷う点は最も保守的な解釈で進める
 - **Deep Research は廃止**（2026-05-19 PM 確定）
-- **WebSearch / WebFetch を市況補完・数値補完で積極使用**
+- **市況補完・数値補完は raw（news/finnhub/立花）＋市況スナップショット（米VIX/日経VI 含む）で完結させる**。GHA では WebSearch / WebFetch が 404 のため Web に依存しない（[prompts/_common_rules.md](_common_rules.md) §14）
 - 既存の `${PRIVATE_REPO_ROOT}/market/daily/macro/` 配下の他ファイルを編集・削除しない（夕刊ファイル `_evening.md` のみ Write 対象）
 
 ### マクロ夕刊特有
@@ -107,7 +105,7 @@
 - 出力言語: **日本語**
 - 形式: マークダウン（コードブロックで囲まない）
 - **英語原文の転記は完全禁止**
-- **数値・事実を断言する場合**は WebFetch / WebSearch で確認済みの値のみ使用
+- **数値・事実を断言する場合**は raw・市況スナップショットで確認済みの値のみ使用（記憶ベース禁止・§8。Web は GHA で 404 のため使わない）
 - **専門用語の注釈ルール**: 投資用語は注釈不要、事業モデル・業界用語のみ注釈
 
 ### 不可逆操作禁止
