@@ -211,18 +211,20 @@ jobs:
           python make_sector_rich_md.py --date ${{ steps.date.outputs.value }}
 
       - name: セクター「なぜ動いた」理由補完（Claude・追記専用・失敗許容）
-        # PM 2026-06-28 option 2: 決定論レポートに理由層のみ Claude+WebSearch で追記する。
+        # PM 2026-06-28 option 2: 決定論レポートに理由層のみ Claude で追記する。
+        # この GHA 環境では WebSearch/WebFetch が 404（利用不可）のため、理由は既存ローカル一次
+        # レポート（macro/movers/theme）＋各セクター主役銘柄から合成する（Web 非依存）。
         # continue-on-error: true ＝ 補完が失敗しても直前の決定論レポートをそのまま送信し、
         # 旧来の「Claude 生成失敗 → レポート欠落・parquet 凍結」事故を再発させない。
-        # allowed_tools に Write を含めず Edit のみ＝数値・表の全文上書きを構造的に禁止。
+        # allowed_tools に Write/Web を含めず Read+Edit 中心＝数値・表の全文上書きを構造的に禁止。
         continue-on-error: true
         uses: anthropics/claude-code-base-action@beta
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           model: claude-opus-4-7
           prompt_file: report-pipelines/prompts/sector-report-full.md
-          allowed_tools: "Read,Edit,Bash,Grep,Glob,WebSearch,WebFetch"
-          timeout_minutes: "30"
+          allowed_tools: "Read,Edit,Bash,Grep,Glob"
+          timeout_minutes: "20"
           claude_env: |
             MAX_THINKING_TOKENS: 32000
             CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
