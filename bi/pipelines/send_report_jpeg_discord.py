@@ -133,6 +133,11 @@ KIND_CONFIG = {
         "webhook_env": "DISCORD_WEBHOOK_RESEARCH",
         "label": "個別銘柄レポート",
     },
+    "largecap_weekly": {
+        "md_path": "market/daily/largecap/{date}.md",
+        "webhook_env": "DISCORD_WEBHOOK_LARGECAP",
+        "label": "週次大型株速報",
+    },
 }
 
 

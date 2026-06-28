@@ -46,6 +46,7 @@ _PDF_KIND = {
     "movers": "movers", "movers_weekly": "movers",
     "ideas": "ideas", "scout": "ideas",
     "themes": "themes", "earnings": "earnings", "stock": "stock",
+    "largecap_weekly": "largecap_weekly",
 }
 
 

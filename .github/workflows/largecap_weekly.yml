@@ -1,0 +1,293 @@
+name: 週次大型株速報（セクター輪番）
+
+"on":
+  # PM 2026-06-28 確定: 金曜 21:00 JST = UTC 12:00（cron '0 12 * * 5'）で発火。
+  # workflow_dispatch をメイン経路に併用（手動再実行 / dry_run テスト用）。
+  # guard ジョブが当日既存 run を検知して重複発火を防止（mover_weekly / sector_full と同方式）。
+  workflow_dispatch:
+    inputs:
+      target_date:
+        description: '対象日付 (YYYY-MM-DD・空欄で当日の金曜)'
+        required: false
+        default: ''
+      force_rerun:
+        description: 'true で当日重複ガードを無視して強制実行（修正後の再テスト用）'
+        required: false
+        default: 'false'
+      dry_run:
+        description: 'true で Discord 送信せず生成・PDF 化のみ（送信ステップに --skip-send を付与）'
+        type: boolean
+        required: false
+        default: false
+  schedule:
+    - cron: '0 12 * * 5'
+
+# 二重発火を GHA 内部ロックで防ぐ（mover_weekly / sector_full 準拠）。
+concurrency:
+  group: largecap_weekly-weekly
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      proceed: ${{ steps.check.outputs.proceed }}
+      reason: ${{ steps.check.outputs.reason }}
+    steps:
+      - name: Check today's runs
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # force_rerun は「手動 workflow_dispatch かつ明示 true」の時のみ有効。
+          # schedule(cron) / 通常 dispatch は既定 false のままで重複ガードが効く（誤再発火しない）。
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.force_rerun }}" = "true" ]; then
+            echo "proceed=true" >> $GITHUB_OUTPUT
+            echo "reason=force_rerun (manual guard bypass)" >> $GITHUB_OUTPUT
+            echo "force_rerun=true (手動): 重複ガードを無視して実行します"
+            exit 0
+          fi
+          TODAY_JST=$(TZ=Asia/Tokyo date +%Y-%m-%d)
+          TODAY_START="${TODAY_JST}T00:00:00+09:00"
+          MY_RUN_ID=${{ github.run_id }}
+          EVENT="${{ github.event_name }}"
+
+          RUNS=$(gh api -X GET \
+            "repos/${{ github.repository }}/actions/workflows/largecap_weekly.yml/runs" \
+            -f "created=>=${TODAY_START}" \
+            --jq "[.workflow_runs[] | select(.id != ${MY_RUN_ID})]")
+
+          ACTIVE=$(echo "$RUNS" | jq '[.[] | select(.status=="in_progress" or .status=="queued" or .status=="waiting" or .status=="action_required" or .status=="pending")] | length')
+          DONE_OK=$(echo "$RUNS" | jq '[.[] | select(.conclusion=="success" or .conclusion=="neutral")] | length')
+          DONE_FAIL=$(echo "$RUNS" | jq '[.[] | select(.conclusion=="failure" or .conclusion=="cancelled" or .conclusion=="startup_failure" or .conclusion=="timed_out" or .conclusion=="stale" or .conclusion=="action_required")] | length')
+
+          echo "Today (${TODAY_JST}): active=${ACTIVE} done_ok=${DONE_OK} done_fail=${DONE_FAIL} event=${EVENT}"
+
+          if [ "$DONE_OK" -gt 0 ]; then
+            echo "proceed=false" >> $GITHUB_OUTPUT
+            echo "reason=skip (already succeeded today: done_ok=${DONE_OK})" >> $GITHUB_OUTPUT
+          elif [ "$ACTIVE" -gt 0 ]; then
+            echo "proceed=false" >> $GITHUB_OUTPUT
+            echo "reason=skip (active run exists: active=${ACTIVE})" >> $GITHUB_OUTPUT
+          elif [ "$EVENT" = "schedule" ] && [ "$DONE_FAIL" -ge 2 ]; then
+            echo "proceed=false" >> $GITHUB_OUTPUT
+            echo "reason=retry_cap (cron stopped: done_fail=${DONE_FAIL} >= 2)" >> $GITHUB_OUTPUT
+          else
+            echo "proceed=true" >> $GITHUB_OUTPUT
+            if [ "$DONE_FAIL" -gt 0 ]; then
+              echo "reason=recovery (done_fail=${DONE_FAIL})" >> $GITHUB_OUTPUT
+            else
+              echo "reason=initial" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: Discord notification (cron or skip event)
+        if: github.event_name == 'schedule' || steps.check.outputs.proceed == 'false'
+        env:
+          WH: ${{ secrets.DISCORD_WEBHOOK_LARGECAP }}
+        run: |
+          REASON="${{ steps.check.outputs.reason }}"
+          PROCEED="${{ steps.check.outputs.proceed }}"
+          if [ -z "$WH" ]; then
+            echo "DISCORD_WEBHOOK_LARGECAP 未設定・通知 skip"
+            exit 0
+          fi
+          if [ "$PROCEED" = "true" ]; then
+            MSG="🔶 GHA cron 起動: 週次大型株速報（セクター輪番） (${REASON})"
+          elif echo "$REASON" | grep -q "retry_cap"; then
+            MSG="🚨 GHA cron 連続失敗で停止: 週次大型株速報 (${REASON}) - 手動 dispatch で復旧してください"
+          else
+            echo "skip 通知は抑制（ノイズ削減）: ${{ github.event_name }} skip (${REASON})"
+            exit 0
+          fi
+          curl -s -X POST "$WH" -H "Content-Type: application/json" \
+            -d "{\"content\":\"${MSG}\"}"
+
+  generate:
+    needs: guard
+    if: needs.guard.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60  # Claude 生成 50 分目安 + clone/setup/送信のマージン
+
+    steps:
+      - name: Determine target date
+        id: date
+        run: |
+          if [ -n "${{ github.event.inputs.target_date }}" ]; then
+            echo "value=${{ github.event.inputs.target_date }}" >> $GITHUB_OUTPUT
+          else
+            echo "value=$(TZ=Asia/Tokyo date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout report-pipelines
+        uses: actions/checkout@v4
+        with:
+          path: report-pipelines
+
+      - name: Setup SSH for private repo
+        env:
+          PRIVATE_REPO_DEPLOY_KEY: ${{ secrets.PRIVATE_REPO_DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$PRIVATE_REPO_DEPLOY_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+      - name: Clone private repo (mizuki-fund)
+        run: |
+          git clone git@github.com:mzinvestment1105/mizuki-fund.git private-repo
+
+      - name: Copy pipelines and static files from Public into private working tree
+        run: |
+          cp -f report-pipelines/bi/pipelines/*.py private-repo/bi/pipelines/
+          cp -f report-pipelines/bi/pipelines/requirements.txt private-repo/bi/pipelines/
+          mkdir -p private-repo/bi/pipelines/lib
+          cp -rf report-pipelines/bi/pipelines/lib/*.py private-repo/bi/pipelines/lib/ 2>/dev/null || true
+          # PDF 配信用の埋め込みフォント（assets/fonts/*.woff2）を Public から overlay
+          mkdir -p private-repo/bi/pipelines/assets/fonts
+          cp -rf report-pipelines/bi/pipelines/assets/fonts/* private-repo/bi/pipelines/assets/fonts/ 2>/dev/null || true
+          mkdir -p private-repo/agents private-repo/playbook
+          cp -f report-pipelines/agents/*.md private-repo/agents/ 2>/dev/null || true
+          cp -f report-pipelines/playbook/*.md private-repo/playbook/ 2>/dev/null || true
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: report-pipelines/bi/pipelines/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r report-pipelines/bi/pipelines/requirements.txt
+
+      - name: Install Japanese fonts (Noto Sans CJK JP)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq fonts-noto-cjk fonts-noto-cjk-extra
+
+      - name: Install Playwright Chromium
+        run: |
+          playwright install chromium --with-deps
+
+      - name: Check screening_master parquet existence (no update・PM 2026-05-23 確定)
+        # screening_master 更新は約 5 時間かかるため本 workflow 内では走らせない。
+        # screening_master.yml の cron で別途更新される設計に依存・存在確認のみ。
+        working-directory: ./private-repo/bi/pipelines
+        env:
+          PYTHONIOENCODING: utf-8
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+        run: |
+          python - <<'PY'
+          import os, sys
+          from pathlib import Path
+          import pandas as pd
+
+          parquet = Path("../outputs/screening_master.parquet")
+          if not parquet.exists():
+              print(f"[WARN] screening_master.parquet が見つかりません: {parquet}")
+              print("       本 workflow では更新しない設計のため、screening_master.yml が事前に走っている前提です")
+              sys.exit(0)
+          df = pd.read_parquet(parquet)
+          latest = pd.to_datetime(df["DataDate"]).max().date().isoformat() if "DataDate" in df.columns else "unknown"
+          target = os.environ.get("TARGET_DATE", "")
+          print(f"screening_master DataDate: {latest} (target: {target})")
+          print("PM 確定: 古くてもそのまま使う・更新は実行しない")
+          PY
+
+      - name: 既存の週次大型株レポートファイルを削除（前回不良ファイル読込スキップ防止）
+        working-directory: ./private-repo
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+        run: |
+          TARGET_FILE="market/daily/largecap/${TARGET_DATE}.md"
+          if [ -f "$TARGET_FILE" ]; then
+            echo "Removing existing $TARGET_FILE before Claude run..."
+            rm -f "$TARGET_FILE"
+          fi
+
+      - name: Generate largecap weekly report via Claude Code (Opus 4.7 + max thinking)
+        # Claude が private クローンから最新 macro/sector/theme + 台帳 + セクターマップを読み、
+        # 二軸でセクター約3つを選定 → weekly_largecap_sectors.py --survey/--select で素材取得
+        # （市場系数値は yfinance ライブ・HTTP のみで GHA でも動く）→ 本文生成 → 保存。
+        uses: anthropics/claude-code-base-action@beta
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          model: claude-opus-4-7
+          prompt_file: report-pipelines/prompts/largecap-weekly.md
+          allowed_tools: "Read,Write,Edit,Bash,Grep,Glob"
+          timeout_minutes: "50"
+          claude_env: |
+            MAX_THINKING_TOKENS: 32000
+            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+          PRIVATE_REPO_ROOT: private-repo
+          JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
+          EDINETDB_API_KEYS: ${{ secrets.EDINETDB_API_KEYS }}
+          CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+
+      - name: レポート生成確認（欠落なら fail・空配信防止）
+        working-directory: ./private-repo
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+        run: |
+          TARGET_FILE="market/daily/largecap/${TARGET_DATE}.md"
+          if [ ! -f "$TARGET_FILE" ]; then
+            echo "ERROR: レポートが生成されていません: $TARGET_FILE"
+            exit 1
+          fi
+          LINES=$(wc -l < "$TARGET_FILE")
+          echo "Generated $TARGET_FILE ($LINES lines)"
+          if [ "$LINES" -lt 30 ]; then
+            echo "ERROR: レポートが極端に短い（$LINES 行）・生成不完全とみなし送信中止"
+            exit 1
+          fi
+
+      - name: Send Discord (PDF)
+        working-directory: ./private-repo/bi/pipelines
+        env:
+          DISCORD_WEBHOOK_LARGECAP: ${{ secrets.DISCORD_WEBHOOK_LARGECAP }}
+          PYTHONIOENCODING: utf-8
+        run: |
+          SKIP=""
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            SKIP="--skip-send"
+            echo "dry_run=true: --skip-send で生成・PDF 化のみ実行（Discord 送信なし）"
+          fi
+          python send_report_pdf_discord.py --kind largecap_weekly --date ${{ steps.date.outputs.value }} $SKIP
+
+      - name: Commit and push to private repo
+        # 生成物（market/daily/largecap/{date}.md・更新後 research/largecap/sector_ledger.json）を
+        # private repo に commit-back（既存方式・Public へは出さない）。
+        # always() で生成 step 失敗時もここを通すが、staged 差分が無ければ no-op。
+        if: ${{ always() }}
+        working-directory: ./private-repo
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # Public から overlay した pipelines/agents/playbook は private にコミットしない
+          git checkout -- bi/pipelines/ agents/ playbook/ 2>/dev/null || true
+          git clean -fd bi/pipelines/ agents/ playbook/ 2>/dev/null || true
+          git add market/daily/largecap/ research/largecap/ 2>/dev/null || git add market/daily/largecap/
+          if ! git diff --staged --quiet; then
+            git stash push --keep-index --include-untracked -m "ci-cleanup" 2>/dev/null || true
+            git commit -m "data: largecap weekly ${{ steps.date.outputs.value }}"
+            git fetch origin master
+            git rebase origin/master || (git diff --name-only --diff-filter=U | xargs -I{} git checkout --theirs {}; git diff --name-only --diff-filter=U | xargs git add; git -c core.editor=true rebase --continue)
+            git push origin master
+            git stash drop 2>/dev/null || true
+          fi
+
+      - name: Discord 通知（失敗）
+        if: failure()
+        env:
+          DISCORD_WEBHOOK_LARGECAP: ${{ secrets.DISCORD_WEBHOOK_LARGECAP }}
+        run: |
+          if [ -z "$DISCORD_WEBHOOK_LARGECAP" ]; then
+            echo "DISCORD_WEBHOOK_LARGECAP 未設定・失敗通知 skip"
+            exit 0
+          fi
+          curl -s -X POST "$DISCORD_WEBHOOK_LARGECAP" \
+            -H "Content-Type: application/json" \
+            -d "{\"content\": \"❌ 週次大型株速報（セクター輪番）失敗\n${{ steps.date.outputs.value }}\nログ確認: https://github.com/${{ github.repository }}/actions\"}"
