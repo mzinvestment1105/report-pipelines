@@ -233,6 +233,51 @@ def is_stale_close(data_date: _date, ref_date: _date) -> bool:
     return data_date < previous_business_day(ref_date)
 
 
+_NIKKEI_VI_URL = "https://indexes.nikkei.co.jp/nkave/index?type=vi"
+_NIKKEI_VI_NAME = "日経平均ボラティリティー・インデックス"
+
+
+def get_nikkei_vi(target_date=None) -> Quote | None:
+    """日経VI(^N225VI) を日経公式指数ページからスクレイプして返す（無料 API に存在しないため）。
+
+    日経公式の指数一覧（type=vi）から「日経平均ボラティリティー・インデックス」の最新値・前日比・
+    取引日を抽出する。先物指数（同名＋「先物指数」）とは `</a>` 直後で区別する。WebFetch が GHA で
+    404 になる代替として、生 HTML を urllib で取得し正規表現で抽出する。取得不能時は None。
+    """
+    import re as _re
+
+    try:
+        req = _ur.Request(_NIKKEI_VI_URL, headers={"User-Agent": _UA})
+        with _ur.urlopen(req, timeout=20) as resp:
+            html = resp.read().decode("utf-8", "replace")
+    except Exception:
+        return None
+    m = _re.search(
+        _re.escape(_NIKKEI_VI_NAME) + r"</a>"
+        r'.*?<div class="value">\s*([\d,\.]+)'
+        r'.*?<div class="daily-change[^"]*">.*?([+\-][\d.,]+)'
+        r'.*?<div class="date">\s*(\d{2})\.(\d{2})',
+        html,
+        _re.S,
+    )
+    if not m:
+        return None
+    try:
+        close = float(m.group(1).replace(",", ""))
+        chg = float(m.group(2).replace(",", ""))
+        mon, day = int(m.group(3)), int(m.group(4))
+    except ValueError:
+        return None
+    today = _datetime.now(_timezone(_timedelta(hours=9))).date()
+    try:
+        d = _date(today.year, mon, day)
+        if d > today:  # 年跨ぎ（1月実行で 12 月の値を見る等）への保険
+            d = _date(today.year - 1, mon, day)
+    except ValueError:
+        return None
+    return Quote(close=close, prev=close - chg, date=d, source="nikkei_official")
+
+
 def get_latest_close(ticker: str, target_date=None) -> Quote | None:
     """ticker の「当日終値・前日終値・取得日」を最も新しい確定値で返す。取得不能なら None。
 
@@ -250,6 +295,10 @@ def get_latest_close(ticker: str, target_date=None) -> Quote | None:
             target_date = _date.fromisoformat(target_date)
         except ValueError:
             target_date = None
+
+    # 日経VI は Yahoo/CNBC など無料 API に存在しないため日経公式ページからスクレイプする。
+    if ticker == "^N225VI":
+        return get_nikkei_vi(target_date)
 
     chart_pairs, meta_pt = _chart_payload(ticker)
 

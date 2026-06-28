@@ -52,12 +52,14 @@ SNAPSHOT_TICKERS = {
     "金(Gold)":        "GC=F",
     "BTC":             "BTC-USD",
     "米10年債":         "^TNX",
+    "米VIX":            "^VIX",
+    "日経VI":           "^N225VI",
 }
 
 # 小数2桁を維持する銘柄（為替・金利）。それ以外（指数・株価指数・コモディティ・暗号資産）は
 # 整数表示（PM 2026-06-27 指示：指数の小数は不要・読みづらいだけ）。前日比は「円整数 / %小数1桁」、
 # 区切りはスラッシュで統一する。
-_DECIMAL_NAMES = {"ドル円", "米10年債"}
+_DECIMAL_NAMES = {"ドル円", "米10年債", "米VIX", "日経VI"}
 
 def _is_stale(path: Path, target_date: date, max_age_minutes: int) -> bool:
     """
