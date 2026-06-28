@@ -12,6 +12,10 @@ name: 動意銘柄レポート週次
         description: '対象日付 (YYYY-MM-DD・空欄で当日の金曜)'
         required: false
         default: ''
+      force_rerun:
+        description: 'true で当日重複ガードを無視して強制実行（修正後の再テスト用）'
+        required: false
+        default: 'false'
   schedule:
     - cron: '0 12 * * 5'
 
@@ -37,6 +41,12 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          if [ "${{ github.event.inputs.force_rerun }}" = "true" ]; then
+            echo "proceed=true" >> $GITHUB_OUTPUT
+            echo "reason=force_rerun (guard bypass)" >> $GITHUB_OUTPUT
+            echo "force_rerun=true: 重複ガードを無視して実行します"
+            exit 0
+          fi
           TODAY_JST=$(TZ=Asia/Tokyo date +%Y-%m-%d)
           TODAY_START="${TODAY_JST}T00:00:00+09:00"
           MY_RUN_ID=${{ github.run_id }}
