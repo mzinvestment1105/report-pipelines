@@ -198,22 +198,17 @@ jobs:
             rm -f "$TARGET_FILE"
           fi
 
-      - name: Generate sector full report via Claude Code (Opus 4.7 + max thinking・Deep Research 内包)
-        uses: anthropics/claude-code-base-action@beta
-        with:
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          model: claude-opus-4-7
-          prompt_file: report-pipelines/prompts/sector-report-full.md
-          allowed_tools: "Read,Write,Edit,Bash,Grep,Glob,WebSearch,WebFetch"
-          timeout_minutes: "60"
-          claude_env: |
-            MAX_THINKING_TOKENS: 32000
-            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 64000
+      - name: Generate sector full report (deterministic・make_sector_rich_md.py)
+        # PM 2026-06-28: Deep Research/Claude 生成を廃止し（gen step 失敗の根本原因）、parquet から
+        # 決定論的に markdown を生成する。直前の Refresh step で再生成済の sector_weekly /
+        # sector_stock_weekly + 既存 screening_master から、強弱ランキング・8週トレンド帯・資金フロー・
+        # 52週高値圏・主役Top5/下落主役Bottom5 を表組みで出力（色付けは lib/md_to_pdf 側）。
+        working-directory: ./private-repo/bi/pipelines
         env:
+          PYTHONIOENCODING: utf-8
           TARGET_DATE: ${{ steps.date.outputs.value }}
-          PRIVATE_REPO_ROOT: private-repo
-          JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
-          REPORT_EDITION: full
+        run: |
+          python make_sector_rich_md.py --date ${{ steps.date.outputs.value }}
 
       - name: Send Discord (PDF)
         working-directory: ./private-repo/bi/pipelines

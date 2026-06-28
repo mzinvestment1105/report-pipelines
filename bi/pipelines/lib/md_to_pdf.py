@@ -35,6 +35,7 @@ KIND_META = {
     "earnings": ("EARNINGS",       "決算レポート",       "#1F8A8A"),
     "themes":   ("THEMES",         "テーマレポート",     "#B8902A"),
     "stock":    ("EQUITY RESEARCH","個別銘柄レポート",   "#B5483D"),
+    "largecap_weekly": ("LARGE CAP WEEKLY", "週次大型株速報", "#1F3A93"),
 }
 
 _WEEKDAY_JP = ["月", "火", "水", "木", "金", "土", "日"]
@@ -191,6 +192,35 @@ hr {{ border:0; border-top:0.8pt solid #DBE1E9; margin:20px 0; }}
 """
 
 
+_POS = "#1F8A4C"  # 上昇=緑
+_NEG = "#C0392B"  # 下落=赤
+# 符号付き数値（+12.3% / −4.0% / +1.39 / -3.03 / 全角＋％対応）。誤着色を抑えるため
+# 「% を伴う」か「小数点を含む」場合のみ着色し、符号付き整数（銘柄コード・年号・順位）は除外する。
+_RE_SIGNED = re.compile(r"([+＋−\-])(\d[\d,]*(?:\.\d+)?)(\s*[%％])?")
+
+
+def _colorize_signed(m: "re.Match[str]") -> str:
+    sign, num, pct = m.group(1), m.group(2), m.group(3) or ""
+    if not pct and "." not in num:  # 符号付き整数（コード/年/順位）は着色しない
+        return m.group(0)
+    color = _NEG if sign in "−-" else _POS
+    return f'<span style="color:{color};font-weight:700">{sign}{num}{pct}</span>'
+
+
+def _colorize_numbers(html: str) -> str:
+    """生成 HTML 中の騰落率・トレンド矢印を上昇=緑/下落=赤で確定着色する（renderer 側で保証・LLM 非依存）。
+
+    金融レポートの一目可読性のため、本文・表セル内の +X%/−X%・符号付きリターンと 8 週トレンド帯の
+    ▲▼ を色分けする。着色は render 後の HTML に対して行い、タグ属性へ符号付き数値は出ないため安全。
+    """
+    html = _RE_SIGNED.sub(_colorize_signed, html)
+    html = (html.replace("▲", f'<span style="color:{_POS}">▲</span>')
+                .replace("△", f'<span style="color:{_POS}">△</span>')
+                .replace("▼", f'<span style="color:{_NEG}">▼</span>')
+                .replace("▽", f'<span style="color:{_NEG}">▽</span>'))
+    return html
+
+
 def render_markdown_to_pdf(
     md_text: str,
     out_path: Path,
@@ -232,6 +262,7 @@ def render_markdown_to_pdf(
     body_md = re.sub(r"（記事ベース[^）]*）", "", body_md)
 
     html_body = md.markdown(body_md, extensions=["tables", "fenced_code", "sane_lists"])
+    html_body = _colorize_numbers(html_body)
 
     date_label = _date_label(target_date)
     masthead = f"""<header class="masthead">
