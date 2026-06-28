@@ -224,6 +224,10 @@ jobs:
           python send_report_pdf_discord.py --kind sector_full --date ${{ steps.date.outputs.value }}
 
       - name: Commit and push to private repo
+        # PM 2026-06-28: 生成 step が失敗しても再生成済 parquet を必ずコミットする（データ凍結防止）。
+        # 旧来は gen 失敗で本 step がスキップされ、新鮮な sector_weekly.parquet が runner ごと破棄され
+        # AsOf が 6/13 で 2 週間凍結した事故の恒久対策。
+        if: ${{ always() }}
         working-directory: ./private-repo
         run: |
           git config user.name  "github-actions[bot]"
