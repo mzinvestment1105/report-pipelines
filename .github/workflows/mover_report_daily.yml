@@ -45,10 +45,12 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if [ "${{ github.event.inputs.force_rerun }}" = "true" ]; then
+          # force_rerun は「手動 workflow_dispatch かつ明示 true」の時のみ有効。
+          # schedule(cron) / Cloudflare Worker / 通常 dispatch は既定 false のままで重複ガードが効く（誤再発火しない）。
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.force_rerun }}" = "true" ]; then
             echo "proceed=true" >> $GITHUB_OUTPUT
-            echo "reason=force_rerun (guard bypass)" >> $GITHUB_OUTPUT
-            echo "force_rerun=true: 重複ガードを無視して実行します"
+            echo "reason=force_rerun (manual guard bypass)" >> $GITHUB_OUTPUT
+            echo "force_rerun=true (手動): 重複ガードを無視して実行します"
             exit 0
           fi
           TODAY_JST=$(TZ=Asia/Tokyo date +%Y-%m-%d)
