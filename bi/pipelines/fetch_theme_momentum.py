@@ -10,7 +10,9 @@
 
 出力:
   bi/outputs/theme_momentum.parquet
-  列: snapshot_date, source, rank_type, rank, theme_name, theme_url, fetched_at
+  列: snapshot_date, source, rank_type, rank, theme_name, theme_url, fetched_at, top_stocks
+  （top_stocks = 各テーマページからスクレイプした代表銘柄「code 名（±x%）/ …」・上位ランクのみ取得・
+    GHA で 404 になる WebFetch の代替。各構成銘柄の当日値動きは「なぜ動いた」理由合成の素材になる）
 """
 from __future__ import annotations
 
@@ -105,6 +107,124 @@ def extract_minkabu_ranking(soup: BeautifulSoup, max_n: int = 20) -> list[dict]:
     return out
 
 
+def _clean(s: str) -> str:
+    return re.sub(r"\s+", " ", s or "").strip()
+
+
+def extract_kabutan_constituents(soup: BeautifulSoup, max_n: int = 6) -> list[dict]:
+    """株探テーマページの構成銘柄テーブルから上位を抽出（code・name・前日比%）。
+
+    行構造: <td class="tac"><a href="/stock/?code=CODE">CODE</a></td>
+            <td class="tal">銘柄名</td> … <td class="w50"><span class="up|down">±X.XX</span>%</td>
+    先頭の 0000/0800/0950 等は指数擬似コードのため除外（実在コードは 0 始まりにならない）。
+    """
+    out: list[dict] = []
+    seen: set[str] = set()
+    for tr in soup.find_all("tr"):
+        a = tr.find("a", href=re.compile(r"/stock/\?code="))
+        name_td = tr.find("td", class_="tal")
+        if not a or not name_td:
+            continue
+        m = re.search(r"code=([0-9A-Z]+)", a["href"])
+        if not m:
+            continue
+        code = m.group(1)
+        if code.startswith("0") or code in seen:
+            continue
+        name = _clean(name_td.get_text())
+        if not name:
+            continue
+        pct = ""
+        pct_td = tr.find("td", class_="w50")
+        if pct_td:
+            span = pct_td.find("span")
+            if span:
+                val = _clean(span.get_text())
+                cls = " ".join(span.get("class", []))
+                if val and val not in ("0.00", "0"):
+                    sign = "-" if ("down" in cls and not val.startswith("-")) else ""
+                    pct = f"{sign}{val}%"
+        seen.add(code)
+        out.append({"code": code, "name": name, "chg": pct})
+        if len(out) >= max_n:
+            break
+    return out
+
+
+def extract_minkabu_constituents(soup: BeautifulSoup, max_n: int = 6) -> list[dict]:
+    """みんかぶテーマページの関連銘柄から上位を抽出（code・name）。
+
+    構造: <a href="/stock/CODE"><p class="text-xs …">CODE</p><p class="… font-bold …">銘柄名</p></a>
+    """
+    out: list[dict] = []
+    seen: set[str] = set()
+    for a in soup.find_all("a", href=re.compile(r"^/stock/[0-9]")):
+        ps = a.find_all("p")
+        if len(ps) < 2:
+            continue
+        code = _clean(ps[0].get_text())
+        name = _clean(ps[1].get_text())
+        if not re.match(r"^[0-9][0-9A-Z]{3}$", code) or not name:
+            continue
+        if code in seen:
+            continue
+        seen.add(code)
+        out.append({"code": code, "name": name, "chg": ""})
+        if len(out) >= max_n:
+            break
+    return out
+
+
+def fetch_constituents(source: str, theme_url: str) -> str:
+    """テーマページを取得し『code 名（±x%）/ …』形式の代表銘柄文字列を返す（WebFetch 代替）。
+
+    株探はデフォルトがコード昇順で小型新規上場が先頭に来るため、売買代金降順
+    （stm=2&col=val）で取得して主力銘柄を代表に据える。みんかぶは関連度順で良好なため素のまま。
+    """
+    url = theme_url
+    if source == "kabutan" and "/themes/" in theme_url:
+        sep = "&" if "?" in theme_url else "?"
+        url = f"{theme_url}{sep}market=0&capitalization=-1&stc=&stm=2&col=val"
+    soup = fetch(url)
+    time.sleep(SLEEP)
+    if soup is None:
+        return ""
+    items = (
+        extract_kabutan_constituents(soup) if source == "kabutan"
+        else extract_minkabu_constituents(soup)
+    )
+    parts = []
+    for it in items:
+        if it.get("chg"):
+            parts.append(f"{it['code']} {it['name']}（{it['chg']}）")
+        else:
+            parts.append(f"{it['code']} {it['name']}")
+    return " / ".join(parts)
+
+
+def attach_top_stocks(new_rows: list[dict], max_rank: int = 12) -> None:
+    """各テーマの代表銘柄をテーマページからスクレイプし new_rows に top_stocks を付与する。
+
+    report が使う上位（rank<=max_rank）に限定し、同一 theme_url は 1 回だけ取得（dedupe）。
+    """
+    print("\n[代表銘柄] テーマページから構成銘柄を取得中（WebFetch 代替）...")
+    cache: dict[str, str] = {}
+    n = 0
+    for row in new_rows:
+        if row["rank"] > max_rank:
+            row["top_stocks"] = ""
+            continue
+        url = row["theme_url"]
+        if url not in cache:
+            cache[url] = fetch_constituents(row["source"], url)
+            n += 1
+        row["top_stocks"] = cache[url]
+    for row in new_rows:
+        row.setdefault("top_stocks", "")
+    got = sum(1 for v in cache.values() if v)
+    print(f"  取得テーマ数: {n}（うち代表銘柄あり {got}）")
+
+
 def main() -> int:
     print("=== テーマ動意検知 ETL ===")
     snapshot_date = datetime.now(JST).date().isoformat()
@@ -174,6 +294,8 @@ def main() -> int:
     if not new_rows:
         print("\nERROR: no rows extracted")
         return 1
+
+    attach_top_stocks(new_rows)
 
     new_df = pd.DataFrame(new_rows)
 

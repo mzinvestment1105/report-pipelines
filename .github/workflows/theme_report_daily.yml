@@ -186,7 +186,10 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           model: claude-opus-4-7
           prompt_file: report-pipelines/prompts/themes-report.md
-          allowed_tools: "Read,Write,Edit,Bash,Grep,Glob,WebSearch,WebFetch"
+          # PM 2026-06-28: WebSearch/WebFetch は GHA で 404（補助モデル解決不可）のため除去。
+          # 代表銘柄は fetch_theme_momentum.py がスクレイプ済（top_stocks 列）・動意理由はローカル
+          # 一次レポート（マクロ・動意・テーマ TDNet/掲示板 raw）＋構成銘柄の当日値動きから合成する。
+          allowed_tools: "Read,Write,Edit,Bash,Grep,Glob"
           timeout_minutes: "45"
           claude_env: |
             MAX_THINKING_TOKENS: 32000
