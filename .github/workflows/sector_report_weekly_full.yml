@@ -3,8 +3,7 @@ name: セクター週次レポート（フルバージョン）
 "on":
   # PM 2026-05-27 確定: Cloudflare Worker (mizuki-fund-scheduler-1) からの workflow_dispatch がメイン経路。
   # PM 2026-06-06 追加: Worker SPOF 回避のため GHA cron をフェイルセーフ併用。
-  # 仮設定: 月曜 09:00 JST = UTC 00:00（週次レポート月曜朝想定）。
-  # 正確な Worker 時刻が判明したら本値を Worker + 1h 程度に調整する。
+  # PM 2026-06-29: 金曜 21:00 JST = UTC 金 12:00 へ変更（Worker と同枠・金曜終値の price_history 更新完了後）。
   workflow_dispatch:
     inputs:
       target_date:
@@ -16,7 +15,7 @@ name: セクター週次レポート（フルバージョン）
         required: false
         default: 'false'
   schedule:
-    - cron: '0 0 * * 1'
+    - cron: '0 12 * * 5'
 
 concurrency:
   group: sector_report_weekly_full-weekly

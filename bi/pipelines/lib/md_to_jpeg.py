@@ -144,6 +144,27 @@ ACCENT_BY_KIND = {
     "stock": "#C0392B",       # 赤：個別銘柄
 }
 
+# レポート種別ごとのページ幅（px）。テーマは横長 4 列テーブル（動意の理由が長文）が
+# 1080px だと詰まって文字の壁になるため広げる。未指定の種別は DEFAULT_PAGE_WIDTH。
+PAGE_WIDTH_BY_KIND = {
+    "themes": 1440,
+}
+DEFAULT_PAGE_WIDTH = 1080
+
+# テーマレポートの急上昇 Top10 テーブル専用 CSS（kind=="themes" のみ追加適用）。
+# table-layout: fixed + 列幅固定で「動意の理由」(長文) を読める幅に割り当て、
+# word-break で日本語長文をセル内で素直に折り返す。順位は中央寄せ。
+THEMES_TABLE_CSS = """
+table { table-layout: fixed; font-size: 23px; }
+table td { word-break: break-word; line-height: 1.7; vertical-align: top; }
+table th:nth-child(1), table td:nth-child(1) { width: 5%; text-align: center; }
+table th:nth-child(2), table td:nth-child(2) { width: 23%; }
+table th:nth-child(3), table td:nth-child(3) { width: 46%; }
+table th:nth-child(4), table td:nth-child(4) { width: 26%; }
+/* 代表銘柄列：全角ローマ字社名を1文字ずつ分割せず単語単位で折り返す（はみ出す時のみ強制改行） */
+table td:nth-child(4) { word-break: keep-all; overflow-wrap: anywhere; }
+"""
+
 
 _EMPTY_LABEL_BULLET_RE = re.compile(r"^\s*-\s+\*\*([^*]+?)\*\*\s*[:：]\s*$")
 
@@ -217,7 +238,11 @@ def render_markdown_to_jpeg(md_text: str, out_path: Path, kind: str = "macro", q
         生成された JPEG ファイルパス
     """
     accent = ACCENT_BY_KIND.get(kind, "#FFD700")
+    page_width = PAGE_WIDTH_BY_KIND.get(kind, DEFAULT_PAGE_WIDTH)
     custom_css = CSS.replace("border-bottom: 5px solid #FFD700;", f"border-bottom: 5px solid {accent};")
+    custom_css = custom_css.replace("width: 1080px;", f"width: {page_width}px;")
+    if kind == "themes":
+        custom_css += THEMES_TABLE_CSS
 
     html_body = markdown_to_html(md_text)
     footer_html = f'<div class="footer-brand">{footer}</div>' if footer else ""
@@ -236,7 +261,7 @@ def render_markdown_to_jpeg(md_text: str, out_path: Path, kind: str = "macro", q
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with sync_playwright() as p:
         browser = p.chromium.launch()
-        ctx = browser.new_context(viewport={"width": 1080, "height": 1920}, device_scale_factor=1)
+        ctx = browser.new_context(viewport={"width": page_width, "height": 1920}, device_scale_factor=1)
         page = ctx.new_page()
         page.set_content(full_html, wait_until="load")
         page.screenshot(path=str(out_path), full_page=True, type="jpeg", quality=quality)
