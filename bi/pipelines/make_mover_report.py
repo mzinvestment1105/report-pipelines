@@ -527,8 +527,31 @@ def build_full_table(
         supply_meta["Code"] = supply_meta["Code"].astype(str).str[:4]
         df = df.merge(supply_meta, on="Code", how="left")
 
-    if "MarketCap" in df.columns:
-        df["MarketCapOku"] = pd.to_numeric(df["MarketCap"], errors="coerce") / 1e8
+    # ① PM 2026-06-30 確定: 時価総額は対象日 EOD に統一する。
+    # screening_master の MarketCap は parquet ビルド日の終値由来で、レポート対象日 EOD と
+    # 数日ずれる（例: 3133 を 6/25 終値由来の 71億 と表示・実際の対象日は 31億）。
+    # 当日終値 Close_T × 発行済株数（screening_master と同じ株数列）で再計算して当日値に統一。
+    # 株数が無い銘柄（IPO直後等）は screening_master の MarketCap にフォールバック。
+    _shares_col = "NumberOfIssuedAndOutstandingSharesAtTheEndOfFiscalYearIncludingTreasuryStock"
+    _base_cap = (pd.to_numeric(df["MarketCap"], errors="coerce")
+                 if "MarketCap" in df.columns else pd.Series(pd.NA, index=df.index))
+    if _shares_col in df.columns:
+        _shares = pd.to_numeric(df[_shares_col], errors="coerce")
+        _live_cap = pd.to_numeric(df["Close_T"], errors="coerce") * _shares
+        df["MarketCap"] = _live_cap.where(_live_cap.notna(), _base_cap)
+    else:
+        df["MarketCap"] = _base_cap
+    df["MarketCapOku"] = pd.to_numeric(df["MarketCap"], errors="coerce") / 1e8
+
+    # 売買代金 Turnover を全銘柄に付与（PM 2026-06-30・raw 欠落防止）。
+    # TurnoverJQ（JQuants 実績売買代金）優先・無ければ当日終値×出来高で近似。
+    # これがないと値上がり/値下がり専用銘柄の raw 詳細から売買代金が抜け、配信が雑魚化する。
+    _vol_t = pd.to_numeric(df.get("Volume_T"), errors="coerce") if "Volume_T" in df.columns else pd.Series(pd.NA, index=df.index)
+    _close_t = pd.to_numeric(df["Close_T"], errors="coerce")
+    if "TurnoverJQ" in df.columns:
+        df["Turnover"] = pd.to_numeric(df["TurnoverJQ"], errors="coerce").fillna(_close_t * _vol_t)
+    else:
+        df["Turnover"] = _close_t * _vol_t
 
     # PM 2026-05-22 確定: ETF/REIT/上場投信を全レポート全セクションから完全除外
     # raw データ生成時点で除外することで claude-code-action が ETF を Top10 に入れる事故を構造的に防止
@@ -1016,6 +1039,19 @@ def _append_detail(
     vol_str = f"{vol/1e4:.0f}万株" if pd.notna(vol) else "─"
 
     turnover_label = row.get("_turnover_label", "")
+    if not turnover_label:
+        # 値上がり/値下がり専用銘柄も raw に売買代金を必ず入れる（PM 2026-06-30・欠落防止）。
+        _tv = row.get("Turnover")
+        if _tv is None or pd.isna(_tv):
+            _c, _v = row.get("Close_T"), row.get("Volume_T")
+            _tv = (_c * _v) if (pd.notna(_c) and pd.notna(_v)) else None
+        if _tv is not None and pd.notna(_tv):
+            if _tv >= 1e8:
+                turnover_label = f"{_tv/1e8:.0f}億円"
+            elif _tv >= 1e6:
+                turnover_label = f"約{_tv/1e6:.0f}百万円"
+            else:
+                turnover_label = f"約{_tv/1e4:.0f}万円"
     turnover_str   = f"　売買代金: {turnover_label}" if turnover_label else ""
 
     # Yahoo 事業内容・Deep Dive

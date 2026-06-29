@@ -142,6 +142,7 @@ ACCENT_BY_KIND = {
     "earnings": "#16A085",    # 青緑：決算
     "themes": "#FFD700",      # 金：テーマ
     "stock": "#C0392B",       # 赤：個別銘柄
+    "largecap_weekly": "#1F3A93",  # ネイビー：週次大型株速報
 }
 
 # レポート種別ごとのページ幅（px）。テーマは横長 4 列テーブル（動意の理由が長文）が
@@ -184,9 +185,46 @@ def _promote_empty_label_bullets(text: str) -> str:
     return "\n".join(out)
 
 
+# 時価総額サイズ目印（PM 2026-06-30・md_to_pdf と同仕様・LLM 非依存で renderer が付与）:
+# 100億以上=無印 / 50〜100億未満=〔小型〕 / 50億未満=〔極小・対象外〕（赤太字）。
+_SIZE_MCAP_RE = re.compile(r"時価総額\s*([\d,]+(?:\.\d+)?)\s*(兆|億)円")
+_SIZE_PCT_RE = re.compile(r"(\s*[+\-−][\d.]+\s*%\s*)(（)")
+_SIZE_NEG = "#C0392B"
+
+
+def _size_tag(mcap_oku):
+    if mcap_oku is None:
+        return None
+    if mcap_oku < 50:
+        return f'<span style="color:{_SIZE_NEG};font-weight:700">〔極小 {mcap_oku:.0f}億・対象外〕</span>'
+    if mcap_oku < 100:
+        return f'〔小型 {mcap_oku:.0f}億〕'
+    return None
+
+
+def _inject_size_tags(md_text: str) -> str:
+    """個別株見出し行の時価総額からサイズ目印タグを銘柄名直後に挿入（極小は赤太字）。"""
+    out = []
+    for line in md_text.split("\n"):
+        if line.startswith("### ") and "時価総額" in line and "〔" not in line:
+            mm = _SIZE_MCAP_RE.search(line)
+            if mm:
+                val = float(mm.group(1).replace(",", ""))
+                oku = val * 10000 if mm.group(2) == "兆" else val
+                tag = _size_tag(oku)
+                if tag:
+                    new, n = _SIZE_PCT_RE.subn(rf" {tag}\1\2", line, count=1)
+                    if n == 0:
+                        new = line.replace("（", f" {tag}（", 1)
+                    line = new
+        out.append(line)
+    return "\n".join(out)
+
+
 def markdown_to_html(text: str) -> str:
     """Markdown → HTML 変換。h2 にクラス付与（人気/急上昇/Part）。"""
     text = _promote_empty_label_bullets(text)
+    text = _inject_size_tags(text)
     html = md.markdown(text, extensions=["tables", "fenced_code", "sane_lists"])
 
     def rewrite_h2(m: re.Match) -> str:

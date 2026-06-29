@@ -5,6 +5,8 @@
 merge 後の統合 md（{date}.md / {date}_weekly.md）を市場ブロックへ分割し、
 各市場の「値上がり / 値下がり / 売買代金」セクションの銘柄エントリ（### N位 …）
 件数を機械カウントして、規定数に満たなければ exit 1 で Discord 送信をブロックする。
+加えて各エントリ行に 終値・時価総額・売買代金 が全て揃っているかの完備ゲートも行い、
+1 項目でも欠落していれば exit 1 で送信をブロックする（雑魚配信防止・PM 2026-06-30）。
 
 規定数（日次・週次共通）:
   プライム  : 値上がり 5 / 値下がり 5 / 売買代金 5
@@ -37,6 +39,10 @@ EXPECTED = {
 TITLE_RE   = re.compile(r"^#\s*動意銘柄レポート", )
 SECTION_RE = re.compile(r"^##\s*(値上がり|値下がり|売買代金)")
 ENTRY_RE   = re.compile(r"^###\s")
+
+# 各エントリ行に必須の項目（PM 2026-06-30 確定・欠落配信防止）。
+# 例: 売買代金欠落（### 1位 7815 東京ボード工業 …（終値 306円 / 時価総額 9億円）） を送信前に止める。
+REQUIRED_FIELDS = ("終値", "時価総額", "売買代金")
 
 
 def detect_market(title_line: str) -> str | None:
@@ -83,6 +89,25 @@ def count_sections(lines: list[str]) -> dict[str, int]:
     return counts
 
 
+def check_entry_fields(lines: list[str]) -> list[tuple[str, list[str]]]:
+    """値上がり/値下がり/売買代金の各 ### エントリ行が終値・時価総額・売買代金を全て含むか検査。
+    欠落があれば (見出し抜粋, 欠落項目リスト) を返す。"""
+    incomplete: list[tuple[str, list[str]]] = []
+    cur_sec: str | None = None
+    for line in lines:
+        if SECTION_RE.match(line):
+            cur_sec = "in_section"
+            continue
+        if line.startswith("## "):
+            cur_sec = None
+            continue
+        if cur_sec and ENTRY_RE.match(line):
+            missing = [f for f in REQUIRED_FIELDS if f not in line]
+            if missing:
+                incomplete.append((line.strip()[:48], missing))
+    return incomplete
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--file", required=True, help="統合 md ファイルパス")
@@ -115,6 +140,10 @@ def main() -> int:
             print(f"[件数ゲート] {market} {sec}: {got}/{need} {mark}")
             if got < need:
                 failures.append(f"{market} {sec} が {got} 件（規定 {need} 件）")
+        # 完備ゲート: 各エントリに 終値・時価総額・売買代金 が揃っているか（PM 2026-06-30）
+        for head, missing in check_entry_fields(lines):
+            print(f"[完備ゲート] {market} 項目欠落[{'/'.join(missing)}]: {head}", file=sys.stderr)
+            failures.append(f"{market} エントリ項目欠落[{'/'.join(missing)}]: {head}")
 
     if failures:
         print("\n[件数ゲート] [NG] 規定件数を満たさないため送信を中止します:", file=sys.stderr)

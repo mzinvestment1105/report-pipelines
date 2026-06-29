@@ -221,6 +221,43 @@ def _colorize_numbers(html: str) -> str:
     return html
 
 
+# 時価総額サイズ目印（PM 2026-06-30 確定・LLM 非依存で renderer が付与）。
+# 個別株を列挙する見出し（### …（… 時価総額 X億/兆円 …））に対し時価総額で区分タグを挿入:
+#   100億以上=無印 / 50〜100億未満=〔小型 ◯◯億〕 / 50億未満=〔極小 ◯◯億・対象外〕（赤太字）。
+# PM は100億未満を基本回避・50億未満は禁止リスト（playbook/entry_exit_rules.md §3-6）。
+_SIZE_MCAP_RE = re.compile(r"時価総額\s*([\d,]+(?:\.\d+)?)\s*(兆|億)円")
+_SIZE_PCT_RE = re.compile(r"(\s*[+\-−][\d.]+\s*%\s*)(（)")
+
+
+def _size_tag(mcap_oku: float | None) -> str | None:
+    if mcap_oku is None:
+        return None
+    if mcap_oku < 50:
+        return f'<span style="color:{_NEG};font-weight:700">〔極小 {mcap_oku:.0f}億・対象外〕</span>'
+    if mcap_oku < 100:
+        return f'〔小型 {mcap_oku:.0f}億〕'
+    return None
+
+
+def _inject_size_tags(md_text: str) -> str:
+    """個別株見出し行の時価総額からサイズ目印タグを銘柄名直後に挿入する（極小は赤太字）。"""
+    out = []
+    for line in md_text.split("\n"):
+        if line.startswith("### ") and "時価総額" in line and "〔" not in line:
+            mm = _SIZE_MCAP_RE.search(line)
+            if mm:
+                val = float(mm.group(1).replace(",", ""))
+                oku = val * 10000 if mm.group(2) == "兆" else val
+                tag = _size_tag(oku)
+                if tag:
+                    new, n = _SIZE_PCT_RE.subn(rf" {tag}\1\2", line, count=1)
+                    if n == 0:
+                        new = line.replace("（", f" {tag}（", 1)
+                    line = new
+        out.append(line)
+    return "\n".join(out)
+
+
 def render_markdown_to_pdf(
     md_text: str,
     out_path: Path,
@@ -260,6 +297,7 @@ def render_markdown_to_pdf(
     body_md = "\n".join(lines).strip()
     # 内部メタ表現の確定除去（PM 2026-06-27・LLM が本文に書いても renderer 側で必ず削除する）
     body_md = re.sub(r"（記事ベース[^）]*）", "", body_md)
+    body_md = _inject_size_tags(body_md)
 
     html_body = md.markdown(body_md, extensions=["tables", "fenced_code", "sane_lists"])
     html_body = _colorize_numbers(html_body)
