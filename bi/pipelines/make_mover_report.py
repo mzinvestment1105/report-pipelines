@@ -114,6 +114,25 @@ def _yf_market_cap_oku(code4: str, close_t) -> float | None:
     return None
 
 
+def _yf_turnover(code4: str, close_t) -> float | None:
+    """screening_master 未登録銘柄の売買代金（円）を yfinance からライブ取得する。
+    当日出来高 × 終値で近似。取得不能なら None（GHA でも動く HTTP 手段のみ）。"""
+    try:
+        import yfinance as yf
+        info = yf.Ticker(f"{code4}.T").info or {}
+    except Exception:
+        return None
+    try:
+        vol = info.get("volume") or info.get("regularMarketVolume") or info.get("averageVolume")
+        close_val = pd.to_numeric(close_t, errors="coerce")
+        if vol and pd.notna(close_val):
+            tv = float(vol) * float(close_val)
+            return tv if tv > 0 else None
+    except Exception:
+        return None
+    return None
+
+
 # TDNet設定
 DEFAULT_TDNET_DAYS   = 30
 TDNET_PDF_MAX_CHARS  = 2000
@@ -599,6 +618,18 @@ def build_full_table(
         df["Turnover"] = pd.to_numeric(df["TurnoverJQ"], errors="coerce").fillna(_close_t * _vol_t)
     else:
         df["Turnover"] = _close_t * _vol_t
+
+    # ③ PM 2026-07-01 確定: screening_master 未登録の IPO 直後銘柄は出来高列も NaN で Turnover が欠落し、
+    # 売買代金欠落で完備ゲートが全体停止する（464A QPS等）。yfinance の当日出来高×終値で補完（②と同様）。
+    _missing_tv = df["Turnover"].isna()
+    _n_tv = int(_missing_tv.sum())
+    if 0 < _n_tv <= 30:
+        for _idx in df.index[_missing_tv]:
+            _code = normalize_code_4(df.at[_idx, "Code"])
+            _tv = _yf_turnover(_code, df.at[_idx, "Close_T"])
+            if _tv is not None and _tv > 0:
+                df.at[_idx, "Turnover"] = _tv
+                print(f"[yf補完] {_code} 売買代金 {_tv/1e8:.1f}億（screening_master 未登録・yfinance フォールバック）")
 
     # PM 2026-05-22 確定: ETF/REIT/上場投信を全レポート全セクションから完全除外
     # raw データ生成時点で除外することで claude-code-action が ETF を Top10 に入れる事故を構造的に防止
