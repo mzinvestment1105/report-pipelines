@@ -109,7 +109,9 @@ jobs:
     needs: guard
     if: needs.guard.outputs.proceed == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # PM 2026-07-01: 株探/みんかぶ等のスクレイピングが 403 で弾かれる日（GHA IP ブロック）に
+    # ニュース取得段が遅延し 20 分枠を超えてキャンセルされ未送信になる。余裕を持って 35 分へ。
+    timeout-minutes: 35
     outputs:
       target_date: ${{ steps.date.outputs.value }}
     steps:
