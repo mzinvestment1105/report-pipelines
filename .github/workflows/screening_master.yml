@@ -2,9 +2,13 @@ name: スクリーニングマスター更新
 
 "on":
   # PM 2026-05-27 確定: Cloudflare Worker (mizuki-fund-scheduler-1) からの workflow_dispatch がメイン経路。
-  # PM 2026-06-06: 重量級 ETL（5h・JQuants クォータ使用）のため GHA cron による二重起動は実装せず、
-  # guard ジョブによる重複防止のみ実装。Worker 落ち時のフェイルセーフは daily_healthcheck workflow で検知。
+  # PM 2026-06-30: Worker 単一経路の SPOF（実測で金曜の Worker 発火が毎週欠落）回避のため、
+  # 他レポート（mover/macro/theme）と同様に GHA cron をフェイルセーフとして併用。
+  # 平日のみ（UTC 月-金 = 08:15 = JST 17:15・Worker 16:13 の約 1 時間後）。
+  # guard ジョブが当日の既存 run（成功・実行中）を検知し重複発火・二重 ETL を防ぐ。
   workflow_dispatch:
+  schedule:
+    - cron: '15 8 * * 1-5'
 
 concurrency:
   group: screening_master-daily
