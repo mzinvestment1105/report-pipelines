@@ -369,7 +369,9 @@ jobs:
   merge-and-send:
     needs: [setup-raw, generate-market]
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # PM 2026-07-01: フォント/Playwright の apt 導入が遅い日（実測14分）に 15 分枠だと
+    # ゲート到達前にジョブ timeout でキャンセルされ未送信になる。余裕を持って 30 分へ。
+    timeout-minutes: 30
     steps:
       - name: Checkout report-pipelines
         uses: actions/checkout@v4
