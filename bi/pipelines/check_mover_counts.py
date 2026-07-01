@@ -44,6 +44,11 @@ ENTRY_RE   = re.compile(r"^###\s")
 # 例: 売買代金欠落（### 1位 7815 東京ボード工業 …（終値 306円 / 時価総額 9億円）） を送信前に止める。
 REQUIRED_FIELDS = ("終値", "時価総額", "売買代金")
 
+# このうち欠落したらレポート全体の送信を止める（=バグの疑い・常に取得可能）項目。
+# 時価総額は IPO 直後で全ソースが未提供のことがあり（589A ネイス等）、欠落しても
+# レポート全体は止めず警告のみに留める（PM 2026-07-01・prompt「取れない項目は省略」と整合）。
+FATAL_FIELDS = ("終値", "売買代金")
+
 
 def detect_market(title_line: str) -> str | None:
     for name in EXPECTED:
@@ -140,10 +145,18 @@ def main() -> int:
             print(f"[件数ゲート] {market} {sec}: {got}/{need} {mark}")
             if got < need:
                 failures.append(f"{market} {sec} が {got} 件（規定 {need} 件）")
-        # 完備ゲート: 各エントリに 終値・時価総額・売買代金 が揃っているか（PM 2026-06-30）
+        # 完備ゲート: 各エントリに 終値・時価総額・売買代金 が揃っているか（PM 2026-06-30）。
+        # 終値・売買代金の欠落は送信ブロック（バグ検知）。時価総額のみ欠落は警告して送信継続
+        # （IPO 直後の未提供銘柄で全体停止しないため・PM 2026-07-01）。
         for head, missing in check_entry_fields(lines):
-            print(f"[完備ゲート] {market} 項目欠落[{'/'.join(missing)}]: {head}", file=sys.stderr)
-            failures.append(f"{market} エントリ項目欠落[{'/'.join(missing)}]: {head}")
+            fatal = [f for f in missing if f in FATAL_FIELDS]
+            warn = [f for f in missing if f not in FATAL_FIELDS]
+            if warn:
+                print(f"[完備ゲート:警告] {market} 項目欠落[{'/'.join(warn)}]（送信は継続）: {head}",
+                      file=sys.stderr)
+            if fatal:
+                print(f"[完備ゲート] {market} 項目欠落[{'/'.join(fatal)}]: {head}", file=sys.stderr)
+                failures.append(f"{market} エントリ項目欠落[{'/'.join(fatal)}]: {head}")
 
     if failures:
         print("\n[件数ゲート] [NG] 規定件数を満たさないため送信を中止します:", file=sys.stderr)

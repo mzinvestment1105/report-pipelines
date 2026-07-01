@@ -83,6 +83,37 @@ TURNOVER_CONFIG = {
 # Layer 2: 全動意銘柄リスト上位件数
 ALL_MOVERS_TOP_N = 100
 
+
+# ---------------------------------------------------------------------------
+# screening_master 未登録銘柄（IPO直後の末尾A等）の時価総額ライブ補完
+# ---------------------------------------------------------------------------
+def _yf_market_cap_oku(code4: str, close_t) -> float | None:
+    """screening_master 未登録銘柄の時価総額（億円）を yfinance からライブ取得する。
+    発行済株数 × 当日終値（EOD統一）を優先し、無ければ info.marketCap にフォールバック。
+    取得不能なら None。GHA でも動く HTTP 手段のみ（ローカル MCP 非依存・CLAUDE.md §C）。"""
+    try:
+        import yfinance as yf
+    except Exception:
+        return None
+    try:
+        info = yf.Ticker(f"{code4}.T").info or {}
+    except Exception:
+        return None
+    try:
+        shares = info.get("sharesOutstanding")
+        close_val = pd.to_numeric(close_t, errors="coerce")
+        if shares and pd.notna(close_val):
+            oku = float(shares) * float(close_val) / 1e8
+            if oku > 0:
+                return oku
+        mc = info.get("marketCap")
+        if mc and float(mc) > 0:
+            return float(mc) / 1e8
+    except Exception:
+        return None
+    return None
+
+
 # TDNet設定
 DEFAULT_TDNET_DAYS   = 30
 TDNET_PDF_MAX_CHARS  = 2000
@@ -542,6 +573,22 @@ def build_full_table(
     else:
         df["MarketCap"] = _base_cap
     df["MarketCapOku"] = pd.to_numeric(df["MarketCap"], errors="coerce") / 1e8
+
+    # ② PM 2026-07-01 確定: screening_master 未登録銘柄（IPO直後の末尾A等）は MarketCap・株数とも NaN で
+    # 時価総額が欠落し、raw が「時価総額: ─」→ 生成 LLM が省略 → 完備ゲート（check_mover_counts.py）で
+    # レポート全体の送信が停止する（589A ネイス等）。yfinance（GHA でも動く HTTP 手段）で
+    # 発行済株数×当日終値を補完して欠落を根治する。通常 0〜3 件・安全弁で全件叩きを防ぐ。
+    _missing_cap = df["MarketCapOku"].isna()
+    _n_missing = int(_missing_cap.sum())
+    if 0 < _n_missing <= 30:
+        for _idx in df.index[_missing_cap]:
+            _code = normalize_code_4(df.at[_idx, "Code"])
+            _oku = _yf_market_cap_oku(_code, df.at[_idx, "Close_T"])
+            if _oku is not None and _oku > 0:
+                df.at[_idx, "MarketCap"] = _oku * 1e8
+                df.at[_idx, "MarketCapOku"] = _oku
+                print(f"[yf補完] {_code} 時価総額 {_oku:.0f}億"
+                      "（screening_master 未登録・yfinance フォールバック）")
 
     # 売買代金 Turnover を全銘柄に付与（PM 2026-06-30・raw 欠落防止）。
     # TurnoverJQ（JQuants 実績売買代金）優先・無ければ当日終値×出来高で近似。
