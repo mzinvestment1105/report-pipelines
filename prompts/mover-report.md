@@ -153,7 +153,7 @@ raw に時価総額・売買代金が欠落していたら、以下を順に試�
 raw データの各銘柄を機械チェックし、該当したら**全セクションから完全除外**：
 
 1. **銘柄名 = コード**（例「200A 200A」）
-2. **銘柄名キーワード**：「ETF」「上場投信」「上場投資信託」「投信」「NEXT FUNDS」「iShares」「MAXIS」「ダイワ上場」「日経連動」「指数連動」「TOPIX 連動」「J-REIT」「REIT」「リート」「不動産投資法人」「インフラファンド」「ETN」
+2. **銘柄名キーワード**：「ETF」「上場投信」「上場投資信託」「投信」「NEXT FUNDS」「iShares」「MAXIS」「ダイワ上場」「日経連動」「指数連動」「指数連動型」「TOPIX 連動」「J-REIT」「REIT」「リート」「不動産投資法人」「インフラファンド」「ETN」
 3. **セクター nan + 末尾 A コード**
 4. **screening_master.parquet 未登録**
 
@@ -192,7 +192,7 @@ raw データの各銘柄を機械チェックし、該当したら**全セク�
    - `${PRIVATE_REPO_ROOT}/playbook/entry_exit_rules.md` — §3 銘柄選定の必須条件・§3-6 禁止リスト（時価総額50億未満NG 等。「チャンス」判定の機械ゲートに使う）
    - `${PRIVATE_REPO_ROOT}/market/daily/macro/` 直近 1 件（地合い把握・本文には書かない）
 4. `${PRIVATE_REPO_ROOT}/market/daily/${TARGET_DATE}_movers_raw.md` を Read（**担当市場の節に絞り込み済み**）。
-   - **再読込ループ厳禁**：standard / growth は `Read(file, offset=1, limit=2000)` の 1 回（足りなければ続きを 1 回追加・計 2 回まで）。prime は `limit=900` 程度で先頭から数回通読。一度読んだ範囲を再 Read しない。各銘柄の数値・材料は最初の通読でメモし、以後は自分のメモを参照。引数なし Read 禁止。
+   - **再読込ループ厳禁**：standard / growth は `Read(file, offset=1, limit=2000)` の 1 回（足りなければ続きを 1 回追加・計 2 回まで）。prime は `limit=900` 程度で先頭から数回通読。一度読んだ範囲を再 Read しない。各銘柄の数値・材料は最初の通読でメモし、以後は自分のメモを参照。引数なし Read 禁止。（この一括通読は _common_rules §10「銘柄ごと個別 Read」の明示的例外：本タスクの raw は担当市場の節に絞り込み済みのため）
 5. 担当範囲のセクションを新フォーマットで生成し、`${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}_${TARGET_MARKET}.md` に Write。
 
 ---

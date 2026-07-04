@@ -70,7 +70,7 @@
 
 - **PMに質問しない**。判断に迷う点は最も保守的な解釈で進める。
 - **Deep Research は廃止**（2026-05-19 PM 確定）。Deep Research 候補セクションを出力しない。`## 📌 Deep Research 候補` の見出しも書かない。Perplexity 等の外部調査プロンプトも生成しない。
-- **市況補完・数値補完・イベント解釈は raw（news_raw / finnhub_raw / 立花 raw）と市況スナップショットで完結させる**。市況スナップショットは generate_macro_report.py が yfinance＋CNBC＋日経公式から確定整形済（**米VIX・日経VI を含む**）。GHA では WebSearch / WebFetch が補助モデル 404 で機能しないため Web に依存しない（呼んでも空振りしトークンを消費するだけ・[prompts/_common_rules.md](_common_rules.md) §14）：
+- **市況補完・数値補完・イベント解釈は raw（news_raw / finnhub_raw / 立花 raw）と市況スナップショットで完結させる**。市況スナップショットは generate_macro_report.py が yfinance＋CNBC＋日経公式から確定整形済。**raw に米VIX・日経VI の行があってもレポートには出力しない（転記時に除外・PM 2026-06-27 指示・2026-07-04 確定）**。GHA では WebSearch / WebFetch が補助モデル 404 で機能しないため Web に依存しない（呼んでも空振りしトークンを消費するだけ・[prompts/_common_rules.md](_common_rules.md) §14）：
   - news_raw / finnhub_raw に該当ニュースが無い・解釈に不足がある場合は、raw 内の関連記事・前日レポート・立花 AI 市況コメントを突き合わせて解釈する。raw に無い事象は「raw 未取得のため言及せず」とし、記憶ベースで補完しない（§8）。
   - 市況スナップショットの数値は generate_macro_report.py が確定整形した値をそのまま転記する（§21-A）。取得不能な指標は当該行を「取得不可」とし、Web で取りに行かない（GHA で 404）。
   - 外部ツール（Perplexity 等）への依存は禁止。
@@ -82,9 +82,7 @@
 - **米国引け後を「日本市場引け後」と誤訳しない**（[prompts/_common_rules.md](_common_rules.md) §3 参照・最重要）
   - 米市場引け 16:00 EDT = JST **翌朝 05:00**
   - 例：「Nvidia 決算 5/21 米国引け後判明」→ **JST 5/22 05:00 早朝**（同日の日本市場引け後ではない）
-- **VIX 言及時は米株/日本株を必ず明示**（[prompts/_common_rules.md](_common_rules.md) §6 参照）
-  - 「米 VIX 18.14」「日経 VI 22.5」のように国名を含める
-  - 日本株投資家向けのため**日経 VI を優先して言及**
+- **VIX（米VIX・日経VI）はレポートに出力しない**（PM 2026-06-27 指示・2026-07-04 確定）。市況スナップショット転記時に VIX 行を除外する。本文でやむを得ず言及する場合のみ「米 VIX」「日経 VI」と市場を明示（[prompts/_common_rules.md](_common_rules.md) §6 参照）
 - **金利→為替→株の因果**を記述する際は外部ソースの転記禁止・自分でロジックトレース
 - **ETF/REIT への言及禁止**（[prompts/_common_rules.md](_common_rules.md) §1 参照）。「中小型主導」「主導銘柄」等の例示で ETF/REIT を出さない
 
@@ -108,7 +106,7 @@
 
 - `${PRIVATE_REPO_ROOT}/market/daily/macro/${TARGET_DATE}.md` が生成され、内容が空でない
 - **「米国引け後」「EDT」「EST」をキーワードで grep し、直近に JST 換算が併記されている**
-- **VIX 言及箇所が全て「米 VIX」「日経 VI」のいずれかで市場明示されている**
+- **市況スナップショットに VIX 行（米VIX・日経VI）が出力されていない**（PM 2026-06-27 確定）
 - **英語原文（アルファベット 2 単語以上連続）が混入していない**
 - **専門用語に括弧注釈が付いている**
 - **ETF/REIT への言及がない**

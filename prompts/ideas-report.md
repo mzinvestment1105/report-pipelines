@@ -30,7 +30,7 @@ raw を読み、**機械的なスコアリング基準**で各銘柄を評価し
 
 1. **TOB セクションを絶対に出力しない**（PM 2026-05-25 確定）。raw に TOB 関連が含まれていても本レポートから完全除外。
 2. **% 単位で統一**：自社株買い・大量保有等は「発行済株式数比 %」で表示。株数のみのデータは % 換算するか、% 換算不可なら注記。
-3. **株価動意・ファンダを併記**：Top10 銘柄には `${PRIVATE_REPO_ROOT}/bi/outputs/screening_master.parquet` から時価総額・売買代金・信用倍率を join。
+3. **株価動意・ファンダを併記**：Top10 銘柄には `${PRIVATE_REPO_ROOT}/bi/outputs/screening_master.parquet` から時価総額・売買代金・信用買残/売残（対発行株数%）を join。**信用倍率は出力禁止**（PM 確定）。
 4. **重複セクション銘柄に ⚡ マーカー**：複数セクション登場の銘柄を自動検出して Top10 最上位に。
 5. **フォロースルー追跡 ⏰ マーカー**：過去 5 営業日の ideas レポート Top10 に登場した銘柄が本日 raw に再ヒットしたら ⏰ マーカー。
 
@@ -98,7 +98,8 @@ raw を読み、**機械的なスコアリング基準**で各銘柄を評価し
 Top10 銘柄について `${PRIVATE_REPO_ROOT}/bi/outputs/screening_master.parquet` を join：
 - **時価総額** (MarketCap / 1e8): ○○億円
 - **5 日平均売買代金** (AvgDailyValue5d / 1e8): ○○億円/日
-- **信用倍率** (LongMarginTradeVolume / ShortMarginTradeVolume): ○○倍
+- **信用買残率** (Scr_LongMargin_to_SharesOutstanding): ○.○%
+- **信用売残率** (ShortMarginTradeVolume ÷ NumberOfIssuedAndOutstandingSharesAtTheEndOfFiscalYearIncludingTreasuryStock): ○.○%
 - **PER**（あれば）
 
 #### 出力構造
@@ -125,7 +126,7 @@ Top10 銘柄について `${PRIVATE_REPO_ROOT}/bi/outputs/screening_master.parqu
 |---|---|---|---|---|
 
 ## 4. 翌営業日 注目銘柄 Top10（定量スコア順・メイン）
-| 順位 | 銘柄 | スコア内訳 | 動意（時価総額・5d 売買代金・信用倍率） | マーカー |
+| 順位 | 銘柄 | スコア内訳 | 動意（時価総額・5d 売買代金・信用買残/売残%） | マーカー |
 |---|---|---|---|---|
 
 各銘柄について本文で：スコア根拠／なぜ注目すべきか（事実ベース・主観禁止）／直近の関連 IR・補足／最終益のみ上方修正なら「営業益動かず・一時要因の可能性」明記。
