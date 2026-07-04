@@ -127,8 +127,8 @@
 3. **受益銘柄マップ必須** — 深掘りセクターには具体的な銘柄を最低3社挙げる
 4. **3シナリオ+確率必須** — ベース・強気・弱気の合計が100%になるように
 5. **自己完結** — このレポートだけでセクターローテーション判断ができるレベルに仕上げる
-6. **言及銘柄の事業モデルは中学生が読んで分かる粒度**（§26 [prompts/_common_rules.md](C:/Users/mizuk/report-pipelines/prompts/_common_rules.md)）— 受益銘柄を挙げる際は主力プロダクト + 具体的な使用シーンを含める。業界用語 + 注釈だけで終わらせない
-7. **材料は事実 + 解釈の両方記載**（§27 [prompts/_common_rules.md](C:/Users/mizuk/report-pipelines/prompts/_common_rules.md)）— セクターの強弱・受益銘柄の動意理由を事実（IR・指標・テーマ）と解釈（なぜそれで動いたか）の両方で説明
+6. **言及銘柄の事業モデルは中学生が読んで分かる粒度**（§26 [prompts/_common_rules.md](https://github.com/mzinvestment1105/report-pipelines/blob/main/prompts/_common_rules.md)）— 受益銘柄を挙げる際は主力プロダクト + 具体的な使用シーンを含める。業界用語 + 注釈だけで終わらせない
+7. **材料は事実 + 解釈の両方記載**（§27 [prompts/_common_rules.md](https://github.com/mzinvestment1105/report-pipelines/blob/main/prompts/_common_rules.md)）— セクターの強弱・受益銘柄の動意理由を事実（IR・指標・テーマ）と解釈（なぜそれで動いたか）の両方で説明
 
 ---
 

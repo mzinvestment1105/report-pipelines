@@ -93,13 +93,13 @@ PM が「テーマ名のフル版を作って」と明示指示した場合の�
 
 - 保存：[market/daily/theme/{date}_themes_summary.md](../market/daily/theme/)
 - 送信：[bi/pipelines/send_themes_summary_discord.py](../bi/pipelines/send_themes_summary_discord.py) で `DISCORD_WEBHOOK_THEME` へ
-- フォールバック禁止（[feedback_discord_send_rules.md](../../C:/Users/mizuk/.claude/projects/c--Users-mizuk-2026--investment-Mizuki-Fund/memory/feedback_discord_send_rules.md) 参照）
+- フォールバック禁止（[feedback_discord_send_rules.md](../claude_memory/feedback_discord_send_rules.md) 参照）
 
 ---
 
 ## 凍結プロトタイプの取り扱い
 
-[dev/prototype/themes/](../dev/prototype/themes/) 配下のスクリプト・生産物・レポートは**呼び出し禁止**（[feedback_theme_prototype_no_call.md](../../C:/Users/mizuk/.claude/projects/c--Users-mizuk-2026--investment-Mizuki-Fund/memory/feedback_theme_prototype_no_call.md) 参照）。新仕様で必要な機能が出た場合は、PM 明示承認を得てから個別ファイルを参考として参照する。
+[dev/prototype/themes/](../dev/prototype/themes/) 配下のスクリプト・生産物・レポートは**呼び出し禁止**（[feedback_theme_prototype_no_call.md](../claude_memory/feedback_theme_prototype_no_call.md) 参照）。新仕様で必要な機能が出た場合は、PM 明示承認を得てから個別ファイルを参考として参照する。
 
 ---
 

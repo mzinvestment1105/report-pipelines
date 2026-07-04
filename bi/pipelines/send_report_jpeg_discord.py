@@ -10,6 +10,7 @@
     python send_report_jpeg_discord.py --kind ideas --date 2026-05-18
     python send_report_jpeg_discord.py --kind themes --date 2026-05-18
     python send_report_jpeg_discord.py --kind earnings --month 2026-05
+    python send_report_jpeg_discord.py --kind largecap_weekly --date 2026-06-27
 
 レポート種別ごとに Markdown パスと送信先 Webhook が自動選択される。
 """
