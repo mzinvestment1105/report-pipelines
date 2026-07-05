@@ -3,11 +3,14 @@ name: Daily Healthcheck (dead-man switch)
 "on":
   # PM 2026-06-06 新設: Worker と GHA cron が両方落ちて完全無音失敗する事故を検知。
   # 朝刊チェック: 09:00 JST = UTC 00:00（マクロ朝刊 06:23 の 2.5h 後・cron 07:30 の 1.5h 後）
+  #   + 前日夕方 ETL 3 本（price_history 16:00 / financial_history 17:00 / screening_master 17:15 JST）を前日日付で判定
   # 夕方チェック: 19:00 JST = UTC 10:00（夕方 4 レポート想定完了の 15-30 分後）
+  # 金曜夜チェック: 23:30 JST 金曜 = UTC 14:30 金曜（週次 3 本の 21:00 JST 発火から 2.5h 後・同日判定）
   workflow_dispatch: {}
   schedule:
     - cron: '0 0 * * 1-5'
     - cron: '0 10 * * 1-5'
+    - cron: '30 14 * * 5'
 
 # PM 2026-06-06: 同時起動排除（cron 2 つが同時に走ることはないが念のため）
 concurrency:
@@ -19,20 +22,37 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Determine check scope (morning / evening)
+      - name: Determine check scope (morning / evening / friday-weekly)
         id: scope
         run: |
+          # workflows 出力は「<workflow ファイル名>=<判定基準日 (JST)>」のカンマ区切り。
+          # 判定基準日 00:00 JST 以降に success run があるかを check step が見る。
           HOUR_JST=$(TZ=Asia/Tokyo date +%H)
+          DOW_JST=$(TZ=Asia/Tokyo date +%u)   # 1=月 ... 7=日
+          TODAY_JST=$(TZ=Asia/Tokyo date +%Y-%m-%d)
+          YESTERDAY_JST=$(TZ=Asia/Tokyo date -d 'yesterday' +%Y-%m-%d)
           if [ "$HOUR_JST" -lt 12 ]; then
+            # 朝スコープ: 当日朝刊 + 前日夕方 ETL 3 本（前日日付で判定）
+            # screening_master は平日のみ実行のため月曜朝は前週金曜分を判定
+            if [ "$DOW_JST" -eq 1 ]; then
+              SM_DATE=$(TZ=Asia/Tokyo date -d '3 days ago' +%Y-%m-%d)
+            else
+              SM_DATE="$YESTERDAY_JST"
+            fi
             echo "scope=morning" >> $GITHUB_OUTPUT
-            echo "workflows=macro_report_daily.yml" >> $GITHUB_OUTPUT
-            echo "label=朝刊" >> $GITHUB_OUTPUT
+            echo "workflows=macro_report_daily.yml=${TODAY_JST},screening_master.yml=${SM_DATE},financial_history.yml=${YESTERDAY_JST},price_history.yml=${YESTERDAY_JST}" >> $GITHUB_OUTPUT
+            echo "label=朝刊 + 前日 ETL 3 本" >> $GITHUB_OUTPUT
+          elif [ "$DOW_JST" -eq 5 ] && [ "$HOUR_JST" -ge 22 ]; then
+            # 金曜夜スコープ: 金曜 21:00 JST 発火の週次 3 本を同日（金曜）日付で判定
+            echo "scope=friday_weekly" >> $GITHUB_OUTPUT
+            echo "workflows=largecap_weekly.yml=${TODAY_JST},mover_weekly.yml=${TODAY_JST},sector_report_weekly_full.yml=${TODAY_JST}" >> $GITHUB_OUTPUT
+            echo "label=金曜週次 3 本" >> $GITHUB_OUTPUT
           else
             echo "scope=evening" >> $GITHUB_OUTPUT
-            echo "workflows=sector_report_daily.yml,mover_report_daily.yml,macro_report_evening.yml,theme_report_daily.yml" >> $GITHUB_OUTPUT
+            echo "workflows=sector_report_daily.yml=${TODAY_JST},mover_report_daily.yml=${TODAY_JST},macro_report_evening.yml=${TODAY_JST},theme_report_daily.yml=${TODAY_JST}" >> $GITHUB_OUTPUT
             echo "label=夕方 4 本" >> $GITHUB_OUTPUT
           fi
-          echo "today_jst=$(TZ=Asia/Tokyo date +%Y-%m-%d)" >> $GITHUB_OUTPUT
+          echo "today_jst=${TODAY_JST}" >> $GITHUB_OUTPUT
           echo "hour_jst=${HOUR_JST}" >> $GITHUB_OUTPUT
 
       - name: Check today's report success
@@ -40,20 +60,22 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TODAY_START="${{ steps.scope.outputs.today_jst }}T00:00:00+09:00"
           MISSING=""
-          IFS=',' read -ra WORKFLOWS <<< "${{ steps.scope.outputs.workflows }}"
-          for wf in "${WORKFLOWS[@]}"; do
-            wf=$(echo "$wf" | tr -d ' ')
+          IFS=',' read -ra ENTRIES <<< "${{ steps.scope.outputs.workflows }}"
+          for entry in "${ENTRIES[@]}"; do
+            entry=$(echo "$entry" | tr -d ' ')
+            wf="${entry%%=*}"
+            since="${entry#*=}"
+            SINCE_START="${since}T00:00:00+09:00"
             SUCCESS=$(gh api -X GET \
               "repos/${{ github.repository }}/actions/workflows/${wf}/runs" \
-              -f "created=>=${TODAY_START}" \
+              -f "created=>=${SINCE_START}" \
               --jq '[.workflow_runs[] | select(.conclusion=="success")] | length')
             ACTIVE=$(gh api -X GET \
               "repos/${{ github.repository }}/actions/workflows/${wf}/runs" \
-              -f "created=>=${TODAY_START}" \
+              -f "created=>=${SINCE_START}" \
               --jq '[.workflow_runs[] | select(.status=="in_progress" or .status=="queued" or .status=="waiting" or .status=="pending")] | length')
-            echo "${wf}: success=${SUCCESS} active=${ACTIVE}"
+            echo "${wf} (since ${since}): success=${SUCCESS} active=${ACTIVE}"
             if [ "$SUCCESS" -eq 0 ] && [ "$ACTIVE" -eq 0 ]; then
               MISSING="${MISSING} ${wf}"
             fi

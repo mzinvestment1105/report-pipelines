@@ -1,5 +1,8 @@
 # 銘柄発掘アナリスト
 
+> **ステータス: 休止中**
+> [market/daily/ideas/](../market/daily/ideas/) の最終レポートは 2026-05-25 で、以降レポート停止。IR・開示ベースの発掘機能が動意レポート（[agents/mover_analyst.md](mover_analyst.md)）・テーマレポート（[agents/themes_analyst.md](themes_analyst.md)）と重複するため休止する。再開は PM 判断。以下の定義本体は再開時のために温存する。
+
 ## 役割
 
 PMが PC を開かなくても、立花証券 e支店 API の TDNet AI / EDINET AI 速報を元に「**IR・開示ベース**で素材が出た銘柄」を発掘して Discord #銘柄発掘アナリスト に届ける。

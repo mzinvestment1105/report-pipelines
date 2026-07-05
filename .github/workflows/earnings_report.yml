@@ -1,0 +1,342 @@
+# ドラフト: PUBLIC/.github/workflows/earnings_report.yml
+# 決算シーズン総括レポート GHA 化（PM 承認前・実配置禁止）
+#
+# 設計方針（2026-07 ドラフト時点）:
+# - 決算オフ期のため cron なし・workflow_dispatch 手動発火のみ。
+#   8月シーズン前に dry_run で試運転 → 問題なければ 8月に cron 追加を別途 PM 承認で検討。
+# - largecap_weekly.yml（単一 generate ジョブ + guard）を雛形に踏襲。
+# - 決算ピーク期は同月内で何度も実行する運用（feedback_earnings_report §0）のため、
+#   guard は「当日成功済み」でも force_rerun=true で再実行できる設計を維持。
+# - dry_run=true は Discord 送信と private repo への commit-back を両方スキップし、
+#   生成 overview を artifact でのみ確認できるようにする（過去月での試運転で
+#   本番 {month}_overview.md を上書き commit しないための安全弁）。
+
+name: 決算シーズン総括レポート
+
+"on":
+  # cron なし（決算オフ期）。8月シーズン開始時に cron 追加を PM 承認の上で検討。
+  workflow_dispatch:
+    inputs:
+      target_month:
+        description: '対象月 (YYYY-MM・空欄で当月)'
+        required: false
+        default: ''
+      force_rerun:
+        description: 'true で当日重複ガードを無視して強制実行（同日内の累積スナップショット更新・再テスト用）'
+        required: false
+        default: 'false'
+      dry_run:
+        description: 'true で Discord 送信・private repo への commit-back を両方スキップ（生成物は artifact で確認）'
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  group: earnings_report-run
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    # workflow_dispatch のみだが、二重クリック・Cloudflare Worker 将来接続時の
+    # 重複発火を防ぐため既存 workflow と同方式の guard を置く。
+    # 決算ピーク期の同日複数回実行は force_rerun=true で行う。
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      proceed: ${{ steps.check.outputs.proceed }}
+      reason: ${{ steps.check.outputs.reason }}
+    steps:
+      - name: Check today's runs
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.force_rerun }}" = "true" ]; then
+            echo "proceed=true" >> $GITHUB_OUTPUT
+            echo "reason=force_rerun (manual guard bypass)" >> $GITHUB_OUTPUT
+            echo "force_rerun=true (手動): 重複ガードを無視して実行します"
+            exit 0
+          fi
+          TODAY_JST=$(TZ=Asia/Tokyo date +%Y-%m-%d)
+          TODAY_START="${TODAY_JST}T00:00:00+09:00"
+          MY_RUN_ID=${{ github.run_id }}
+
+          RUNS=$(gh api -X GET \
+            "repos/${{ github.repository }}/actions/workflows/earnings_report.yml/runs" \
+            -f "created=>=${TODAY_START}" \
+            --jq "[.workflow_runs[] | select(.id != ${MY_RUN_ID})]")
+
+          ACTIVE=$(echo "$RUNS" | jq '[.[] | select(.status=="in_progress" or .status=="queued" or .status=="waiting" or .status=="action_required" or .status=="pending")] | length')
+          DONE_OK=$(echo "$RUNS" | jq '[.[] | select(.conclusion=="success" or .conclusion=="neutral")] | length')
+          DONE_FAIL=$(echo "$RUNS" | jq '[.[] | select(.conclusion=="failure" or .conclusion=="cancelled" or .conclusion=="startup_failure" or .conclusion=="timed_out" or .conclusion=="stale" or .conclusion=="action_required")] | length')
+
+          echo "Today (${TODAY_JST}): active=${ACTIVE} done_ok=${DONE_OK} done_fail=${DONE_FAIL} (excluding self ${MY_RUN_ID})"
+
+          if [ "$DONE_OK" -gt 0 ]; then
+            echo "proceed=false" >> $GITHUB_OUTPUT
+            echo "reason=skip (already succeeded today: done_ok=${DONE_OK}・同日再実行は force_rerun=true で)" >> $GITHUB_OUTPUT
+          elif [ "$ACTIVE" -gt 0 ]; then
+            echo "proceed=false" >> $GITHUB_OUTPUT
+            echo "reason=skip (active run exists: active=${ACTIVE})" >> $GITHUB_OUTPUT
+          else
+            echo "proceed=true" >> $GITHUB_OUTPUT
+            if [ "$DONE_FAIL" -gt 0 ]; then
+              echo "reason=recovery (done_fail=${DONE_FAIL})" >> $GITHUB_OUTPUT
+            else
+              echo "reason=initial" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: Discord notification (skip event)
+        if: steps.check.outputs.proceed == 'false'
+        env:
+          WH: ${{ secrets.DISCORD_WEBHOOK_EARNINGS }}
+        run: |
+          REASON="${{ steps.check.outputs.reason }}"
+          if [ -z "$WH" ]; then
+            echo "DISCORD_WEBHOOK_EARNINGS 未設定・通知 skip"
+            exit 0
+          fi
+          curl -s -X POST "$WH" -H "Content-Type: application/json" \
+            -d "{\"content\":\"⏭️ 決算シーズン総括 skip: ${REASON}\"}"
+
+  generate:
+    needs: guard
+    if: needs.guard.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    # ETL（JQuants 全カバレッジ逐次取得 約10-20分 + yfinance 一括2回 + TDNet ループ）
+    # + Claude 生成 50 分目安 + setup/送信マージン。
+    timeout-minutes: 110
+
+    steps:
+      - name: Determine target month
+        id: month
+        run: |
+          if [ -n "${{ github.event.inputs.target_month }}" ]; then
+            echo "value=${{ github.event.inputs.target_month }}" >> $GITHUB_OUTPUT
+          else
+            echo "value=$(TZ=Asia/Tokyo date +'%Y-%m')" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout report-pipelines
+        uses: actions/checkout@v4
+        with:
+          path: report-pipelines
+
+      - name: Setup SSH for private repo
+        env:
+          PRIVATE_REPO_DEPLOY_KEY: ${{ secrets.PRIVATE_REPO_DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$PRIVATE_REPO_DEPLOY_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+      - name: Clone private repo (mizuki-fund)
+        run: |
+          git clone git@github.com:mzinvestment1105/mizuki-fund.git private-repo
+
+      - name: Copy pipelines and static files from Public into private working tree
+        run: |
+          cp -f report-pipelines/bi/pipelines/*.py private-repo/bi/pipelines/
+          cp -f report-pipelines/bi/pipelines/requirements.txt private-repo/bi/pipelines/
+          mkdir -p private-repo/bi/pipelines/lib
+          cp -rf report-pipelines/bi/pipelines/lib/*.py private-repo/bi/pipelines/lib/ 2>/dev/null || true
+          mkdir -p private-repo/bi/pipelines/assets/fonts
+          cp -rf report-pipelines/bi/pipelines/assets/fonts/* private-repo/bi/pipelines/assets/fonts/ 2>/dev/null || true
+          mkdir -p private-repo/agents private-repo/playbook
+          cp -f report-pipelines/agents/*.md private-repo/agents/ 2>/dev/null || true
+          cp -f report-pipelines/playbook/*.md private-repo/playbook/ 2>/dev/null || true
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: report-pipelines/bi/pipelines/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r report-pipelines/bi/pipelines/requirements.txt
+
+      - name: Install Japanese fonts (Noto Sans CJK JP)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq fonts-noto-cjk fonts-noto-cjk-extra
+
+      - name: Install Playwright Chromium
+        run: |
+          playwright install chromium --with-deps
+
+      - name: Check screening_master parquet existence (no update・PM 2026-05-23 確定)
+        # rebuild_overview_with_jq.py が bi/outputs/screening_master.parquet の
+        # Sector17CodeName / MarketCap / PER / PBR / ROE を参照する。
+        # 更新は screening_master.yml の cron に依存・ここは存在確認のみ（古くても使う）。
+        working-directory: ./private-repo/bi/pipelines
+        env:
+          PYTHONIOENCODING: utf-8
+        run: |
+          python - <<'PY'
+          import sys
+          from pathlib import Path
+          import pandas as pd
+
+          parquet = Path("../outputs/screening_master.parquet")
+          if not parquet.exists():
+              print(f"ERROR: screening_master.parquet が見つかりません: {parquet}")
+              print("       rebuild_overview_with_jq.py が必須参照するため中止")
+              sys.exit(1)
+          df = pd.read_parquet(parquet)
+          latest = pd.to_datetime(df["DataDate"]).max().date().isoformat() if "DataDate" in df.columns else "unknown"
+          print(f"screening_master DataDate: {latest}")
+          print("PM 確定: 古くてもそのまま使う・更新は実行しない")
+          PY
+
+      # ---- ETL 段（/earnings-report スキル Step 1〜5 と同一順序） ----
+
+      - name: "ETL Step 1: カバレッジ銘柄リスト生成 (extract_coverage_stocks.py)"
+        working-directory: ./private-repo/bi/pipelines
+        env:
+          PYTHONIOENCODING: utf-8
+        run: |
+          python extract_coverage_stocks.py
+          test -f ../../research/earnings/coverage_stocks.csv
+
+      - name: "ETL Step 2: JQuants 確定発表日取得 (fetch_jq_statements.py)"
+        # 全カバレッジ銘柄を 0.5 秒間隔で逐次取得（内部リトライ4回・
+        # 取得数がカバレッジの 50% 未満なら既存 CSV を保持して非ゼロ終了）。
+        working-directory: ./private-repo/bi/pipelines
+        env:
+          JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
+          PYTHONIOENCODING: utf-8
+        run: |
+          python fetch_jq_statements.py --month ${{ steps.month.outputs.value }}
+
+      - name: "ETL Step 3: 株価反応データ取得 (fetch_post_earnings_reaction.py)"
+        working-directory: ./private-repo/bi/pipelines
+        env:
+          PYTHONIOENCODING: utf-8
+        run: |
+          python fetch_post_earnings_reaction.py --month ${{ steps.month.outputs.value }}
+
+      - name: "ETL Step 4: 集計テーブル構築 (rebuild_overview_with_jq.py)"
+        working-directory: ./private-repo/bi/pipelines
+        env:
+          PYTHONIOENCODING: utf-8
+        run: |
+          python rebuild_overview_with_jq.py --month ${{ steps.month.outputs.value }}
+          test -f ../../research/earnings/overview_table.csv
+          test -f ../../research/earnings/overview_sector_reaction.csv
+
+      - name: "ETL Step 5: 保有・Watchlist の TDNet 取得 (fetch_tdnet_disclosures.py)"
+        # coverage_stocks.csv の sources 列に positions / watchlist を含む銘柄のみ対象。
+        # やのしん WebAPI は認証不要 HTTP・GHA IP でのブロック有無は試運転で要確認のため
+        # continue-on-error（TDNet 欠落時もレポート生成は続行・プロンプト側で欠落許容）。
+        working-directory: ./private-repo/bi/pipelines
+        continue-on-error: true
+        env:
+          PYTHONIOENCODING: utf-8
+        run: |
+          CODES=$(python - <<'PY'
+          import pandas as pd
+          cov = pd.read_csv("../../research/earnings/coverage_stocks.csv")
+          mask = cov["sources"].astype(str).str.contains("positions|watchlist", regex=True)
+          print(" ".join(cov.loc[mask, "code"].astype(str)))
+          PY
+          )
+          echo "TDNet 対象: $CODES"
+          for CODE in $CODES; do
+            python fetch_tdnet_disclosures.py --code "$CODE" --days 30 || echo "[WARN] TDNet 取得失敗: $CODE（続行）"
+          done
+
+      # ---- Claude 生成段 ----
+
+      - name: Generate earnings overview via Claude Code (Opus 4.7 + max thinking)
+        # 既存 {month}_overview.md は削除しない（累積スナップショット運用・
+        # 更新履歴 v1/v2/v3 をプロンプト側で引き継がせるため）。
+        uses: anthropics/claude-code-base-action@beta
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          model: claude-opus-4-7
+          prompt_file: report-pipelines/prompts/earnings-report.md
+          allowed_tools: "Read,Write,Edit,Bash,Grep,Glob"
+          timeout_minutes: "50"
+          claude_env: |
+            MAX_THINKING_TOKENS: 32000
+            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+        env:
+          TARGET_MONTH: ${{ steps.month.outputs.value }}
+          PRIVATE_REPO_ROOT: private-repo
+          CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+
+      - name: レポート生成確認（欠落・極端に短い場合は fail・空配信防止）
+        working-directory: ./private-repo
+        env:
+          TARGET_MONTH: ${{ steps.month.outputs.value }}
+        run: |
+          TARGET_FILE="research/earnings/${TARGET_MONTH}_overview.md"
+          if [ ! -f "$TARGET_FILE" ]; then
+            echo "ERROR: レポートが生成されていません: $TARGET_FILE"
+            exit 1
+          fi
+          LINES=$(wc -l < "$TARGET_FILE")
+          echo "Generated $TARGET_FILE ($LINES lines)"
+          if [ "$LINES" -lt 100 ]; then
+            echo "ERROR: レポートが極端に短い（$LINES 行）・必須セクション欠落とみなし送信中止"
+            exit 1
+          fi
+
+      - name: Upload overview as artifact (dry_run 検証用・常時)
+        uses: actions/upload-artifact@v4
+        with:
+          name: earnings-overview-${{ steps.month.outputs.value }}
+          path: |
+            private-repo/research/earnings/${{ steps.month.outputs.value }}_overview.md
+            private-repo/research/earnings/overview_table_${{ steps.month.outputs.value }}.csv
+            private-repo/research/earnings/overview_sector_reaction_${{ steps.month.outputs.value }}.csv
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Send Discord (JPEG・DISCORD_WEBHOOK_EARNINGS)
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        working-directory: ./private-repo/bi/pipelines
+        env:
+          DISCORD_WEBHOOK_EARNINGS: ${{ secrets.DISCORD_WEBHOOK_EARNINGS }}
+          PYTHONIOENCODING: utf-8
+        run: |
+          python send_report_jpeg_discord.py --kind earnings --month ${{ steps.month.outputs.value }}
+
+      - name: Commit and push to private repo
+        # dry_run=true では commit しない（過去月試運転で本番 overview を上書きしないため）。
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        working-directory: ./private-repo
+        env:
+          TARGET_MONTH: ${{ steps.month.outputs.value }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # Public から overlay した pipelines/agents/playbook は private にコミットしない
+          git checkout -- bi/pipelines/ agents/ playbook/ 2>/dev/null || true
+          git clean -fd bi/pipelines/ agents/ playbook/ 2>/dev/null || true
+          git add research/earnings/
+          git add research/stocks/*_tdnet_raw.md 2>/dev/null || true
+          if ! git diff --staged --quiet; then
+            git stash push --keep-index --include-untracked -m "ci-cleanup" 2>/dev/null || true
+            git commit -m "data: earnings overview ${TARGET_MONTH}"
+            git fetch origin master
+            git rebase origin/master || (git diff --name-only --diff-filter=U | xargs -I{} git checkout --theirs {}; git diff --name-only --diff-filter=U | xargs git add; git -c core.editor=true rebase --continue)
+            git push origin master
+            git stash drop 2>/dev/null || true
+          fi
+
+      - name: Discord 通知（失敗）
+        if: failure()
+        env:
+          DISCORD_WEBHOOK_EARNINGS: ${{ secrets.DISCORD_WEBHOOK_EARNINGS }}
+        run: |
+          if [ -z "$DISCORD_WEBHOOK_EARNINGS" ]; then
+            echo "DISCORD_WEBHOOK_EARNINGS 未設定・失敗通知 skip"
+            exit 0
+          fi
+          curl -s -X POST "$DISCORD_WEBHOOK_EARNINGS" \
+            -H "Content-Type: application/json" \
+            -d "{\"content\": \"❌ 決算シーズン総括レポート失敗\n対象月 ${{ steps.month.outputs.value }}\nログ確認: https://github.com/${{ github.repository }}/actions\"}"

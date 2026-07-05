@@ -11,9 +11,10 @@ name: セクター日次レポート（短縮版）
         description: '対象日付 (YYYY-MM-DD・空欄で当日)'
         required: false
         default: ''
-  # PM 2026-06-28: セクター日次は廃止（週末のみ運用へ移行）。cron 停止 + generate 無効化。
-  # schedule:
-  #   - cron: '30 8 * * 1-5'
+  # PM 2026-06-28: セクター日次は廃止（週末のみ運用へ移行）で cron 停止 + generate 無効化。
+  # PM 2026-07-05: cron フェイルセーフを復活（guard ジョブが当日成功 run を検知して重複 skip する）。
+  schedule:
+    - cron: '30 8 * * 1-5'
 
 # PM 2026-06-06 修正: target_date による group 分裂を防ぐため固定 group へ変更。
 concurrency:

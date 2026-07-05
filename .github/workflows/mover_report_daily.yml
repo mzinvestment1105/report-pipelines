@@ -274,14 +274,8 @@ jobs:
       - name: Install dependencies
         run: pip install -r report-pipelines/bi/pipelines/requirements.txt
 
-      - name: Install Japanese fonts (Noto Sans CJK JP)
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq fonts-noto-cjk fonts-noto-cjk-extra
-
-      - name: Install Playwright Chromium
-        run: |
-          playwright install chromium --with-deps
+      # PM 2026-07-05: generate-market は .md 生成のみ（PDF 化は merge-and-send 側）のため
+      # Japanese fonts / Playwright のインストールは不要・削除。
 
       - name: Download movers raw artifact (from setup-raw)
         # PM 2026-05-25 確定: setup-raw ジョブで生成した raw を全 generate-market 並列で共有
@@ -475,6 +469,16 @@ jobs:
           PYTHONIOENCODING: utf-8
         run: |
           python send_report_pdf_discord.py --kind movers --date ${{ needs.setup-raw.outputs.target_date }}
+
+      - name: Rotate report archives (5 件超過分を archive/ へ退避)
+        working-directory: ./private-repo
+        env:
+          PYTHONIOENCODING: utf-8
+        run: |
+          # ops/ は Copy pipelines step の対象外のため Public 側から都度 overlay（最新版を保証）
+          mkdir -p bi/pipelines/ops
+          cp -f ../report-pipelines/bi/pipelines/ops/rotate_report_archives.py bi/pipelines/ops/
+          python bi/pipelines/ops/rotate_report_archives.py
 
       - name: Commit and push to private repo
         working-directory: ./private-repo

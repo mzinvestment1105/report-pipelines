@@ -264,6 +264,16 @@ jobs:
         run: |
           python send_report_pdf_discord.py --kind macro_evening --date ${{ steps.date.outputs.value }}
 
+      - name: Rotate report archives (5 件超過分を archive/ へ退避)
+        working-directory: ./private-repo
+        env:
+          PYTHONIOENCODING: utf-8
+        run: |
+          # ops/ は Copy pipelines step の対象外のため Public 側から都度 overlay（最新版を保証）
+          mkdir -p bi/pipelines/ops
+          cp -f ../report-pipelines/bi/pipelines/ops/rotate_report_archives.py bi/pipelines/ops/
+          python bi/pipelines/ops/rotate_report_archives.py
+
       - name: Commit and push to private repo
         working-directory: ./private-repo
         run: |
