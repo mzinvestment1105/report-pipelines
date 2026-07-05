@@ -258,7 +258,7 @@ raw データの各銘柄を機械チェックし、該当したら**全セク�
 
 - **原則（ローカル・全市場入りフル raw）**：raw は通常 500〜700KB / 3,000 行超あり、**引数なし Read を禁止**（デフォルト 2,000 行で末尾セクションが欠落し銘柄を取りこぼす）。まず **Grep（`^### \d+[A-Z]?\s`・output_mode=content・-n=true・head_limit=200）で全銘柄エントリの行番号を特定**し、対象銘柄ごとに **`Read(file, offset={行番号}, limit=70)`** で個別取得する（1 銘柄あたり約 60 行）。
 - **例外（GHA）**：GHA の raw は**担当市場の節に絞り込み済み**のため、offset/limit 指定の通読（計 1〜2 回）で一括読みしてよい。
-- **共通**：一度読んだ範囲を再 Read しない（**再読込ループ厳禁**）。1 回の通読でメモを取り、以後は自分のメモを参照する。「詳細未取得」と書く前に Grep で raw 内の該当銘柄存在を必ず確認する。[feedback_movers_raw_full_read.md](../claude_memory/feedback_movers_raw_full_read.md) 参照。
+- **共通**：一度読んだ範囲を再 Read しない（**再読込ループ厳禁**）。1 回の通読でメモを取り、以後は自分のメモを参照する。「詳細未取得」と書く前に Grep で raw 内の該当銘柄存在を必ず確認する。[project_mover_report.md](../claude_memory/project_mover_report.md) §2 参照。
 
 ---
 
