@@ -88,7 +88,7 @@
 - **テーマランキング**：[bi/pipelines/fetch_theme_momentum.py](../bi/pipelines/fetch_theme_momentum.py) がみんかぶ・株探の人気テーマ・急上昇テーマをスクレイピングし [bi/outputs/theme_momentum.parquet](../bi/outputs/theme_momentum.parquet) に保存。当日 snapshot_date 分から人気テーマ（rank_type=popular / access_3d）・急上昇テーマ（rank_type=rise）を取り出す。エラー時は内容を報告して終了。
 - **代表銘柄**：parquet の `top_stocks` 列から取得（テーマページから構成銘柄をスクレイプ済・WebFetch 不要）。「6857 アドテスト（-9.64%）/ …」形式から上位を**コード＋銘柄名**で代表銘柄セルに**最大 3 銘柄**記載する。`top_stocks` が空のテーマは代表銘柄セルを空欄にし、**テーマ自体はランキングから外さない**（ランキング保全）。ETF/REIT/投資法人は代表銘柄から除外する。
 - **週間騰落（週末版）**：[bi/outputs/sector_stock_weekly.parquet](../bi/outputs/sector_stock_weekly.parquet) の `Return_W01`。
-- **動意理由の文脈**：[market/daily/macro/](../market/daily/macro/) 直近 1〜2 件（米株・FRB・日銀・金利・為替・原油・地政学・地合い）／`market/daily/` 直近の動意 raw（`{date}_movers_raw.md`）または [market/daily/movers/](../market/daily/movers/) の日次/週次レポート（個別銘柄の具体材料・カタリスト。`ls -t` で最新を特定し、引数なし Read を避け必要範囲を読む）／[market/daily/theme/](../market/daily/theme/) 配下に `*_theme_tdnet_raw.md`・`*_theme_yahoo_bbs_raw.md` があれば直近（無ければスキップ）。
+- **動意理由の文脈**：[market/daily/macro/](../market/daily/macro/) 直近 1〜2 件（米株・FRB・日銀・金利・為替・原油・地政学・地合い）／[market/daily/](../market/daily/) 直近の動意 raw（`{date}_movers_raw.md`）または [market/daily/movers/](../market/daily/movers/) の日次/週次レポート（個別銘柄の具体材料・カタリスト。`ls -t` で最新を特定し、引数なし Read を避け必要範囲を読む）／[market/daily/theme/](../market/daily/theme/) 配下に `*_theme_tdnet_raw.md`・`*_theme_yahoo_bbs_raw.md` があれば直近（無ければスキップ）。
 
 ---
 
@@ -105,7 +105,7 @@
 
 ## フル版（PM 明示指示時のみ・ローカル拡張仕様）
 
-PM が「テーマ名のフル版を作って」と明示指示した場合のみ生成する（日次 GHA では生成しない）。保存先：`market/daily/theme/{date}_{slug}_full.md`。半導体サンプル [market/daily/theme/2026-05-16_semicon_sample.md](../market/daily/theme/) と同じ深さで以下を含む：
+PM が「テーマ名のフル版を作って」と明示指示した場合のみ生成する（日次 GHA では生成しない）。保存先：`market/daily/theme/{date}_{slug}_full.md`。半導体サンプル [market/daily/theme/archive/2026-05-16_semicon_sample.md](../market/daily/theme/archive/2026-05-16_semicon_sample.md) と同じ深さで以下を含む：
 
 1. テーマ概要
 2. 🔍 なぜ盛り上がっているか（詳細・複数項目）

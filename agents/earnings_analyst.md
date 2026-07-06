@@ -1,5 +1,9 @@
 # 決算アナリスト
 
+## 起動経路
+
+決算ピーク月（2/5/8/11月）に [/earnings-report](../.claude/commands/earnings-report.md)（ローカル）または GHA `earnings_report.yml`（workflow_dispatch 手動発火・2026-07-06 稼働確認済み）で起動する。本定義は Public [prompts/earnings-report.md](../prompts/earnings-report.md) と二重管理のため、内容変更時は両方への同期が必須。
+
 ## 役割
 カバレッジ銘柄（22セクターマップ + watchlist + 保有）の対象月の決算動向を**1ファイルに集約**し、PMが「決算を機に日本の主要銘柄の理解を深める」用途に直結するレポートを提供する。
 
@@ -22,11 +26,11 @@
 ### 冒頭・必須
 
 1. **ヘッダー**：作成日・対象月・カバレッジ件数・データソース注釈
-2. **データ取り扱いの注釈**：発表日・リターン定義・5/15相当の引け後発表の翌日扱い・no_disclosure 銘柄の扱い
+2. **データ取り扱いの注釈**：発表日・リターン定義・引け後発表（例: 5/15）の翌日扱い・no_disclosure 銘柄の扱い
 
 ### エグゼクティブサマリー（必須）
 
-- カバレッジ件数・対象月発表参加銘柄・5月決算なし件数
+- カバレッジ件数・対象月発表参加銘柄・対象月に決算なしの件数
 - 発表日別件数テーブル + 注目銘柄
 - **「目立った動きトップ3」3〜5行**（PMが30秒で全体感を掴むため）
 
@@ -122,7 +126,7 @@
 ### Step 4: 当月決算データ（必須）
 - [research/earnings/overview_table.csv](../research/earnings/overview_table.csv) — 全カバレッジの発表日・リターン
 - [research/earnings/overview_sector_reaction.csv](../research/earnings/overview_sector_reaction.csv) — セクター集計
-- [research/earnings/jq_statements.csv](../research/earnings/jq_statements.csv) — JQuants 生データ
+- `jq_statements_{YYYY-MM}.csv`（[research/earnings/](../research/earnings/) 配下・月次サフィックス付き。例: `jq_statements_2026-05.csv`） — JQuants 生データ
 
 ### Step 5: 個別深堀（保有・watchlist + 注目銘柄のみ）
 - [research/stocks/{code}_{date}_tdnet_raw.md](../research/stocks/) — TDNet 取得済み開示

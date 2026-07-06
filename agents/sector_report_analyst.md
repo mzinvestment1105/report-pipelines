@@ -75,6 +75,8 @@ PM が明示的にローカルでの週次深掘り生成を指示した場合�
 
 ### 1. セクター週次パフォーマンス一覧（必須・全19セクター）
 
+19セクター = [bi/outputs/sector_weekly.parquet](../bi/outputs/sector_weekly.parquet) のタクソノミ。決算の17業種・大型株の22業界とは別。
+
 以下の表形式で**全 19 セクター**（PM 2026-05-23 確定・1 セクターも省略禁止）を騰落率順に並べる。
 
 | セクター | W01 | W02 | W03 | W04 | 3M | 1Y | PER | PBR | 判定 |
@@ -172,18 +174,18 @@ PM が明示的にローカルでの週次深掘り生成を指示した場合�
 ### 系統A（日次短縮版）
 
 1. Public [prompts/_common_rules.md](https://github.com/mzinvestment1105/report-pipelines/blob/main/prompts/_common_rules.md)（Step 0 必須）→ 本ファイル
-2. `market/daily/macro/` 直近 1 件（地合い）・`market/daily/sector/` 直近 1 件（前営業日・テーマローテーション差分計算用）
+2. [market/daily/macro/](../market/daily/macro/) 直近 1 件（地合い）・[market/daily/sector/](../market/daily/sector/) 直近 1 件（前営業日・テーマローテーション差分計算用）
 3. `make_sector_raw.py --anchor today` で更新した sector_weekly.parquet / sector_stock_weekly.parquet
 
 ### 系統B（週次フル版・理由補完）
 
 1. Public _common_rules.md（Step 0 必須）→ 補完対象 `market/daily/sector/{date}_full.md`
-2. `market/daily/macro/` 直近 1〜2 件・`market/daily/movers/` 直近の日次+週次・`market/daily/theme/` 直近 1 件（`ls -t` で最新特定・引数なし Read 回避）
+2. [market/daily/macro/](../market/daily/macro/) 直近 1〜2 件・[market/daily/movers/](../market/daily/movers/) 直近の日次+週次・[market/daily/theme/](../market/daily/theme/) 直近 1 件（`ls -t` で最新特定・引数なし Read 回避）
 
 ### 系統C（ローカル手動）
 
 1. [playbook/philosophy.md](../playbook/philosophy.md)（逆張り原則）・[playbook/sector_criteria.md](../playbook/sector_criteria.md)（セクター選定基準）
-2. `market/daily/macro/` 直近 2 件・`market/daily/movers/` 直近 2 件・`market/daily/sector/` 直近 2 件（週次比較用）
+2. [market/daily/macro/](../market/daily/macro/) 直近 2 件・[market/daily/movers/](../market/daily/movers/) 直近 2 件・[market/daily/sector/](../market/daily/sector/) 直近 2 件（週次比較用）
 3. `market/daily/{date}_sector_raw.md` — 当日セクター生データ（スクリーニングマスター集計済み・存在しなければエラー報告して終了）
 
 ## 出力先

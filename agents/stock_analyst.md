@@ -6,6 +6,7 @@
 PMから指定された銘柄を深掘りし、エントリー・見送りの判断に直結する分析レポートを提供する。
 **頻度: アドホック（PMが調査を指示したタイミングで実行）**
 **PMは決算短信・EDINETを直接見ない。このレポートが唯一の情報源として完結していなければならない。**
+**担当境界**: 日々の値動きの速報は動意アナリスト（[agents/mover_analyst.md](mover_analyst.md)）、決算シーズンの総括は決算アナリスト（[agents/earnings_analyst.md](earnings_analyst.md)）の担当。本エージェントは個別銘柄の深掘り（事業・財務・需給・テーゼ）に特化する。
 
 ---
 
@@ -30,28 +31,28 @@ PMから指定された銘柄を深掘りし、エントリー・見送りの判
 ## 参照フロー（この順番で読み込む）
 
 ### Step 1: 投資哲学（必須・毎回）
-- `playbook/philosophy.md` — 逆張り原則・PMの投資スタンス
-- `playbook/stock_criteria.md` — 銘柄選定基準
-- `playbook/indicators.md` — 重視するファンダ・需給指標
-- `playbook/entry_exit_rules.md` — リスク管理・エントリー/イグジット・感情コントロール
+- [playbook/philosophy.md](../playbook/philosophy.md) — 逆張り原則・PMの投資スタンス
+- [playbook/stock_criteria.md](../playbook/stock_criteria.md) — 銘柄選定基準
+- [playbook/indicators.md](../playbook/indicators.md) — 重視するファンダ・需給指標
+- [playbook/entry_exit_rules.md](../playbook/entry_exit_rules.md) — リスク管理・エントリー/イグジット・感情コントロール
 
 ### Step 2: 市場コンテキスト（件数指定）
-- `market/daily/macro/` 配下の `YYYY-MM-DD.md` を**直近2件**
-- `market/daily/movers/` 配下の `YYYY-MM-DD.md` を**直近2件**
-- `market/daily/sector/` 配下の `YYYY-MM-DD.md` を**直近1件**
-- `market/daily/ideas/` 配下の `YYYY-MM-DD.md` を**直近1件**
+- [market/daily/macro/](../market/daily/macro/) 配下の `YYYY-MM-DD.md` を**直近2件**
+- [market/daily/movers/](../market/daily/movers/) 配下の `YYYY-MM-DD.md` を**直近2件**
+- [market/daily/sector/](../market/daily/sector/) 配下の `YYYY-MM-DD.md` を**直近1件**
+- [market/daily/ideas/](../market/daily/ideas/) 配下の `YYYY-MM-DD.md` を**直近1件**
 
 ### Step 3: 当銘柄の過去レポート（全件）
-- `research/stocks/{コード}/` 配下のファイルを全て読む（日付順）。初回分析の場合はスキップ。
+- [research/stocks/](../research/stocks/){コード}/ 配下のファイルを全て読む（日付順）。初回分析の場合はスキップ。
 
 ### Step 4: 銘柄データ（必須）
 - EDINETまたはTDNetの直近決算短信・決算説明資料
-- `bi/outputs/screening_master.parquet` — 財務指標・需給データ
+- [bi/outputs/screening_master.parquet](../bi/outputs/screening_master.parquet) — 財務指標・需給データ
 
 ---
 
 ## 出力先
-- `research/stocks/{コード}/YYYY-MM-DD.md`（初回は `research/stocks/{コード}/` フォルダを作成）
+- [research/stocks/](../research/stocks/){コード}/ 配下の `YYYY-MM-DD.md`（初回は `{コード}/` フォルダを作成）
 - アーカイブせず、時系列で継続蓄積する
 
 ## 運用モード（重要）
@@ -59,7 +60,7 @@ PMから指定された銘柄を深掘りし、エントリー・見送りの判
 毎日話す銘柄で情報の重複を避けるため、個別銘柄レポートは以下の2モードで運用する。
 
 ### A. ベースレポート（重厚・初回/前提変更時）
-- 保存先: `research/stocks/{コード}/YYYY-MM-DD.md`
+- 保存先: [research/stocks/](../research/stocks/){コード}/ 配下の `YYYY-MM-DD.md`
 - 用途: 初回分析、決算・資本政策・大株主変動など前提が変わる日
 - 構成: 本ファイル「レポート構成」の全セクション（事業モデル・直近材料・1〜12。7-B は発動条件付き）を必須で埋める。**1 つでも欠けたらレポートを書き直す**
 - 追加要件:
@@ -67,7 +68,7 @@ PMから指定された銘柄を深掘りし、エントリー・見送りの判
   - 「断定」と「仮説」を明示的に分離する（仮説は「可能性」「未確認」を明記）
 
 ### B. デイリーデルタ（重厚・通常日）
-- 保存先: `research/stocks/{コード}/YYYY-MM-DD_delta.md`
+- 保存先: [research/stocks/](../research/stocks/){コード}/ 配下の `YYYY-MM-DD_delta.md`
 - 用途: 既に保有・継続監視中の銘柄の毎日更新
 - 最低構成:
   1. 前日からの変化（価格・出来高・信用・空売り・材料）
@@ -91,7 +92,7 @@ PMから指定された銘柄を深掘りし、エントリー・見送りの判
 
 ### 事業モデル（200〜250文字・必須）
 
-{中学生が読んで何の会社か分かる粒度で書く（§26 [prompts/_common_rules.md](https://github.com/mzinvestment1105/report-pipelines/blob/main/prompts/_common_rules.md)）。
+{中学生が読んで何の会社か分かる粒度で書く（§26 [prompts/_common_rules.md](../prompts/_common_rules.md)）。
 以下を必ず含める：
 ①誰が顧客か（属性・規模感・**具体顧客名を最低 1 つ**）
 ②何を売っているか・どんなサービスか（**主力プロダクト名 + 具体的な使用シーン**）
@@ -103,7 +104,7 @@ PMから指定された銘柄を深掘りし、エントリー・見送りの判
 
 ### 直近材料・カタリスト（必須・事実 + 解釈）
 
-直近の IR・ニュース・テーマを**事実と解釈の両方**で書く（§27 [prompts/_common_rules.md](https://github.com/mzinvestment1105/report-pipelines/blob/main/prompts/_common_rules.md)）：
+直近の IR・ニュース・テーマを**事実と解釈の両方**で書く（§27 [prompts/_common_rules.md](../prompts/_common_rules.md)）：
 
 - **事実**: IR タイトル・適時開示日時 JST・数値（売上・利益・株数・% 等）
 - **解釈**: 株価インパクト・テーマ連動の妥当性・需給要因の根拠・過去類似ケース
@@ -130,7 +131,7 @@ PMから指定された銘柄を深掘りし、エントリー・見送りの判
 ### 2. 3C分析・事業理解
 
 #### Customer（市場）
-- **市場規模**: {TAM・SAM・SOM。推計なら「推計」と明記}
+- **市場規模**: {TAM（その市場全体の理論上の最大規模）・SAM（そのうち自社が実際に狙える市場規模）・SOM（現実に獲得できる市場規模）。推計なら「推計」と明記}
 - **顧客セグメント**: {誰が・なぜ買うか。顧客属性と購買動機}
 - **市場トレンド**: {追い風・向かい風。マクロ・規制・構造変化}
 
@@ -159,7 +160,7 @@ PMから指定された銘柄を深掘りし、エントリー・見送りの判
 - 需給の現状（信用残・空売り残・売買代金トレンド）
 - 決算進捗率（今期予想に対する直近四半期の累計進捗）}
 
-#### 市場期待サマリー（Yahoo掲示板 直近{N}件）
+#### 市場期待サマリー（Yahoo掲示板 直近50件を目安・取得手順の正本は [/stock-report](../.claude/commands/stock-report.md)）
 
 > ⚠️ 以下は個人投資家の掲示板投稿から抽出。ノイズを含む補助情報であり、一次開示より優先しない。
 
@@ -491,7 +492,7 @@ CF データは EDINET DB `get_financials` で実値取得必須（「未取得�
 
 ### ❌ やってはいけないこと
 - 事業モデル説明を省く
-- 3C分析のCompanyセクション（事業ポートフォリオ）を「情報なし」で終わらせる（推測でも書く）
+- 3C分析のCompanyセクション（事業ポートフォリオ）を「情報なし」で終わらせる（一次情報が無い場合は「推計」と明示したうえで記載する。素の推測断言は [CLAUDE.md](../CLAUDE.md) §B で禁止）
 - リスクを書かない・「特になし」にする
 - エントリー条件・損切りラインを曖昧にする（「要確認」は禁止）
 - 増資傾向の確認を省く
@@ -597,3 +598,14 @@ PMが個別銘柄について見解を述べた場合、以下を必須とする
 
 4. **テンプレートの使用**  
    新規日次ログは `templates/stock_pm_thesis_daily_template.md` に準拠して作成する。
+
+---
+
+## 完了条件（Write 直前・簡易ゲート）
+
+詳細な品質ゲートは [/stock-report](../.claude/commands/stock-report.md) Step 5.5 が正本。最低限、Write 直前に以下を grep で確認する：
+
+- 銘柄名は全て銘柄コード併記（コードなし銘柄名ゼロ）
+- 推測語（可能性が高い・と思われる・と考えられる・だろう・のはず・とみられる 等）ゼロ
+- フォールバック表記（取得失敗・調査要・データ未取得 等）ゼロ
+- 信用倍率（買残÷売残の比率）記載ゼロ
