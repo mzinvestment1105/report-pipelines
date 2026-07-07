@@ -48,16 +48,37 @@ KABUTAN_BASE = "https://kabutan.jp"
 RESERVED_MINKABU_PATHS = {"popular_ranking", "rise_ranking", "new", ""}
 
 
+# 2026-07-07: GHA ランナー IP が一時的に弾かれ「no rows extracted」で日次レポートが
+# 落ちた実績があるため、リトライ（指数バックオフ）+ UA ローテーションを追加。
+_RETRY_WAITS = (2, 5, 12)
+_UA_POOL = (
+    HEADERS.get("User-Agent", "Mozilla/5.0"),
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+)
+
+
 def fetch(url: str) -> BeautifulSoup | None:
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
-    except Exception as e:
-        print(f"  [WARN] fetch failed {url}: {e}")
-        return None
-    if r.status_code != 200:
-        print(f"  [WARN] status={r.status_code} {url}")
-        return None
-    return BeautifulSoup(r.text, "html.parser")
+    last_err = ""
+    for attempt, wait in enumerate((0,) + _RETRY_WAITS):
+        if wait:
+            time.sleep(wait)
+        headers = dict(HEADERS)
+        headers["User-Agent"] = _UA_POOL[attempt % len(_UA_POOL)]
+        try:
+            r = requests.get(url, headers=headers, timeout=TIMEOUT)
+        except Exception as e:
+            last_err = str(e)
+            print(f"  [WARN] fetch failed (try {attempt + 1}) {url}: {e}")
+            continue
+        if r.status_code == 200:
+            return BeautifulSoup(r.text, "html.parser")
+        last_err = f"status={r.status_code}"
+        print(f"  [WARN] status={r.status_code} (try {attempt + 1}) {url}")
+        if r.status_code not in (403, 429, 500, 502, 503, 504):
+            break  # 404 等はリトライしても無駄
+    print(f"  [WARN] fetch giving up {url}: {last_err}")
+    return None
 
 
 def extract_kabutan_access(soup: BeautifulSoup) -> list[dict]:
