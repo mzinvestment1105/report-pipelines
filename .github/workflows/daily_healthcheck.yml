@@ -3,7 +3,8 @@ name: Daily Healthcheck (dead-man switch)
 "on":
   # PM 2026-06-06 新設: Worker と GHA cron が両方落ちて完全無音失敗する事故を検知。
   # 朝刊チェック: 09:00 JST = UTC 00:00（マクロ朝刊 06:23 の 2.5h 後・cron 07:30 の 1.5h 後）
-  #   + 前日夕方 ETL 3 本（price_history 16:00 / financial_history 17:00 / screening_master 17:15 JST）を前日日付で判定
+  #   + 前日夕方 ETL 2 本（financial_history 17:00 / screening_master 17:15 JST）を前日日付で判定
+  #     （price_history は 2026-07-07 退役: 履歴減量で push-back 廃止のため監視対象外）
   # 夕方チェック: 19:00 JST = UTC 10:00（夕方 4 レポート想定完了の 15-30 分後）
   # 金曜夜チェック: 23:30 JST 金曜 = UTC 14:30 金曜（週次 3 本の 21:00 JST 発火から 2.5h 後・同日判定）
   workflow_dispatch: {}
@@ -40,7 +41,7 @@ jobs:
               SM_DATE="$YESTERDAY_JST"
             fi
             echo "scope=morning" >> $GITHUB_OUTPUT
-            echo "workflows=macro_report_daily.yml=${TODAY_JST},screening_master.yml=${SM_DATE},financial_history.yml=${YESTERDAY_JST},price_history.yml=${YESTERDAY_JST}" >> $GITHUB_OUTPUT
+            echo "workflows=macro_report_daily.yml=${TODAY_JST},screening_master.yml=${SM_DATE},financial_history.yml=${YESTERDAY_JST}" >> $GITHUB_OUTPUT
             echo "label=朝刊 + 前日 ETL 3 本" >> $GITHUB_OUTPUT
           elif [ "$DOW_JST" -eq 5 ] && [ "$HOUR_JST" -ge 22 ]; then
             # 金曜夜スコープ: 金曜 21:00 JST 発火の週次 3 本を同日（金曜）日付で判定

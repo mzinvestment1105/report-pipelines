@@ -12,9 +12,12 @@ name: Price History Daily Update
         options:
           - daily
           - initial
-  # 毎日 UTC 07:00 = JST 16:00（東証引け後）
-  schedule:
-    - cron: "0 7 * * *"
+  # 2026-07-07 退役: git 履歴減量に伴い price_history parquet は git 管理外（gitignore 化）となり、
+  # 本 workflow の push-back 同期は役目を終えた。ローカル更新は
+  # `python bi/pipelines/make_price_history_master.py --daily` を必要時に実行する。
+  # 再開する場合は下記 schedule のコメントを解除（workflow_dispatch は温存）。
+  # schedule:
+  #   - cron: "0 7 * * *"
 
 # PM 2026-06-06 追加: 二重発火を GHA 内部ロックで防ぐ。
 concurrency:
