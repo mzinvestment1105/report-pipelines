@@ -68,10 +68,11 @@ jobs:
     needs: guard
     if: needs.guard.outputs.proceed == 'true'
     runs-on: ubuntu-latest
-    # 業績は四半期粒度のため日次更新は数件のみ・通常 60 分で十分
-    # initial 実行時は workflow_dispatch から手動起動し timeout を超える想定（360 分相当）。
-    # 安全のため initial 時は最大 360 分・daily 時は 60 分を明示的に切り替える。
-    timeout-minutes: ${{ github.event.inputs.mode == 'initial' && 360 || 60 }}
+    # 2026-07-07 修正: daily の実行時間が 60 分を超過し 7/6〜7/7 に3連続で強制中断
+    # （"exceeded the maximum execution time of 1h0m0s"・financial データが 7/5 で停止する実害）。
+    # daily も 180 分に引き上げ。initial は従来どおり 360 分。
+    # 根本の実行時間肥大（日次差分のはずが長時間化）は別途 ETL 側を調査する。
+    timeout-minutes: ${{ github.event.inputs.mode == 'initial' && 360 || 180 }}
 
     steps:
       - name: Checkout report-pipelines
