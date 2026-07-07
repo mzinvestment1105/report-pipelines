@@ -61,6 +61,22 @@ SNAPSHOT_TICKERS = {
 # 区切りはスラッシュで統一する。
 _DECIMAL_NAMES = {"ドル円", "米10年債", "米VIX", "日経VI"}
 
+# 市場別サマリー（PM 2026-07-07 指示）で使う J-Quants v2 指数コード
+# （公式 spec jpx-jquants.com/ja/spec/idx-bars-daily/indexcodes・プラン制限なし）。
+#   0500 = 東証プライム市場指数 / 0501 = 東証スタンダード市場指数 / 0070 = 東証グロース市場250指数
+# グロースは市場代表として一般に引用される「グロース市場250指数」（旧マザーズ指数の後継）を採用
+# （0502=グロース市場指数は使わない。0075 は REIT 指数のため使用不可）。
+SEGMENT_INDEX_CODES = {
+    "プライム": "0500",
+    "スタンダード": "0501",
+    "グロース": "0070",
+}
+
+# 市場区分（MarketCodeName）と ETF/REIT 除外の結合元。screening_master は生成時点で
+# 個別株のみを収録（ETF・REIT・上場投信は除外済み）のため、これと結合することで
+# 市場別サマリーのブレッドス集計が自然に個別株のみに絞られる。
+SCREENING_MASTER_PATH = REPO_ROOT / "bi" / "outputs" / "screening_master.parquet"
+
 def _is_stale(path: Path, target_date: date, max_age_minutes: int) -> bool:
     """
     入力ファイルの鮮度判定。
@@ -156,6 +172,146 @@ def get_market_snapshot(target_date: str | None = None) -> str:
 
 
 # ---------------------------------------------------------------------------
+# 市場別サマリー（プライム / スタンダード / グロース・PM 2026-07-07 指示）
+# ---------------------------------------------------------------------------
+
+def get_market_segment_summary(target_date: str | None = None) -> str | None:
+    """市場別サマリー（3市場の指数前日比 + ブレッドス）の md ブロックを返す。
+
+    データソースは J-Quants v2（キーは JQUANTS_API_KEY 環境変数・GHA でも動く HTTP）:
+    - 指数: /indices/bars/daily の 0500/0501/0070（SEGMENT_INDEX_CODES 参照）
+    - ブレッドス: /equities/bars/daily の対象日・前営業日 2 回取得を、screening_master の
+      MarketCodeName（市場区分）と Code 先頭4桁で結合して市場別に集計。
+      ETF・REIT・上場投信は screening_master 側で除外済みのため結合により自然に個別株のみになる。
+    - 対象日 = target_date 以下の最新営業日（朝刊=前営業日・夕刊=当日）。営業日の解決は
+      /markets/calendar ベースの recent_trading_days_v2 を再利用する。
+    - 取得行の Date が対象日と一致しない場合は採用しない（古い日付での黙ったフォールバック禁止）。
+      データが揃わない市場は行ごと省略し、「取得失敗」等のフォールバック表記は書かない（§25 流儀）。
+    - 全体が取得できない場合は None を返して stderr に警告する（レポート生成自体は止めない）。
+    """
+    import statistics
+    from datetime import date as date_cls
+
+    try:
+        import jquantsapi
+        import pandas as pd
+
+        from jq_client_utils import fetch_paginated_v2, recent_trading_days_v2
+
+        api_key = os.environ.get("JQUANTS_API_KEY", "").strip()
+        if not api_key:
+            print("[WARN] 市場別サマリー: JQUANTS_API_KEY 未設定のためブロックを省略します", file=sys.stderr)
+            return None
+
+        end: date_cls | None = None
+        if target_date:
+            try:
+                end = date_cls.fromisoformat(target_date)
+            except ValueError:
+                end = None
+        if end is None:
+            end = datetime.now(JST).date()
+
+        client = jquantsapi.ClientV2(api_key=api_key)
+        days = recent_trading_days_v2(client, 2, end=end)  # [対象日, 前営業日]
+        if len(days) < 2:
+            print("[WARN] 市場別サマリー: 営業日2日分を解決できずブロックを省略します", file=sys.stderr)
+            return None
+        day_t, day_p = days[0], days[1]
+
+        def _index_closes(d: date_cls) -> dict[str, float]:
+            """d 日の指数終値 {指数コード: 終値}。Date 不一致の行は採用しない。"""
+            rows = fetch_paginated_v2(
+                client, "/indices/bars/daily", params={"date": d.strftime("%Y-%m-%d")}
+            )
+            out: dict[str, float] = {}
+            for r in rows:
+                if str(r.get("Date", ""))[:10] != d.isoformat():
+                    continue
+                code = str(r.get("Code", ""))
+                close = r.get("C")  # v2 のフィールド名は C（Close ではない）
+                if code in SEGMENT_INDEX_CODES.values() and close is not None:
+                    out[code] = float(close)
+            return out
+
+        def _equity_closes(d: date_cls) -> dict[str, float]:
+            """d 日の全銘柄終値 {Code先頭4桁: 終値}。Date 不一致の行は採用しない。"""
+            rows = fetch_paginated_v2(
+                client, "/equities/bars/daily", params={"date": d.strftime("%Y-%m-%d")}
+            )
+            out: dict[str, float] = {}
+            for r in rows:
+                if str(r.get("Date", ""))[:10] != d.isoformat():
+                    continue
+                close = r.get("C")
+                if close is None:
+                    continue
+                # v2 の Code は5桁（例 13010・130A0）。screening_master は4桁のため先頭4桁で結合。
+                # 普通株の5桁目は常に "0"。優先株・種類株（例 75505 ゼンショー優先株）は5桁目が
+                # 0 以外のためスキップし、普通株の終値を種類株が上書きする衝突を防ぐ（2026-07-07 検証で6社の実害を確認）。
+                code5 = str(r.get("Code", ""))
+                if not code5.endswith("0"):
+                    continue
+                out[code5[:4]] = float(close)
+            return out
+
+        idx_t = _index_closes(day_t)
+        idx_p = _index_closes(day_p)
+        eq_t = _equity_closes(day_t)
+        eq_p = _equity_closes(day_p)
+        if not eq_t or not eq_p:
+            print("[WARN] 市場別サマリー: 株価日足が取得できずブロックを省略します", file=sys.stderr)
+            return None
+
+        # ETF/REIT 除外と市場区分の結合元（モジュール定数 SCREENING_MASTER_PATH のコメント参照）
+        sm = pd.read_parquet(SCREENING_MASTER_PATH, columns=["Code", "MarketCodeName"])
+
+        rows_out: list[str] = []
+        for mkt, idx_code in SEGMENT_INDEX_CODES.items():
+            codes = sm.loc[sm["MarketCodeName"] == mkt, "Code"].astype(str)
+            changes: list[float] = []
+            for c4 in codes:
+                t_close, p_close = eq_t.get(c4), eq_p.get(c4)
+                if t_close is not None and p_close:
+                    changes.append((t_close / p_close - 1.0) * 100.0)
+            it, ip = idx_t.get(idx_code), idx_p.get(idx_code)
+            if not changes or it is None or ip is None or ip == 0:
+                # データが揃わない市場は行ごと省略（フォールバック表記を書かない・§25 流儀）
+                print(f"[WARN] 市場別サマリー: {mkt} のデータ欠落のため行を省略します", file=sys.stderr)
+                continue
+            ups = [x for x in changes if x > 0]
+            downs = [x for x in changes if x < 0]
+            flat = len(changes) - len(ups) - len(downs)
+            # 中央値が定義できない側（全銘柄が同方向の日）は既存スナップショットの「─」流儀
+            med_up = f"{statistics.median(ups):+.2f}%" if ups else "─"
+            med_dn = f"{statistics.median(downs):+.2f}%" if downs else "─"
+            # 市場指数は TOPIX 型（700〜2,100 pt 水準）のため公式引用どおり小数2桁を維持。
+            # 前日比は §21-A のスラッシュ区切り流儀「±pt / ±%」。
+            chg_txt = f"{it - ip:+,.2f}pt / {(it / ip - 1.0) * 100.0:+.2f}%"
+            rows_out.append(
+                f"| {mkt} | {it:,.2f} | {chg_txt} | {len(ups)} | {len(downs)} | {flat} "
+                f"| {med_up} | {med_dn} |"
+            )
+
+        if not rows_out:
+            print("[WARN] 市場別サマリー: 全市場でデータが揃わずブロックを省略します", file=sys.stderr)
+            return None
+
+        return "\n".join(
+            [
+                f"### 市場別サマリー（{day_t.month}/{day_t.day} 終値）",
+                "",
+                "| 市場 | 指数 | 前日比 | 値上がり | 値下がり | 変わらず | 上昇側中央値 | 下落側中央値 |",
+                "|------|------|--------|--------|--------|--------|--------------|--------------|",
+                *rows_out,
+            ]
+        )
+    except Exception as e:  # noqa: BLE001 — 補助ブロックの失敗でレポート全体を止めない（既存流儀）
+        print(f"[WARN] 市場別サマリー取得失敗（ブロック省略）: {type(e).__name__}: {e}", file=sys.stderr)
+        return None
+
+
+# ---------------------------------------------------------------------------
 # 新着記事の検出
 # ---------------------------------------------------------------------------
 
@@ -192,8 +348,12 @@ def build_prompt(
     target_date: str,
     finnhub_raw: str | None = None,
     tachibana_raw: str | None = None,
+    segment_summary: str | None = None,
 ) -> str:
     agent_spec = (AGENTS_DIR / "macro_analyst.md").read_text(encoding="utf-8")
+
+    # 市場別サマリー（取得失敗時は None → ブロックごと省略・注記も書かない）
+    segment_section = f"\n{segment_summary}\n" if segment_summary else ""
 
     delta_section = ""
     if yesterday_report:
@@ -249,7 +409,7 @@ def build_prompt(
 
 ## 本日の市況スナップショット（yfinance 取得）
 {snapshot}
-{delta_section}{finnhub_section}
+{segment_section}{delta_section}{finnhub_section}
 ## 本日のニュース生データ（{target_date}_news_raw.md 全文）
 {today_raw}
 
@@ -278,6 +438,8 @@ def build_prompt(
    - (b) **市況スナップショット表の備考列は数値の意味のみ**（例「close=6/26・現物比 +0.5%」）。材料の物語（「Apple 値上げで値嵩株に売り集中」等）を備考に書かない。
    - (c) **先物セクションは数値関係（現物比・基準）のみ**。材料（米テック・中東等）をここで再説明しない。
    - (d) 各材料はいずれか **1 テーマでのみ**説明し、他セクションでは 1 行ポインタ（「→ テーマ◯参照」）か結論だけにする。同じ固有名詞が 4 セクション以上に説明として登場する状態を作らない。
+
+6. **市場別サマリー表の転記（PM 2026-07-07 指示）**：上の市況スナップショットに「### 市場別サマリー（M/D 終値）」ブロックがある場合、市況スナップショット表の直後に**見出し（対象日含む）・数値とも一字一句そのまま転記**する（§21-A 準用）。再計算・丸め直し・行/列の追加・削除・並べ替え・コメント列の付加を禁止し、raw にある行だけを転記する。ブロックが無い日は市場別サマリーを書かず、取得失敗等の注記も書かない。
 """
 
 
@@ -308,6 +470,10 @@ def main() -> None:
     if args.snapshot_only:
         print(f"市況データ取得中 (yfinance) target_date={target_date_str}...")
         print(get_market_snapshot(target_date_str))
+        print(f"市場別サマリー取得中 (J-Quants v2) target_date={target_date_str}...")
+        segment_summary = get_market_segment_summary(target_date_str)
+        if segment_summary:
+            print(segment_summary)
         sys.exit(EXIT_OK)
 
     # news_raw.md を読み込む
@@ -372,7 +538,13 @@ def main() -> None:
     print(f"市況データ取得中 (yfinance) target_date={target_date_str}...")
     snapshot = get_market_snapshot(target_date_str)
 
-    prompt = build_prompt(today_raw, yesterday_report, snapshot, target_date_str, finnhub_raw, tachibana_raw)
+    # 市場別サマリー取得（J-Quants v2・取得失敗時は None → raw からブロックごと省略）
+    print(f"市場別サマリー取得中 (J-Quants v2) target_date={target_date_str}...")
+    segment_summary = get_market_segment_summary(target_date_str)
+
+    prompt = build_prompt(
+        today_raw, yesterday_report, snapshot, target_date_str, finnhub_raw, tachibana_raw, segment_summary
+    )
 
     # rawファイルに保存（後続の Claude 分析用）
     raw_output_path = MARKET_DIR / f"{target_date_str}_macro_raw.md"

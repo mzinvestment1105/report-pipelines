@@ -3,7 +3,7 @@
 
 CLAUDE.md データ鮮度ルール:
   「sector 以外のレポートフォルダは 5 件上限で超過分を archive/ へ移動」
-を自動化する。対象フォルダ: macro / movers / theme / ideas / largecap / scout
+を自動化する。対象フォルダ: macro / movers / theme / ideas / largecap / scout / positions
 （sector は上限なしのため対象外）。
 
 動作:
@@ -39,7 +39,7 @@ import sys
 from pathlib import Path
 
 KEEP_COUNT = 5
-TARGET_FOLDERS = ["macro", "movers", "theme", "ideas", "largecap", "scout"]
+TARGET_FOLDERS = ["macro", "movers", "theme", "ideas", "largecap", "scout", "positions"]
 DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
 
 # market/daily/ 直下の raw ファイル（{YYYY-MM-DD}_{source}_raw.md）ローテーション設定

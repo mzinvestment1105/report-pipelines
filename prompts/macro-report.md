@@ -73,6 +73,7 @@
 - **市況補完・数値補完・イベント解釈は raw（news_raw / finnhub_raw / 立花 raw）と市況スナップショットで完結させる**。市況スナップショットは generate_macro_report.py が yfinance＋CNBC＋日経公式から確定整形済。**raw に米VIX・日経VI の行があってもレポートには出力しない（転記時に除外・PM 2026-06-27 指示・2026-07-04 確定）**。GHA では WebSearch / WebFetch が補助モデル 404 で機能しないため Web に依存しない（呼んでも空振りしトークンを消費するだけ・[prompts/_common_rules.md](_common_rules.md) §14）：
   - news_raw / finnhub_raw に該当ニュースが無い・解釈に不足がある場合は、raw 内の関連記事・前日レポート・立花 AI 市況コメントを突き合わせて解釈する。raw に無い事象は「raw 未取得のため言及せず」とし、記憶ベースで補完しない（§8）。
   - 市況スナップショットの数値は generate_macro_report.py が確定整形した値をそのまま転記する（§21-A）。取得不能な指標は当該行を「取得不可」とし、Web で取りに行かない（GHA で 404）。
+  - raw に「### 市場別サマリー（M/D 終値）」ブロック（プライム/スタンダード/グロース・generate_macro_report.py が J-Quants から確定整形）がある場合は、市況スナップショット表の直後に**見出し（対象日含む）・数値とも一字一句そのまま転記**する（§21-A 準用・再計算・行/列の追加削除禁止・`agents/macro_analyst.md` §1-B が正本）。ブロックが無い日は市場別サマリーを書かず、取得失敗等の注記も書かない。
   - 外部ツール（Perplexity 等）への依存は禁止。
   - Deep Research プロンプト発行・`{date}_deep_research.md` ファイル作成は禁止（[prompts/_common_rules.md](_common_rules.md) §13）。
 - 既存の `${PRIVATE_REPO_ROOT}/market/daily/macro/` 配下の他ファイルを編集・削除しない。
@@ -107,6 +108,7 @@
 - `${PRIVATE_REPO_ROOT}/market/daily/macro/${TARGET_DATE}.md` が生成され、内容が空でない
 - **「米国引け後」「EDT」「EST」をキーワードで grep し、直近に JST 換算が併記されている**
 - **市況スナップショットに VIX 行（米VIX・日経VI）が出力されていない**（PM 2026-06-27 確定）
+- **raw に市場別サマリーブロックがある場合、市況スナップショット表の直後に一字一句転記されている**（raw に無い日は出力していない・注記も書かない）
 - **英語原文（アルファベット 2 単語以上連続）が混入していない**
 - **専門用語に括弧注釈が付いている**
 - **ETF/REIT への言及がない**

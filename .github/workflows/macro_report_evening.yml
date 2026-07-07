@@ -208,6 +208,9 @@ jobs:
         id: build_prompt
         working-directory: ./private-repo/bi/pipelines
         env:
+          # 市場別サマリー（J-Quants v2 指数+ブレッドス・PM 2026-07-07）用。
+          # 未設定でもレポート生成は止まらない（ブロックごと省略・stderr 警告のみ）。
+          JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
           PYTHONIOENCODING: utf-8
         continue-on-error: true
         run: |
