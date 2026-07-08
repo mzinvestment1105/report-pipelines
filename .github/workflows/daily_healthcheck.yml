@@ -59,11 +59,11 @@ jobs:
             echo "workflows=largecap_weekly.yml=${TODAY_JST},mover_weekly.yml=${TODAY_JST},sector_report_weekly_full.yml=${TODAY_JST}" >> $GITHUB_OUTPUT
             echo "label=金曜週次 3 本" >> $GITHUB_OUTPUT
           else
-            # 夕方スコープ: 夕方 4 レポート + position_check(pm)（当日 12:00 JST 以降で判定）
-            # sector_report_daily はレーン休止中だが PM 判断①（cron 削除/復活）確定まで監視対象を維持
+            # 夕方スコープ: 夕方 3 レポート + position_check(pm)（当日 12:00 JST 以降で判定）
+            # sector_report_daily は PM 2026-07-08 確定（判断①A）でレーン休止・cron 削除のため監視対象外
             echo "scope=evening" >> $GITHUB_OUTPUT
-            echo "workflows=sector_report_daily.yml=${TODAY_JST},mover_report_daily.yml=${TODAY_JST},macro_report_evening.yml=${TODAY_JST},theme_report_daily.yml=${TODAY_JST},position_check.yml=${TODAY_JST}T12:00:00+09:00" >> $GITHUB_OUTPUT
-            echo "label=夕方 4 本 + ポジションチェック(夕)" >> $GITHUB_OUTPUT
+            echo "workflows=mover_report_daily.yml=${TODAY_JST},macro_report_evening.yml=${TODAY_JST},theme_report_daily.yml=${TODAY_JST},position_check.yml=${TODAY_JST}T12:00:00+09:00" >> $GITHUB_OUTPUT
+            echo "label=夕方 3 本 + ポジションチェック(夕)" >> $GITHUB_OUTPUT
           fi
           echo "today_jst=${TODAY_JST}" >> $GITHUB_OUTPUT
           echo "hour_jst=${HOUR_JST}" >> $GITHUB_OUTPUT

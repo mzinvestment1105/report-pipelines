@@ -13,8 +13,10 @@ name: セクター日次レポート（短縮版）
         default: ''
   # PM 2026-06-28: セクター日次は廃止（週末のみ運用へ移行）で cron 停止 + generate 無効化。
   # PM 2026-07-05: cron フェイルセーフを復活（guard ジョブが当日成功 run を検知して重複 skip する）。
-  schedule:
-    - cron: '30 8 * * 1-5'
+  # PM 2026-07-08 確定（判断①A）: レーン休止中のため cron を削除。毎日の空起動と「⏭発行なし」通知を停止。
+  # 日次レーンを復活する場合は下記 cron を解除し generate ジョブの `if: false` も外すこと。
+  # schedule:
+  #   - cron: '30 8 * * 1-5'
 
 # PM 2026-06-06 修正: target_date による group 分裂を防ぐため固定 group へ変更。
 concurrency:

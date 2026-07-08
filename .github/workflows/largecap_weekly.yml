@@ -86,18 +86,8 @@ jobs:
             fi
           fi
 
-      # PM 判断②未確定のため通知の廃止はせず、文言のみ標準文法へ変更（旧 🔶 → ⏱ 定刻起動）。
-      # largecap は GHA cron が正規経路（Worker 未登録）のため「予備タイマー」ではなく「定刻起動」。
-      - name: Discord 通知（⏱ 定刻起動）
-        if: github.event_name == 'schedule' && steps.check.outputs.proceed == 'true'
-        uses: ./.github/actions/notify-discord
-        with:
-          webhook: ${{ secrets.DISCORD_WEBHOOK_LARGECAP }}
-          state: timer
-          label: 週次大型株速報 定刻起動
-          meaning: 金曜定時の GHA cron が生成を開始しました。レポートはこのあと通常どおり届きます。
-          action_required: 不要
-
+      # PM 2026-07-08 確定（判断②A）: 定刻起動通知（旧 🔶/⏱）は廃止。正常時はレポート本体の
+      # 配信が成功通知を兼ねる。異常系（🚨 retry_cap・❌）のみ通知する。
       - name: Discord 通知（🚨 自動リトライ停止）
         if: contains(steps.check.outputs.reason, 'retry_cap')
         uses: ./.github/actions/notify-discord
