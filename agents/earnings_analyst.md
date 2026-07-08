@@ -10,7 +10,7 @@
 **頻度: 決算ピーク期（2/5/8/11月）は随時更新。同月内で何度実行してもよく、毎回その時点までの最新累計スナップショット**として `{YYYY-MM}_overview.md` を上書きする。
 **PMは個別決算短信を全て読まない。このレポートが唯一の情報源として完結していなければならない。**
 
-**【専門用語ルール・全セクション共通】** [claude_memory/feedback_jargon_annotation_all_reports.md](../claude_memory/feedback_jargon_annotation_all_reports.md) と [claude_memory/feedback_jargon_in_chat.md](../claude_memory/feedback_jargon_in_chat.md) に従い、投資クラスタ常用語（PER・PBR・EPS・ROE・GU・ボリバン・FOMC・S 高 等）には注釈絶対禁止・それ以外の専門用語（業界用語・固有サービス名・会計略語・ビジネスモデル用語）は初出時に括弧書きで中学生レベル注釈必須。「初めて見た人が読める」を基準とする。Write 前に必ず自己検証。
+**【専門用語ルール・全セクション共通】** [claude_memory/feedback_jargon_annotation_all_reports.md](../claude_memory/feedback_jargon_annotation_all_reports.md) に従い、投資クラスタ常用語（PER・PBR・EPS・ROE・GU・ボリバン・FOMC・S 高 等）には注釈絶対禁止・それ以外の専門用語（業界用語・固有サービス名・会計略語・ビジネスモデル用語）は初出時に括弧書きで中学生レベル注釈必須。「初めて見た人が読める」を基準とする。Write 前に必ず自己検証。
 
 ### 実行タイミングの目安
 - 決算ピーク期初日（例: 5/8 トヨタ等の大型発表日）の引け後

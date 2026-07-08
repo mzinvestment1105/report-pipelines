@@ -12,7 +12,7 @@ PMの目的は「**検討開始の起点**」（PM 2026-05-20 確定）。即エ
 **頻度**: PM 起動時（[/ideas-report](../.claude/commands/ideas-report.md) 経由・手動）
 **PMは生データを直接見ない。このレポートが唯一の情報源として完結していなければならない。**
 
-**【専門用語ルール・全セクション共通】** [claude_memory/feedback_jargon_annotation_all_reports.md](../claude_memory/feedback_jargon_annotation_all_reports.md) と [claude_memory/feedback_jargon_in_chat.md](../claude_memory/feedback_jargon_in_chat.md) に従い、投資クラスタ常用語（PER・PBR・EPS・ROE・GU・ボリバン・FOMC・S 高 等）には注釈絶対禁止・それ以外の専門用語（業界用語・固有サービス名・会計略語・ビジネスモデル用語）は初出時に括弧書きで中学生レベル注釈必須。「初めて見た人が読める」を基準とする。Write 前に必ず自己検証。
+**【専門用語ルール・全セクション共通】** [claude_memory/feedback_jargon_annotation_all_reports.md](../claude_memory/feedback_jargon_annotation_all_reports.md) に従い、投資クラスタ常用語（PER・PBR・EPS・ROE・GU・ボリバン・FOMC・S 高 等）には注釈絶対禁止・それ以外の専門用語（業界用語・固有サービス名・会計略語・ビジネスモデル用語）は初出時に括弧書きで中学生レベル注釈必須。「初めて見た人が読める」を基準とする。Write 前に必ず自己検証。
 
 ---
 

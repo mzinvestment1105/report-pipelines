@@ -24,7 +24,7 @@ PMから指定された銘柄を深掘りし、エントリー・見送りの判
 - 同一レポート内で**初出時のみ**注釈（繰り返し不要）
 - 注釈の中で別の専門用語を使わない（注釈も中学生レベル）
 
-詳細 memory: [feedback_jargon_annotation_all_reports.md](../claude_memory/feedback_jargon_annotation_all_reports.md)・[feedback_jargon_in_chat.md](../claude_memory/feedback_jargon_in_chat.md)。保存前の自己検証手順は [/stock-report](../.claude/commands/stock-report.md) Step 4.5 で実行する（スキップ即重大インシデント）。
+詳細 memory: [feedback_jargon_annotation_all_reports.md](../claude_memory/feedback_jargon_annotation_all_reports.md)。保存前の自己検証手順は [/stock-report](../.claude/commands/stock-report.md) Step 4.5 で実行する（スキップ即重大インシデント）。
 
 ---
 
