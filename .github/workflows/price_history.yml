@@ -32,6 +32,10 @@ jobs:
       proceed: ${{ steps.check.outputs.proceed }}
       reason: ${{ steps.check.outputs.reason }}
     steps:
+      # 通知 composite action（.github/actions/notify-discord）を使うため checkout が必要
+      - name: Checkout report-pipelines (通知 action 用)
+        uses: actions/checkout@v4
+
       - name: Check today's runs
         id: check
         env:
@@ -66,6 +70,16 @@ jobs:
             echo "proceed=true" >> $GITHUB_OUTPUT
             echo "reason=proceed" >> $GITHUB_OUTPUT
           fi
+
+      - name: Discord 通知（guard 失敗）
+        if: failure() || cancelled()
+        uses: ./.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          state: failed
+          label: 価格履歴ETL guard 失敗
+          meaning: 実行前チェック（当日重複判定）自体がエラーになり、更新ジョブが起動していません。
+          action_required: run ログ確認 → 手動 dispatch（mode=daily）で再実行
 
   update:
     needs: guard
@@ -126,38 +140,32 @@ jobs:
           python make_price_history_master.py ${{ steps.mode.outputs.mode }} 2>&1 | tee /tmp/etl.log
 
       - name: Commit and push to private repo
+        # rebase 方式は履歴書き換え・並行 push で index.lock 残留の構造的弱点があるため、
+        # fresh-base 方式の共通ヘルパー（Public 側から直接実行・repo 内コピー禁止）へ置換。
         working-directory: ./private-repo
         run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          # 一時コピーしたスクリプトは戻す（Private 側の履歴を汚さない）
-          git checkout -- bi/pipelines/ 2>/dev/null || true
-          git add bi/outputs/price_history/
-          if ! git diff --staged --quiet; then
-            git commit -m "data: price_history $(date +'%Y-%m-%d') (${{ steps.mode.outputs.mode }})"
-            git fetch origin master
-            if ! git rebase origin/master; then
-              git diff --name-only --diff-filter=U | xargs -I{} git checkout --theirs {}
-              git diff --name-only --diff-filter=U | xargs git add
-              git -c core.editor=true rebase --continue
-            fi
-            git push origin master
-          fi
+          bash ../report-pipelines/bi/pipelines/ops/ci_commit_push.sh \
+            -m "data: price_history $(TZ=Asia/Tokyo date +'%Y-%m-%d') (${{ steps.mode.outputs.mode }})" \
+            bi/outputs/price_history
 
-      - name: Discord 通知（成功）
+      - name: Discord 通知（✅ 完了）
         if: success()
-        env:
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        run: |
-          curl -s -X POST "$DISCORD_WEBHOOK_URL" \
-            -H "Content-Type: application/json" \
-            -d "{\"content\": \"✅ price_history 更新完了 (${{ steps.mode.outputs.mode }})\n$(date +'%Y-%m-%d %H:%M') JST\"}"
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          state: done
+          label: 価格履歴ETL 完了（${{ steps.mode.outputs.mode }}）
+          meaning: 全銘柄の価格履歴 parquet を最新営業日分まで更新しました。
+          action_required: 不要
 
-      - name: Discord 通知（失敗）
-        if: failure()
-        env:
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        run: |
-          curl -s -X POST "$DISCORD_WEBHOOK_URL" \
-            -H "Content-Type: application/json" \
-            -d "{\"content\": \"❌ price_history 失敗 (${{ steps.mode.outputs.mode }})\n$(date +'%Y-%m-%d %H:%M') JST\nログ確認: https://github.com/${{ github.repository }}/actions\"}"
+      - name: Discord 通知（❌ 失敗）
+        # cancelled() を含める: job timeout 超過は conclusion=cancelled になり
+        # failure() だけでは発火しない穴を塞ぐ（2026-07-07）。
+        if: failure() || cancelled()
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          state: failed
+          label: 価格履歴ETL 失敗（${{ steps.mode.outputs.mode }}）
+          meaning: 更新が完了せず（エラーまたは制限時間超過）、価格履歴は前回値のまま更新されていません。
+          action_required: run ログ確認 → 手動 dispatch（mode=daily）で再実行

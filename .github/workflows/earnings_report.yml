@@ -1,9 +1,8 @@
-# ドラフト: PUBLIC/.github/workflows/earnings_report.yml
-# 決算シーズン総括レポート GHA 化（PM 承認前・実配置禁止）
+# 決算シーズン総括レポート GHA（実運用・2026-07-07 ドラフト注記解除）
 #
-# 設計方針（2026-07 ドラフト時点）:
+# 設計方針:
 # - 決算オフ期のため cron なし・workflow_dispatch 手動発火のみ。
-#   8月シーズン前に dry_run で試運転 → 問題なければ 8月に cron 追加を別途 PM 承認で検討。
+#   8月シーズン開始時の cron 追加は別途 PM 承認で検討。
 # - largecap_weekly.yml（単一 generate ジョブ + guard）を雛形に踏襲。
 # - 決算ピーク期は同月内で何度も実行する運用（feedback_earnings_report §0）のため、
 #   guard は「当日成功済み」でも force_rerun=true で再実行できる設計を維持。
@@ -46,6 +45,10 @@ jobs:
       proceed: ${{ steps.check.outputs.proceed }}
       reason: ${{ steps.check.outputs.reason }}
     steps:
+      # 通知 composite action（.github/actions/notify-discord）を使うため checkout が必要
+      - name: Checkout report-pipelines (通知 action 用)
+        uses: actions/checkout@v4
+
       - name: Check today's runs
         id: check
         env:
@@ -87,18 +90,25 @@ jobs:
             fi
           fi
 
-      - name: Discord notification (skip event)
+      - name: Discord 通知（⏭ 発行なし・重複スキップ）
         if: steps.check.outputs.proceed == 'false'
-        env:
-          WH: ${{ secrets.DISCORD_WEBHOOK_EARNINGS }}
-        run: |
-          REASON="${{ steps.check.outputs.reason }}"
-          if [ -z "$WH" ]; then
-            echo "DISCORD_WEBHOOK_EARNINGS 未設定・通知 skip"
-            exit 0
-          fi
-          curl -s -X POST "$WH" -H "Content-Type: application/json" \
-            -d "{\"content\":\"⏭️ 決算シーズン総括 skip: ${REASON}\"}"
+        uses: ./.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_EARNINGS || secrets.DISCORD_WEBHOOK_URL }}
+          state: none
+          label: 決算シーズン総括 発行なし
+          meaning: 当日すでに成功済みまたは実行中の run があるため、この起動では生成しません（正常動作）。
+          action_required: 同日内に再発行したい場合のみ手動 dispatch（force_rerun=true）
+
+      - name: Discord 通知（guard 失敗）
+        if: failure() || cancelled()
+        uses: ./.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_EARNINGS || secrets.DISCORD_WEBHOOK_URL }}
+          state: failed
+          label: 決算シーズン総括 guard 失敗
+          meaning: 実行前チェック（当日重複判定）自体がエラーになり、生成ジョブが起動していません。
+          action_required: run ログ確認 → 手動 dispatch で再実行
 
   generate:
     needs: guard
@@ -269,21 +279,23 @@ jobs:
           CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
 
       - name: レポート生成確認（欠落・極端に短い場合は fail・空配信防止）
+        # exit 3 = 品質ゲート不合格（⛔ 通知へ分岐・生成物の欠落/不完全）
+        id: gate
         working-directory: ./private-repo
         env:
           TARGET_MONTH: ${{ steps.month.outputs.value }}
         run: |
+          block() { echo "::error::$1"; echo "exit_code=3" >> $GITHUB_OUTPUT; exit 3; }
           TARGET_FILE="research/earnings/${TARGET_MONTH}_overview.md"
           if [ ! -f "$TARGET_FILE" ]; then
-            echo "ERROR: レポートが生成されていません: $TARGET_FILE"
-            exit 1
+            block "レポートが生成されていません: $TARGET_FILE"
           fi
           LINES=$(wc -l < "$TARGET_FILE")
           echo "Generated $TARGET_FILE ($LINES lines)"
           if [ "$LINES" -lt 100 ]; then
-            echo "ERROR: レポートが極端に短い（$LINES 行）・必須セクション欠落とみなし送信中止"
-            exit 1
+            block "レポートが極端に短い（$LINES 行）・必須セクション欠落とみなし送信中止"
           fi
+          echo "exit_code=0" >> $GITHUB_OUTPUT
 
       - name: Upload overview as artifact (dry_run 検証用・常時)
         uses: actions/upload-artifact@v4
@@ -297,6 +309,7 @@ jobs:
           if-no-files-found: error
 
       - name: Send Discord (JPEG・DISCORD_WEBHOOK_EARNINGS)
+        id: send
         if: ${{ github.event.inputs.dry_run != 'true' }}
         working-directory: ./private-repo/bi/pipelines
         env:
@@ -307,36 +320,45 @@ jobs:
 
       - name: Commit and push to private repo
         # dry_run=true では commit しない（過去月試運転で本番 overview を上書きしないため）。
+        # rebase 方式は並行 push に弱いため fresh-base 方式の共通ヘルパーへ置換。
         if: ${{ github.event.inputs.dry_run != 'true' }}
         working-directory: ./private-repo
         env:
           TARGET_MONTH: ${{ steps.month.outputs.value }}
         run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          # Public から overlay した pipelines/agents/playbook は private にコミットしない
-          git checkout -- bi/pipelines/ agents/ playbook/ 2>/dev/null || true
-          git clean -fd bi/pipelines/ agents/ playbook/ 2>/dev/null || true
-          git add research/earnings/
-          git add research/stocks/*_tdnet_raw.md 2>/dev/null || true
-          if ! git diff --staged --quiet; then
-            git stash push --keep-index --include-untracked -m "ci-cleanup" 2>/dev/null || true
-            git commit -m "data: earnings overview ${TARGET_MONTH}"
-            git fetch origin master
-            git rebase origin/master || (git diff --name-only --diff-filter=U | xargs -I{} git checkout --theirs {}; git diff --name-only --diff-filter=U | xargs git add; git -c core.editor=true rebase --continue)
-            git push origin master
-            git stash drop 2>/dev/null || true
-          fi
+          bash ../report-pipelines/bi/pipelines/ops/ci_commit_push.sh \
+            -m "data: earnings overview ${TARGET_MONTH}" \
+            research/earnings research/stocks/*_tdnet_raw.md
 
-      - name: Discord 通知（失敗）
-        if: failure()
-        env:
-          DISCORD_WEBHOOK_EARNINGS: ${{ secrets.DISCORD_WEBHOOK_EARNINGS }}
-        run: |
-          if [ -z "$DISCORD_WEBHOOK_EARNINGS" ]; then
-            echo "DISCORD_WEBHOOK_EARNINGS 未設定・失敗通知 skip"
-            exit 0
-          fi
-          curl -s -X POST "$DISCORD_WEBHOOK_EARNINGS" \
-            -H "Content-Type: application/json" \
-            -d "{\"content\": \"❌ 決算シーズン総括レポート失敗\n対象月 ${{ steps.month.outputs.value }}\nログ確認: https://github.com/${{ github.repository }}/actions\"}"
+      - name: Discord 通知（⛔ 生成確認で送信中止）
+        if: failure() && steps.gate.outputs.exit_code == '3'
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_EARNINGS || secrets.DISCORD_WEBHOOK_URL }}
+          state: blocked
+          label: 決算シーズン総括 送信中止（生成確認不合格）
+          date: ${{ steps.month.outputs.value }}
+          meaning: レポートが未生成または極端に短く不完全だったため、配信を止めました。未配信です。
+          action_required: run ログで生成失敗理由を確認 → 修正後に手動 dispatch（force_rerun=true）
+
+      - name: Discord 通知（⚠️ 配信済み・後処理のみ失敗）
+        if: (failure() || cancelled()) && steps.send.outcome == 'success'
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_EARNINGS || secrets.DISCORD_WEBHOOK_URL }}
+          state: partial
+          label: 決算シーズン総括 後処理のみ失敗
+          date: ${{ steps.month.outputs.value }}
+          meaning: レポート本体は配信済みです。配信後の commit だけが失敗しました。
+          action_required: 不要（差分は次回 run が回収）
+
+      - name: Discord 通知（❌ 失敗）
+        if: (failure() || cancelled()) && steps.gate.outputs.exit_code != '3' && steps.send.outcome != 'success'
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_EARNINGS || secrets.DISCORD_WEBHOOK_URL }}
+          state: failed
+          label: 決算シーズン総括 失敗
+          date: ${{ steps.month.outputs.value }}
+          meaning: ETL・生成・送信のいずれかが完了せず、未配信です。
+          action_required: run ログ確認 → 手動 dispatch（force_rerun=true）で再実行。ログに「Spending cap reached」がある場合は Claude 利用枠切れ＝リセット時刻以降に force_rerun=true

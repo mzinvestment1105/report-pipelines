@@ -29,6 +29,10 @@ jobs:
       proceed: ${{ steps.check.outputs.proceed }}
       reason: ${{ steps.check.outputs.reason }}
     steps:
+      # 通知 composite action（.github/actions/notify-discord）を使うため checkout が必要
+      - name: Checkout report-pipelines (通知 action 用)
+        uses: actions/checkout@v4
+
       - name: Check today's runs
         id: check
         env:
@@ -75,23 +79,35 @@ jobs:
             fi
           fi
 
-      - name: Discord notification (cron or skip event)
-        if: github.event_name == 'schedule' || steps.check.outputs.proceed == 'false'
-        env:
-          WH: ${{ secrets.DISCORD_WEBHOOK_SECTOR }}
-        run: |
-          REASON="${{ steps.check.outputs.reason }}"
-          PROCEED="${{ steps.check.outputs.proceed }}"
-          if [ "$PROCEED" = "true" ]; then
-            MSG="🔶 GHA cron フェイルセーフ起動: セクター週次レポート (${REASON})"
-          elif echo "$REASON" | grep -q "retry_cap"; then
-            MSG="🚨 GHA cron 連続失敗で停止: セクター週次レポート (${REASON}) - 手動 dispatch で復旧してください"
-          else
-            echo "skip 通知は抑制（ノイズ削減）: ${{ github.event_name }} skip (${REASON})"
-            exit 0
-          fi
-          curl -s -X POST "$WH" -H "Content-Type: application/json" \
-            -d "{\"content\":\"${MSG}\"}"
+      - name: Discord 通知（⏱ 予備タイマー起動）
+        if: github.event_name == 'schedule' && steps.check.outputs.proceed == 'true'
+        uses: ./.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_SECTOR }}
+          state: timer
+          label: セクター週次レポート 予備タイマー起動
+          meaning: 定時の Cloudflare Worker 発火が届かなかったため、GHA 側の予備タイマーが代わりに生成を開始しました。レポートはこのあと通常どおり届きます。
+          action_required: 不要（毎週続く場合のみ Worker 点検）
+
+      - name: Discord 通知（🚨 自動リトライ停止）
+        if: contains(steps.check.outputs.reason, 'retry_cap')
+        uses: ./.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_SECTOR }}
+          state: alert
+          label: セクター週次レポート 自動リトライ停止
+          meaning: 当日 2 回以上失敗したため cron の自動再実行を停止しました。今週分は未配信です。
+          action_required: run ログ確認 → 原因解消後に手動 dispatch（force_rerun=true）で再実行
+
+      - name: Discord 通知（guard 失敗）
+        if: failure() || cancelled()
+        uses: ./.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_SECTOR || secrets.DISCORD_WEBHOOK_URL }}
+          state: failed
+          label: セクター週次レポート guard 失敗
+          meaning: 実行前チェック（当日重複判定）自体がエラーになり、生成ジョブが起動していません。
+          action_required: run ログ確認 → 手動 dispatch で再実行
 
   generate:
     needs: guard
@@ -243,6 +259,7 @@ jobs:
           PRIVATE_REPO_ROOT: private-repo
 
       - name: Send Discord (PDF)
+        id: send
         working-directory: ./private-repo/bi/pipelines
         env:
           DISCORD_WEBHOOK_SECTOR: ${{ secrets.DISCORD_WEBHOOK_SECTOR }}
@@ -254,28 +271,32 @@ jobs:
         # PM 2026-06-28: 生成 step が失敗しても再生成済 parquet を必ずコミットする（データ凍結防止）。
         # 旧来は gen 失敗で本 step がスキップされ、新鮮な sector_weekly.parquet が runner ごと破棄され
         # AsOf が 6/13 で 2 週間凍結した事故の恒久対策。
+        # rebase 方式は並行 push に弱いため fresh-base 方式の共通ヘルパーへ置換。
         if: ${{ always() }}
         working-directory: ./private-repo
         run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git checkout -- bi/pipelines/ agents/ playbook/ 2>/dev/null || true
-          git clean -fd bi/pipelines/ agents/ playbook/ 2>/dev/null || true
-          git add market/daily/ bi/outputs/sector_weekly.parquet bi/outputs/sector_stock_weekly.parquet 2>/dev/null || git add market/daily/
-          if ! git diff --staged --quiet; then
-            git stash push --keep-index --include-untracked -m "ci-cleanup" 2>/dev/null || true
-            git commit -m "data: sector weekly full ${{ steps.date.outputs.value }}"
-            git fetch origin master
-            git rebase origin/master || (git diff --name-only --diff-filter=U | xargs -I{} git checkout --theirs {}; git diff --name-only --diff-filter=U | xargs git add; git -c core.editor=true rebase --continue)
-            git push origin master
-            git stash drop 2>/dev/null || true
-          fi
+          bash ../report-pipelines/bi/pipelines/ops/ci_commit_push.sh \
+            -m "data: sector weekly full ${{ steps.date.outputs.value }}" \
+            market/daily bi/outputs/sector_weekly.parquet bi/outputs/sector_stock_weekly.parquet
 
-      - name: Discord 通知（失敗）
-        if: failure()
-        env:
-          DISCORD_WEBHOOK_SECTOR: ${{ secrets.DISCORD_WEBHOOK_SECTOR }}
-        run: |
-          curl -s -X POST "$DISCORD_WEBHOOK_SECTOR" \
-            -H "Content-Type: application/json" \
-            -d "{\"content\": \"❌ セクター週次レポート（フルバージョン）失敗\n${{ steps.date.outputs.value }}\nログ確認: https://github.com/${{ github.repository }}/actions\"}"
+      - name: Discord 通知（⚠️ 配信済み・後処理のみ失敗）
+        if: (failure() || cancelled()) && steps.send.outcome == 'success'
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_SECTOR }}
+          state: partial
+          label: セクター週次レポート 後処理のみ失敗
+          date: ${{ steps.date.outputs.value }}
+          meaning: レポート本体は配信済みです。配信後の commit だけが失敗しました。
+          action_required: 不要（差分は次回 run が回収）
+
+      - name: Discord 通知（❌ 失敗）
+        if: (failure() || cancelled()) && steps.send.outcome != 'success'
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_SECTOR }}
+          state: failed
+          label: セクター週次レポート 失敗
+          date: ${{ steps.date.outputs.value }}
+          meaning: 生成または送信が完了せず、今週分は未配信です（集計 parquet は可能な範囲で commit 済み）。
+          action_required: run ログ確認 → 手動 dispatch（force_rerun=true）で再実行

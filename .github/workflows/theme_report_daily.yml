@@ -34,6 +34,10 @@ jobs:
       proceed: ${{ steps.check.outputs.proceed }}
       reason: ${{ steps.check.outputs.reason }}
     steps:
+      # 通知 composite action（.github/actions/notify-discord）を使うため checkout が必要
+      - name: Checkout report-pipelines (通知 action 用)
+        uses: actions/checkout@v4
+
       - name: Check today's runs
         id: check
         env:
@@ -43,6 +47,16 @@ jobs:
           TODAY_START="${TODAY_JST}T00:00:00+09:00"
           MY_RUN_ID=${{ github.run_id }}
           EVENT="${{ github.event_name }}"
+
+          # 2026-07-07: GitHub cron は数時間遅延することがあり、深夜に遅延着火すると日付ズレ
+          # レポートを発行する事故源になる（macro/position_check と同方式の時間帯ゲートを移植）。
+          # schedule(cron) 起動のみ JST 15〜23 時の外なら skip。workflow_dispatch は常に通す。
+          HOUR_JST=$((10#$(TZ=Asia/Tokyo date +%H)))
+          if [ "$EVENT" = "schedule" ] && { [ "$HOUR_JST" -lt 15 ] || [ "$HOUR_JST" -gt 23 ]; }; then
+            echo "proceed=false" >> $GITHUB_OUTPUT
+            echo "reason=skip (cron outside evening window: ${HOUR_JST}h JST)" >> $GITHUB_OUTPUT
+            exit 0
+          fi
 
           RUNS=$(gh api -X GET \
             "repos/${{ github.repository }}/actions/workflows/theme_report_daily.yml/runs" \
@@ -76,23 +90,35 @@ jobs:
             fi
           fi
 
-      - name: Discord notification (cron or skip event)
-        if: github.event_name == 'schedule' || steps.check.outputs.proceed == 'false'
-        env:
-          WH: ${{ secrets.DISCORD_WEBHOOK_THEME }}
-        run: |
-          REASON="${{ steps.check.outputs.reason }}"
-          PROCEED="${{ steps.check.outputs.proceed }}"
-          if [ "$PROCEED" = "true" ]; then
-            MSG="🔶 GHA cron フェイルセーフ起動: テーマ動意レポート (${REASON})"
-          elif echo "$REASON" | grep -q "retry_cap"; then
-            MSG="🚨 GHA cron 連続失敗で停止: テーマ動意レポート (${REASON}) - 手動 dispatch で復旧してください"
-          else
-            echo "skip 通知は抑制（ノイズ削減）: ${{ github.event_name }} skip (${REASON})"
-            exit 0
-          fi
-          curl -s -X POST "$WH" -H "Content-Type: application/json" \
-            -d "{\"content\":\"${MSG}\"}"
+      - name: Discord 通知（⏱ 予備タイマー起動）
+        if: github.event_name == 'schedule' && steps.check.outputs.proceed == 'true'
+        uses: ./.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_THEME }}
+          state: timer
+          label: テーマ動意レポート 予備タイマー起動
+          meaning: 定時の Cloudflare Worker 発火が届かなかったため、GHA 側の予備タイマーが代わりに生成を開始しました。レポートはこのあと通常どおり届きます。
+          action_required: 不要（毎日続く場合のみ Worker 点検）
+
+      - name: Discord 通知（🚨 自動リトライ停止）
+        if: contains(steps.check.outputs.reason, 'retry_cap')
+        uses: ./.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_THEME }}
+          state: alert
+          label: テーマ動意レポート 自動リトライ停止
+          meaning: 当日 2 回以上失敗したため cron の自動再実行を停止しました。本日未配信です。
+          action_required: run ログ確認 → 原因解消後に手動 dispatch で再実行
+
+      - name: Discord 通知（guard 失敗）
+        if: failure() || cancelled()
+        uses: ./.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_THEME || secrets.DISCORD_WEBHOOK_URL }}
+          state: failed
+          label: テーマ動意レポート guard 失敗
+          meaning: 実行前チェック（当日重複判定）自体がエラーになり、生成ジョブが起動していません。
+          action_required: run ログ確認 → 手動 dispatch で再実行
 
   generate:
     needs: guard
@@ -161,6 +187,7 @@ jobs:
           playwright install chromium --with-deps
 
       - name: Generate themes raw (fetch_theme_momentum.py)
+        id: fetch_raw
         working-directory: ./private-repo/bi/pipelines
         env:
           PYTHONIOENCODING: utf-8
@@ -199,6 +226,7 @@ jobs:
           PRIVATE_REPO_ROOT: private-repo
 
       - name: Send Discord (PDF)
+        id: send
         working-directory: ./private-repo/bi/pipelines
         env:
           DISCORD_WEBHOOK_THEME: ${{ secrets.DISCORD_WEBHOOK_THEME }}
@@ -217,27 +245,45 @@ jobs:
           python bi/pipelines/ops/rotate_report_archives.py
 
       - name: Commit and push to private repo
+        # rebase 方式は履歴書き換え・並行 push で index.lock 残留の構造的弱点があるため、
+        # fresh-base 方式の共通ヘルパー（Public 側から直接実行・repo 内コピー禁止）へ置換。
         working-directory: ./private-repo
         run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git checkout -- bi/pipelines/ agents/ playbook/ 2>/dev/null || true
-          git clean -fd bi/pipelines/ agents/ playbook/ 2>/dev/null || true
-          git add market/daily/ bi/outputs/theme_momentum.parquet 2>/dev/null || git add market/daily/
-          if ! git diff --staged --quiet; then
-            git stash push --keep-index --include-untracked -m "ci-cleanup" 2>/dev/null || true
-            git commit -m "data: themes daily ${{ steps.date.outputs.value }}"
-            git fetch origin master
-            git rebase origin/master || (git diff --name-only --diff-filter=U | xargs -I{} git checkout --theirs {}; git diff --name-only --diff-filter=U | xargs git add; git -c core.editor=true rebase --continue)
-            git push origin master
-            git stash drop 2>/dev/null || true
-          fi
+          bash ../report-pipelines/bi/pipelines/ops/ci_commit_push.sh \
+            -m "data: themes daily ${{ steps.date.outputs.value }}" \
+            market/daily bi/outputs/theme_momentum.parquet
 
-      - name: Discord 通知（失敗）
-        if: failure()
-        env:
-          DISCORD_WEBHOOK_THEME: ${{ secrets.DISCORD_WEBHOOK_THEME }}
-        run: |
-          curl -s -X POST "$DISCORD_WEBHOOK_THEME" \
-            -H "Content-Type: application/json" \
-            -d "{\"content\": \"❌ テーマ動意レポート失敗\n${{ steps.date.outputs.value }}\nログ確認: https://github.com/${{ github.repository }}/actions\"}"
+      - name: Discord 通知（❌ raw 取得ブロック）
+        # fetch_theme_momentum.py の失敗 = 株探/みんかぶが GHA ランナー IP を弾いた
+        # （405 等・リトライ済み）とみられるため、専用文言でリカバリ手段を明示する。
+        if: (failure() || cancelled()) && steps.fetch_raw.outcome == 'failure'
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_THEME }}
+          state: failed
+          label: テーマ動意レポート 失敗（raw 取得ブロック）
+          date: ${{ steps.date.outputs.value }}
+          meaning: テーマランキングの取得元（株探/みんかぶ）が GHA の接続を拒否し（IP ブロック起因・リトライ済み）、本日未配信です。
+          action_required: ローカルで /themes-report を実行してリカバリ（GHA の再実行は同じ IP 帯で失敗しやすい）
+
+      - name: Discord 通知（⚠️ 配信済み・後処理のみ失敗）
+        if: (failure() || cancelled()) && steps.send.outcome == 'success'
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_THEME }}
+          state: partial
+          label: テーマ動意レポート 後処理のみ失敗
+          date: ${{ steps.date.outputs.value }}
+          meaning: レポート本体は配信済みです。配信後のアーカイブ整理または commit だけが失敗しました。
+          action_required: 不要（差分は次回 run が回収）
+
+      - name: Discord 通知（❌ 失敗）
+        if: (failure() || cancelled()) && steps.fetch_raw.outcome != 'failure' && steps.send.outcome != 'success'
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_THEME }}
+          state: failed
+          label: テーマ動意レポート 失敗
+          date: ${{ steps.date.outputs.value }}
+          meaning: 生成または送信が完了せず、本日未配信です。
+          action_required: run ログ確認 → 手動 dispatch で再実行。ログに「Spending cap reached」がある場合は Claude 利用枠切れ＝リセット時刻以降に再実行

@@ -16,7 +16,7 @@
     # 初回フル取得（先頭 N 銘柄のみ・動作確認用）
     python make_financial_history_master.py initial --limit 50
 
-    # 日次差分更新（本日付近の新規開示分のみ追記）
+    # 日次差分更新（直近 14 暦日の開示を開示日ベースで取得・数分）
     python make_financial_history_master.py daily
 
 出力:
@@ -74,6 +74,7 @@ SCREENING_MASTER = REPO_ROOT / "bi" / "outputs" / "screening_master.parquet"
 
 REQUEST_SLEEP = 1.2  # /fins/summary は 429 になりやすいため長め
 MAX_RETRIES = 6
+DAILY_LOOKBACK_DAYS = 14  # daily モードで遡る暦日数（開示日ベース取得の窓）
 
 # /fins/summary -> 論理カラム名 のマッピング
 COL_MAP: dict[str, str] = {
@@ -173,6 +174,35 @@ def _fetch_summary_with_backoff(client: jquantsapi.ClientV2, code4: str) -> list
             msg = str(e)
             wait = min(120.0, backoff)
             print(f"  retry {attempt}/{MAX_RETRIES} for {code4}: {type(e).__name__} {msg[:80]} wait {wait:.1f}s")
+            time.sleep(wait)
+            backoff *= 1.8
+    if last_err is not None:
+        raise last_err
+    return []
+
+
+def _fetch_summary_by_date_with_backoff(client: jquantsapi.ClientV2, day_iso: str) -> list[dict]:
+    """`/fins/summary` を 1 開示日分（date=YYYY-MM-DD）取得。429 / 一過性失敗は backoff リトライ。
+
+    date= パラメータは DiscDate（開示日）完全一致でフィルタされることを実測確認済み
+    （2026-07-07・非営業日は 0 行が返る）。
+    """
+    backoff = 5.0
+    last_err: BaseException | None = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            rows = fetch_paginated_v2(
+                client,
+                "/fins/summary",
+                params={"date": day_iso},
+                sleep_seconds=REQUEST_SLEEP,
+            )
+            return rows
+        except Exception as e:
+            last_err = e
+            msg = str(e)
+            wait = min(120.0, backoff)
+            print(f"  retry {attempt}/{MAX_RETRIES} for date={day_iso}: {type(e).__name__} {msg[:80]} wait {wait:.1f}s")
             time.sleep(wait)
             backoff *= 1.8
     if last_err is not None:
@@ -353,11 +383,19 @@ def cmd_initial(args) -> int:
 
 
 def cmd_daily(args) -> int:
-    """日次差分: 当日 ± 7 日付近の開示があった銘柄のみ取得して既存 parquet にマージする。
+    """日次差分: 直近 14 暦日の開示を「開示日ベース」で取得して既存 parquet にマージする。
 
-    実装方針: 銘柄リストは screening_master 全件。各銘柄について /fins/summary を取得し、
-    既存 parquet と (Code, FiscalYear, FiscalQuarter) で merge_existing=True で結合する。
-    既存にない期は新規追加・既存にある期は最新 DiscDate で上書きされる。
+    2026-07-07 改修（GHA job timeout の恒久対策）:
+    旧実装は全ユニバース約 3,800 銘柄を 1 銘柄ずつ `/fins/summary?code=` で取得しており、
+    REQUEST_SLEEP=1.2s の sleep だけで約 76 分を要して GHA の job timeout を毎日超過し、
+    parquet が約 30 日間更新されない実害が出た。`/fins/summary?date=` が開示日フィルタに
+    対応していることを実測確認（2026-07-07）したため、直近 14 暦日 ≈ 14 コールの
+    日付ベース取得へ書き換え（数分で完走・非営業日は 0 行）。
+
+    マージ方針: 新規開示のあった銘柄は既存 parquet の同銘柄行と結合して
+    (Code, FiscalYear, FiscalQuarter) ごとに最新 DiscDate の開示を採用し、
+    YoY を銘柄単位で再計算してから該当銘柄の行を丸ごと差し替える
+    （新着行だけで YoY を計算すると前年同期が無く欠損になるため）。
     """
     api_key = os.environ.get("JQUANTS_API_KEY", "").strip()
     if not api_key:
@@ -368,34 +406,55 @@ def cmd_daily(args) -> int:
         return 1
 
     client = jquantsapi.ClientV2(api_key=api_key)
-    codes = load_universe()
-    print(f"=== 日次差分更新: {len(codes)} 銘柄 ===")
+    universe = set(load_universe())
 
-    rows_by_code: dict[str, list[dict]] = {}
-    failures: list[tuple[str, str]] = []
-    cutoff = (date.today() - timedelta(days=14)).isoformat()
+    days = [(date.today() - timedelta(days=i)).isoformat() for i in range(DAILY_LOOKBACK_DAYS)]
+    print(f"=== 日次差分更新（日付ベース）: {days[-1]} 〜 {days[0]} の開示を取得 ===")
 
-    for i, code4 in enumerate(codes, start=1):
+    raw_rows: list[dict] = []
+    failed_days: list[str] = []
+    for day_iso in days:
         try:
-            rows = _fetch_summary_with_backoff(client, code4)
-            # 直近 14 日以内に新規開示があったものだけ採用（差分効率化）
-            recent = [r for r in rows if str(r.get("DiscDate", "")) >= cutoff]
-            if recent:
-                rows_by_code[code4] = rows  # 全期間入れる（マージ時に diff 解決）
+            rows = _fetch_summary_by_date_with_backoff(client, day_iso)
+            print(f"  {day_iso}: {len(rows)} rows")
+            raw_rows.extend(rows)
         except Exception as e:
-            failures.append((code4, f"{type(e).__name__}: {e}"))
+            failed_days.append(day_iso)
+            print(f"  {day_iso}: 取得失敗 {type(e).__name__}: {e}")
 
-        if i == 1 or i % 100 == 0 or i == len(codes):
-            print(f"  progress: {i}/{len(codes)} (with_recent={len(rows_by_code)} fail={len(failures)})")
+    if failed_days and len(failed_days) == len(days):
+        print("ERROR: 全対象日の取得に失敗しました")
+        return 1
 
-    if not rows_by_code:
+    # ユニバース（screening_master 掲載銘柄）のみ採用
+    in_univ = [r for r in raw_rows if normalize_code_4(r.get("Code", "")) in universe]
+    print(f"  取得 {len(raw_rows)} 行 → ユニバース内 {len(in_univ)} 行")
+
+    if failed_days:
+        print(
+            f"WARNING: {len(failed_days)} 日分の取得に失敗（{','.join(failed_days)}）。"
+            "翌日以降の run の 14 日窓で再取得される。"
+        )
+
+    if not in_univ:
         print("直近 14 日以内に新規開示なし。何もせず終了。")
         return 0
 
-    new_df = build_history_frame(rows_by_code)
-    print(f"\n  new/updated rows: {len(new_df):,}")
-    print("\n=== parquet マージ保存 ===")
-    save_parquet(new_df, OUT_PARQUET, merge_existing=True)
+    new_df = normalize_summary_df(in_univ)
+    codes_new = sorted(new_df["Code"].unique().tolist())
+    print(f"  新規開示銘柄: {len(codes_new)} 銘柄")
+
+    # 既存 parquet の該当銘柄行と結合 → 期別最新開示の採用 + YoY 再計算 → 銘柄単位で差し替え
+    existing = pd.read_parquet(OUT_PARQUET)
+    mask = existing["Code"].isin(codes_new)
+    combined_sub = pd.concat([existing[mask], new_df], ignore_index=True)
+    combined_sub = _pick_latest_per_period(combined_sub)
+    combined_sub = _enrich_yoy(combined_sub)
+
+    final = pd.concat([existing[~mask], combined_sub], ignore_index=True)
+    print(f"\n  更新後: {len(final):,} 行（うち更新対象銘柄 {len(combined_sub):,} 行）")
+    print("\n=== parquet 保存 ===")
+    save_parquet(final, OUT_PARQUET, merge_existing=False)
     return 0
 
 
@@ -442,7 +501,7 @@ def main() -> int:
     p_init.add_argument("--limit", type=int, default=0,
                         help="先頭 N 銘柄のみ取得（動作確認用・0 で全銘柄）")
 
-    sub.add_parser("daily", help="日次差分更新（直近 14 日以内の新規開示のみ）")
+    sub.add_parser("daily", help="日次差分更新（直近 14 暦日の開示を開示日ベースで取得）")
 
     p_test = sub.add_parser("test", help="テスト（指定銘柄のみ）")
     p_test.add_argument("--codes", type=str, required=True,

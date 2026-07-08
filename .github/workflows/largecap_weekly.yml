@@ -35,6 +35,10 @@ jobs:
       proceed: ${{ steps.check.outputs.proceed }}
       reason: ${{ steps.check.outputs.reason }}
     steps:
+      # 通知 composite action（.github/actions/notify-discord）を使うため checkout が必要
+      - name: Checkout report-pipelines (通知 action 用)
+        uses: actions/checkout@v4
+
       - name: Check today's runs
         id: check
         env:
@@ -82,27 +86,37 @@ jobs:
             fi
           fi
 
-      - name: Discord notification (cron or skip event)
-        if: github.event_name == 'schedule' || steps.check.outputs.proceed == 'false'
-        env:
-          WH: ${{ secrets.DISCORD_WEBHOOK_LARGECAP }}
-        run: |
-          REASON="${{ steps.check.outputs.reason }}"
-          PROCEED="${{ steps.check.outputs.proceed }}"
-          if [ -z "$WH" ]; then
-            echo "DISCORD_WEBHOOK_LARGECAP 未設定・通知 skip"
-            exit 0
-          fi
-          if [ "$PROCEED" = "true" ]; then
-            MSG="🔶 GHA cron 起動: 週次大型株速報（セクター輪番） (${REASON})"
-          elif echo "$REASON" | grep -q "retry_cap"; then
-            MSG="🚨 GHA cron 連続失敗で停止: 週次大型株速報 (${REASON}) - 手動 dispatch で復旧してください"
-          else
-            echo "skip 通知は抑制（ノイズ削減）: ${{ github.event_name }} skip (${REASON})"
-            exit 0
-          fi
-          curl -s -X POST "$WH" -H "Content-Type: application/json" \
-            -d "{\"content\":\"${MSG}\"}"
+      # PM 判断②未確定のため通知の廃止はせず、文言のみ標準文法へ変更（旧 🔶 → ⏱ 定刻起動）。
+      # largecap は GHA cron が正規経路（Worker 未登録）のため「予備タイマー」ではなく「定刻起動」。
+      - name: Discord 通知（⏱ 定刻起動）
+        if: github.event_name == 'schedule' && steps.check.outputs.proceed == 'true'
+        uses: ./.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_LARGECAP }}
+          state: timer
+          label: 週次大型株速報 定刻起動
+          meaning: 金曜定時の GHA cron が生成を開始しました。レポートはこのあと通常どおり届きます。
+          action_required: 不要
+
+      - name: Discord 通知（🚨 自動リトライ停止）
+        if: contains(steps.check.outputs.reason, 'retry_cap')
+        uses: ./.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_LARGECAP || secrets.DISCORD_WEBHOOK_URL }}
+          state: alert
+          label: 週次大型株速報 自動リトライ停止
+          meaning: 当日 2 回以上失敗したため cron の自動再実行を停止しました。今週分は未配信です。
+          action_required: run ログ確認 → 原因解消後に手動 dispatch（force_rerun=true）で再実行
+
+      - name: Discord 通知（guard 失敗）
+        if: failure() || cancelled()
+        uses: ./.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_LARGECAP || secrets.DISCORD_WEBHOOK_URL }}
+          state: failed
+          label: 週次大型株速報 guard 失敗
+          meaning: 実行前チェック（当日重複判定）自体がエラーになり、生成ジョブが起動していません。
+          action_required: run ログ確認 → 手動 dispatch で再実行
 
   generate:
     needs: guard
@@ -228,23 +242,26 @@ jobs:
           CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
 
       - name: レポート生成確認（欠落なら fail・空配信防止）
+        # exit 3 = 品質ゲート不合格（⛔ 通知へ分岐・生成物の欠落/不完全）
+        id: gate
         working-directory: ./private-repo
         env:
           TARGET_DATE: ${{ steps.date.outputs.value }}
         run: |
+          block() { echo "::error::$1"; echo "exit_code=3" >> $GITHUB_OUTPUT; exit 3; }
           TARGET_FILE="market/daily/largecap/${TARGET_DATE}.md"
           if [ ! -f "$TARGET_FILE" ]; then
-            echo "ERROR: レポートが生成されていません: $TARGET_FILE"
-            exit 1
+            block "レポートが生成されていません: $TARGET_FILE"
           fi
           LINES=$(wc -l < "$TARGET_FILE")
           echo "Generated $TARGET_FILE ($LINES lines)"
           if [ "$LINES" -lt 30 ]; then
-            echo "ERROR: レポートが極端に短い（$LINES 行）・生成不完全とみなし送信中止"
-            exit 1
+            block "レポートが極端に短い（$LINES 行）・生成不完全とみなし送信中止"
           fi
+          echo "exit_code=0" >> $GITHUB_OUTPUT
 
       - name: Send Discord (PDF)
+        id: send
         working-directory: ./private-repo/bi/pipelines
         env:
           DISCORD_WEBHOOK_LARGECAP: ${{ secrets.DISCORD_WEBHOOK_LARGECAP }}
@@ -270,34 +287,44 @@ jobs:
       - name: Commit and push to private repo
         # 生成物（market/daily/largecap/{date}.md・更新後 research/largecap/sector_ledger.json）を
         # private repo に commit-back（既存方式・Public へは出さない）。
-        # always() で生成 step 失敗時もここを通すが、staged 差分が無ければ no-op。
+        # always() で生成 step 失敗時もここを通すが、差分が無ければ no-op。
+        # rebase 方式は並行 push に弱いため fresh-base 方式の共通ヘルパーへ置換。
         if: ${{ always() }}
         working-directory: ./private-repo
         run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          # Public から overlay した pipelines/agents/playbook は private にコミットしない
-          git checkout -- bi/pipelines/ agents/ playbook/ 2>/dev/null || true
-          git clean -fd bi/pipelines/ agents/ playbook/ 2>/dev/null || true
-          git add market/daily/largecap/ research/largecap/ 2>/dev/null || git add market/daily/largecap/
-          if ! git diff --staged --quiet; then
-            git stash push --keep-index --include-untracked -m "ci-cleanup" 2>/dev/null || true
-            git commit -m "data: largecap weekly ${{ steps.date.outputs.value }}"
-            git fetch origin master
-            git rebase origin/master || (git diff --name-only --diff-filter=U | xargs -I{} git checkout --theirs {}; git diff --name-only --diff-filter=U | xargs git add; git -c core.editor=true rebase --continue)
-            git push origin master
-            git stash drop 2>/dev/null || true
-          fi
+          bash ../report-pipelines/bi/pipelines/ops/ci_commit_push.sh \
+            -m "data: largecap weekly ${{ steps.date.outputs.value }}" \
+            market/daily/largecap research/largecap
 
-      - name: Discord 通知（失敗）
-        if: failure()
-        env:
-          DISCORD_WEBHOOK_LARGECAP: ${{ secrets.DISCORD_WEBHOOK_LARGECAP }}
-        run: |
-          if [ -z "$DISCORD_WEBHOOK_LARGECAP" ]; then
-            echo "DISCORD_WEBHOOK_LARGECAP 未設定・失敗通知 skip"
-            exit 0
-          fi
-          curl -s -X POST "$DISCORD_WEBHOOK_LARGECAP" \
-            -H "Content-Type: application/json" \
-            -d "{\"content\": \"❌ 週次大型株速報（セクター輪番）失敗\n${{ steps.date.outputs.value }}\nログ確認: https://github.com/${{ github.repository }}/actions\"}"
+      - name: Discord 通知（⛔ 生成確認で送信中止）
+        if: failure() && steps.gate.outputs.exit_code == '3'
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_LARGECAP || secrets.DISCORD_WEBHOOK_URL }}
+          state: blocked
+          label: 週次大型株速報 送信中止（生成確認不合格）
+          date: ${{ steps.date.outputs.value }}
+          meaning: レポートが未生成または極端に短く不完全だったため、配信を止めました。今週分は未配信です。
+          action_required: run ログで生成失敗理由を確認 → 修正後に手動 dispatch（force_rerun=true）
+
+      - name: Discord 通知（⚠️ 配信済み・後処理のみ失敗）
+        if: (failure() || cancelled()) && steps.send.outcome == 'success'
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_LARGECAP || secrets.DISCORD_WEBHOOK_URL }}
+          state: partial
+          label: 週次大型株速報 後処理のみ失敗
+          date: ${{ steps.date.outputs.value }}
+          meaning: レポート本体は配信済みです。配信後のアーカイブ整理または commit だけが失敗しました。
+          action_required: 不要（差分は次回 run が回収）
+
+      - name: Discord 通知（❌ 失敗）
+        if: (failure() || cancelled()) && steps.gate.outputs.exit_code != '3' && steps.send.outcome != 'success'
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_LARGECAP || secrets.DISCORD_WEBHOOK_URL }}
+          state: failed
+          label: 週次大型株速報 失敗
+          date: ${{ steps.date.outputs.value }}
+          meaning: 生成または送信が完了せず、今週分は未配信です。
+          action_required: run ログ確認 → 手動 dispatch（force_rerun=true）で再実行。ログに「Spending cap reached」がある場合は Claude 利用枠切れ＝リセット時刻以降に force_rerun=true

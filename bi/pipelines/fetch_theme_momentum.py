@@ -50,7 +50,10 @@ RESERVED_MINKABU_PATHS = {"popular_ranking", "rise_ranking", "new", ""}
 
 # 2026-07-07: GHA ランナー IP が一時的に弾かれ「no rows extracted」で日次レポートが
 # 落ちた実績があるため、リトライ（指数バックオフ）+ UA ローテーションを追加。
-_RETRY_WAITS = (2, 5, 12)
+# 同日追記: 実際に観測されたブロックは 405 だった（当初のリトライ対象 403/429/5xx に
+# 含まれず即 give-up していた）ため 405 を追加し、待機列も (2,5,15,40) へ延長。
+_RETRY_WAITS = (2, 5, 15, 40)
+_RETRY_STATUSES = (403, 405, 429, 500, 502, 503, 504)
 _UA_POOL = (
     HEADERS.get("User-Agent", "Mozilla/5.0"),
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
@@ -75,7 +78,7 @@ def fetch(url: str) -> BeautifulSoup | None:
             return BeautifulSoup(r.text, "html.parser")
         last_err = f"status={r.status_code}"
         print(f"  [WARN] status={r.status_code} (try {attempt + 1}) {url}")
-        if r.status_code not in (403, 429, 500, 502, 503, 504):
+        if r.status_code not in _RETRY_STATUSES:
             break  # 404 等はリトライしても無駄
     print(f"  [WARN] fetch giving up {url}: {last_err}")
     return None
@@ -251,13 +254,18 @@ def main() -> int:
     snapshot_date = datetime.now(JST).date().isoformat()
     fetched_at = datetime.now(JST).isoformat(timespec="seconds")
     new_rows: list[dict] = []
+    # ソース別の成否サマリ（部分成功時は続行・全滅時の ERROR 出力に含める）
+    source_status: dict[str, str] = {}
 
     print(f"\n[1/3] 株探 アクセスランキング3日（既注目軸）")
     print(f"  URL: {KABUTAN_ACCESS_URL}")
     soup = fetch(KABUTAN_ACCESS_URL)
     time.sleep(SLEEP)
+    if soup is None:
+        source_status["株探 アクセスランキング3日"] = "取得失敗（ブロック/接続不可）"
     if soup is not None:
         items = extract_kabutan_access(soup)
+        source_status["株探 アクセスランキング3日"] = f"OK {len(items)}件"
         print(f"  抽出: {len(items)}件")
         for it in items:
             new_rows.append({
@@ -276,8 +284,11 @@ def main() -> int:
     print(f"  URL: {MINKABU_POPULAR_URL}")
     soup = fetch(MINKABU_POPULAR_URL)
     time.sleep(SLEEP)
+    if soup is None:
+        source_status["みんかぶ 人気テーマ"] = "取得失敗（ブロック/接続不可）"
     if soup is not None:
         items = extract_minkabu_ranking(soup)
+        source_status["みんかぶ 人気テーマ"] = f"OK {len(items)}件"
         print(f"  抽出: {len(items)}件")
         for it in items:
             new_rows.append({
@@ -296,8 +307,11 @@ def main() -> int:
     print(f"  URL: {MINKABU_RISE_URL}")
     soup = fetch(MINKABU_RISE_URL)
     time.sleep(SLEEP)
+    if soup is None:
+        source_status["みんかぶ 急上昇テーマ"] = "取得失敗（ブロック/接続不可）"
     if soup is not None:
         items = extract_minkabu_ranking(soup)
+        source_status["みんかぶ 急上昇テーマ"] = f"OK {len(items)}件"
         print(f"  抽出: {len(items)}件")
         for it in items:
             new_rows.append({
@@ -312,8 +326,11 @@ def main() -> int:
         if items[:5]:
             print(f"  top5: {[i['theme_name'] for i in items[:5]]}")
 
+    summary = " / ".join(f"{k}: {v}" for k, v in source_status.items())
+    print(f"\n[ソース別サマリ] {summary}")
+
     if not new_rows:
-        print("\nERROR: no rows extracted")
+        print(f"\nERROR: no rows extracted（3ソース全滅）  [ソース別サマリ] {summary}")
         return 1
 
     attach_top_stocks(new_rows)

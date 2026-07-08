@@ -1,0 +1,83 @@
+name: notify-discord
+description: >
+  Discord 通知の標準文法（2026-07-07 確定・4行定型）で送信する composite action。
+  形式: 「[絵文字] [label]（M/D）/ [何が起きたか1行] / 対応: [PMがやること] / [run直リンク(失敗系のみ)]」。
+  絵文字語彙は7種に固定: ✅done(ETL完了のみ) ⏱timer(予備タイマー起動・対応不要) ⏭none(発行なし・正常)
+  ⛔blocked(品質ゲートで送信中止) ⚠️partial(配信済み・後処理のみ失敗) ❌failed(失敗・復旧手順つき)
+  🚨alert(自動リトライ停止/未発行検知・PM対応必須)。
+  通知はベストエフォート（webhook 未設定・送信失敗でも job を落とさない）。
+
+inputs:
+  webhook:
+    description: "Discord webhook URL（空なら通知 skip・呼び出し側で `secrets.X || secrets.DISCORD_WEBHOOK_URL` のフォールバック可）"
+    required: true
+  state:
+    description: "状態キー: done | timer | none | blocked | partial | failed | alert"
+    required: true
+  label:
+    description: "1行目本文: レポート/ETL 名 + 状態（例: 動意銘柄レポート 送信中止）"
+    required: true
+  date:
+    description: "対象日。YYYY-MM-DD なら M/D へ変換・M/D 等はそのまま・空なら当日 JST"
+    required: false
+    default: ""
+  meaning:
+    description: "2行目: 何が起きたか 1 行（PM が読んで分かる言葉で）"
+    required: true
+  action_required:
+    description: "3行目: PM がやること（不要なら「不要」）"
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Send Discord notification (standard format)
+      shell: bash
+      env:
+        WEBHOOK: ${{ inputs.webhook }}
+        STATE: ${{ inputs.state }}
+        LABEL: ${{ inputs.label }}
+        DATE_IN: ${{ inputs.date }}
+        MEANING: ${{ inputs.meaning }}
+        ACTION_REQ: ${{ inputs.action_required }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: |
+        if [ -z "$WEBHOOK" ]; then
+          echo "[notify-discord] webhook 未設定・通知 skip"
+          exit 0
+        fi
+
+        case "$STATE" in
+          done)    EMOJI="✅" ;;
+          timer)   EMOJI="⏱" ;;
+          none)    EMOJI="⏭" ;;
+          blocked) EMOJI="⛔" ;;
+          partial) EMOJI="⚠️" ;;
+          failed)  EMOJI="❌" ;;
+          alert)   EMOJI="🚨" ;;
+          *)       echo "[notify-discord] WARN: 不明な state '$STATE'（failed 扱い）"; EMOJI="❌" ;;
+        esac
+
+        # 日付を M/D 表記へ（YYYY-MM-DD → M/D・それ以外はそのまま・空なら当日 JST）
+        if [ -n "$DATE_IN" ]; then
+          case "$DATE_IN" in
+            [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9])
+              MD="$((10#${DATE_IN:5:2}))/$((10#${DATE_IN:8:2}))" ;;
+            *)
+              MD="$DATE_IN" ;;
+          esac
+        else
+          MD="$((10#$(TZ=Asia/Tokyo date +%m)))/$((10#$(TZ=Asia/Tokyo date +%d)))"
+        fi
+
+        MSG="${EMOJI} ${LABEL}（${MD}）"$'\n'"${MEANING}"$'\n'"対応: ${ACTION_REQ}"
+        # run 直リンクは失敗系（blocked/partial/failed/alert）のみ付ける
+        case "$STATE" in
+          blocked|partial|failed|alert)
+            MSG="${MSG}"$'\n'"${RUN_URL}"
+            ;;
+        esac
+
+        jq -n --arg content "$MSG" '{content: $content}' \
+          | curl -s -X POST "$WEBHOOK" -H "Content-Type: application/json" -d @- \
+          || echo "[notify-discord] WARN: 送信失敗（通知はベストエフォート・job は落とさない）"

@@ -29,6 +29,10 @@ jobs:
       proceed: ${{ steps.check.outputs.proceed }}
       reason: ${{ steps.check.outputs.reason }}
     steps:
+      # 通知 composite action（.github/actions/notify-discord）を使うため checkout が必要
+      - name: Checkout report-pipelines (通知 action 用)
+        uses: actions/checkout@v4
+
       - name: Check today's runs
         id: check
         env:
@@ -64,15 +68,35 @@ jobs:
             echo "reason=proceed" >> $GITHUB_OUTPUT
           fi
 
+      - name: Discord 通知（🚨 自動リトライ停止）
+        if: contains(steps.check.outputs.reason, 'retry_cap')
+        uses: ./.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          state: alert
+          label: 業績履歴ETL 自動リトライ停止
+          meaning: 当日 2 回以上失敗したため cron の自動再実行を停止しました。業績データは前回値のまま更新されていません。
+          action_required: run ログ確認 → 原因解消後に手動 dispatch（mode=daily）で再実行
+
+      - name: Discord 通知（guard 失敗）
+        if: failure() || cancelled()
+        uses: ./.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          state: failed
+          label: 業績履歴ETL guard 失敗
+          meaning: 実行前チェック（当日重複判定）自体がエラーになり、更新ジョブが起動していません。
+          action_required: run ログ確認 → 手動 dispatch（mode=daily）で再実行
+
   update:
     needs: guard
     if: needs.guard.outputs.proceed == 'true'
     runs-on: ubuntu-latest
-    # 2026-07-07 修正: daily の実行時間が 60 分を超過し 7/6〜7/7 に3連続で強制中断
-    # （"exceeded the maximum execution time of 1h0m0s"・financial データが 7/5 で停止する実害）。
-    # daily も 180 分に引き上げ。initial は従来どおり 360 分。
-    # 根本の実行時間肥大（日次差分のはずが長時間化）は別途 ETL 側を調査する。
-    timeout-minutes: ${{ github.event.inputs.mode == 'initial' && 360 || 180 }}
+    # 2026-07-07 修正: daily が銘柄ループ（約 3,800 銘柄 × sleep 1.2s ≈ 76 分）で job timeout を
+    # 毎日超過し、parquet が約 30 日間更新されない実害が出たため、ETL 側を開示日ベース取得
+    # （直近 14 暦日 ≈ 14 コール・数分で完走）へ書き換え。timeout は余裕を見て daily 120 分・
+    # initial は従来どおり 360 分。
+    timeout-minutes: ${{ github.event.inputs.mode == 'initial' && 360 || 120 }}
 
     steps:
       - name: Checkout report-pipelines
@@ -127,39 +151,32 @@ jobs:
           python make_financial_history_master.py ${{ steps.mode.outputs.mode }} 2>&1 | tee /tmp/etl.log
 
       - name: Commit and push to private repo
+        # rebase 方式は履歴書き換え・並行 push で index.lock 残留の構造的弱点があるため、
+        # fresh-base 方式の共通ヘルパー（Public 側から直接実行・repo 内コピー禁止）へ置換。
         working-directory: ./private-repo
         run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          # 一時コピーしたスクリプトは戻す（Private 側の履歴を汚さない）
-          git checkout -- bi/pipelines/ 2>/dev/null || true
-          # bi/outputs/*.parquet は private repo の .gitignore で除外されているため -f で強制追加
-          git add -f bi/outputs/financial_history_master.parquet
-          if ! git diff --staged --quiet; then
-            git commit -m "data: financial_history $(date +'%Y-%m-%d') (${{ steps.mode.outputs.mode }})"
-            git fetch origin master
-            if ! git rebase origin/master; then
-              git diff --name-only --diff-filter=U | xargs -I{} git checkout --theirs {}
-              git diff --name-only --diff-filter=U | xargs git add
-              git -c core.editor=true rebase --continue
-            fi
-            git push origin master
-          fi
+          bash ../report-pipelines/bi/pipelines/ops/ci_commit_push.sh \
+            -m "data: financial_history $(TZ=Asia/Tokyo date +'%Y-%m-%d') (${{ steps.mode.outputs.mode }})" \
+            -f bi/outputs/financial_history_master.parquet
 
-      - name: Discord 通知（成功）
+      - name: Discord 通知（✅ 完了）
         if: success()
-        env:
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        run: |
-          curl -s -X POST "$DISCORD_WEBHOOK_URL" \
-            -H "Content-Type: application/json" \
-            -d "{\"content\": \"✅ financial_history 更新完了 (${{ steps.mode.outputs.mode }})\n$(date +'%Y-%m-%d %H:%M') JST\"}"
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          state: done
+          label: 業績履歴ETL 完了（${{ steps.mode.outputs.mode }}）
+          meaning: 全銘柄の業績履歴 parquet を最新開示分まで更新しました。
+          action_required: 不要
 
-      - name: Discord 通知（失敗）
-        if: failure()
-        env:
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        run: |
-          curl -s -X POST "$DISCORD_WEBHOOK_URL" \
-            -H "Content-Type: application/json" \
-            -d "{\"content\": \"❌ financial_history 失敗 (${{ steps.mode.outputs.mode }})\n$(date +'%Y-%m-%d %H:%M') JST\nログ確認: https://github.com/${{ github.repository }}/actions\"}"
+      - name: Discord 通知（❌ 失敗）
+        # cancelled() を含める: job timeout 超過は conclusion=cancelled になり
+        # failure() だけでは発火せず 30 日間無音だった穴を塞ぐ（2026-07-07）。
+        if: failure() || cancelled()
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          state: failed
+          label: 業績履歴ETL 失敗（${{ steps.mode.outputs.mode }}）
+          meaning: 日次更新が完了せず（エラーまたは制限時間超過）、業績データは前回値のまま更新されていません。
+          action_required: run ログ確認 → 手動 dispatch（mode=daily）で再実行

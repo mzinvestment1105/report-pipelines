@@ -36,6 +36,10 @@ jobs:
       proceed: ${{ steps.check.outputs.proceed }}
       reason: ${{ steps.check.outputs.reason }}
     steps:
+      # 通知 composite action（.github/actions/notify-discord）を使うため checkout が必要
+      - name: Checkout report-pipelines (通知 action 用)
+        uses: actions/checkout@v4
+
       - name: Check today's runs
         id: check
         env:
@@ -83,23 +87,35 @@ jobs:
             fi
           fi
 
-      - name: Discord notification (cron or skip event)
-        if: github.event_name == 'schedule' || steps.check.outputs.proceed == 'false'
-        env:
-          WH: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
-        run: |
-          REASON="${{ steps.check.outputs.reason }}"
-          PROCEED="${{ steps.check.outputs.proceed }}"
-          if [ "$PROCEED" = "true" ]; then
-            MSG="🔶 GHA cron フェイルセーフ起動: 動意銘柄レポート週次 (${REASON})"
-          elif echo "$REASON" | grep -q "retry_cap"; then
-            MSG="🚨 GHA cron 連続失敗で停止: 動意銘柄レポート週次 (${REASON}) - 手動 dispatch で復旧してください"
-          else
-            echo "skip 通知は抑制（ノイズ削減）: ${{ github.event_name }} skip (${REASON})"
-            exit 0
-          fi
-          curl -s -X POST "$WH" -H "Content-Type: application/json" \
-            -d "{\"content\":\"${MSG}\"}"
+      - name: Discord 通知（⏱ 予備タイマー起動）
+        if: github.event_name == 'schedule' && steps.check.outputs.proceed == 'true'
+        uses: ./.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
+          state: timer
+          label: 動意銘柄レポート週次 予備タイマー起動
+          meaning: 定時の Cloudflare Worker 発火が届かなかったため、GHA 側の予備タイマーが代わりに生成を開始しました。レポートはこのあと通常どおり届きます。
+          action_required: 不要（毎週続く場合のみ Worker 点検）
+
+      - name: Discord 通知（🚨 自動リトライ停止）
+        if: contains(steps.check.outputs.reason, 'retry_cap')
+        uses: ./.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
+          state: alert
+          label: 動意銘柄レポート週次 自動リトライ停止
+          meaning: 当日 2 回以上失敗したため cron の自動再実行を停止しました。今週分は未配信です。
+          action_required: run ログ確認 → 原因解消後に手動 dispatch（force_rerun=true）で再実行
+
+      - name: Discord 通知（guard 失敗）
+        if: failure() || cancelled()
+        uses: ./.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS || secrets.DISCORD_WEBHOOK_URL }}
+          state: failed
+          label: 動意銘柄レポート週次 guard 失敗
+          meaning: 実行前チェック（当日重複判定）自体がエラーになり、生成ジョブが起動していません。
+          action_required: run ログ確認 → 手動 dispatch で再実行
 
   setup-raw:
     needs: guard
@@ -195,6 +211,17 @@ jobs:
           path: private-repo/market/daily/${{ steps.date.outputs.value }}_movers_raw.md
           retention-days: 7
           if-no-files-found: error
+
+      - name: Discord 通知（❌ raw 生成失敗）
+        if: failure() || cancelled()
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
+          state: failed
+          label: 動意銘柄レポート週次 失敗（raw 生成）
+          date: ${{ steps.date.outputs.value }}
+          meaning: 週次動意の元データ（raw）生成が失敗し、後続の市場別生成が始まらないため今週分は未配信です。
+          action_required: run ログ確認 → 手動 dispatch（force_rerun=true）で再実行
 
   generate-market:
     needs: setup-raw
@@ -336,15 +363,16 @@ jobs:
           prompt_file: report-pipelines/prompts/mover-weekly.md
           allowed_tools: "Read,Write,Edit,Bash,Grep,Glob,WebSearch,WebFetch"
           timeout_minutes: "45"
+          # PM 2026-07-07: 32001 出力トークン上限で市場セクションが途中終了する事故の予防で 64000 へ。
           claude_env: |
             MAX_THINKING_TOKENS: 32000
-            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 64000
         env:
           TARGET_DATE: ${{ needs.setup-raw.outputs.target_date }}
           TARGET_MARKET: ${{ matrix.market }}
           PRIVATE_REPO_ROOT: private-repo
           JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
-          CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+          CLAUDE_CODE_MAX_OUTPUT_TOKENS: 64000
 
       - name: Upload market section as artifact
         uses: actions/upload-artifact@v4
@@ -354,14 +382,16 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
-      - name: Discord 通知（市場別失敗）
-        if: failure()
-        env:
-          DISCORD_WEBHOOK_MOVERS: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
-        run: |
-          curl -s -X POST "$DISCORD_WEBHOOK_MOVERS" \
-            -H "Content-Type: application/json" \
-            -d "{\"content\": \"❌ 動意週次レポート（${{ matrix.market }} 市場）失敗\n${{ needs.setup-raw.outputs.target_date }}\nログ確認: https://github.com/${{ github.repository }}/actions\"}"
+      - name: Discord 通知（❌ 市場別失敗）
+        if: failure() || cancelled()
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
+          state: failed
+          label: 動意銘柄レポート週次 失敗（${{ matrix.market }} 市場の生成）
+          date: ${{ needs.setup-raw.outputs.target_date }}
+          meaning: ${{ matrix.market }} 市場セクションの生成が失敗し、統合レポートが組めないため今週分は未配信です。
+          action_required: run ログ確認 → 手動 dispatch（force_rerun=true）で再実行。ログに「Spending cap reached」がある場合は Claude 利用枠切れ＝リセット時刻以降に force_rerun=true
 
   merge-and-send:
     needs: [setup-raw, generate-market]
@@ -456,14 +486,21 @@ jobs:
           echo "Merged into $OUTPUT ($(wc -l < "$OUTPUT") lines)"
 
       - name: 件数ゲート（売買代金/値上がり/値下がり・不足なら送信中止）
+        # exit 3 = 品質ゲート不合格（⛔ 通知へ分岐）/ exit 1 = インフラ失敗（❌）
+        id: gate
         working-directory: ./private-repo
         env:
           TARGET_DATE: ${{ needs.setup-raw.outputs.target_date }}
           PYTHONIOENCODING: utf-8
         run: |
+          set +e
           python bi/pipelines/check_mover_counts.py --file market/daily/movers/${TARGET_DATE}_weekly.md
+          ec=$?
+          echo "exit_code=$ec" >> $GITHUB_OUTPUT
+          exit $ec
 
       - name: Send Discord (PDF・市場別 3 枚分割)
+        id: send
         working-directory: ./private-repo/bi/pipelines
         env:
           DISCORD_WEBHOOK_MOVERS: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
@@ -482,29 +519,44 @@ jobs:
           python bi/pipelines/ops/rotate_report_archives.py
 
       - name: Commit and push to private repo
+        # rebase 方式は履歴書き換え・並行 push で index.lock 残留の構造的弱点があるため、
+        # fresh-base 方式の共通ヘルパー（Public 側から直接実行・repo 内コピー禁止）へ置換。
         working-directory: ./private-repo
         env:
           TARGET_DATE: ${{ needs.setup-raw.outputs.target_date }}
         run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git checkout -- bi/pipelines/ 2>/dev/null || true
-          git clean -fd bi/pipelines/ 2>/dev/null || true
-          git add market/daily/
-          if ! git diff --staged --quiet; then
-            git stash push --keep-index --include-untracked -m "ci-cleanup" 2>/dev/null || true
-            git commit -m "data: mover weekly ${TARGET_DATE}"
-            git fetch origin master
-            git rebase origin/master || (git diff --name-only --diff-filter=U | xargs -I{} git checkout --theirs {}; git diff --name-only --diff-filter=U | xargs git add; git -c core.editor=true rebase --continue)
-            git push origin master
-            git stash drop 2>/dev/null || true
-          fi
+          bash ../report-pipelines/bi/pipelines/ops/ci_commit_push.sh \
+            -m "data: mover weekly ${TARGET_DATE}" market/daily
 
-      - name: Discord 通知（merge 失敗）
-        if: failure()
-        env:
-          DISCORD_WEBHOOK_MOVERS: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
-        run: |
-          curl -s -X POST "$DISCORD_WEBHOOK_MOVERS" \
-            -H "Content-Type: application/json" \
-            -d "{\"content\": \"❌ 動意週次レポート merge/送信失敗\n${{ needs.setup-raw.outputs.target_date }}\nログ確認: https://github.com/${{ github.repository }}/actions\"}"
+      - name: Discord 通知（⛔ 件数ゲートで送信中止）
+        if: failure() && steps.gate.outputs.exit_code == '3'
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
+          state: blocked
+          label: 動意銘柄レポート週次 送信中止（件数ゲート不合格）
+          date: ${{ needs.setup-raw.outputs.target_date }}
+          meaning: 規定の銘柄件数を満たさない不完全なレポートだったため、配信を止めました。今週分は未配信です。
+          action_required: run ログで不足市場/セクションを確認 → 修正後に手動 dispatch（force_rerun=true）
+
+      - name: Discord 通知（⚠️ 配信済み・後処理のみ失敗）
+        if: (failure() || cancelled()) && steps.send.outcome == 'success'
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
+          state: partial
+          label: 動意銘柄レポート週次 後処理のみ失敗
+          date: ${{ needs.setup-raw.outputs.target_date }}
+          meaning: レポート本体は配信済みです。配信後のアーカイブ整理または commit だけが失敗しました。
+          action_required: 不要（差分は次回 run が回収）
+
+      - name: Discord 通知（❌ merge/送信失敗）
+        if: (failure() || cancelled()) && steps.gate.outputs.exit_code != '3' && steps.send.outcome != 'success'
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
+          state: failed
+          label: 動意銘柄レポート週次 失敗（統合/送信）
+          date: ${{ needs.setup-raw.outputs.target_date }}
+          meaning: 市場別セクションの統合または Discord 送信が失敗し、今週分は未配信です。
+          action_required: run ログ確認 → 手動 dispatch（force_rerun=true）で再実行

@@ -37,7 +37,11 @@ jobs:
       session: ${{ steps.check.outputs.session }}
       reason: ${{ steps.check.outputs.reason }}
     steps:
-      # Secrets 未登録時に分かりやすく fail する（先頭 step・必須チェック）
+      # 通知 composite action（.github/actions/notify-discord）を使うため checkout が必要
+      - name: Checkout report-pipelines (通知 action 用)
+        uses: actions/checkout@v4
+
+      # Secrets 未登録時に分かりやすく fail する（必須チェック）
       - name: Check required secrets (DISCORD_WEBHOOK_TRADER)
         env:
           WH: ${{ secrets.DISCORD_WEBHOOK_TRADER }}
@@ -131,13 +135,25 @@ jobs:
             fi
           fi
 
-      - name: Discord notification (retry_cap)
+      - name: Discord 通知（🚨 自動リトライ停止）
         if: contains(steps.check.outputs.reason, 'retry_cap')
-        env:
-          WH: ${{ secrets.DISCORD_WEBHOOK_TRADER }}
-        run: |
-          curl -s -X POST "$WH" -H "Content-Type: application/json" \
-            -d "{\"content\":\"🚨 GHA cron 連続失敗で停止: ポジションチェック ${{ steps.check.outputs.session }} (${{ steps.check.outputs.reason }}) - 手動 dispatch で復旧してください\"}"
+        uses: ./.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_TRADER }}
+          state: alert
+          label: ポジションチェック（${{ steps.check.outputs.session }}）自動リトライ停止
+          meaning: 同セッションで 2 回以上失敗したため cron の自動再実行を停止しました。本セッション分は未配信です。
+          action_required: run ログ確認 → 原因解消後に手動 dispatch（session=${{ steps.check.outputs.session }}・force_rerun=true）で再実行
+
+      - name: Discord 通知（guard 失敗）
+        if: failure() || cancelled()
+        uses: ./.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_TRADER || secrets.DISCORD_WEBHOOK_URL }}
+          state: failed
+          label: ポジションチェック guard 失敗
+          meaning: 実行前チェック（セッション判定・当日重複判定）自体がエラーになり、生成ジョブが起動していません。
+          action_required: run ログ確認 → 手動 dispatch で再実行
 
   generate:
     needs: guard
@@ -233,31 +249,32 @@ jobs:
           PRIVATE_REPO_ROOT: private-repo
 
       - name: 行数・品質ゲート（不足なら送信せず fail）
+        # exit 3 = 品質ゲート不合格（⛔ 通知へ分岐・生成物の内容不良）/ exit 1 相当はなし
+        id: gate
         env:
           TARGET_DATE: ${{ steps.date.outputs.value }}
           SESSION: ${{ needs.guard.outputs.session }}
         run: |
+          block() { echo "::error::$1"; echo "exit_code=3" >> $GITHUB_OUTPUT; exit 3; }
           FILE="private-repo/market/daily/positions/${TARGET_DATE}_${SESSION}.md"
           if [ ! -f "$FILE" ]; then
-            echo "::error::出力ファイルが存在しません: $FILE"
-            exit 1
+            block "出力ファイルが存在しません: $FILE"
           fi
           LINES=$(wc -l < "$FILE")
           if [ "$LINES" -lt 10 ]; then
-            echo "::error::行数不足（${LINES} 行 < 10 行）: 生成不良のため送信を中止します"
-            exit 1
+            block "行数不足（${LINES} 行 < 10 行）: 生成不良のため送信を中止します"
           fi
           if ! grep -q "アラートサマリー" "$FILE"; then
-            echo "::error::「アラートサマリー」セクションが欠落: 送信を中止します"
-            exit 1
+            block "「アラートサマリー」セクションが欠落: 送信を中止します"
           fi
           if grep -nE "N/A|取得失敗|データなし|調査要" "$FILE"; then
-            echo "::error::フォールバック表記を検出: 送信を中止します"
-            exit 1
+            block "フォールバック表記を検出: 送信を中止します"
           fi
+          echo "exit_code=0" >> $GITHUB_OUTPUT
           echo "品質ゲート OK（${LINES} 行）"
 
       - name: Send Discord (text)
+        id: send
         env:
           DISCORD_WEBHOOK_TRADER: ${{ secrets.DISCORD_WEBHOOK_TRADER }}
           REPORT_FILE: private-repo/market/daily/positions/${{ steps.date.outputs.value }}_${{ needs.guard.outputs.session }}.md
@@ -309,28 +326,43 @@ jobs:
           python bi/pipelines/ops/rotate_report_archives.py
 
       - name: Commit and push to private repo
+        # rebase 方式は履歴書き換え・並行 push で index.lock 残留の構造的弱点があるため、
+        # fresh-base 方式の共通ヘルパー（Public 側から直接実行・repo 内コピー禁止）へ置換。
         working-directory: ./private-repo
         run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          # Public から overlay した一時コピーをすべて掃除
-          git checkout -- bi/pipelines/ agents/ playbook/ 2>/dev/null || true
-          git clean -fd bi/pipelines/ agents/ playbook/ 2>/dev/null || true
-          git add market/daily/
-          if ! git diff --staged --quiet; then
-            git stash push --keep-index --include-untracked -m "ci-cleanup" 2>/dev/null || true
-            git commit -m "data: position check ${{ steps.date.outputs.value }} ${{ needs.guard.outputs.session }}"
-            git fetch origin master
-            git rebase origin/master || (git diff --name-only --diff-filter=U | xargs -I{} git checkout --theirs {}; git diff --name-only --diff-filter=U | xargs git add; git -c core.editor=true rebase --continue)
-            git push origin master
-            git stash drop 2>/dev/null || true
-          fi
+          bash ../report-pipelines/bi/pipelines/ops/ci_commit_push.sh \
+            -m "data: position check ${{ steps.date.outputs.value }} ${{ needs.guard.outputs.session }}" \
+            market/daily
 
-      - name: Discord 通知（失敗）
-        if: failure()
-        env:
-          DISCORD_WEBHOOK_TRADER: ${{ secrets.DISCORD_WEBHOOK_TRADER }}
-        run: |
-          curl -s -X POST "$DISCORD_WEBHOOK_TRADER" \
-            -H "Content-Type: application/json" \
-            -d "{\"content\": \"❌ ポジションチェック失敗 (${{ needs.guard.outputs.session }})\n${{ steps.date.outputs.value }}\nログ確認: https://github.com/${{ github.repository }}/actions\"}"
+      - name: Discord 通知（⛔ 品質ゲートで送信中止）
+        if: failure() && steps.gate.outputs.exit_code == '3'
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_TRADER }}
+          state: blocked
+          label: ポジションチェック（${{ needs.guard.outputs.session }}）送信中止（品質ゲート不合格）
+          date: ${{ steps.date.outputs.value }}
+          meaning: 生成物が品質基準（必須セクション・行数・フォールバック表記なし）を満たさなかったため、配信を止めました。本セッション分は未配信です。
+          action_required: run ログで不合格理由を確認 → 修正後に手動 dispatch（session=${{ needs.guard.outputs.session }}・force_rerun=true）
+
+      - name: Discord 通知（⚠️ 配信済み・後処理のみ失敗）
+        if: (failure() || cancelled()) && steps.send.outcome == 'success'
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_TRADER }}
+          state: partial
+          label: ポジションチェック（${{ needs.guard.outputs.session }}）後処理のみ失敗
+          date: ${{ steps.date.outputs.value }}
+          meaning: レポート本体は配信済みです。配信後のアーカイブ整理または commit だけが失敗しました。
+          action_required: 不要（差分は次回 run が回収）
+
+      - name: Discord 通知（❌ 失敗）
+        if: (failure() || cancelled()) && steps.gate.outputs.exit_code != '3' && steps.send.outcome != 'success'
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_TRADER }}
+          state: failed
+          label: ポジションチェック（${{ needs.guard.outputs.session }}）失敗
+          date: ${{ steps.date.outputs.value }}
+          meaning: 生成または送信が完了せず、本セッション分は未配信です。
+          action_required: run ログ確認 → 手動 dispatch（session=${{ needs.guard.outputs.session }}・force_rerun=true）で再実行。ログに「Spending cap reached」がある場合は Claude 利用枠切れ＝リセット時刻以降に再実行

@@ -33,6 +33,10 @@ jobs:
       proceed: ${{ steps.check.outputs.proceed }}
       reason: ${{ steps.check.outputs.reason }}
     steps:
+      # 通知 composite action（.github/actions/notify-discord）を使うため checkout が必要
+      - name: Checkout report-pipelines (通知 action 用)
+        uses: actions/checkout@v4
+
       - name: Check today's runs
         id: check
         env:
@@ -72,23 +76,29 @@ jobs:
             fi
           fi
 
-      - name: Discord notification (cron or skip event)
-        if: github.event_name == 'schedule' || steps.check.outputs.proceed == 'false'
-        env:
-          WH: ${{ secrets.DISCORD_WEBHOOK_SECTOR }}
-        run: |
-          REASON="${{ steps.check.outputs.reason }}"
-          PROCEED="${{ steps.check.outputs.proceed }}"
-          if [ "$PROCEED" = "true" ]; then
-            MSG="🔶 GHA cron フェイルセーフ起動: セクター日次レポート (${REASON})"
-          elif echo "$REASON" | grep -q "retry_cap"; then
-            MSG="🚨 GHA cron 連続失敗で停止: セクター日次レポート (${REASON}) - 手動 dispatch で復旧してください"
-          else
-            echo "skip 通知は抑制（ノイズ削減）: ${{ github.event_name }} skip (${REASON})"
-            exit 0
-          fi
-          curl -s -X POST "$WH" -H "Content-Type: application/json" \
-            -d "{\"content\":\"${MSG}\"}"
+      # 2026-07-07 文言是正: generate ジョブは `if: false`（日次レーン休止・PM 2026-06-28）のため、
+      # 旧「🔶 フェイルセーフ起動（レポートはこのあと届く）」は構造上あり得ない誤案内だった。
+      # 実態どおり「発行なし（レーン休止中）」へ変更。cron 自体の削除は PM 判断①（A: cron 削除 /
+      # B: generate 再有効化）の確定待ちのため本改修では触らない。
+      - name: Discord 通知（⏭ 発行なし・日次レーン休止中）
+        if: github.event_name == 'schedule' && steps.check.outputs.proceed == 'true'
+        uses: ./.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_SECTOR }}
+          state: none
+          label: セクター日次レポート 発行なし
+          meaning: セクター日次レーンは休止中（週末フル版へ移行済み・生成ジョブ無効化）のため、この起動では何も生成されません（正常動作）。
+          action_required: 不要（cron 削除 or 日次レーン復活は PM 判断待ち）
+
+      - name: Discord 通知（guard 失敗）
+        if: failure() || cancelled()
+        uses: ./.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_SECTOR || secrets.DISCORD_WEBHOOK_URL }}
+          state: failed
+          label: セクター日次レポート guard 失敗
+          meaning: 実行前チェック（当日重複判定）自体がエラーになりました（日次レーン休止中のため配信への影響はありません）。
+          action_required: 不要（頻発する場合のみ run ログ確認）
 
   generate:
     needs: guard

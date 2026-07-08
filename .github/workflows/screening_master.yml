@@ -22,6 +22,10 @@ jobs:
       proceed: ${{ steps.check.outputs.proceed }}
       reason: ${{ steps.check.outputs.reason }}
     steps:
+      # 通知 composite action（.github/actions/notify-discord）を使うため checkout が必要
+      - name: Checkout report-pipelines (通知 action 用)
+        uses: actions/checkout@v4
+
       - name: Check today's runs
         id: check
         env:
@@ -30,6 +34,7 @@ jobs:
           TODAY_JST=$(TZ=Asia/Tokyo date +%Y-%m-%d)
           TODAY_START="${TODAY_JST}T00:00:00+09:00"
           MY_RUN_ID=${{ github.run_id }}
+          EVENT="${{ github.event_name }}"
 
           RUNS=$(gh api -X GET \
             "repos/${{ github.repository }}/actions/workflows/screening_master.yml/runs" \
@@ -38,8 +43,10 @@ jobs:
 
           ACTIVE=$(echo "$RUNS" | jq '[.[] | select(.status=="in_progress" or .status=="queued" or .status=="waiting" or .status=="action_required" or .status=="pending")] | length')
           DONE_OK=$(echo "$RUNS" | jq '[.[] | select(.conclusion=="success" or .conclusion=="neutral")] | length')
+          # 2026-07-07 追加: 他 workflow と同じ retry_cap 判定（連続失敗時の cron 暴走停止）
+          DONE_FAIL=$(echo "$RUNS" | jq '[.[] | select(.conclusion=="failure" or .conclusion=="cancelled" or .conclusion=="startup_failure" or .conclusion=="timed_out" or .conclusion=="stale" or .conclusion=="action_required")] | length')
 
-          echo "Today (${TODAY_JST}): active=${ACTIVE} done_ok=${DONE_OK}"
+          echo "Today (${TODAY_JST}): active=${ACTIVE} done_ok=${DONE_OK} done_fail=${DONE_FAIL} event=${EVENT}"
 
           if [ "$DONE_OK" -gt 0 ]; then
             echo "proceed=false" >> $GITHUB_OUTPUT
@@ -47,10 +54,33 @@ jobs:
           elif [ "$ACTIVE" -gt 0 ]; then
             echo "proceed=false" >> $GITHUB_OUTPUT
             echo "reason=skip (active run exists: active=${ACTIVE})" >> $GITHUB_OUTPUT
+          elif [ "$EVENT" = "schedule" ] && [ "$DONE_FAIL" -ge 2 ]; then
+            echo "proceed=false" >> $GITHUB_OUTPUT
+            echo "reason=retry_cap (cron stopped: done_fail=${DONE_FAIL} >= 2)" >> $GITHUB_OUTPUT
           else
             echo "proceed=true" >> $GITHUB_OUTPUT
             echo "reason=initial" >> $GITHUB_OUTPUT
           fi
+
+      - name: Discord 通知（🚨 自動リトライ停止）
+        if: contains(steps.check.outputs.reason, 'retry_cap')
+        uses: ./.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          state: alert
+          label: スクリーニングETL 自動リトライ停止
+          meaning: 当日 2 回以上失敗したため cron の自動再実行を停止しました。screening_master は前回値のまま更新されていません。
+          action_required: run ログ確認 → 原因解消後に手動 dispatch で再実行
+
+      - name: Discord 通知（guard 失敗）
+        if: failure() || cancelled()
+        uses: ./.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          state: failed
+          label: スクリーニングETL guard 失敗
+          meaning: 実行前チェック（当日重複判定）自体がエラーになり、更新ジョブが起動していません。
+          action_required: run ログ確認 → 手動 dispatch で再実行
 
   update:
     needs: guard
@@ -119,38 +149,31 @@ jobs:
         run: python convert_to_excel.py
 
       - name: Commit and push to private repo
+        # rebase 方式は履歴書き換え・並行 push で index.lock 残留の構造的弱点があるため、
+        # fresh-base 方式の共通ヘルパー（Public 側から直接実行・repo 内コピー禁止）へ置換。
         working-directory: ./private-repo
         run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          # 一時コピーしたスクリプトは戻す（Private 側の履歴を汚さない）
-          git checkout -- bi/pipelines/ 2>/dev/null || true
-          git add bi/outputs/
-          if ! git diff --staged --quiet; then
-            git commit -m "data: screening master $(date +'%Y-%m-%d')"
-            git fetch origin master
-            if ! git rebase origin/master; then
-              git diff --name-only --diff-filter=U | xargs -I{} git checkout --theirs {}
-              git diff --name-only --diff-filter=U | xargs git add
-              git -c core.editor=true rebase --continue
-            fi
-            git push origin master
-          fi
+          bash ../report-pipelines/bi/pipelines/ops/ci_commit_push.sh \
+            -m "data: screening master $(TZ=Asia/Tokyo date +'%Y-%m-%d')" bi/outputs
 
-      - name: Discord 通知（成功）
+      - name: Discord 通知（✅ 完了）
         if: success()
-        env:
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        run: |
-          curl -s -X POST "$DISCORD_WEBHOOK_URL" \
-            -H "Content-Type: application/json" \
-            -d "{\"content\": \"✅ スクリーニング完了\n$(date +'%Y-%m-%d %H:%M') JST\n銘柄数: ${{ steps.etl.outputs.rows }}\nYF補完: ${{ steps.etl.outputs.yf_used }}銘柄\"}"
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          state: done
+          label: スクリーニングETL 完了
+          meaning: screening_master を更新しました（銘柄数 ${{ steps.etl.outputs.rows }}・YF補完 ${{ steps.etl.outputs.yf_used }}銘柄）。
+          action_required: 不要
 
-      - name: Discord 通知（失敗）
-        if: failure()
-        env:
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        run: |
-          curl -s -X POST "$DISCORD_WEBHOOK_URL" \
-            -H "Content-Type: application/json" \
-            -d "{\"content\": \"❌ スクリーニング失敗\n$(date +'%Y-%m-%d %H:%M') JST\nログ確認: https://github.com/${{ github.repository }}/actions\"}"
+      - name: Discord 通知（❌ 失敗）
+        # cancelled() を含める: job timeout 超過は conclusion=cancelled になり
+        # failure() だけでは発火しない穴を塞ぐ（2026-07-07）。
+        if: failure() || cancelled()
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          state: failed
+          label: スクリーニングETL 失敗
+          meaning: 日次更新が完了せず（エラーまたは制限時間超過）、screening_master は前回値のまま更新されていません。
+          action_required: run ログ確認 → 手動 dispatch で再実行
