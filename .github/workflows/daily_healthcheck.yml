@@ -8,9 +8,7 @@ name: Daily Healthcheck (dead-man switch)
   # 朝刊チェック: 09:00 JST = UTC 00:00（マクロ朝刊 06:23 の 2.5h 後・cron 07:30 の 1.5h 後）
   #   + 前日夕方 ETL 2 本（financial_history 17:00 / screening_master 17:15 JST）を前日日付で判定
   #     （price_history は 2026-07-07 退役: 履歴減量で push-back 廃止のため監視対象外）
-  #   + position_check 朝セッション（08:15 JST・当日 00:00 以降で判定）
-  # 夕方チェック: 19:00 JST = UTC 10:00（夕方 4 レポート想定完了の 15-30 分後）
-  #   + position_check 夕セッション（15:45 JST・当日 12:00 JST 以降で判定＝朝の成功と混同しない）
+  # 夕方チェック: 19:00 JST = UTC 10:00（夕方レポート想定完了の 15-30 分後）
   # 金曜夜チェック: 23:30 JST 金曜 = UTC 14:30 金曜（週次 3 本の 21:00 JST 発火から 2.5h 後・同日判定）
   workflow_dispatch: {}
   schedule:
@@ -43,7 +41,8 @@ jobs:
           TODAY_JST=$(TZ=Asia/Tokyo date +%Y-%m-%d)
           YESTERDAY_JST=$(TZ=Asia/Tokyo date -d 'yesterday' +%Y-%m-%d)
           if [ "$HOUR_JST" -lt 12 ]; then
-            # 朝スコープ: 当日朝刊 + position_check(am) + 前日夕方 ETL 2 本（前日日付で判定）
+            # 朝スコープ: 当日朝刊 + 前日夕方 ETL 2 本（前日日付で判定）
+            # position_check は PM 2026-07-09 でレーン抹消のため監視対象外
             # screening_master は平日のみ実行のため月曜朝は前週金曜分を判定
             if [ "$DOW_JST" -eq 1 ]; then
               SM_DATE=$(TZ=Asia/Tokyo date -d '3 days ago' +%Y-%m-%d)
@@ -51,19 +50,19 @@ jobs:
               SM_DATE="$YESTERDAY_JST"
             fi
             echo "scope=morning" >> $GITHUB_OUTPUT
-            echo "workflows=macro_report_daily.yml=${TODAY_JST},position_check.yml=${TODAY_JST},screening_master.yml=${SM_DATE},financial_history.yml=${YESTERDAY_JST}" >> $GITHUB_OUTPUT
-            echo "label=朝刊 + ポジションチェック(朝) + 前日 ETL 2 本" >> $GITHUB_OUTPUT
+            echo "workflows=macro_report_daily.yml=${TODAY_JST},screening_master.yml=${SM_DATE},financial_history.yml=${YESTERDAY_JST}" >> $GITHUB_OUTPUT
+            echo "label=朝刊 + 前日 ETL 2 本" >> $GITHUB_OUTPUT
           elif [ "$DOW_JST" -eq 5 ] && [ "$HOUR_JST" -ge 22 ]; then
             # 金曜夜スコープ: 金曜 21:00 JST 発火の週次 3 本を同日（金曜）日付で判定
             echo "scope=friday_weekly" >> $GITHUB_OUTPUT
             echo "workflows=largecap_weekly.yml=${TODAY_JST},mover_weekly.yml=${TODAY_JST},sector_report_weekly_full.yml=${TODAY_JST}" >> $GITHUB_OUTPUT
             echo "label=金曜週次 3 本" >> $GITHUB_OUTPUT
           else
-            # 夕方スコープ: 夕方 3 レポート + position_check(pm)（当日 12:00 JST 以降で判定）
-            # sector_report_daily は PM 2026-07-08 確定（判断①A）でレーン休止・cron 削除のため監視対象外
+            # 夕方スコープ: 夕方 3 レポート（当日 12:00 JST 以降で判定）
+            # sector_report_daily（PM 2026-07-08）・position_check（PM 2026-07-09）はレーン抹消のため監視対象外
             echo "scope=evening" >> $GITHUB_OUTPUT
-            echo "workflows=mover_report_daily.yml=${TODAY_JST},macro_report_evening.yml=${TODAY_JST},theme_report_daily.yml=${TODAY_JST},position_check.yml=${TODAY_JST}T12:00:00+09:00" >> $GITHUB_OUTPUT
-            echo "label=夕方 3 本 + ポジションチェック(夕)" >> $GITHUB_OUTPUT
+            echo "workflows=mover_report_daily.yml=${TODAY_JST},macro_report_evening.yml=${TODAY_JST},theme_report_daily.yml=${TODAY_JST}" >> $GITHUB_OUTPUT
+            echo "label=夕方 3 本" >> $GITHUB_OUTPUT
           fi
           echo "today_jst=${TODAY_JST}" >> $GITHUB_OUTPUT
           echo "hour_jst=${HOUR_JST}" >> $GITHUB_OUTPUT
