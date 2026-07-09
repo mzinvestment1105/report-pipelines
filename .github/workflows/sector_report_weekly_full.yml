@@ -79,16 +79,8 @@ jobs:
             fi
           fi
 
-      - name: Discord 通知（⏱ 予備タイマー起動）
-        if: github.event_name == 'schedule' && steps.check.outputs.proceed == 'true'
-        uses: ./.github/actions/notify-discord
-        with:
-          webhook: ${{ secrets.DISCORD_WEBHOOK_SECTOR }}
-          state: timer
-          label: セクター週次レポート 予備タイマー起動
-          meaning: 定時の Cloudflare Worker 発火が届かなかったため、GHA 側の予備タイマーが代わりに生成を開始しました。レポートはこのあと通常どおり届きます。
-          action_required: 不要（毎週続く場合のみ Worker 点検）
-
+      # ⏱予備タイマー起動通知は削除（PM 2026-07-09）: Worker が週次を発火しておらず cron が
+      # 実質本経路のため「Worker未達」案内が毎週金曜に誤発報していた。レポート生成・送信は継続。
       - name: Discord 通知（🚨 自動リトライ停止）
         if: contains(steps.check.outputs.reason, 'retry_cap')
         uses: ./.github/actions/notify-discord
