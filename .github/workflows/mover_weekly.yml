@@ -178,10 +178,12 @@ jobs:
         # sector_stock_weekly.parquet の再生成をプロンプト任せ（旧 prompts/mover-weekly.md Step 4）に
         # せず、workflow の機械 step へ昇格する（2026-07-10 に 7/3 生成のコミット済み parquet を
         # 「当週」として全行誤配信・2986 -66.3%／4596 +55.4% 事故の再発防止）。
-        # --expect-price-date: 価格データが対象日（当週金曜）に届いていなければ exit 3
-        #   （品質ゲート・⛔ 通知へ分岐。exit 1 = インフラ失敗 ❌）。
-        # --cold-lookback-days 90: price_history parquet は 2026-07-07 に git 管理外化され clone に
-        #   無いため、JQuants コールドフェッチを W01〜W08 計算に必要な約 13 週分へ短縮（3年分≈90分→数分）。
+        # --expect-price-date: 価格データが対象日（当週金曜）に届いていなければ exit 3。
+        #   PM 2026-07-12 改定（絶対配信原則）: exit 3 でも中止しない（parquet は保存済み）。
+        #   品質フラグ（実際の PriceDataAsOf を明記）を書き出して続行し、merge-and-send が
+        #   レポート冒頭へ注記を機械挿入して必ず配信する（旧「⛔ 生成中止＝未配信」は PM 却下）。
+        # --cold-lookback-days 90: price_history parquet が clone に無い場合の JQuants コールド
+        #   フェッチを W01〜W08 計算に必要な約 13 週分へ短縮（3年分≈90分→数分）。
         # 生成した parquet は artifact で generate-market の 4 並列へ配布する（commit はしない＝
         # リポの parquet 鮮度管理は従来どおり sector_report_weekly_full.yml の責務）。
         id: weekly_parquet
@@ -195,6 +197,15 @@ jobs:
             --expect-price-date ${{ steps.date.outputs.value }} --cold-lookback-days 90
           ec=$?
           echo "exit_code=$ec" >> $GITHUB_OUTPUT
+          FLAGS=../../market/daily/${{ steps.date.outputs.value }}_weekly_quality_flags.txt
+          if [ "$ec" -eq 3 ]; then
+            ASOF=$(python -c "import pandas as pd; print(pd.read_parquet('../outputs/sector_stock_weekly.parquet')['PriceDataAsOf'].iloc[0])")
+            echo "週間ランキングの価格データが対象週の金曜（${{ steps.date.outputs.value }}）に未着。実際の価格最新日は ${ASOF} で、週間騰落・売買代金は ${ASOF} までの窓（前週の可能性）。" > "$FLAGS"
+            echo "品質フラグを出力し配信続行（PM 2026-07-12 絶対配信原則）"
+            exit 0
+          fi
+          # 正常時も空フラグを出力（artifact 収集・注記判定を単純化するため）
+          : > "$FLAGS"
           exit $ec
 
       - name: Upload weekly ranking parquet as artifact
@@ -207,13 +218,15 @@ jobs:
 
       - name: Generate movers raw (make_mover_report.py --no-pdf)
         # 週次 workflow が当週分の raw を新規生成。3 並列の generate-market が artifact 経由で共有。
+        # PM 2026-07-12（絶対配信原則）: --date-gate（注記モード）を付与。対象日 EOD 未着でも中止せず
+        # 真のデータ日付のまま生成し、品質注記を raw 冒頭と {date}_quality_flags.txt に出力する。
         working-directory: ./private-repo/bi/pipelines
         env:
           JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
           EDINETDB_API_KEYS: ${{ secrets.EDINETDB_API_KEYS }}
           PYTHONIOENCODING: utf-8
         run: |
-          python make_mover_report.py --date ${{ steps.date.outputs.value }} --no-pdf
+          python make_mover_report.py --date ${{ steps.date.outputs.value }} --no-pdf --date-gate
 
       - name: Append 立花証券 e支店 API context to movers raw
         working-directory: ./private-repo/bi/pipelines
@@ -231,29 +244,20 @@ jobs:
           python fetch_tachibana_mover_context.py --date ${{ steps.date.outputs.value }}
 
       - name: Upload movers raw as artifact
+        # PM 2026-07-12: 品質フラグ 2 種（EOD 未着 / 週間ランキング窓ずれ）を同梱し merge-and-send の
+        # 注記挿入 step へ届ける。パスの共通親が market/daily のためダウンロード側はフラット配置のまま。
         uses: actions/upload-artifact@v4
         with:
           name: movers-raw-${{ steps.date.outputs.value }}
-          path: private-repo/market/daily/${{ steps.date.outputs.value }}_movers_raw.md
+          path: |
+            private-repo/market/daily/${{ steps.date.outputs.value }}_movers_raw.md
+            private-repo/market/daily/${{ steps.date.outputs.value }}_quality_flags.txt
+            private-repo/market/daily/${{ steps.date.outputs.value }}_weekly_quality_flags.txt
           retention-days: 7
           if-no-files-found: error
 
-      - name: Discord 通知（⛔ 対象週ゲートで生成中止）
-        # exit 3 = 週間ランキングの価格データが対象週の金曜に届いていない（品質ゲート）。
-        # 前週の窓での「今週」誤配信を防いで中止した状態（2026-07-10 事故の再発防止・PM 2026-07-12）。
-        if: failure() && steps.weekly_parquet.outputs.exit_code == '3'
-        uses: ./report-pipelines/.github/actions/notify-discord
-        with:
-          webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
-          state: blocked
-          label: 動意銘柄レポート週次 生成中止（週間ランキングデータが対象週不一致）
-          date: ${{ steps.date.outputs.value }}
-          meaning: 週間ランキングの価格データが対象週の金曜まで届いておらず、前週の数値での誤配信を防いで生成を中止しました。今週分は未配信です。
-          action_required: JQuants の当日データ反映後（夜間）に手動 dispatch（force_rerun=true）で再実行
-
       - name: Discord 通知（❌ raw 生成失敗）
-        # 品質ゲート exit 3 は上の ⛔ 通知が担当するため除外。
-        if: (failure() || cancelled()) && steps.weekly_parquet.outputs.exit_code != '3'
+        if: failure() || cancelled()
         uses: ./report-pipelines/.github/actions/notify-discord
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
@@ -539,8 +543,19 @@ jobs:
           cat "${MOVERS_DIR}/${TARGET_DATE}_weekly_growth_b.md" >> "$OUTPUT"
           echo "Merged into $OUTPUT ($(wc -l < "$OUTPUT") lines)"
 
-      - name: 件数ゲート（売買代金/値上がり/値下がり・不足なら送信中止）
-        # exit 3 = 品質ゲート不合格（⛔ 通知へ分岐）/ exit 1 = インフラ失敗（❌）
+      - name: Download movers raw artifact (品質フラグ取得用)
+        # PM 2026-07-12（絶対配信原則）: setup-raw が出力した品質フラグ 2 種（EOD 未着 /
+        # 週間ランキング窓ずれ）を注記挿入 step へ渡す。
+        uses: actions/download-artifact@v4
+        with:
+          name: movers-raw-${{ needs.setup-raw.outputs.target_date }}
+          path: /tmp/movers-raw
+
+      - name: 品質検査（件数/タイトル日付・不合格でも送信は止めない）
+        # PM 2026-07-12 改定（絶対配信原則）: check_mover_counts の exit 3（品質不合格）は検知
+        # シグナルとして受けて step は成功で通し、次の注記挿入 step が品質注記を機械挿入して
+        # 必ず配信する（旧「⛔ 送信中止＝未配信」は PM 却下）。--date でタイトル日付検知も適用。
+        # exit 1（ファイル読込不可等のインフラ失敗）のみ step 失敗（❌）。
         id: gate
         working-directory: ./private-repo
         env:
@@ -548,10 +563,46 @@ jobs:
           PYTHONIOENCODING: utf-8
         run: |
           set +e
-          python bi/pipelines/check_mover_counts.py --file market/daily/movers/${TARGET_DATE}_weekly.md
-          ec=$?
+          python bi/pipelines/check_mover_counts.py --file market/daily/movers/${TARGET_DATE}_weekly.md --date ${TARGET_DATE} 2>&1 | tee /tmp/gate.log
+          ec=${PIPESTATUS[0]}
           echo "exit_code=$ec" >> $GITHUB_OUTPUT
+          if [ "$ec" -eq 3 ]; then
+            echo "品質ゲート不合格 → 注記を挿入して配信を続行します（PM 2026-07-12 絶対配信原則）"
+            exit 0
+          fi
           exit $ec
+
+      - name: 品質注記の機械挿入（フラグ検知時のみ・各市場タイトル直後）
+        # PM 2026-07-12（絶対配信原則）: EOD 未着注記・週間ランキング窓ずれ注記（setup-raw の
+        # フラグ 2 種）と品質検査の不合格内容を、市場別 PDF すべてに載るよう各タイトル行
+        # （# 動意銘柄レポート …）直後へ挿入する。Claude 側注記と重複しても可。
+        id: annotate
+        working-directory: ./private-repo
+        env:
+          TARGET_DATE: ${{ needs.setup-raw.outputs.target_date }}
+        run: |
+          NOTE=""
+          for FLAGS in /tmp/movers-raw/${TARGET_DATE}_quality_flags.txt /tmp/movers-raw/${TARGET_DATE}_weekly_quality_flags.txt; do
+            if [ -s "$FLAGS" ]; then
+              PART="$(tr '\n' ' ' < "$FLAGS" | sed 's/ *$//')"
+              NOTE="${NOTE}${NOTE:+ ／ }${PART}"
+            fi
+          done
+          if [ "${{ steps.gate.outputs.exit_code }}" = "3" ]; then
+            # paste -d はマルチバイト区切りをバイト分割するため awk で連結（・区切り）
+            DETAIL=$(grep '^  - ' /tmp/gate.log | head -5 | sed 's/^  - //' | awk 'NR>1{printf "・"} {printf "%s", $0} END{print ""}')
+            NOTE="${NOTE}${NOTE:+ ／ }機械検査で不合格項目あり（${DETAIL}）"
+          fi
+          if [ -n "$NOTE" ]; then
+            F=market/daily/movers/${TARGET_DATE}_weekly.md
+            awk -v note="> ⚠️ **品質注記**: ${NOTE}" '{print} /^# 動意銘柄レポート /{print ""; print note}' "$F" > "${F}.tmp" && mv "${F}.tmp" "$F"
+            echo "annotated=true" >> $GITHUB_OUTPUT
+            echo "note=${NOTE}" >> $GITHUB_OUTPUT
+            echo "品質注記を挿入: ${NOTE}"
+          else
+            echo "annotated=false" >> $GITHUB_OUTPUT
+            echo "品質フラグなし・注記挿入なし"
+          fi
 
       - name: Send Discord (PDF・市場別 3 枚分割)
         id: send
@@ -582,16 +633,17 @@ jobs:
           bash ../report-pipelines/bi/pipelines/ops/ci_commit_push.sh \
             -m "data: mover weekly ${TARGET_DATE}" market/daily
 
-      - name: Discord 通知（⛔ 件数ゲートで送信中止）
-        if: failure() && steps.gate.outputs.exit_code == '3'
+      - name: Discord 通知（⚠️ 配信済み・品質注記あり）
+        # PM 2026-07-12（絶対配信原則）: 品質問題があってもレポートは配信済み。何が注記されたかを PM へ通知。
+        if: steps.annotate.outputs.annotated == 'true' && steps.send.outcome == 'success'
         uses: ./report-pipelines/.github/actions/notify-discord
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
-          state: blocked
-          label: 動意銘柄レポート週次 送信中止（件数ゲート不合格）
+          state: partial
+          label: 動意銘柄レポート週次 配信済み（品質注記あり）
           date: ${{ needs.setup-raw.outputs.target_date }}
-          meaning: 規定の銘柄件数を満たさない不完全なレポートだったため、配信を止めました。今週分は未配信です。
-          action_required: run ログで不足市場/セクションを確認 → 修正後に手動 dispatch（force_rerun=true）
+          meaning: レポートは配信済みです。品質注記（${{ steps.annotate.outputs.note }}）を各市場の冒頭に付けています。
+          action_required: レポート冒頭の品質注記を確認（数値を使う前に注記のデータ日付・週の窓を参照）
 
       - name: Discord 通知（⚠️ 配信済み・後処理のみ失敗）
         if: (failure() || cancelled()) && steps.send.outcome == 'success'
@@ -605,7 +657,8 @@ jobs:
           action_required: 不要（差分は次回 run が回収）
 
       - name: Discord 通知（❌ merge/送信失敗）
-        if: (failure() || cancelled()) && steps.gate.outputs.exit_code != '3' && steps.send.outcome != 'success'
+        # 品質フラグ（exit_code=3）は step 成功で通し注記配信するため、ここに来るのはインフラ失敗のみ。
+        if: (failure() || cancelled()) && steps.send.outcome != 'success'
         uses: ./report-pipelines/.github/actions/notify-discord
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}

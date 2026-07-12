@@ -39,9 +39,9 @@ WD=$(date -d "${TARGET_DATE}" +%u)   # 1=月 ... 5=金 ... 7=日
 cd ${PRIVATE_REPO_ROOT}/bi/pipelines && python fetch_theme_momentum.py
 ```
 
-   - みんかぶ・株探の人気テーマ・急上昇テーマをスクレイピングして parquet 保存。エラー時は内容を報告して終了。
+   - みんかぶ・株探の人気テーマ・急上昇テーマをスクレイピングして parquet 保存。**エラー（exit 3 = 当日の急上昇 rise 欠落を含む）でも生成を中止しない（無配信禁止・PM 2026-07-12 絶対配信原則）**。当日分が取得できない場合は Step 7 のとおり最新 snapshot を使い、タイトル直後に `> ⚠️ **品質注記**: 急上昇テーマは {snapshot_date} 時点のランキング（当日分未取得）` を書いた上で必ず Write する。GHA では workflow が事前実行済みのため二重実行になっても可（同一 snapshot は置換され安全）。
 
-7. **生成された raw データを読み込み**（[bi/outputs/theme_momentum.parquet](../bi/outputs/theme_momentum.parquet)・当日 snapshot_date 分）。人気テーマ（rank_type=popular / access_3d）・急上昇テーマ（rank_type=rise）の当日ランキングを取り出す。各行には `top_stocks` 列（代表銘柄＝テーマページからスクレイプ済の構成銘柄。Step 8 で使用）が含まれる。
+7. **生成された raw データを読み込み**（[bi/outputs/theme_momentum.parquet](../bi/outputs/theme_momentum.parquet)・当日 snapshot_date 分）。人気テーマ（rank_type=popular / access_3d）・急上昇テーマ（rank_type=rise）の当日ランキングを取り出す。**当日分が無い rank_type は最新 snapshot を使い、その snapshot_date を冒頭の品質注記に明記する（古いランキングを黙って当日扱いしない＝虚偽の日付ラベル禁止）**。各行には `top_stocks` 列（代表銘柄＝テーマページからスクレイプ済の構成銘柄。Step 8 で使用）が含まれる。
 
 8. **代表銘柄は parquet の `top_stocks` 列から取得**（`fetch_theme_momentum.py` がテーマページから構成銘柄をスクレイプ済・WebFetch 不要）。各テーマ行の `top_stocks`（「6857 アドテスト（-9.64%）/ 6855 電子材料（-7.26%）/ …」形式・株探テーマは当日前日比つき）から上位 3〜5 を**コード＋銘柄名**で代表銘柄セルに記載する。`top_stocks` が空のテーマは代表銘柄セルを空欄にし、**テーマ自体はランキングから外さない**（ランキング保全）。ETF/REIT/投資法人（§1 のキーワード・コード一致）は代表銘柄から除外する。
 
@@ -93,7 +93,7 @@ cd ${PRIVATE_REPO_ROOT}/bi/pipelines && python fetch_theme_momentum.py
 
 ## 代表銘柄の週間騰落
 
-主要テーマ（人気・急上昇の上位）の代表銘柄について、`${PRIVATE_REPO_ROOT}/bi/outputs/sector_stock_weekly.parquet` の `Return_W01`（直近1週間リターン・小数→%）を表で示す。テーマごとに：
+主要テーマ（人気・急上昇の上位）の代表銘柄について、`${PRIVATE_REPO_ROOT}/bi/outputs/sector_stock_weekly.parquet` の `Return_W01`（直近1週間リターン・小数→%）を表で示す。**必ず parquet の `PriceDataAsOf` 列を読み、騰落の実際の窓を見出しまたは冒頭行に明記する**（例「6/29〜7/3 週の騰落（価格データ最新日 7/3 時点）」。`PriceDataAsOf` から 1 週間さかのぼった営業日〜`PriceDataAsOf` が窓）。commit 済み parquet は平日で最大 6 営業日・セクター週次 ETL 失敗週はさらに古いことがあるため、**当週でない場合はその旨を注記した上で本節は省略せず必ず出す**（無言省略禁止・古い窓を「今週」と書く虚偽ラベルも禁止・PM 2026-07-12）。テーマごとに：
 
 ### {テーマ名（注釈）}
 | コード | 銘柄名 | 週間リターン(%) |

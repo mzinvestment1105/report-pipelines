@@ -187,10 +187,10 @@ jobs:
           playwright install chromium --with-deps
 
       - name: Generate themes raw (fetch_theme_momentum.py)
-        # PM 2026-07-12 確定: exit code を捕捉して通知を分岐する。
-        # exit 3 = 品質ゲート不合格（当日の急上昇 rise が取得できず・⛔ 通知へ分岐。
-        # 前日ランキングを「当日」として誤生成する 2026-07-09 型事故の再発防止）/
-        # exit 1 = インフラ失敗（3ソース全滅・❌ 通知）。
+        # PM 2026-07-12 改定（絶対配信原則）: exit 3 = 当日の急上昇（rise）欠落の検知シグナル。
+        # 旧「exit 3 → ⛔ 生成中止＝未配信」は PM 却下。exit 3 でも step は成功で通し、送信前の
+        # 注記挿入 step がレポート冒頭へ品質注記（使用ランキングが当日でない旨）を機械挿入して
+        # 必ず配信する。exit 1（3ソース全滅等のインフラ失敗）のみ step 失敗（❌）。
         id: fetch_raw
         working-directory: ./private-repo/bi/pipelines
         env:
@@ -200,6 +200,10 @@ jobs:
           python fetch_theme_momentum.py
           ec=$?
           echo "exit_code=$ec" >> $GITHUB_OUTPUT
+          if [ "$ec" -eq 3 ]; then
+            echo "当日 rise 欠落 → 品質注記つき配信で続行（PM 2026-07-12 絶対配信原則）"
+            exit 0
+          fi
           exit $ec
 
       - name: 既存テーマレポートファイルを削除（前回不良ファイル読込スキップ防止）
@@ -233,10 +237,10 @@ jobs:
           TARGET_DATE: ${{ steps.date.outputs.value }}
           PRIVATE_REPO_ROOT: private-repo
 
-      - name: 対象日整合ゲート（タイトル日付・不一致なら送信中止）
-        # PM 2026-07-12 確定: exit 3 = 品質ゲート不合格（⛔ 通知へ分岐）/ exit 1 = インフラ失敗（❌）。
-        # 生成レポートのタイトル行に対象日が無い（別日付レポートを生成した等）場合に送信前で止める
-        # （2026-07-09 に前営業日データを「本日」として配信した日付品質事故の再発防止）。
+      - name: 対象日整合検査（タイトル日付・不一致でも送信は止めない）
+        # PM 2026-07-12 改定（絶対配信原則）: タイトル日付の対象日不一致は検知シグナル（exit_code=3）
+        # として次の注記挿入 step へ渡し、送信は止めない（旧「exit 3 → ⛔ 送信中止」は PM 却下）。
+        # レポート未生成（ファイル無し）のみインフラ失敗（exit 1・❌）。
         id: title_gate
         working-directory: ./private-repo
         env:
@@ -249,12 +253,40 @@ jobs:
             exit 1
           fi
           if ! head -1 "$F" | grep -q "${TARGET_DATE}"; then
-            echo "[QUALITY GATE] タイトル行に対象日 ${TARGET_DATE} が無いため送信を中止します: $(head -1 "$F")"
+            echo "[QUALITY FLAG] タイトル行に対象日 ${TARGET_DATE} が無い → 注記を挿入して配信続行: $(head -1 "$F")"
             echo "exit_code=3" >> $GITHUB_OUTPUT
-            exit 3
+            exit 0
           fi
-          echo "[QUALITY GATE] タイトル日付 OK: $(head -1 "$F")"
+          echo "[QUALITY FLAG] タイトル日付 OK: $(head -1 "$F")"
           echo "exit_code=0" >> $GITHUB_OUTPUT
+
+      - name: 品質注記の機械挿入（フラグ検知時のみ・タイトル行直後）
+        # PM 2026-07-12（絶対配信原則）: rise 欠落・タイトル日付不一致を検知した場合、md の
+        # タイトル行直後へ品質注記を機械挿入して必ず配信する（Claude 側注記と重複しても可）。
+        id: annotate
+        working-directory: ./private-repo
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+          PYTHONIOENCODING: utf-8
+        run: |
+          NOTE=""
+          if [ "${{ steps.fetch_raw.outputs.exit_code }}" = "3" ]; then
+            SNAP=$(python -c "import pandas as pd; m=pd.read_parquet('bi/outputs/theme_momentum.parquet'); print(m[m['rank_type']=='rise']['snapshot_date'].max())" 2>/dev/null || echo "不明")
+            NOTE="急上昇テーマの当日ランキングが取得できず、掲載は取得済みの最新ランキング（${SNAP} 時点）に基づく"
+          fi
+          if [ "${{ steps.title_gate.outputs.exit_code }}" = "3" ]; then
+            NOTE="${NOTE}${NOTE:+ ／ }タイトル日付が対象日 ${TARGET_DATE} と不一致"
+          fi
+          if [ -n "$NOTE" ]; then
+            F=market/daily/theme/${TARGET_DATE}_themes_summary.md
+            awk -v note="> ⚠️ **品質注記**: ${NOTE}" 'NR==1{print; print ""; print note; next} {print}' "$F" > "${F}.tmp" && mv "${F}.tmp" "$F"
+            echo "annotated=true" >> $GITHUB_OUTPUT
+            echo "note=${NOTE}" >> $GITHUB_OUTPUT
+            echo "品質注記を挿入: ${NOTE}"
+          else
+            echo "annotated=false" >> $GITHUB_OUTPUT
+            echo "品質フラグなし・注記挿入なし"
+          fi
 
       - name: Send Discord (PDF)
         id: send
@@ -284,36 +316,23 @@ jobs:
             -m "data: themes daily ${{ steps.date.outputs.value }}" \
             market/daily bi/outputs/theme_momentum.parquet
 
-      - name: Discord 通知（⛔ 当日テーマ未取得で生成中止）
-        # exit 3 = 急上昇（rise）の当日分だけ取得失敗（部分ブロック）。前日ランキングを
-        # 「当日」として誤生成する事故（2026-07-09 型）を防いで中止した状態（PM 2026-07-12）。
-        if: failure() && steps.fetch_raw.outputs.exit_code == '3'
+      - name: Discord 通知（⚠️ 配信済み・品質注記あり）
+        # PM 2026-07-12（絶対配信原則）: 品質問題があってもレポートは配信済み。何が注記されたかを PM へ通知。
+        if: steps.annotate.outputs.annotated == 'true' && steps.send.outcome == 'success'
         uses: ./report-pipelines/.github/actions/notify-discord
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_THEME }}
-          state: blocked
-          label: テーマ動意レポート 生成中止（当日の急上昇テーマ未取得）
+          state: partial
+          label: テーマ動意レポート 配信済み（品質注記あり）
           date: ${{ steps.date.outputs.value }}
-          meaning: 急上昇テーマの当日分が取得できず、前日ランキングでの誤生成を防いで配信を止めました。本日未配信です。
-          action_required: ローカルで /themes-report を実行してリカバリ（GHA の再実行は同じ IP 帯で失敗しやすい）
-
-      - name: Discord 通知（⛔ タイトル日付不一致で送信中止）
-        # exit 3 = 生成レポートのタイトル日付が対象日と不一致（品質ゲート・PM 2026-07-12）。
-        if: failure() && steps.title_gate.outputs.exit_code == '3'
-        uses: ./report-pipelines/.github/actions/notify-discord
-        with:
-          webhook: ${{ secrets.DISCORD_WEBHOOK_THEME }}
-          state: blocked
-          label: テーマ動意レポート 送信中止（タイトル日付不一致）
-          date: ${{ steps.date.outputs.value }}
-          meaning: 生成レポートのタイトル日付が対象日と一致せず、別日付レポートの誤配信を防いで送信を止めました。本日未配信です。
-          action_required: run ログでタイトル行を確認 → 修正後に手動 dispatch で再実行
+          meaning: レポートは配信済みです。品質注記（${{ steps.annotate.outputs.note }}）を冒頭に付けています。
+          action_required: レポート冒頭の品質注記を確認（数値を使う前に注記のデータ日付を参照）
 
       - name: Discord 通知（❌ raw 取得ブロック）
-        # fetch_theme_momentum.py の失敗 = 株探/みんかぶが GHA ランナー IP を弾いた
-        # （405 等・リトライ済み）とみられるため、専用文言でリカバリ手段を明示する。
-        # exit 3（品質ゲート）は上の ⛔ 通知が担当するため除外。
-        if: (failure() || cancelled()) && steps.fetch_raw.outcome == 'failure' && steps.fetch_raw.outputs.exit_code != '3'
+        # fetch_theme_momentum.py の失敗（exit 1 = 3ソース全滅）= 株探/みんかぶが GHA ランナー IP を
+        # 弾いた（405 等・リトライ済み）とみられるため、専用文言でリカバリ手段を明示する。
+        # exit 3（rise 欠落）は step 成功で通し注記配信するため、ここには来ない。
+        if: (failure() || cancelled()) && steps.fetch_raw.outcome == 'failure'
         uses: ./report-pipelines/.github/actions/notify-discord
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_THEME }}
@@ -335,8 +354,8 @@ jobs:
           action_required: 不要（差分は次回 run が回収）
 
       - name: Discord 通知（❌ 失敗）
-        # 品質ゲート exit 3（fetch_raw / title_gate）は上の ⛔ 通知が担当するため除外。
-        if: (failure() || cancelled()) && steps.fetch_raw.outcome != 'failure' && steps.title_gate.outputs.exit_code != '3' && steps.send.outcome != 'success'
+        # 品質フラグ（exit_code=3）は step 成功で通し注記配信するため、ここに来るのはインフラ失敗のみ。
+        if: (failure() || cancelled()) && steps.fetch_raw.outcome != 'failure' && steps.send.outcome != 'success'
         uses: ./report-pipelines/.github/actions/notify-discord
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_THEME }}

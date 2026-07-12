@@ -137,7 +137,8 @@ jobs:
     runs-on: ubuntu-latest
     # PM 2026-07-01: 株探/みんかぶ等のスクレイピングが 403 で弾かれる日（GHA IP ブロック）に
     # ニュース取得段が遅延し 20 分枠を超えてキャンセルされ未送信になる。余裕を持って 35 分へ。
-    timeout-minutes: 35
+    # PM 2026-07-12: 対象日 EOD 未着時の待機リトライ（20 分 × 最大 2 回）を追加したため 90 分へ。
+    timeout-minutes: 90
     outputs:
       target_date: ${{ steps.date.outputs.value }}
     steps:
@@ -215,9 +216,11 @@ jobs:
       - name: Generate movers raw (make_mover_report.py --no-pdf)
         # PM 2026-05-25 確定: setup-raw ジョブで 1 回だけ実行・artifact 共有で
         # 3 並列ジョブの JQuants API 過剰呼び出しを回避。
-        # PM 2026-07-12 確定: --date-gate で対象日ゲートを有効化（日次のみ・週次 yml は従来動作）。
-        # exit 3 = 品質ゲート不合格（対象日 EOD 未着/休場→⛔ 通知へ分岐）/ exit 1 = インフラ失敗（❌）。
-        # 2026-07-09 に前営業日データを「本日」として配信した日付品質事故の再発防止。
+        # PM 2026-07-12 改定（絶対配信原則）: 対象日 EOD 未着時は ①軽量プローブ（--probe-date-only）
+        # で 20 分待機 × 最大 2 回の再確認 ②なお未着でも生成を中止しない（--date-gate=注記モード。
+        # 真のデータ日付のまま生成し、品質注記を raw 冒頭と {date}_quality_flags.txt に出力 →
+        # merge-and-send がレポート冒頭へ機械挿入して必ず配信）。旧「exit 3 → ⛔ 生成中止＝未配信」
+        # 設計は PM 却下。本 step の失敗（exit 非0）はインフラ失敗（❌）のみ。
         id: raw
         working-directory: ./private-repo/bi/pipelines
         env:
@@ -225,11 +228,17 @@ jobs:
           EDINETDB_API_KEYS: ${{ secrets.EDINETDB_API_KEYS }}
           PYTHONIOENCODING: utf-8
         run: |
-          set +e
-          python make_mover_report.py --date ${{ steps.date.outputs.value }} --no-pdf --date-gate
-          ec=$?
-          echo "exit_code=$ec" >> $GITHUB_OUTPUT
-          exit $ec
+          D=${{ steps.date.outputs.value }}
+          for i in 1 2 3; do
+            if python make_mover_report.py --date "$D" --probe-date-only; then
+              break
+            fi
+            if [ "$i" -lt 3 ]; then
+              echo "対象日 EOD 未着・20 分待機して再確認します（待機 $i/2 回目）"
+              sleep 1200
+            fi
+          done
+          python make_mover_report.py --date "$D" --no-pdf --date-gate
 
       - name: Append 立花証券 e支店 API context to movers raw
         # 動意銘柄 raw 末尾に QUICK 個別解説（動意理由）+ AI 市況 + 信用残・逆日歩を追記
@@ -249,28 +258,20 @@ jobs:
           python fetch_tachibana_mover_context.py --date ${{ steps.date.outputs.value }}
 
       - name: Upload movers raw as artifact
+        # PM 2026-07-12: 品質フラグ（{date}_quality_flags.txt・--date-gate が常時出力）を同梱し、
+        # merge-and-send の注記挿入 step へ届ける。両パスの共通親が market/daily のため
+        # ダウンロード側のフラット配置（/tmp/movers-raw/ 直下）は従来と変わらない。
         uses: actions/upload-artifact@v4
         with:
           name: movers-raw-${{ steps.date.outputs.value }}
-          path: private-repo/market/daily/${{ steps.date.outputs.value }}_movers_raw.md
+          path: |
+            private-repo/market/daily/${{ steps.date.outputs.value }}_movers_raw.md
+            private-repo/market/daily/${{ steps.date.outputs.value }}_quality_flags.txt
           retention-days: 7
           if-no-files-found: error
 
-      - name: Discord 通知（⛔ 対象日ゲートで生成中止）
-        # exit 3 = 対象日の EOD データ未着（または休場）。前営業日データでの「本日」誤生成を
-        # 防いで生成を止めた状態（2026-07-09 日付品質事故の再発防止・PM 2026-07-12）。
-        if: failure() && steps.raw.outputs.exit_code == '3'
-        uses: ./report-pipelines/.github/actions/notify-discord
-        with:
-          webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
-          state: blocked
-          label: 動意銘柄レポート 生成中止（対象日データ未着）
-          date: ${{ steps.date.outputs.value }}
-          meaning: 対象日の株価EODが未配信（または休場）のため、前営業日データでの誤生成を防いで生成を中止しました。本日未配信です。
-          action_required: 営業日なら夕方以降に手動 dispatch（force_rerun=true）で再実行／休場日は対応不要
-
       - name: Discord 通知（❌ raw 生成失敗）
-        if: (failure() || cancelled()) && steps.raw.outputs.exit_code != '3'
+        if: failure() || cancelled()
         uses: ./report-pipelines/.github/actions/notify-discord
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
@@ -522,9 +523,19 @@ jobs:
           cat "${MOVERS_DIR}/${TARGET_DATE}_growth_b.md" >> "$OUTPUT"
           echo "Merged into $OUTPUT ($(wc -l < "$OUTPUT") lines)"
 
-      - name: 件数ゲート（売買代金/値上がり/値下がり・タイトル日付・不足なら送信中止）
-        # exit 3 = 品質ゲート不合格（⛔ 通知へ分岐）/ exit 1 = インフラ失敗（❌）
-        # PM 2026-07-12 確定: --date でタイトル日付ゲートも有効化（別日付レポートの誤配信防止）。
+      - name: Download movers raw artifact (品質フラグ取得用)
+        # PM 2026-07-12（絶対配信原則）: setup-raw が出力した {date}_quality_flags.txt（対象日 EOD
+        # 未着等の注記）を注記挿入 step へ渡す。
+        uses: actions/download-artifact@v4
+        with:
+          name: movers-raw-${{ needs.setup-raw.outputs.target_date }}
+          path: /tmp/movers-raw
+
+      - name: 品質検査（件数/タイトル日付・不合格でも送信は止めない）
+        # PM 2026-07-12 改定（絶対配信原則）: check_mover_counts の exit 3（品質不合格）で送信を
+        # 中止する旧設計は PM 却下。exit 3 は検知シグナルとして受けて step は成功で通し、次の
+        # 注記挿入 step がレポート冒頭へ品質注記を機械挿入して必ず配信する。
+        # exit 1（ファイル読込不可等のインフラ失敗）のみ step 失敗（❌）。
         id: gate
         working-directory: ./private-repo
         env:
@@ -532,10 +543,44 @@ jobs:
           PYTHONIOENCODING: utf-8
         run: |
           set +e
-          python bi/pipelines/check_mover_counts.py --file market/daily/movers/${TARGET_DATE}.md --date ${TARGET_DATE}
-          ec=$?
+          python bi/pipelines/check_mover_counts.py --file market/daily/movers/${TARGET_DATE}.md --date ${TARGET_DATE} 2>&1 | tee /tmp/gate.log
+          ec=${PIPESTATUS[0]}
           echo "exit_code=$ec" >> $GITHUB_OUTPUT
+          if [ "$ec" -eq 3 ]; then
+            echo "品質ゲート不合格 → 注記を挿入して配信を続行します（PM 2026-07-12 絶対配信原則）"
+            exit 0
+          fi
           exit $ec
+
+      - name: 品質注記の機械挿入（フラグ検知時のみ・各市場タイトル直後）
+        # PM 2026-07-12（絶対配信原則）: データ未着注記（setup-raw のフラグ）と品質検査の不合格
+        # 内容を、市場別 PDF すべてに載るよう各タイトル行（# 動意銘柄レポート …）直後へ挿入する。
+        # Claude 側の注記と重複しても可（機械挿入を正とする）。
+        id: annotate
+        working-directory: ./private-repo
+        env:
+          TARGET_DATE: ${{ needs.setup-raw.outputs.target_date }}
+        run: |
+          NOTE=""
+          FLAGS=/tmp/movers-raw/${TARGET_DATE}_quality_flags.txt
+          if [ -s "$FLAGS" ]; then
+            NOTE="$(tr '\n' ' ' < "$FLAGS" | sed 's/ *$//')"
+          fi
+          if [ "${{ steps.gate.outputs.exit_code }}" = "3" ]; then
+            # paste -d はマルチバイト区切りをバイト分割するため awk で連結（・区切り）
+            DETAIL=$(grep '^  - ' /tmp/gate.log | head -5 | sed 's/^  - //' | awk 'NR>1{printf "・"} {printf "%s", $0} END{print ""}')
+            NOTE="${NOTE}${NOTE:+ ／ }機械検査で不合格項目あり（${DETAIL}）"
+          fi
+          if [ -n "$NOTE" ]; then
+            F=market/daily/movers/${TARGET_DATE}.md
+            awk -v note="> ⚠️ **品質注記**: ${NOTE}" '{print} /^# 動意銘柄レポート /{print ""; print note}' "$F" > "${F}.tmp" && mv "${F}.tmp" "$F"
+            echo "annotated=true" >> $GITHUB_OUTPUT
+            echo "note=${NOTE}" >> $GITHUB_OUTPUT
+            echo "品質注記を挿入: ${NOTE}"
+          else
+            echo "annotated=false" >> $GITHUB_OUTPUT
+            echo "品質フラグなし・注記挿入なし"
+          fi
 
       - name: Send Discord (PDF・市場別 3 枚分割)
         id: send
@@ -566,16 +611,17 @@ jobs:
           bash ../report-pipelines/bi/pipelines/ops/ci_commit_push.sh \
             -m "data: mover report ${TARGET_DATE}" market/daily
 
-      - name: Discord 通知（⛔ 品質ゲートで送信中止）
-        if: failure() && steps.gate.outputs.exit_code == '3'
+      - name: Discord 通知（⚠️ 配信済み・品質注記あり）
+        # PM 2026-07-12（絶対配信原則）: 品質問題があってもレポートは配信済み。何が注記されたかを PM へ通知。
+        if: steps.annotate.outputs.annotated == 'true' && steps.send.outcome == 'success'
         uses: ./report-pipelines/.github/actions/notify-discord
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
-          state: blocked
-          label: 動意銘柄レポート 送信中止（品質ゲート不合格）
+          state: partial
+          label: 動意銘柄レポート 配信済み（品質注記あり）
           date: ${{ needs.setup-raw.outputs.target_date }}
-          meaning: 規定の銘柄件数不足またはタイトル日付の対象日不一致がある不完全なレポートだったため、配信を止めました。本日未配信です。
-          action_required: run ログで不足セクション/日付不一致を確認 → 修正後に手動 dispatch（force_rerun=true）
+          meaning: レポートは配信済みです。品質注記（${{ steps.annotate.outputs.note }}）を各市場の冒頭に付けています。
+          action_required: レポート冒頭の品質注記を確認（数値を使う前に注記のデータ日付を参照）
 
       - name: Discord 通知（⚠️ 配信済み・後処理のみ失敗）
         if: (failure() || cancelled()) && steps.send.outcome == 'success'
@@ -589,7 +635,7 @@ jobs:
           action_required: 不要（差分は次回 run が回収）
 
       - name: Discord 通知（❌ merge/送信失敗）
-        if: (failure() || cancelled()) && steps.gate.outputs.exit_code != '3' && steps.send.outcome != 'success'
+        if: (failure() || cancelled()) && steps.send.outcome != 'success'
         uses: ./report-pipelines/.github/actions/notify-discord
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}

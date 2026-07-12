@@ -196,14 +196,24 @@ jobs:
       - name: Refresh sector_weekly.parquet (make_sector_report.py --anchor friday)
         # PM 2026-05-30 確定: 週次セクターレポートに stale な sector_weekly.parquet（5/22 AsOf）が使われる事故が
         # 発生したため、Claude 実行前に必ず当週分のセクター集計を再生成する step を追加。
-        # screening_master.parquet（commit 済の最新版）を universe として JQuants から週次価格を取得・集計。
-        # 所要時間 5-15 分（screening_master.parquet 自体は更新しない）。
+        # screening_master.parquet（commit 済の最新版）を universe として週次価格を取得・集計。
+        # PM 2026-07-12 改定（絶対配信原則）:
+        # - --cold-lookback-days 90: price_history が 1 営業日 stale なだけで top-up が 3 年コールド
+        #   フェッチ化 → 90 分 timeout → 未配信、の経路を遮断（キャッシュ sector_prices.parquet は
+        #   gitignore で clone に無いため）。price_history が新鮮なら従来どおり 3 年分の高速パス。
+        # - --expect-price-date: 不一致でも parquet は保存済みのまま exit 3 が返る（検知シグナル）。
+        # - continue-on-error + step timeout: 本 step がどう失敗しても後続の決定論生成は commit 済み
+        #   parquet で必ず走り、後段の注記挿入 step が鮮度ずれを冒頭注記して必ず配信する。
+        id: refresh
+        continue-on-error: true
+        timeout-minutes: 30
         working-directory: ./private-repo/bi/pipelines
         env:
           JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
           PYTHONIOENCODING: utf-8
         run: |
-          python make_sector_report.py --anchor friday
+          python make_sector_report.py --anchor friday \
+            --expect-price-date ${{ steps.date.outputs.value }} --cold-lookback-days 90
 
       - name: 既存セクター週次フルレポートファイルを削除（前回不良ファイル読込スキップ防止）
         working-directory: ./private-repo
@@ -250,6 +260,45 @@ jobs:
           TARGET_DATE: ${{ steps.date.outputs.value }}
           PRIVATE_REPO_ROOT: private-repo
 
+      - name: 品質注記の機械挿入（parquet 鮮度ずれ検知時のみ・タイトル行直後）
+        # PM 2026-07-12（絶対配信原則）: Refresh の成否によらず、実際に使われた parquet の
+        # PriceDataAsOf が対象週の金曜より古い場合（Refresh 失敗で commit 済み旧 parquet を使った
+        # 場合を含む）は、実際の窓を明記した品質注記をレポート冒頭へ機械挿入して必ず配信する。
+        id: annotate
+        working-directory: ./private-repo
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+          PYTHONIOENCODING: utf-8
+        run: |
+          NOTE=$(python - <<'PY'
+          import os
+          from datetime import date, timedelta
+          import pandas as pd
+          t = date.fromisoformat(os.environ["TARGET_DATE"])
+          friday = t - timedelta(days=(t.weekday() - 4) % 7)  # 対象週の金曜（アンカー）
+          df = pd.read_parquet("bi/outputs/sector_weekly.parquet")
+          asof = str(df["PriceDataAsOf"].iloc[0])[:10] if "PriceDataAsOf" in df.columns else ""
+          if asof and date.fromisoformat(asof) < friday:
+              print(f"週間ランキングの価格データ最新日は {asof}（対象週の金曜 {friday.isoformat()} に未達）。"
+                    f"週次リターン・ランキングは {asof} までの窓（前週の可能性）。")
+          PY
+          )
+          if [ -n "$NOTE" ]; then
+            F=market/daily/sector/${TARGET_DATE}_full.md
+            if [ -f "$F" ]; then
+              awk -v note="> ⚠️ **品質注記**: ${NOTE}" 'NR==1{print; print ""; print note; next} {print}' "$F" > "${F}.tmp" && mv "${F}.tmp" "$F"
+              echo "annotated=true" >> $GITHUB_OUTPUT
+              echo "note=${NOTE}" >> $GITHUB_OUTPUT
+              echo "品質注記を挿入: ${NOTE}"
+            else
+              echo "annotated=false" >> $GITHUB_OUTPUT
+              echo "[WARN] レポート md が見つからないため注記なし: $F"
+            fi
+          else
+            echo "annotated=false" >> $GITHUB_OUTPUT
+            echo "品質フラグなし・注記挿入なし"
+          fi
+
       - name: Send Discord (PDF)
         id: send
         working-directory: ./private-repo/bi/pipelines
@@ -258,6 +307,18 @@ jobs:
           PYTHONIOENCODING: utf-8
         run: |
           python send_report_pdf_discord.py --kind sector_full --date ${{ steps.date.outputs.value }}
+
+      - name: Discord 通知（⚠️ 配信済み・品質注記あり）
+        # PM 2026-07-12（絶対配信原則）: 品質問題があってもレポートは配信済み。何が注記されたかを PM へ通知。
+        if: steps.annotate.outputs.annotated == 'true' && steps.send.outcome == 'success'
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_SECTOR }}
+          state: partial
+          label: セクター週次レポート 配信済み（品質注記あり）
+          date: ${{ steps.date.outputs.value }}
+          meaning: レポートは配信済みです。品質注記（${{ steps.annotate.outputs.note }}）を冒頭に付けています。
+          action_required: レポート冒頭の品質注記を確認（数値を使う前に注記のデータ日付・週の窓を参照）
 
       - name: Commit and push to private repo
         # PM 2026-06-28: 生成 step が失敗しても再生成済 parquet を必ずコミットする（データ凍結防止）。

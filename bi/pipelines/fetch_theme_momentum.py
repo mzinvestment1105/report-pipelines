@@ -357,15 +357,17 @@ def main() -> int:
     print(f"saved: {OUT_PATH}")
     print(f"snapshot_date={snapshot_date}  追加行数={len(new_df)}")
 
-    # PM 2026-07-12 確定: 対象日ゲート（exit 3 = 品質ゲート不合格・⛔ 通知分岐用。
+    # PM 2026-07-12 確定（絶対配信原則・同日改定）: 対象日ゲート（exit 3 = 品質不合格の検知シグナル。
     # exit code 規約は check_mover_counts.py と共通: 0=合格 / 1=インフラ失敗 / 3=品質ゲート）。
     # 急上昇（rise）は日次テーマレポートの背骨で毎日必須。rise だけ取得失敗した部分成功日は
-    # 当日 snapshot が rise 欠落のまま parquet に残り、下流のレポート生成が前日の rise を
-    # 「当日」として誤生成する素通り経路になる（2026-07-09 日付品質事故の再発防止レイヤー③）。
+    # 当日 snapshot が rise 欠落のまま parquet に残り、下流が前日の rise を「当日」として
+    # 誤生成する素通り経路になる（2026-07-09 日付品質事故の再発防止レイヤー③）。
+    # workflow は exit 3 でも配信を中止せず、レポート冒頭へ品質注記（使用 snapshot の日付明示）を
+    # 機械挿入して必ず配信する（旧「⛔ 送信中止＝未配信」は PM 却下）。
     # 取得できたソース分は上で保存済みのため、ここでの exit 3 はデータを失わない。
     if not any(r["rank_type"] == "rise" for r in new_rows):
-        print(f"\n[QUALITY GATE] 当日 snapshot に急上昇（rise）が無いため exit 3（送信フロー中止）"
-              f"  [ソース別サマリ] {summary}")
+        print(f"\n[QUALITY FLAG] 当日 snapshot に急上昇（rise）が無いため exit 3"
+              f"（検知シグナル・workflow は品質注記つきで配信続行）  [ソース別サマリ] {summary}")
         return 3
     return 0
 

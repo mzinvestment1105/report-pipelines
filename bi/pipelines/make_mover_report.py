@@ -1272,6 +1272,7 @@ def build_report(
     today: date,
     prev: date,
     hist_df: pd.DataFrame | None = None,
+    quality_note: str = "",
 ) -> str:
     lines = [
         f"# 動意銘柄レポート 生データ ({today.strftime('%Y-%m-%d')})",
@@ -1283,6 +1284,11 @@ def build_report(
         f"- **推定トークン数**: （レポート末尾参照）",
         f"",
     ]
+
+    # 品質注記（PM 2026-07-12 絶対配信原則）: 対象日 EOD 未着等でも配信は止めず、
+    # データの真の日付を raw 冒頭に明示して Claude・レンダラへ引き継ぐ。
+    if quality_note:
+        lines += [f"> ⚠️ **品質注記**: {quality_note}", ""]
 
     # ---- 対象日市場概況（PM 2026-07-12 確定・「本日の地合い」の唯一の引用元） ----
     # 夕方の生成時点で読める最新マクロレポートは朝刊（＝日本市場数値は前営業日実績）のため、
@@ -1512,7 +1518,10 @@ def main() -> None:
     parser.add_argument("--date",   default=None, help="対象日 YYYY-MM-DD（省略時は本日）")
     parser.add_argument("--no-pdf", action="store_true", help="TDNet PDF本文取得スキップ")
     parser.add_argument("--date-gate", action="store_true",
-                        help="対象日ゲート: 解決された営業日が対象日と不一致なら exit 3（日次 GHA 専用）")
+                        help="対象日ゲート（注記モード・GHA 用）: 対象日 EOD 未着でも生成を続行し、"
+                             "品質注記を raw 冒頭と {対象日}_quality_flags.txt に出力する（中止しない）")
+    parser.add_argument("--probe-date-only", action="store_true",
+                        help="対象日 EOD の着信確認のみ行い exit 0/3 を返す（workflow の待機リトライ用・生成しない）")
     args = parser.parse_args()
 
     api_key = os.environ.get("JQUANTS_API_KEY", "").strip()
@@ -1530,17 +1539,34 @@ def main() -> None:
     today_dt, prev_dt = resolve_trading_days(client, target)
     print(f"  本日: {today_dt}　前日: {prev_dt}")
 
-    # PM 2026-07-12 確定: 対象日ゲート（--date-gate 指定時のみ）。exit code 規約は
-    # check_mover_counts.py と共通（0=合格 / 1=インフラ失敗 / 3=品質ゲート不合格・⛔ 通知分岐用）。
-    # resolve_trading_days は対象日にデータが無いと過去営業日へ黙って遡るため、JQuants 未着・
-    # 休場日に前営業日データで「本日」レポートを誤生成する素通り経路になる
-    # （2026-07-09 に 7/8 データを「本日」と記載した日付品質事故の再発防止レイヤー①）。
-    # --date-gate は日次 GHA（mover_report_daily.yml）のみが指定する。週次 GHA
-    # （mover_weekly.yml）・ローカル実行は従来動作のまま（フラグなし＝ゲート不適用）。
-    if args.date_gate and today_dt != target:
-        print(f"[QUALITY GATE] 対象日 {target} の EOD データ未着（最新営業日: {today_dt}）。"
-              f"前営業日データでの誤生成を防ぐため生成を中止します (exit 3)")
+    # PM 2026-07-12 確定（絶対配信原則・同日改定）: 品質問題での生成中止・送信中止は PM 却下。
+    # --probe-date-only: 対象日 EOD の着信確認のみを行い exit 0/3 を返す（workflow が待機リトライに
+    #   使う軽量プローブ・生成はしない）。
+    # --date-gate（注記モード）: 対象日 EOD 未着でも中止しない。真のデータ日付（today_dt）のまま
+    #   生成を続行し、品質注記を (1) raw 冒頭ブロック (2) {対象日}_quality_flags.txt マーカー、の
+    #   両方へ出力する。workflow が送信直前にレポート冒頭へ機械挿入して「注記つきで必ず配信」する
+    #   （2026-07-09 の 7/8 データ「本日」記載は真の日付ラベル+注記で防ぎ、無配信も作らない）。
+    # exit code: 0=正常（注記あり含む） / 1=インフラ失敗 / 3=--probe-date-only の未着シグナルのみ。
+    if args.probe_date_only:
+        if today_dt == target:
+            print(f"[PROBE] 対象日 {target} の EOD 着信を確認 (exit 0)")
+            sys.exit(0)
+        print(f"[PROBE] 対象日 {target} の EOD 未着（最新営業日: {today_dt}） (exit 3)")
         sys.exit(3)
+
+    quality_note = ""
+    if args.date_gate:
+        MARKET_DAILY_DIR.mkdir(parents=True, exist_ok=True)
+        flags_path = MARKET_DAILY_DIR / f"{target}_quality_flags.txt"
+        if today_dt != target:
+            quality_note = (
+                f"対象日 {target} の株価EODが未着（または休場）のため、"
+                f"直近営業日 {today_dt}（前営業日 {prev_dt} 比）のデータで生成。"
+                f"本文の価格・騰落率・ランキングはすべて {today_dt} 時点の値。"
+            )
+            print(f"[QUALITY FLAG] {quality_note}（生成は続行・絶対配信）")
+        # 正常時も空ファイルを書く（workflow の artifact 収集・注記判定を単純化するため）
+        flags_path.write_text(quality_note + ("\n" if quality_note else ""), encoding="utf-8")
 
     print(f"価格取得: {today_dt} ...")
     today_df = fetch_daily_all(client, today_dt)
@@ -1612,10 +1638,15 @@ def main() -> None:
         today=today_dt,
         prev=prev_dt,
         hist_df=hist_df,
+        quality_note=quality_note,
     )
 
     MARKET_DAILY_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = MARKET_DAILY_DIR / f"{today_dt}_movers_raw.md"
+    # --date-gate（GHA）はパイプラインのキーが対象日のため対象日名で出力する（EOD 未着日でも
+    # artifact 収集・後続 step が壊れない）。中身のデータ日付ラベル（タイトル・価格比較・
+    # 対象日市場概況）は真の日付（today_dt）のまま＝虚偽ラベルにしない（PM 2026-07-12）。
+    raw_name_date = target if args.date_gate else today_dt
+    out_path = MARKET_DAILY_DIR / f"{raw_name_date}_movers_raw.md"
     out_path.write_text(report_md, encoding="utf-8")
 
     tokens = estimate_tokens(report_md)

@@ -192,7 +192,7 @@ raw / parquet の各銘柄を機械チェックし、該当したら**全セク�
 4. **【週間ランキングデータ読み込み・鮮度検証必須】`sector_stock_weekly.parquet` は workflow の機械 step（make_sector_report.py・対象日ゲート付き）が生成・配置済み**。
    この parquet は週間騰落率（`Return_W01`）・週間売買代金（`AvgDailyValue5d × 5`）・時価総額（`MarketCap`）の唯一の供給源。**Claude が生成スクリプト（make_sector_raw.py / make_sector_report.py）を実行することを禁止**する（旧 4-a〜4-d の Deep Research 手順は廃止・PM 2026-07-12。プロンプト任せの再生成が実行されず、2026-07-10 に前週 7/3 生成の parquet を「今週」として全行誤配信した事故の再発防止）。
 
-   ### 4-a. parquet 鮮度検証（Write 前必須・不一致なら中止）
+   ### 4-a. parquet 鮮度検証（Write 前必須・不一致でも必ず配信）
 
    ```python
    import pandas as pd
@@ -200,7 +200,7 @@ raw / parquet の各銘柄を機械チェックし、該当したら**全セク�
    print(df["AsOf"].iloc[0], df["PriceDataAsOf"].iloc[0])
    ```
 
-   **`PriceDataAsOf` が `TARGET_DATE` と一致し、`AsOf` が `TARGET_DATE` 以降であることを確認する**。不一致なら**何も Write せず、不一致の内容（AsOf・PriceDataAsOf・TARGET_DATE）を報告して終了**する（前週の週間騰落率を「今週」として誤生成しない）。
+   **`PriceDataAsOf` が `TARGET_DATE` と一致するか確認する**。**不一致でも必ず Write する（生成中止・無配信は禁止・PM 2026-07-12 絶対配信原則）**。不一致の場合: (1) 各市場タイトル直後に `> ⚠️ **品質注記**: 週間騰落・売買代金は {PriceDataAsOf の約1週前営業日}〜{PriceDataAsOf} の窓（対象週 {TARGET_DATE} のデータ未着）` の 1 行を書く (2) 本文で「今週」と書かず、**実際の窓の日付（例「6/29〜7/3」）で明記**する（**虚偽の週ラベル禁止**・2026-07-10 に前週の窓を「今週」として全行配信した事故の再発防止）。
 
    ### 4-b. WebSearch で当週動向を調査
 
@@ -245,7 +245,7 @@ raw / parquet の各銘柄を機械チェックし、該当したら**全セク�
 - 全銘柄の見出し行に「コード + 銘柄名 + 週間騰落率% + 金曜終値 + 時価総額 + 週間売買代金」がこの順で揃っている。
 - 各銘柄に「**何の会社**」「**なぜ動いた**」が揃っている。
 - ETF/REIT/上場投信が 1 件も混入していない（個別株のみで件数充足：プライム 5/5/5・スタンダード 5/5/5・グロース 5/5/10）。
-- **日付規律**：週間騰落率・金曜終値・時価総額・週間売買代金がすべて鮮度検証済み parquet（`PriceDataAsOf` = `TARGET_DATE`・Step 4-a）由来である。数値の裏付けの無い値動きの物語・推測語（「公算」「〜とみるのが自然」等）を書いていない。
+- **日付規律**：週間騰落率・金曜終値・時価総額・週間売買代金がすべて Step 4-a で鮮度検証した parquet 由来である。`PriceDataAsOf` が `TARGET_DATE` と不一致の場合は、各市場タイトル直後の品質注記と実際の窓の日付明記（「今週」と書かない）がされた上で**必ず Write している**（無配信は禁止）。数値の裏付けの無い値動きの物語・推測語（「公算」「〜とみるのが自然」等）を書いていない。
 - 命令・FOMO 行動コーチング・需給ブロック・週次サマリー・セクター別フロー等の削除済セクションを書いていない。
 - `ls -la ${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}_weekly_${TARGET_MARKET}.md` で本タスクが生成したファイルの存在を確認。内容が空でない。
 

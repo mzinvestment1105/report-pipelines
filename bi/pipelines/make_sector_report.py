@@ -701,18 +701,18 @@ def main() -> None:
             "price_history.yml の更新状況を確認してください（古い終値で週次リターンを算出する恐れ）。"
         )
 
-    # PM 2026-07-12 確定: 対象日ゲート（--expect-price-date 指定時のみ・exit 3 = 品質ゲート不合格。
-    # exit code 規約は check_mover_counts.py と共通: 0=合格 / 1=インフラ失敗 / 3=品質ゲート・⛔ 通知分岐用）。
+    # PM 2026-07-12 確定（絶対配信原則・同日改定）: 対象日ゲート（--expect-price-date 指定時のみ）。
     # 価格データが対象日（当週金曜）まで届いていないと Return_W01 等の「今週」の窓が丸ごと前週へ
-    # ずれる（2026-07-10 週次動意で 6/29〜7/3 の値を当週として全行配信・2986 -66.3%／4596 +55.4% で
-    # 確認された事故の再発防止レイヤー）。parquet 書き出し前に中止するため、コミット済みの既存
-    # parquet は上書きされない。土日の再実行は新規営業日が無く PriceDataAsOf=金曜のまま通過する。
-    # --expect-price-date は週次動意 GHA（mover_weekly.yml）のみが指定する。セクター週次 GHA
-    # （sector_report_weekly_full.yml）・ローカル実行は従来動作のまま（フラグなし＝ゲート不適用）。
-    if args.expect_price_date and price_data_asof != args.expect_price_date:
-        print(f"[QUALITY GATE] 価格データ最新日 {price_data_asof} が対象日 {args.expect_price_date} と不一致。"
-              f"前週データでの誤生成を防ぐため生成を中止します (exit 3)")
-        sys.exit(3)
+    # ずれる（2026-07-10 週次動意で 6/29〜7/3 の値を当週として全行配信・2986 -66.3%／4596 +55.4%）。
+    # 不一致でも生成は中止しない。parquet を通常どおり生成・保存した上で main 末尾で exit 3 を返し、
+    # workflow が「品質注記つき配信」（真の窓の明記＋冒頭注記＋⚠️ 通知）へ分岐する検知シグナルとする
+    # （旧「書き出し前に exit 3 で中止＝未配信」は PM 却下）。土日の再実行は新規営業日が無く
+    # PriceDataAsOf=金曜のまま一致する。--expect-price-date は週次動意 GHA（mover_weekly.yml）のみが
+    # 指定する。セクター週次 GHA・ローカル実行は従来動作のまま（フラグなし＝ゲート不適用）。
+    date_gate_mismatch = bool(args.expect_price_date and price_data_asof != args.expect_price_date)
+    if date_gate_mismatch:
+        print(f"[QUALITY FLAG] 価格データ最新日 {price_data_asof} が対象日 {args.expect_price_date} と不一致。"
+              f"parquet は生成・保存した上で exit 3 を返す（workflow は品質注記つきで配信続行）")
 
     # 投資主体別売買
     investor_df = fetch_investor_trading(skip=args.skip_investor_fetch)
@@ -742,6 +742,11 @@ def main() -> None:
     cols = [c for c in cols if c in sector_df.columns]
     print(sector_df[cols].to_string(index=False))
     print("\n完了！")
+
+    # 対象日ゲート不一致の検知シグナル（生成・保存は完了済み・PM 2026-07-12 絶対配信原則）
+    if date_gate_mismatch:
+        print(f"[QUALITY FLAG] PriceDataAsOf={price_data_asof} != 対象日 {args.expect_price_date} のため exit 3")
+        sys.exit(3)
 
 
 if __name__ == "__main__":
