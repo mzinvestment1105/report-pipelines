@@ -48,7 +48,7 @@ PM はこのレポートを**楽天証券の週間ランキングと並べて使
 
 1. **既存 `${TARGET_DATE}_weekly*.md` ファイル群の Read を絶対禁止**：存在判定にも使わない・参考にもしない。
 2. workflow_dispatch / cron による起動は**常に「完全再生成」モード**：前回ファイルの内容は一切参照しない。
-3. データ取得（make_sector_raw.py + WebSearch）を**毎回必ず全実行**する。
+3. データ確認（parquet 鮮度検証・Step 4-a）と WebSearch 調査（Step 4-b）を**毎回必ず全実行**する（parquet の生成自体は workflow の機械 step 担当・Claude は実行しない）。
 4. レポート本体の生成も**毎回ゼロから Write**する（差分編集ではなく完全上書き）。
 5. 「既に完成」「No further edits required」「task was completed」型の判断・出力を絶対禁止。
 
@@ -114,7 +114,7 @@ PM はこのレポートを**楽天証券の週間ランキングと並べて使
     - **チャンスの条件**：時価総額100億以上 かつ 直近の自社開示を起点とする会社固有材料による逆行高。**テーマ・国策・地合い連動だけ／材料が既出で値動きのみ／仕手・需給のみ／IPO 物色は『チャンス』にせず『押さえるべき事象』へ回す**。
     - 該当が無ければ**「該当なし」と明記**し無理に作らない。挙げる場合は時価総額と会社固有材料を1〜2文の根拠で添える。時価総額は raw の時価総額（当日 EOD）で判定する。
 - **事実ベースのみ**。「〜すべき」「飛び乗り禁止」「過去最高値圏で買うな」「部分利確優先」等の**命令・FOMO 行動コーチングを一切書かない**（PM 2026-06-28 確定・全レポート共通）。事象と数値だけ提示し、判断は PM に委ねる。
-- 数値（指数の週間騰落・週間売買代金・週間騰落率等）は parquet・raw から取得した実値のみ。記憶ベースの数値は書かない。
+- 数値（指数の週間騰落・週間売買代金・週間騰落率等）は parquet・raw から取得した実値のみ。記憶ベースの数値は書かない。**値動きの物語（投げ売り・崩落・資金ローテーション・週間の値動きパターン等）を parquet・raw の数値の裏付けなしに書かない**（2026-07-10 に前週データ由来の存在しない暴落へ物語を付けて配信した事故の再発防止）。
 
 ## ✍️【書き方】何の会社 / なぜ動いた（今週）
 
@@ -189,35 +189,22 @@ raw / parquet の各銘柄を機械チェックし、該当したら**全セク�
    - `${PRIVATE_REPO_ROOT}/playbook/entry_exit_rules.md` — §3 必須条件・§3-6 禁止リスト（時価総額50億未満NG 等。チャンス判定の機械ゲートに使う）
    - `${PRIVATE_REPO_ROOT}/market/daily/macro/` 直近 1 件（地合い把握・本文には書かない）
 
-4. **【週間ランキングデータ生成・必須】make_sector_raw.py で `sector_stock_weekly.parquet` を生成する**。
-   この parquet は週間騰落率（`Return_W01`）・週間売買代金（`AvgDailyValue5d × 5`）・時価総額（`MarketCap`）の唯一の供給源。**本フォーマットではセクター解説を本文に書かないが、週間ランキング数値を得るために parquet 生成は必須**。
+4. **【週間ランキングデータ読み込み・鮮度検証必須】`sector_stock_weekly.parquet` は workflow の機械 step（make_sector_report.py・対象日ゲート付き）が生成・配置済み**。
+   この parquet は週間騰落率（`Return_W01`）・週間売買代金（`AvgDailyValue5d × 5`）・時価総額（`MarketCap`）の唯一の供給源。**Claude が生成スクリプト（make_sector_raw.py / make_sector_report.py）を実行することを禁止**する（旧 4-a〜4-d の Deep Research 手順は廃止・PM 2026-07-12。プロンプト任せの再生成が実行されず、2026-07-10 に前週 7/3 生成の parquet を「今週」として全行誤配信した事故の再発防止）。
 
-   ### 4-a. Deep Research プロンプト生成（make_sector_raw.py 経由）
+   ### 4-a. parquet 鮮度検証（Write 前必須・不一致なら中止）
 
-   ```bash
-   cd ${PRIVATE_REPO_ROOT}/bi/pipelines
-   python make_sector_raw.py --anchor friday --date ${TARGET_DATE} --no-ensure-fresh || true
+   ```python
+   import pandas as pd
+   df = pd.read_parquet("${PRIVATE_REPO_ROOT}/bi/outputs/sector_stock_weekly.parquet")
+   print(df["AsOf"].iloc[0], df["PriceDataAsOf"].iloc[0])
    ```
 
-   「Deep Research が未入力です」エラーで終了するが、その際にプロンプト本文が標準出力に出力される。標準出力からプロンプト本文を取り出す。
+   **`PriceDataAsOf` が `TARGET_DATE` と一致し、`AsOf` が `TARGET_DATE` 以降であることを確認する**。不一致なら**何も Write せず、不一致の内容（AsOf・PriceDataAsOf・TARGET_DATE）を報告して終了**する（前週の週間騰落率を「今週」として誤生成しない）。
 
    ### 4-b. WebSearch で当週動向を調査
 
-   プロンプトの分析観点（今週の強弱要因・上位セクターの持続性・下位セクターの逆張り余地・来週の注目点）に沿って WebSearch / WebFetch を実行し、Reuters / 日経 / ヤフーファイナンス / みんかぶ / 株探等の日本語ソースを拾う。**ここで得た当週の材料は各銘柄の「なぜ動いた（今週）」にも活用する**。
-
-   ### 4-c. Deep Research 結果を Write（parquet 生成の入力・本文には出さない）
-
-   調査結果を `${PRIVATE_REPO_ROOT}/market/daily/sector/${TARGET_DATE}_deep_research.md` に Write（`## 1. 今週の強弱要因` 〜 `## 4. 来週以降の注目点` の 4 見出し・日本語・出典添付）。**これは make_sector_raw.py への入力ファイルであり、動意週次レポート本文にセクター解説として転記しない**。
-
-   ### 4-d. make_sector_raw.py 再実行（--deep-research-file 付き）
-
-   ```bash
-   cd ${PRIVATE_REPO_ROOT}/bi/pipelines
-   python make_sector_raw.py --anchor friday --date ${TARGET_DATE} --no-ensure-fresh \
-     --deep-research-file ../../market/daily/sector/${TARGET_DATE}_deep_research.md
-   ```
-
-   出力: `${PRIVATE_REPO_ROOT}/bi/outputs/sector_stock_weekly.parquet` ほか。
+   今週の強弱要因・上位セクターの持続性・下位セクターの逆張り余地・来週の注目点の観点で WebSearch / WebFetch を実行し、Reuters / 日経 / ヤフーファイナンス / みんかぶ / 株探等の日本語ソースを拾う。**ここで得た当週の材料は各銘柄の「なぜ動いた（今週）」に活用する**（セクター解説を本文に書かない点は従来どおり）。
 
 5. **週間ランキング抽出**（Python）：
 
@@ -246,6 +233,7 @@ raw / parquet の各銘柄を機械チェックし、該当したら**全セク�
 - **PM に質問しない**。判断に迷う点は最も保守的な解釈で進める。
 - **担当範囲外のセクションを書かない**（standard 実行で prime を書かない・growth_b で値上がりを書かない）。
 - **Claude の記憶ベースの数値・事実・固有名詞を書かない**。parquet・raw・一次情報の実値のみ。
+- **推測語を書かない**：「公算」「〜とみるのが自然」「〜だろう」「〜とみられる」「〜と思われる」等を禁止。値動きの解釈・物語は parquet・raw の数値と出典のある材料で裏付けられる範囲のみ（PM 2026-07-12・2026-07-10 の物語捏造事故の再発防止）。
 - 出力言語：**日本語**。マークダウン（全体をコードブロックで囲まない）。
 - **英語原文の転記を完全禁止**（[_common_rules.md](_common_rules.md) §4）。**時刻表記は JST 統一**（§3）。**専門用語に中学生注釈・投資用語は注釈不要**（§5）。
 - **不可逆削除禁止**：`Remove-Item`・`rm`・`del`・`unlink` を Bash で実行しない。
@@ -257,6 +245,7 @@ raw / parquet の各銘柄を機械チェックし、該当したら**全セク�
 - 全銘柄の見出し行に「コード + 銘柄名 + 週間騰落率% + 金曜終値 + 時価総額 + 週間売買代金」がこの順で揃っている。
 - 各銘柄に「**何の会社**」「**なぜ動いた**」が揃っている。
 - ETF/REIT/上場投信が 1 件も混入していない（個別株のみで件数充足：プライム 5/5/5・スタンダード 5/5/5・グロース 5/5/10）。
+- **日付規律**：週間騰落率・金曜終値・時価総額・週間売買代金がすべて鮮度検証済み parquet（`PriceDataAsOf` = `TARGET_DATE`・Step 4-a）由来である。数値の裏付けの無い値動きの物語・推測語（「公算」「〜とみるのが自然」等）を書いていない。
 - 命令・FOMO 行動コーチング・需給ブロック・週次サマリー・セクター別フロー等の削除済セクションを書いていない。
 - `ls -la ${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}_weekly_${TARGET_MARKET}.md` で本タスクが生成したファイルの存在を確認。内容が空でない。
 

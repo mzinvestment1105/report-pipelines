@@ -116,8 +116,10 @@ jobs:
     # 週次実行時に make_mover_report.py で当週分の raw を新規生成し artifact 共有する。
     # これ以前は raw 生成 step がなく、private リポに commit 済の最新 raw（2026-05-22）を
     # 流用してレポートを生成していたため、5/29 週次が 5/22 内容の使い回しになる事故が発生。
+    # PM 2026-07-12: 週間ランキング parquet 生成 step（make_sector_report.py・約 5〜15 分）を
+    # 追加したため 20 分では不足。movers raw 生成（スクレイピング遅延日あり）と合わせ 40 分へ。
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 40
     outputs:
       target_date: ${{ steps.date.outputs.value }}
     steps:
@@ -171,6 +173,38 @@ jobs:
       - name: Install dependencies
         run: pip install -r report-pipelines/bi/pipelines/requirements.txt
 
+      - name: Generate weekly ranking parquet (make_sector_report.py --anchor friday)
+        # PM 2026-07-12 確定: 週間ランキング（Return_W01・Close_Latest 等）の供給源
+        # sector_stock_weekly.parquet の再生成をプロンプト任せ（旧 prompts/mover-weekly.md Step 4）に
+        # せず、workflow の機械 step へ昇格する（2026-07-10 に 7/3 生成のコミット済み parquet を
+        # 「当週」として全行誤配信・2986 -66.3%／4596 +55.4% 事故の再発防止）。
+        # --expect-price-date: 価格データが対象日（当週金曜）に届いていなければ exit 3
+        #   （品質ゲート・⛔ 通知へ分岐。exit 1 = インフラ失敗 ❌）。
+        # --cold-lookback-days 90: price_history parquet は 2026-07-07 に git 管理外化され clone に
+        #   無いため、JQuants コールドフェッチを W01〜W08 計算に必要な約 13 週分へ短縮（3年分≈90分→数分）。
+        # 生成した parquet は artifact で generate-market の 4 並列へ配布する（commit はしない＝
+        # リポの parquet 鮮度管理は従来どおり sector_report_weekly_full.yml の責務）。
+        id: weekly_parquet
+        working-directory: ./private-repo/bi/pipelines
+        env:
+          JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
+          PYTHONIOENCODING: utf-8
+        run: |
+          set +e
+          python make_sector_report.py --anchor friday \
+            --expect-price-date ${{ steps.date.outputs.value }} --cold-lookback-days 90
+          ec=$?
+          echo "exit_code=$ec" >> $GITHUB_OUTPUT
+          exit $ec
+
+      - name: Upload weekly ranking parquet as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sector-stock-weekly-${{ steps.date.outputs.value }}
+          path: private-repo/bi/outputs/sector_stock_weekly.parquet
+          retention-days: 7
+          if-no-files-found: error
+
       - name: Generate movers raw (make_mover_report.py --no-pdf)
         # 週次 workflow が当週分の raw を新規生成。3 並列の generate-market が artifact 経由で共有。
         working-directory: ./private-repo/bi/pipelines
@@ -204,15 +238,29 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
+      - name: Discord 通知（⛔ 対象週ゲートで生成中止）
+        # exit 3 = 週間ランキングの価格データが対象週の金曜に届いていない（品質ゲート）。
+        # 前週の窓での「今週」誤配信を防いで中止した状態（2026-07-10 事故の再発防止・PM 2026-07-12）。
+        if: failure() && steps.weekly_parquet.outputs.exit_code == '3'
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
+          state: blocked
+          label: 動意銘柄レポート週次 生成中止（週間ランキングデータが対象週不一致）
+          date: ${{ steps.date.outputs.value }}
+          meaning: 週間ランキングの価格データが対象週の金曜まで届いておらず、前週の数値での誤配信を防いで生成を中止しました。今週分は未配信です。
+          action_required: JQuants の当日データ反映後（夜間）に手動 dispatch（force_rerun=true）で再実行
+
       - name: Discord 通知（❌ raw 生成失敗）
-        if: failure() || cancelled()
+        # 品質ゲート exit 3 は上の ⛔ 通知が担当するため除外。
+        if: (failure() || cancelled()) && steps.weekly_parquet.outputs.exit_code != '3'
         uses: ./report-pipelines/.github/actions/notify-discord
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
           state: failed
           label: 動意銘柄レポート週次 失敗（raw 生成）
           date: ${{ steps.date.outputs.value }}
-          meaning: 週次動意の元データ（raw）生成が失敗し、後続の市場別生成が始まらないため今週分は未配信です。
+          meaning: 週次動意の元データ（raw または週間ランキング parquet）の生成が失敗し、後続の市場別生成が始まらないため今週分は未配信です。
           action_required: run ログ確認 → 手動 dispatch（force_rerun=true）で再実行
 
   generate-market:
@@ -275,6 +323,20 @@ jobs:
       - name: Install Playwright Chromium
         run: |
           playwright install chromium --with-deps
+
+      - name: Download weekly ranking parquet artifact (from setup-raw)
+        # PM 2026-07-12 確定: setup-raw が対象日ゲート付きで再生成した sector_stock_weekly.parquet を
+        # 4 並列ジョブへ配布し、clone 内のコミット済み旧 parquet（前週 AsOf の可能性）を上書きする。
+        uses: actions/download-artifact@v4
+        with:
+          name: sector-stock-weekly-${{ needs.setup-raw.outputs.target_date }}
+          path: /tmp/sector-stock-weekly
+
+      - name: Place weekly ranking parquet into private working tree
+        run: |
+          mkdir -p private-repo/bi/outputs
+          cp -f /tmp/sector-stock-weekly/sector_stock_weekly.parquet private-repo/bi/outputs/sector_stock_weekly.parquet
+          echo "Placed sector_stock_weekly.parquet ($(stat -c%s private-repo/bi/outputs/sector_stock_weekly.parquet) bytes)"
 
       - name: Download movers raw artifact (from setup-raw)
         uses: actions/download-artifact@v4

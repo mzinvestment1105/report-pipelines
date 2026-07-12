@@ -110,26 +110,35 @@ def load_price_from_history(*, lookback_years: int = LOOKBACK_YEARS) -> pd.DataF
     """
     hist_dir = OUTPUTS_DIR / "price_history"
     today = date.today()
-    cols = ["Date", "Code", "Open", "High", "Low", "Close", "Volume"]
+    # AdjustmentFactor（株式分割等の調整係数・権利落ち日の行のみ非 1.0）は週次・期間リターンの
+    # 分割調整に必須（PM 2026-07-12 確定・compute_stock_metrics 参照）。
+    cols = ["Date", "Code", "Open", "High", "Low", "Close", "Volume", "AdjustmentFactor"]
     frames: list[pd.DataFrame] = []
     for year in range(today.year - lookback_years, today.year + 1):
         p = hist_dir / f"{year}.parquet"
         if p.exists():
-            frames.append(pd.read_parquet(p, columns=cols))
+            try:
+                frames.append(pd.read_parquet(p, columns=cols))
+            except Exception:
+                # 旧スキーマ（AdjustmentFactor 列なし）の年ファイルは基本列のみ読み係数 1.0 扱い
+                df_y = pd.read_parquet(p, columns=cols[:-1])
+                df_y["AdjustmentFactor"] = 1.0
+                frames.append(df_y)
     if not frames:
-        return pd.DataFrame(columns=["Date", "Code", "O", "H", "L", "C", "V"])
+        return pd.DataFrame(columns=["Date", "Code", "O", "H", "L", "C", "V", "AdjFactor"])
     out = pd.concat(frames, ignore_index=True).rename(
-        columns={"Open": "O", "High": "H", "Low": "L", "Close": "C", "Volume": "V"}
+        columns={"Open": "O", "High": "H", "Low": "L", "Close": "C", "Volume": "V",
+                 "AdjustmentFactor": "AdjFactor"}
     )
     out["Date"] = pd.to_datetime(out["Date"])
     out["Code"] = out["Code"].astype("string").str.strip().str[:4]
     cutoff = pd.Timestamp(today - timedelta(days=lookback_years * 365 + 30))
     out = out[out["Date"] >= cutoff]
-    keep = ["Date", "Code", "O", "H", "L", "C", "V"]
+    keep = ["Date", "Code", "O", "H", "L", "C", "V", "AdjFactor"]
     return out[keep].sort_values(["Code", "Date"]).reset_index(drop=True)
 
 
-def fetch_price_history(codes: list[str], *, limit_codes: int = 0) -> pd.DataFrame:
+def fetch_price_history(codes: list[str], *, limit_codes: int = 0, lookback_days: int = 0) -> pd.DataFrame:
     """
     全銘柄の価格履歴を取得する。
 
@@ -138,6 +147,11 @@ def fetch_price_history(codes: list[str], *, limit_codes: int = 0) -> pd.DataFra
     urllib3 の MaxRetryError で落ちる。そのため日付単位の逐次ループ +
     jq_client_utils.fetch_paginated_v2（指数バックオフ 429 リトライ実装済み）
     に置き換える。並列度 1 + リクエスト間 sleep で 429 を構造的に回避する。
+
+    lookback_days > 0 の場合はコールドフェッチ範囲を直近 lookback_days 日に絞る
+    （PM 2026-07-12 確定・週次動意 GHA 用。price_history parquet は 2026-07-07 に git 管理外化
+    され GHA clone に存在しないため、3 年分のコールドフェッチ（約 90 分・timeout 事故源）を
+    W01〜W08 計算に必要な直近数週間へ短縮する。0 = 従来どおり LOOKBACK_YEARS 年分）。
     """
     import jquantsapi
 
@@ -147,7 +161,10 @@ def fetch_price_history(codes: list[str], *, limit_codes: int = 0) -> pd.DataFra
     client = jquantsapi.ClientV2(api_key=api_key)
 
     cache = _load_price_cache()
-    fetch_from = date.today() - timedelta(days=LOOKBACK_YEARS * 365 + 30)
+    if lookback_days > 0:
+        fetch_from = date.today() - timedelta(days=lookback_days)
+    else:
+        fetch_from = date.today() - timedelta(days=LOOKBACK_YEARS * 365 + 30)
     if not cache.empty and "Date" in cache.columns:
         cached_max = cache["Date"].max().date()
         if cached_max >= fetch_from:
@@ -207,11 +224,12 @@ def fetch_price_history(codes: list[str], *, limit_codes: int = 0) -> pd.DataFra
         elif cl in ("low", "l"):          col_map[col] = "L"
         elif cl in ("close", "c"):        col_map[col] = "C"
         elif cl in ("volume", "vo", "v"): col_map[col] = "V"
+        elif cl == "adjfactor":           col_map[col] = "AdjFactor"  # 分割調整係数（PM 2026-07-12）
         elif cl == "date":                col_map[col] = "Date"
         elif cl == "code":                col_map[col] = "Code"
     df = df.rename(columns=col_map)
 
-    for col in ["O", "H", "L", "C", "V"]:
+    for col in ["O", "H", "L", "C", "V", "AdjFactor"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
         else:
@@ -220,7 +238,7 @@ def fetch_price_history(codes: list[str], *, limit_codes: int = 0) -> pd.DataFra
     df["Code"] = df["Code"].astype("string").str.strip().str[:4]
     df["Date"] = pd.to_datetime(df["Date"])
 
-    keep = [c for c in ["Date", "Code", "O", "H", "L", "C", "V"] if c in df.columns]
+    keep = [c for c in ["Date", "Code", "O", "H", "L", "C", "V", "AdjFactor"] if c in df.columns]
     new_data = df[keep].copy()
 
     combined = pd.concat([cache, new_data], ignore_index=True)
@@ -322,6 +340,19 @@ def compute_stock_metrics(prices: pd.DataFrame, today: date, anchor: str = "frid
         high = sub["H"] if "H" in sub.columns else pd.Series(dtype=float)
         low = sub["L"] if "L" in sub.columns else pd.Series(dtype=float)
 
+        # 株式分割調整（PM 2026-07-12 確定）: Return 系はすべて調整後終値 adj_close で計算する。
+        # 生 C の比較では権利落ち日（AdjFactor != 1.0）を跨ぐ週に「1:3 分割 = -66%」型の虚偽リターンが
+        # 出る（2026-07-10 週次動意で 2986 を -66.3% と誤配信・分割調整後は +1.1%）。日次
+        # make_mover_report.py の「過去終値 × AdjFactor」方式を期間へ一般化し、各日の終値に
+        # 「その日より後の AdjFactor の累積積」を掛けた後方調整終値で比較する（最新終値は生値と一致）。
+        # Close_Wxx / Close_Latest / MA 乖離 / 52W 高安は表示・水準系のため従来どおり生値のまま。
+        if "AdjFactor" in sub.columns:
+            _adj = pd.to_numeric(sub["AdjFactor"], errors="coerce").fillna(1.0)
+        else:
+            _adj = pd.Series(1.0, index=close.index)
+        _factor_after = _adj[::-1].cumprod()[::-1].shift(-1).fillna(1.0)
+        adj_close = close * _factor_after
+
         row: dict = {"Code": str(code)}
 
         # 最新終値
@@ -337,11 +368,12 @@ def compute_stock_metrics(prices: pd.DataFrame, today: date, anchor: str = "frid
         # 週次リターン（W01〜W08）:
         # Wxx は「x週前のスロット終値 ÷ (x+1)週前のスロット終値 - 1」で直接計算する。
         # スロットは anchor=friday なら金曜終値、anchor=today なら today から週単位で逆算した日付。
+        # 分割調整のため adj_close で比較する（PM 2026-07-12・スロット選定日付は close と同一）。
         for w in range(1, WEEKLY_SLOTS + 1):
             cur_target = _week_target(w - 1)
             prev_target = _week_target(w)
-            cur_series = close[close.index <= pd.Timestamp(cur_target)]
-            prev_series = close[close.index <= pd.Timestamp(prev_target)]
+            cur_series = adj_close[adj_close.index <= pd.Timestamp(cur_target)]
+            prev_series = adj_close[adj_close.index <= pd.Timestamp(prev_target)]
             c_cur = cur_series.iloc[-1] if not cur_series.empty else float("nan")
             c_prev = prev_series.iloc[-1] if not prev_series.empty else float("nan")
             if pd.notna(c_cur) and pd.notna(c_prev) and c_prev != 0:
@@ -350,19 +382,23 @@ def compute_stock_metrics(prices: pd.DataFrame, today: date, anchor: str = "frid
                 row[f"Return_W{w:02d}"] = float("nan")
 
         # スナップショットリターン（3M/6M/1Y/2Y/3Y）
+        # Close_{label} は表示用の生値・Return_{label} は分割調整後で計算（PM 2026-07-12）
         for label, bdays in zip(SNAPSHOT_LABELS, SNAPSHOT_DAYS):
             target = today - timedelta(days=int(bdays * 365 / 252))
             sub_before = close[close.index <= pd.Timestamp(target)]
+            adj_before = adj_close[adj_close.index <= pd.Timestamp(target)]
             if sub_before.empty:
                 row[f"Close_{label}"] = float("nan")
                 row[f"Return_{label}"] = float("nan")
             else:
                 snap_close = sub_before.iloc[-1]
+                adj_snap = adj_before.iloc[-1]
                 row[f"Close_{label}"] = snap_close
-                row[f"Return_{label}"] = (latest_close / snap_close - 1) if snap_close != 0 and pd.notna(snap_close) else float("nan")
+                row[f"Return_{label}"] = (adj_close.iloc[-1] / adj_snap - 1) if adj_snap != 0 and pd.notna(adj_snap) else float("nan")
 
         # --- ボラティリティ（過去20営業日の日次リターンσ、年率換算） ---
-        daily_ret = close.pct_change().dropna()
+        # 権利落ち日の「-66%」型の虚偽日次リターンを除くため adj_close で計算（PM 2026-07-12）
+        daily_ret = adj_close.pct_change().dropna()
         if len(daily_ret) >= 5:
             row["Volatility_20d"] = daily_ret.tail(20).std() * (252 ** 0.5)
         else:
@@ -578,6 +614,17 @@ def main() -> None:
         default="friday",
         help="W01の起算日: 'friday'（直近金曜終値・週末実行向け・デフォルト） / 'today'（実行日終値・平日実行で当日まで含めたい場合）",
     )
+    parser.add_argument(
+        "--expect-price-date",
+        default=None,
+        help="対象日ゲート: PriceDataAsOf がこの日付 (YYYY-MM-DD) と不一致なら exit 3（週次動意 GHA 専用・opt-in）",
+    )
+    parser.add_argument(
+        "--cold-lookback-days",
+        type=int,
+        default=0,
+        help="price_history 不在時のコールドフェッチ日数を絞る（0=従来どおり3年分・週次動意 GHA は 90 を指定）",
+    )
     args = parser.parse_args()
 
     etl_run_id = str(uuid.uuid4())
@@ -602,7 +649,8 @@ def main() -> None:
         prices = load_price_from_history()
         if prices.empty:
             print("price_history が見つからないため JQuants コールドフェッチにフォールバック（低速）")
-            prices = fetch_price_history(codes, limit_codes=args.limit_codes)
+            prices = fetch_price_history(codes, limit_codes=args.limit_codes,
+                                         lookback_days=args.cold_lookback_days)
         else:
             print(f"price_history から読込: {len(prices)} 行、{prices['Code'].nunique()} 銘柄（直近{LOOKBACK_YEARS}年）")
 
@@ -625,7 +673,8 @@ def main() -> None:
             " → JQuants で直近営業日を取得して補完します（週末・祝日は即空で返るため無駄打ちなし）"
         )
         try:
-            topup = fetch_price_history(codes, limit_codes=args.limit_codes)
+            topup = fetch_price_history(codes, limit_codes=args.limit_codes,
+                                        lookback_days=args.cold_lookback_days)
             if topup is not None and not topup.empty:
                 topup = topup.copy()
                 topup["Code"] = topup["Code"].astype("string").str.strip().str[:4]
@@ -651,6 +700,19 @@ def main() -> None:
             f"[WARN] 価格マスターが営業日基準で陳腐化: 最新 {price_data_asof} / 実行日 {today.isoformat()}。"
             "price_history.yml の更新状況を確認してください（古い終値で週次リターンを算出する恐れ）。"
         )
+
+    # PM 2026-07-12 確定: 対象日ゲート（--expect-price-date 指定時のみ・exit 3 = 品質ゲート不合格。
+    # exit code 規約は check_mover_counts.py と共通: 0=合格 / 1=インフラ失敗 / 3=品質ゲート・⛔ 通知分岐用）。
+    # 価格データが対象日（当週金曜）まで届いていないと Return_W01 等の「今週」の窓が丸ごと前週へ
+    # ずれる（2026-07-10 週次動意で 6/29〜7/3 の値を当週として全行配信・2986 -66.3%／4596 +55.4% で
+    # 確認された事故の再発防止レイヤー）。parquet 書き出し前に中止するため、コミット済みの既存
+    # parquet は上書きされない。土日の再実行は新規営業日が無く PriceDataAsOf=金曜のまま通過する。
+    # --expect-price-date は週次動意 GHA（mover_weekly.yml）のみが指定する。セクター週次 GHA
+    # （sector_report_weekly_full.yml）・ローカル実行は従来動作のまま（フラグなし＝ゲート不適用）。
+    if args.expect_price_date and price_data_asof != args.expect_price_date:
+        print(f"[QUALITY GATE] 価格データ最新日 {price_data_asof} が対象日 {args.expect_price_date} と不一致。"
+              f"前週データでの誤生成を防ぐため生成を中止します (exit 3)")
+        sys.exit(3)
 
     # 投資主体別売買
     investor_df = fetch_investor_trading(skip=args.skip_investor_fetch)
