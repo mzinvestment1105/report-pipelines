@@ -215,13 +215,21 @@ jobs:
       - name: Generate movers raw (make_mover_report.py --no-pdf)
         # PM 2026-05-25 確定: setup-raw ジョブで 1 回だけ実行・artifact 共有で
         # 3 並列ジョブの JQuants API 過剰呼び出しを回避。
+        # PM 2026-07-12 確定: --date-gate で対象日ゲートを有効化（日次のみ・週次 yml は従来動作）。
+        # exit 3 = 品質ゲート不合格（対象日 EOD 未着/休場→⛔ 通知へ分岐）/ exit 1 = インフラ失敗（❌）。
+        # 2026-07-09 に前営業日データを「本日」として配信した日付品質事故の再発防止。
+        id: raw
         working-directory: ./private-repo/bi/pipelines
         env:
           JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
           EDINETDB_API_KEYS: ${{ secrets.EDINETDB_API_KEYS }}
           PYTHONIOENCODING: utf-8
         run: |
-          python make_mover_report.py --date ${{ steps.date.outputs.value }} --no-pdf
+          set +e
+          python make_mover_report.py --date ${{ steps.date.outputs.value }} --no-pdf --date-gate
+          ec=$?
+          echo "exit_code=$ec" >> $GITHUB_OUTPUT
+          exit $ec
 
       - name: Append 立花証券 e支店 API context to movers raw
         # 動意銘柄 raw 末尾に QUICK 個別解説（動意理由）+ AI 市況 + 信用残・逆日歩を追記
@@ -248,8 +256,21 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
+      - name: Discord 通知（⛔ 対象日ゲートで生成中止）
+        # exit 3 = 対象日の EOD データ未着（または休場）。前営業日データでの「本日」誤生成を
+        # 防いで生成を止めた状態（2026-07-09 日付品質事故の再発防止・PM 2026-07-12）。
+        if: failure() && steps.raw.outputs.exit_code == '3'
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
+          state: blocked
+          label: 動意銘柄レポート 生成中止（対象日データ未着）
+          date: ${{ steps.date.outputs.value }}
+          meaning: 対象日の株価EODが未配信（または休場）のため、前営業日データでの誤生成を防いで生成を中止しました。本日未配信です。
+          action_required: 営業日なら夕方以降に手動 dispatch（force_rerun=true）で再実行／休場日は対応不要
+
       - name: Discord 通知（❌ raw 生成失敗）
-        if: failure() || cancelled()
+        if: (failure() || cancelled()) && steps.raw.outputs.exit_code != '3'
         uses: ./report-pipelines/.github/actions/notify-discord
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
@@ -333,19 +354,26 @@ jobs:
           # PM 2026-06-13 確定: standard / growth ジョブには担当市場の節のみ渡し、
           # 担当外市場（プライム/スタンダード ~1,960 行）の無駄読み・同一 offset 再読込ループを構造的に防ぐ。
           # prime は Section 9 が全市場横断のため全 raw を保持する。
+          # PM 2026-07-12 確定: standard / growth にも raw ヘッダ（タイトル・価格比較・
+          # 「対象日市場概況」ブロック＝「## Layer 1」より前の全行）を前置する。
+          # 「本日の地合い」の引用元と対象日検証のアンカーを全 4 並列ジョブへ届けるため
+          # （2026-07-09 日付品質事故の再発防止）。
           case "$TARGET_MARKET" in
             growth_a|growth_b)
-              awk '/^## グロース/{f=1} f' "$SRC" > "$DST"
+              awk '/^## Layer 1/{exit} {print}' "$SRC" > "$DST"
+              awk '/^## グロース/{f=1} f' "$SRC" >> "$DST"
               ;;
             standard)
-              awk '/^## スタンダード/{f=1} /^## グロース/{f=0} f' "$SRC" > "$DST"
+              awk '/^## Layer 1/{exit} {print}' "$SRC" > "$DST"
+              awk '/^## スタンダード/{f=1} /^## グロース/{f=0} f' "$SRC" >> "$DST"
               ;;
             *)
               cp "$SRC" "$DST"
               ;;
           esac
           # 抽出失敗（見出し不一致等）の保険: 極端に短ければ全 raw にフォールバック
-          if [ "$(wc -l < "$DST")" -lt 20 ]; then
+          # （閾値 40: ヘッダ前置分 ~20 行があっても市場節の抽出失敗を検知できる値・PM 2026-07-12）
+          if [ "$(wc -l < "$DST")" -lt 40 ]; then
             echo "Sliced raw too short for market=$TARGET_MARKET; falling back to full raw"
             cp "$SRC" "$DST"
           fi
@@ -494,8 +522,9 @@ jobs:
           cat "${MOVERS_DIR}/${TARGET_DATE}_growth_b.md" >> "$OUTPUT"
           echo "Merged into $OUTPUT ($(wc -l < "$OUTPUT") lines)"
 
-      - name: 件数ゲート（売買代金/値上がり/値下がり・不足なら送信中止）
+      - name: 件数ゲート（売買代金/値上がり/値下がり・タイトル日付・不足なら送信中止）
         # exit 3 = 品質ゲート不合格（⛔ 通知へ分岐）/ exit 1 = インフラ失敗（❌）
+        # PM 2026-07-12 確定: --date でタイトル日付ゲートも有効化（別日付レポートの誤配信防止）。
         id: gate
         working-directory: ./private-repo
         env:
@@ -503,7 +532,7 @@ jobs:
           PYTHONIOENCODING: utf-8
         run: |
           set +e
-          python bi/pipelines/check_mover_counts.py --file market/daily/movers/${TARGET_DATE}.md
+          python bi/pipelines/check_mover_counts.py --file market/daily/movers/${TARGET_DATE}.md --date ${TARGET_DATE}
           ec=$?
           echo "exit_code=$ec" >> $GITHUB_OUTPUT
           exit $ec
@@ -537,16 +566,16 @@ jobs:
           bash ../report-pipelines/bi/pipelines/ops/ci_commit_push.sh \
             -m "data: mover report ${TARGET_DATE}" market/daily
 
-      - name: Discord 通知（⛔ 件数ゲートで送信中止）
+      - name: Discord 通知（⛔ 品質ゲートで送信中止）
         if: failure() && steps.gate.outputs.exit_code == '3'
         uses: ./report-pipelines/.github/actions/notify-discord
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
           state: blocked
-          label: 動意銘柄レポート 送信中止（件数ゲート不合格）
+          label: 動意銘柄レポート 送信中止（品質ゲート不合格）
           date: ${{ needs.setup-raw.outputs.target_date }}
-          meaning: 規定の銘柄件数を満たさない不完全なレポートだったため、配信を止めました。本日未配信です。
-          action_required: run ログで不足市場/セクションを確認 → 修正後に手動 dispatch（force_rerun=true）
+          meaning: 規定の銘柄件数不足またはタイトル日付の対象日不一致がある不完全なレポートだったため、配信を止めました。本日未配信です。
+          action_required: run ログで不足セクション/日付不一致を確認 → 修正後に手動 dispatch（force_rerun=true）
 
       - name: Discord 通知（⚠️ 配信済み・後処理のみ失敗）
         if: (failure() || cancelled()) && steps.send.outcome == 'success'

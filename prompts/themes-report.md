@@ -28,8 +28,9 @@ WD=$(date -d "${TARGET_DATE}" +%u)   # 1=月 ... 5=金 ... 7=日
 
 5. **以下のファイルを Read で順番に読み込む（動意理由の根拠＝ローカル一次レポート。Web 検索は使わない）**：
    - `${PRIVATE_REPO_ROOT}/agents/themes_analyst.md` — エージェント仕様（存在する場合）
-   - `${PRIVATE_REPO_ROOT}/market/daily/macro/` 配下の直近 1〜2 件（当週/当日のマクロ駆動要因＝米株・FRB・日銀・金利・為替・原油・地政学・地合い）
-   - `${PRIVATE_REPO_ROOT}/market/daily/` 配下の直近の動意 raw（`{date}_movers_raw.md`）または `market/daily/movers/` の日次/週次レポート — 個別銘柄の具体材料・カタリスト。`ls -t` で最新を特定し、引数なし Read を避け必要範囲を読む。
+   - `${PRIVATE_REPO_ROOT}/market/daily/macro/` 配下の直近 1〜2 件（当週/当日のマクロ駆動要因＝米株・FRB・日銀・金利・為替・原油・地政学。**🔴 朝刊マクロ（`{date}.md`）の日本市場数値〈日経・プライム等の指数前日比・値上がり/値下がり銘柄数・全面安/全面高の描写〉はすべて前営業日実績**。「本日/当日の地合い」として転記することを絶対禁止。**指数前日比を当日値として書けるのは対象日の夕刊 `${TARGET_DATE}_evening.md` が存在する場合のみ**。前営業日の値に言及する時は必ず「前日（M/D）」ラベル。2026-07-09 に 7/8 実績を「本日」と記載した品質事故の再発防止）
+   - **当日の地合い・当日値動きのソースはこの 2 つのみ**：①当日動意レポート `${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}.md`（各銘柄の「本日」材料・今日の注目）②Step 7 の parquet 当日 snapshot（`top_stocks` の当日前日比）。※動意レポートが対象日分でない（`${TARGET_DATE}.md` が無い）場合、その内容を「本日」として使わない。
+   - `${PRIVATE_REPO_ROOT}/market/daily/` 配下の直近の動意 raw（`{date}_movers_raw.md`）または `market/daily/movers/` の日次/週次レポート — 個別銘柄の具体材料・カタリスト。`ls -t` で最新を特定し、引数なし Read を避け必要範囲を読む。**ファイル名の日付が `TARGET_DATE` より古いものは過去材料の参照としてのみ使い、記述を「本日」として転記しない**。
    - `${PRIVATE_REPO_ROOT}/market/daily/theme/` 配下に `*_theme_tdnet_raw.md`・`*_theme_yahoo_bbs_raw.md` があれば直近を読む（テーマ関連の適時開示・掲示板材料。無ければスキップ）。
 
 6. **テーマ動意 raw データ生成**：
@@ -61,7 +62,7 @@ cd ${PRIVATE_REPO_ROOT}/bi/pipelines && python fetch_theme_momentum.py
 # テーマレポート {TARGET_DATE}（{金曜は「週末版」/平日は「平日版」}）
 ※時刻は日本時間。
 
-> **今日の注目** ── {当日の急上昇・人気の首位テーマ、地合いを 2〜4 文で。数値・事実のみ。推測語禁止。}
+> **今日の注目** ── {当日の急上昇・人気の首位テーマ、地合いを 2〜4 文で。数値・事実のみ。推測語禁止。地合い（指数騰落・全面安/全面高）は当日ソース〈対象日の夕刊 `${TARGET_DATE}_evening.md`・当日動意レポート `${TARGET_DATE}.md`・当日 snapshot の top_stocks 前日比〉で確認できる場合のみ書き、確認できなければ地合い言及を省きテーマの事実のみ書く。前営業日の数値には必ず「前日（M/D）」を付ける。}
 ```
 
 ### 平日軽量版（月〜木）
@@ -115,6 +116,7 @@ cd ${PRIVATE_REPO_ROOT}/bi/pipelines && python fetch_theme_momentum.py
 - 「動意の理由」はローカル一次レポート（マクロ・動意・テーマ TDNet/掲示板 raw）＋ `top_stocks` の構成銘柄の当日値動きの合成による事実ベースの因果（「なぜ盛り上がったか」）。推測語（〜と思われる・だろう・likely 等）禁止。根拠が取れなければ構成銘柄の当日値動き等の事実のみ記述。WebSearch/WebFetch は GHA で 404 のため使わない。
 - 時刻は和文・JST。英語見出し/原文転記禁止。
 - 数値は raw データ・parquet を忠実転記。Claude 記憶ベース禁止。
+- **「本日/当日」を付けてよい市場数値は当日ソースで確認できたもののみ**（Step 5 参照）。朝刊マクロの日本市場数値（＝前営業日実績）を「本日」と書かない。前営業日値は「前日（M/D）」ラベル必須。Write 前に本文を「本日・当日」で確認し、各数値の日付根拠が対象日であることを検証する（2026-07-09 日付品質事故の再発防止）。
 
 ## 保存先
 

@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -35,6 +36,18 @@ def main() -> int:
     mom = pd.read_parquet(MOMENTUM)
     latest = mom["snapshot_date"].max()
     print(f"latest snapshot: {latest}")
+
+    # PM 2026-07-12 確定: 対象日ゲート（exit 3 = 品質ゲート不合格。
+    # exit code 規約は check_mover_counts.py と共通: 0=合格 / 1=インフラ失敗 / 3=品質ゲート）。
+    # max() は parquet に残った過去 snapshot を無条件採用するため、当日取得が無い日に
+    # 前日ランキングを「当日」として下流へ流す素通り経路になる（2026-07-09 日付品質事故の
+    # 再発防止レイヤー③）。対象日は TARGET_DATE 環境変数（未設定なら JST 当日）。
+    # 土日にローカルで金曜終値ベースの週末ビューを出す場合は TARGET_DATE=金曜日付を設定する。
+    target = os.environ.get("TARGET_DATE", "") or datetime.now(JST).date().isoformat()
+    if str(latest) != target:
+        print(f"[QUALITY GATE] snapshot_date {latest} が対象日 {target} と不一致のため exit 3"
+              f"（fetch_theme_momentum.py の当日実行を確認）")
+        return 3
 
     sub = mom[(mom["snapshot_date"] == latest) & (mom["source"] == "minkabu")]
     popular = sub[sub["rank_type"] == "popular"].sort_values("rank").head(10)

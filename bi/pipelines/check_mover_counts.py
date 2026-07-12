@@ -19,6 +19,9 @@ exit code 規約（2026-07-07 統一）: 0=合格 / 1=インフラ失敗（フ�
 
 使い方:
   python check_mover_counts.py --file market/daily/movers/2026-06-26.md
+  python check_mover_counts.py --file market/daily/movers/2026-06-26.md --date 2026-06-26
+  （--date 指定時はタイトル行の対象日一致も検査＝日付品質ゲート。省略時は従来動作。
+    2026-07-09 に 7/8 データを「本日」として配信した日付品質事故の再発防止・PM 2026-07-12）
 """
 from __future__ import annotations
 
@@ -122,6 +125,8 @@ def check_entry_fields(lines: list[str]) -> list[tuple[str, list[str]]]:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--file", required=True, help="統合 md ファイルパス")
+    ap.add_argument("--date", default="",
+                    help="対象日 YYYY-MM-DD（指定時はタイトル行の日付一致も検査・省略時は従来動作＝検証スキップ）")
     args = ap.parse_args()
 
     try:
@@ -134,6 +139,18 @@ def main() -> int:
     blocks = parse_blocks(text)
     seen_markets = {m for m, _ in blocks}
     failures: list[str] = []
+
+    # 対象日タイトルゲート（PM 2026-07-12 確定・--date 指定時のみ・省略時は従来動作）。
+    # 7/8 データを「本日（7/9）」として記載した 2026-07-09 日付品質事故の再発防止レイヤー②。
+    # 統合 md の全タイトル行（# 動意銘柄レポート …）が対象日文字列を含むことを機械検査し、
+    # 別日付レポートの誤配信を送信前に止める（exit 3 = ⛔ 送信中止）。
+    if args.date:
+        title_lines = [ln for ln in text.splitlines() if TITLE_RE.match(ln)]
+        bad_titles = [ln for ln in title_lines if args.date not in ln]
+        print(f"[日付ゲート] タイトル {len(title_lines)} 件中 対象日 {args.date} 一致 "
+              f"{len(title_lines) - len(bad_titles)} 件")
+        for ln in bad_titles:
+            failures.append(f"タイトル日付が対象日 {args.date} と不一致: {ln.strip()[:60]}")
 
     for market, exp in EXPECTED.items():
         if market not in seen_markets:
@@ -165,7 +182,7 @@ def main() -> int:
                 failures.append(f"{market} エントリ項目欠落[{'/'.join(fatal)}]: {head}")
 
     if failures:
-        print("\n[件数ゲート] [NG] 規定件数を満たさないため送信を中止します:", file=sys.stderr)
+        print("\n[件数ゲート] [NG] 品質ゲート不合格のため送信を中止します:", file=sys.stderr)
         for f_ in failures:
             print(f"  - {f_}", file=sys.stderr)
         return 3  # 品質ゲート不合格（インフラ失敗 exit 1 と区別・⛔ 通知分岐用）

@@ -37,6 +37,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import sys
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -1283,6 +1284,30 @@ def build_report(
         f"",
     ]
 
+    # ---- 対象日市場概況（PM 2026-07-12 確定・「本日の地合い」の唯一の引用元） ----
+    # 夕方の生成時点で読める最新マクロレポートは朝刊（＝日本市場数値は前営業日実績）のため、
+    # Claude が朝刊の指数騰落・騰落銘柄数を「本日」として転記する日付品質事故が 2026-07-09 に
+    # 発生した（再発防止レイヤー④）。対象日 EOD の実測地合いを raw 自身に持たせ、
+    # レポート側の「本日の地合い」の引用元をこのブロックに一本化する（prompts/mover-report.md 参照）。
+    lines += [
+        f"## 対象日市場概況（{today.strftime('%Y-%m-%d')} EOD・実測）",
+        "",
+        "> **「本日の地合い」として引用できる市場全体の数値はこの表のみ**。"
+        "マクロレポート（朝刊）の日本市場数値は前営業日実績のため「本日」として転記しない。",
+        "",
+        "| 市場 | 値上がり | 値下がり | 日次リターン中央値 |",
+        "|------|---------|---------|------------------|",
+    ]
+    for _market in [MARKET_PRIME, MARKET_STANDARD, MARKET_GROWTH]:
+        _mdf = full_df[full_df["MarketCodeName"] == _market].dropna(subset=["DailyReturn"])
+        if _mdf.empty:
+            continue
+        _up   = int((_mdf["DailyReturn"] > 0).sum())
+        _down = int((_mdf["DailyReturn"] < 0).sum())
+        _med  = _mdf["DailyReturn"].median()
+        lines.append(f"| {_market} | {_up} | {_down} | {_med:+.2f}% |")
+    lines.append("")
+
     # ---- Layer 1: セクター別フロー ----
     lines += ["## Layer 1: セクター別フロー", ""]
     if not sector_df.empty:
@@ -1486,6 +1511,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="動意銘柄レポート 生データ生成")
     parser.add_argument("--date",   default=None, help="対象日 YYYY-MM-DD（省略時は本日）")
     parser.add_argument("--no-pdf", action="store_true", help="TDNet PDF本文取得スキップ")
+    parser.add_argument("--date-gate", action="store_true",
+                        help="対象日ゲート: 解決された営業日が対象日と不一致なら exit 3（日次 GHA 専用）")
     args = parser.parse_args()
 
     api_key = os.environ.get("JQUANTS_API_KEY", "").strip()
@@ -1502,6 +1529,18 @@ def main() -> None:
     print("直近2営業日を確認中...")
     today_dt, prev_dt = resolve_trading_days(client, target)
     print(f"  本日: {today_dt}　前日: {prev_dt}")
+
+    # PM 2026-07-12 確定: 対象日ゲート（--date-gate 指定時のみ）。exit code 規約は
+    # check_mover_counts.py と共通（0=合格 / 1=インフラ失敗 / 3=品質ゲート不合格・⛔ 通知分岐用）。
+    # resolve_trading_days は対象日にデータが無いと過去営業日へ黙って遡るため、JQuants 未着・
+    # 休場日に前営業日データで「本日」レポートを誤生成する素通り経路になる
+    # （2026-07-09 に 7/8 データを「本日」と記載した日付品質事故の再発防止レイヤー①）。
+    # --date-gate は日次 GHA（mover_report_daily.yml）のみが指定する。週次 GHA
+    # （mover_weekly.yml）・ローカル実行は従来動作のまま（フラグなし＝ゲート不適用）。
+    if args.date_gate and today_dt != target:
+        print(f"[QUALITY GATE] 対象日 {target} の EOD データ未着（最新営業日: {today_dt}）。"
+              f"前営業日データでの誤生成を防ぐため生成を中止します (exit 3)")
+        sys.exit(3)
 
     print(f"価格取得: {today_dt} ...")
     today_df = fetch_daily_all(client, today_dt)
