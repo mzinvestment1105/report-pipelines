@@ -148,9 +148,9 @@ blockquote {{
   font-size:12.5pt; line-height:1.95; color:#2A3654;
 }}
 blockquote p {{ margin:0; }}
-/* リード内太字はアクセント色にしない（PM 2026-07-11: 太字多用のリードが全面青になり可読性低下）。
-   本文 strong と同じ濃色に統一し、色はアクセント=枠線・騰落数値=緑/赤（inline span）のみに絞る。 */
-blockquote strong {{ color:#1A1A1A; }}
+/* リード内太字はアクセント色（PM 2026-07-13: 黒は読みづらい・青へ戻す）。
+   可読性は色を消すのでなく太字の比率で制御する（prompts 側 §24 でリードの太字を文字数比 1/3 以下に制限）。 */
+blockquote strong {{ color:{accent}; }}
 
 /* ── リスト ── */
 ul, ol {{ margin:9px 0 12px; padding-left:22px; }}
