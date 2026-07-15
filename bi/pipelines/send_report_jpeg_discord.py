@@ -109,6 +109,11 @@ KIND_CONFIG = {
         "webhook_env": "DISCORD_WEBHOOK_MOVERS",
         "label": "動意銘柄レポート（週次）",
     },
+    "pts_movers": {
+        "md_path": "market/daily/pts_movers/{date}.md",
+        "webhook_env": "DISCORD_WEBHOOK_MOVERS",
+        "label": "夜間PTS動意レポート",
+    },
     "ideas": {
         "md_path": "market/daily/ideas/{date}.md",
         "webhook_env": "DISCORD_WEBHOOK_IDEAS",

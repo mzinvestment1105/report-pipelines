@@ -1,0 +1,274 @@
+name: 夜間PTS動意レポート
+
+"on":
+  # メイン経路: Cloudflare Worker (mizuki-fund-scheduler-1) からの workflow_dispatch（平日 21:00 JST = UTC 12:00）。
+  # SPOF 回避のため GHA cron をフェイルセーフとして併用（平日 UTC 13:00 = JST 22:00・Worker の約1時間後）。
+  # guard ジョブで当日既存 run を検知して重複発火を防ぐ。
+  workflow_dispatch:
+    inputs:
+      target_date:
+        description: '対象日付 (YYYY-MM-DD・空欄で当日)'
+        required: false
+        default: ''
+      force_rerun:
+        description: 'true で当日重複ガードを無視して強制実行'
+        required: false
+        default: 'false'
+  schedule:
+    - cron: '0 13 * * 1-5'
+
+concurrency:
+  group: pts_mover_report-daily
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      proceed: ${{ steps.check.outputs.proceed }}
+      reason: ${{ steps.check.outputs.reason }}
+    steps:
+      - name: Checkout report-pipelines (通知 action 用)
+        uses: actions/checkout@v4
+
+      - name: Check today's runs
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.force_rerun }}" = "true" ]; then
+            echo "proceed=true" >> $GITHUB_OUTPUT
+            echo "reason=force_rerun (manual guard bypass)" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          TODAY_JST=$(TZ=Asia/Tokyo date +%Y-%m-%d)
+          TODAY_START="${TODAY_JST}T00:00:00+09:00"
+          MY_RUN_ID=${{ github.run_id }}
+          EVENT="${{ github.event_name }}"
+
+          # 夜間帯のレポートのため cron 起動は JST 18〜23 時の外なら skip（深夜遅延着火の日付ズレ防止）。
+          HOUR_JST=$((10#$(TZ=Asia/Tokyo date +%H)))
+          if [ "$EVENT" = "schedule" ] && { [ "$HOUR_JST" -lt 18 ] || [ "$HOUR_JST" -gt 23 ]; }; then
+            echo "proceed=false" >> $GITHUB_OUTPUT
+            echo "reason=skip (cron outside evening window: ${HOUR_JST}h JST)" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          RUNS=$(gh api -X GET \
+            "repos/${{ github.repository }}/actions/workflows/pts_mover_report.yml/runs" \
+            -f "created=>=${TODAY_START}" \
+            --jq "[.workflow_runs[] | select(.id != ${MY_RUN_ID})]")
+
+          ACTIVE=$(echo "$RUNS" | jq '[.[] | select(.status=="in_progress" or .status=="queued" or .status=="waiting" or .status=="action_required" or .status=="pending")] | length')
+          DONE_OK=$(echo "$RUNS" | jq '[.[] | select(.conclusion=="success" or .conclusion=="neutral")] | length')
+          DONE_FAIL=$(echo "$RUNS" | jq '[.[] | select(.conclusion=="failure" or .conclusion=="cancelled" or .conclusion=="startup_failure" or .conclusion=="timed_out" or .conclusion=="stale" or .conclusion=="action_required")] | length')
+
+          echo "Today (${TODAY_JST}): active=${ACTIVE} done_ok=${DONE_OK} done_fail=${DONE_FAIL} event=${EVENT} (excluding self ${MY_RUN_ID})"
+
+          if [ "$DONE_OK" -gt 0 ]; then
+            echo "proceed=false" >> $GITHUB_OUTPUT
+            echo "reason=skip (already succeeded today)" >> $GITHUB_OUTPUT
+          elif [ "$ACTIVE" -gt 0 ]; then
+            echo "proceed=false" >> $GITHUB_OUTPUT
+            echo "reason=skip (active run exists)" >> $GITHUB_OUTPUT
+          elif [ "$EVENT" = "schedule" ] && [ "$DONE_FAIL" -ge 2 ]; then
+            echo "proceed=false" >> $GITHUB_OUTPUT
+            echo "reason=retry_cap (cron stopped: done_fail=${DONE_FAIL})" >> $GITHUB_OUTPUT
+          else
+            echo "proceed=true" >> $GITHUB_OUTPUT
+            if [ "$DONE_FAIL" -gt 0 ]; then
+              echo "reason=recovery" >> $GITHUB_OUTPUT
+            else
+              echo "reason=initial" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: Discord 通知（🚨 自動リトライ停止）
+        if: contains(steps.check.outputs.reason, 'retry_cap')
+        uses: ./.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
+          state: alert
+          label: 夜間PTS動意レポート 自動リトライ停止
+          meaning: 当日 2 回以上失敗したため cron の自動再実行を停止しました。本日未配信です。
+          action_required: run ログ確認 → 原因解消後に手動 dispatch（force_rerun=true）で再実行
+
+  build-and-send:
+    needs: guard
+    if: needs.guard.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Determine target date
+        id: date
+        run: |
+          if [ -n "${{ github.event.inputs.target_date }}" ]; then
+            echo "value=${{ github.event.inputs.target_date }}" >> $GITHUB_OUTPUT
+          else
+            echo "value=$(TZ=Asia/Tokyo date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout report-pipelines
+        uses: actions/checkout@v4
+        with:
+          path: report-pipelines
+
+      - name: Setup SSH for private repo
+        env:
+          PRIVATE_REPO_DEPLOY_KEY: ${{ secrets.PRIVATE_REPO_DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$PRIVATE_REPO_DEPLOY_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+      - name: Clone private repo (mizuki-fund)
+        run: |
+          git clone git@github.com:mzinvestment1105/mizuki-fund.git private-repo
+
+      - name: Copy pipelines and static files from Public into private working tree
+        run: |
+          cp -f report-pipelines/bi/pipelines/*.py private-repo/bi/pipelines/
+          cp -f report-pipelines/bi/pipelines/requirements.txt private-repo/bi/pipelines/
+          mkdir -p private-repo/bi/pipelines/lib
+          cp -rf report-pipelines/bi/pipelines/lib/*.py private-repo/bi/pipelines/lib/ 2>/dev/null || true
+          mkdir -p private-repo/bi/pipelines/assets/fonts
+          cp -rf report-pipelines/bi/pipelines/assets/fonts/* private-repo/bi/pipelines/assets/fonts/ 2>/dev/null || true
+          mkdir -p private-repo/agents private-repo/playbook
+          cp -f report-pipelines/agents/*.md private-repo/agents/ 2>/dev/null || true
+          cp -f report-pipelines/playbook/*.md private-repo/playbook/ 2>/dev/null || true
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: report-pipelines/bi/pipelines/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r report-pipelines/bi/pipelines/requirements.txt
+
+      - name: Generate PTS movers raw (make_pts_mover_report.py --date-gate)
+        # 絶対配信原則: 当日EOD未着でも中止せず品質注記付きで続行（--date-gate）。
+        # 本 step の失敗（exit 非0）はインフラ失敗のみ。
+        working-directory: ./private-repo/bi/pipelines
+        env:
+          JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
+          EDINETDB_API_KEYS: ${{ secrets.EDINETDB_API_KEYS }}
+          PYTHONIOENCODING: utf-8
+        run: |
+          python make_pts_mover_report.py --date ${{ steps.date.outputs.value }} --date-gate
+
+      - name: 既存レポートファイルを削除（前回不良ファイル読込スキップ防止）
+        working-directory: ./private-repo
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+        run: |
+          rm -f "market/daily/pts_movers/${TARGET_DATE}.md"
+
+      - name: Generate report via Claude Code (Opus 4.7 + max thinking)
+        uses: anthropics/claude-code-base-action@beta
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          model: claude-opus-4-7
+          prompt_file: report-pipelines/prompts/pts-mover-report.md
+          allowed_tools: "Read,Write,Edit,Bash,Grep,Glob"
+          timeout_minutes: "30"
+          claude_env: |
+            MAX_THINKING_TOKENS: 32000
+            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 64000
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+          PRIVATE_REPO_ROOT: private-repo
+          CLAUDE_CODE_MAX_OUTPUT_TOKENS: 64000
+
+      - name: 品質注記の機械挿入（フラグ検知時のみ・タイトル直後）
+        # 絶対配信原則: make_pts_mover_report.py --date-gate が出力する {date}_pts_quality_flags.txt を
+        # レポート冒頭（# 夜間PTS動意レポート …）直後へ挿入。Claude 側の注記と重複しても機械挿入を正とする。
+        id: annotate
+        working-directory: ./private-repo
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+        run: |
+          F=market/daily/pts_movers/${TARGET_DATE}.md
+          FLAGS=market/daily/${TARGET_DATE}_pts_quality_flags.txt
+          if [ ! -f "$F" ]; then
+            echo "ERROR: report not found: $F"; exit 1
+          fi
+          if [ -s "$FLAGS" ]; then
+            NOTE="$(tr '\n' ' ' < "$FLAGS" | sed 's/ *$//')"
+            awk -v note="> ⚠️ **品質注記**: ${NOTE}" '{print} /^# 夜間PTS動意レポート /{print ""; print note}' "$F" > "${F}.tmp" && mv "${F}.tmp" "$F"
+            echo "annotated=true" >> $GITHUB_OUTPUT
+            echo "note=${NOTE}" >> $GITHUB_OUTPUT
+          else
+            echo "annotated=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Install Japanese fonts (Noto Sans CJK JP)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq fonts-noto-cjk fonts-noto-cjk-extra
+
+      - name: Install Playwright Chromium
+        run: |
+          playwright install chromium --with-deps
+
+      - name: Send Discord (単一 JPEG/PDF・分割なし)
+        id: send
+        working-directory: ./private-repo/bi/pipelines
+        env:
+          DISCORD_WEBHOOK_MOVERS: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
+          PYTHONIOENCODING: utf-8
+        run: |
+          python send_report_pdf_discord.py --kind pts_movers --date ${{ steps.date.outputs.value }}
+
+      - name: Rotate report archives (5 件超過分を archive/ へ退避)
+        working-directory: ./private-repo
+        env:
+          PYTHONIOENCODING: utf-8
+        run: |
+          mkdir -p bi/pipelines/ops
+          cp -f ../report-pipelines/bi/pipelines/ops/rotate_report_archives.py bi/pipelines/ops/
+          python bi/pipelines/ops/rotate_report_archives.py
+
+      - name: Commit and push to private repo
+        working-directory: ./private-repo
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+        run: |
+          bash ../report-pipelines/bi/pipelines/ops/ci_commit_push.sh \
+            -m "data: pts mover report ${TARGET_DATE}" market/daily
+
+      - name: Discord 通知（⚠️ 配信済み・品質注記あり）
+        if: steps.annotate.outputs.annotated == 'true' && steps.send.outcome == 'success'
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
+          state: partial
+          label: 夜間PTS動意レポート 配信済み（品質注記あり）
+          date: ${{ steps.date.outputs.value }}
+          meaning: レポートは配信済みです。品質注記（${{ steps.annotate.outputs.note }}）を冒頭に付けています。
+          action_required: レポート冒頭の品質注記を確認
+
+      - name: Discord 通知（⚠️ 配信済み・後処理のみ失敗）
+        if: (failure() || cancelled()) && steps.send.outcome == 'success'
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
+          state: partial
+          label: 夜間PTS動意レポート 後処理のみ失敗
+          date: ${{ steps.date.outputs.value }}
+          meaning: レポート本体は配信済みです。配信後のアーカイブ整理または commit だけが失敗しました。
+          action_required: 不要（差分は次回 run が回収）
+
+      - name: Discord 通知（❌ 生成/送信失敗）
+        if: (failure() || cancelled()) && steps.send.outcome != 'success'
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
+          state: failed
+          label: 夜間PTS動意レポート 失敗（生成/送信）
+          date: ${{ steps.date.outputs.value }}
+          meaning: raw 生成・Claude 生成・Discord 送信のいずれかが失敗し、本日未配信です。
+          action_required: run ログ確認 → 手動 dispatch（force_rerun=true）で再実行。ログに「Spending cap reached」がある場合は Claude 利用枠切れ＝リセット時刻以降に force_rerun=true
