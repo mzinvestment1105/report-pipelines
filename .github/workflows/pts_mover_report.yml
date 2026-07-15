@@ -160,11 +160,12 @@ jobs:
         run: |
           python make_pts_mover_report.py --date ${{ steps.date.outputs.value }} --date-gate
 
-      - name: 既存レポートファイルを削除（前回不良ファイル読込スキップ防止）
+      - name: 出力ディレクトリ作成 + 既存レポートファイル削除（前回不良ファイル読込スキップ防止）
         working-directory: ./private-repo
         env:
           TARGET_DATE: ${{ steps.date.outputs.value }}
         run: |
+          mkdir -p market/daily/pts_movers
           rm -f "market/daily/pts_movers/${TARGET_DATE}.md"
 
       - name: Generate report via Claude Code (Opus 4.7 + max thinking)
