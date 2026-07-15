@@ -357,8 +357,15 @@ def build_prompt(
 
     delta_section = ""
     if yesterday_report:
-        # 前日レポートの冒頭2500字を差分コンテキストとして渡す
-        preview = yesterday_report[:2500].rstrip()
+        # 前日レポートの冒頭2500字を差分コンテキストとして渡す。
+        # ただし前日の H1 タイトル行（先頭 `# ...`）は除外する。
+        # 巨大な羅列型タイトルをそのまま手本として渡すと、当日タイトルが
+        # 同じ体裁を模倣し続けてローデータ羅列が自己増殖するため（PM 2026-07-15）。
+        yr_body = yesterday_report.lstrip()
+        if yr_body.startswith("# "):
+            nl = yr_body.find("\n")
+            yr_body = yr_body[nl + 1 :].lstrip() if nl != -1 else ""
+        preview = yr_body[:2500].rstrip()
         delta_section = f"""
 ---
 ## 前日レポート（差分参照用）
