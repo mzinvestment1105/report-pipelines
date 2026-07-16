@@ -43,7 +43,7 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 _PDF_KIND = {
     "macro": "macro", "macro_evening": "macro",
     "sector": "sector", "sector_full": "sector",
-    "movers": "movers", "movers_weekly": "movers",
+    "movers": "movers", "movers_weekly": "movers", "pts_movers": "movers",
     "ideas": "ideas", "scout": "ideas",
     "themes": "themes", "earnings": "earnings", "stock": "stock",
     "largecap_weekly": "largecap_weekly",
