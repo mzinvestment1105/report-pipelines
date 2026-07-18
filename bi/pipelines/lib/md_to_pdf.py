@@ -36,6 +36,7 @@ KIND_META = {
     "themes":   ("THEMES",         "テーマレポート",     "#B8902A"),
     "stock":    ("EQUITY RESEARCH","個別銘柄レポート",   "#B5483D"),
     "largecap_weekly": ("LARGE CAP WEEKLY", "週次大型株速報", "#1F3A93"),
+    "review": ("DEV REVIEW", "開発レビュー資料", "#555F73"),
 }
 
 _WEEKDAY_JP = ["月", "火", "水", "木", "金", "土", "日"]
