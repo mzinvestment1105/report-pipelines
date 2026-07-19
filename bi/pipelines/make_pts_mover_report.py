@@ -75,7 +75,9 @@ _HEADERS = {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
     ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "ja,en-US;q=0.7,en;q=0.3",
+    "Referer": "https://kabutan.jp/",
 }
 
 _SHARES_COL = "NumberOfIssuedAndOutstandingSharesAtTheEndOfFiscalYearIncludingTreasuryStock"
@@ -374,8 +376,8 @@ def main() -> None:
         down_df = down_df[(pd.to_numeric(down_df["DiffPct"], errors="coerce") <= DOWN_PCT_MAX)
                           & (down_df["_val"].fillna(0) >= VALUE_MIN) & (~down_df["_etf"])] \
             .sort_values("DiffPct").head(DOWN_MAX).reset_index(drop=True)
-    else:
-        quality_notes.append("値下がりデータ元（株探）取得失敗または0件")
+    # 株探（値下がり）は best-effort。GHAのIPは株探に405で弾かれるため、取得失敗しても
+    # ⚠️品質注記は出さず該当セクションを省略する（主役の値上がり＝カブラボは確実に取れる）。
     print(f"値下がり: {len(down_df)} 件")
 
     val_raw, _ = scrape_kabutan(_KABUTAN_VALUE_URL, value_col=True)
@@ -388,8 +390,7 @@ def main() -> None:
         v = val_raw.copy()
         v["_etf"] = v.apply(lambda r: is_etf_reit(r["MarketRaw"], r["Name"]), axis=1)
         val_df = v[~v["_etf"]].sort_values("ValueYen", ascending=False).head(TURNOVER_MAX).reset_index(drop=True)
-    else:
-        quality_notes.append("売買代金データ元（株探）取得失敗または0件")
+    # 株探（売買代金）も best-effort（値下がりと同様・405で弾かれても⚠️は出さない）。
     print(f"売買代金 Top: {len(val_df)} 件 / 実額 {len(value_lookup)} 銘柄")
 
     sections = [("値上がり", up_df), ("値下がり", down_df), ("売買代金", val_df)]
@@ -469,12 +470,16 @@ def main() -> None:
                                 themes.get(rec["Code"], ""), value_lookup.get(rec["Code"]), args.fast)
         return out
 
+    # 値上がり（カブラボ・主役）は必ず出す。値下がり・売買代金（株探・best-effort）は
+    # 取得できた時だけセクションを出す（GHAで株探が405の日はセクションごと省略＝⚠️も空セクションも出さない）。
     lines += [f"## 夜間PTS 値上がり（当日終値比 +{UP_PCT_MIN:.0f}%以上・上位{UP_MAX}件）", ""]
     lines += _emit(up_df) if not up_df.empty else ["（該当なし）", ""]
-    lines += [f"## 夜間PTS 値下がり（当日終値比 {DOWN_PCT_MAX:.0f}%以下・下位{DOWN_MAX}件）", ""]
-    lines += _emit(down_df) if not down_df.empty else ["（該当なし）", ""]
-    lines += [f"## 夜間PTS 売買代金 Top{TURNOVER_MAX}（実額・ETF除外）", ""]
-    lines += _emit(val_df) if not val_df.empty else ["（該当なし）", ""]
+    if not down_df.empty:
+        lines += [f"## 夜間PTS 値下がり（当日終値比 {DOWN_PCT_MAX:.0f}%以下・下位{DOWN_MAX}件）", ""]
+        lines += _emit(down_df)
+    if not val_df.empty:
+        lines += [f"## 夜間PTS 売買代金 Top{TURNOVER_MAX}（実額・ETF除外）", ""]
+        lines += _emit(val_df)
 
     body = "\n".join(lines)
     MARKET_DAILY_DIR.mkdir(parents=True, exist_ok=True)
