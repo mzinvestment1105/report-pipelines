@@ -149,7 +149,7 @@ jobs:
       - name: Install dependencies
         run: pip install -r report-pipelines/bi/pipelines/requirements.txt
 
-      - name: Generate PTS movers raw (v5: カブラボ+株探 当日終値比・動意と同一材料プロセス)
+      - name: Generate PTS movers raw (v5 カブラボと株探の当日終値比・動意と同一材料プロセス)
         # 値動きデータ＝カブラボ/株探（当日終値比）。材料はTDNet/EDINET/みんかぶ/Yahoo掲示板/需給で動意と同一。
         # 取得失敗は品質注記として raw 冒頭と {date}_pts_quality_flags.txt に出力し配信は止めない（絶対配信）。
         # 本 step の失敗（exit 非0）はインフラ失敗のみ。
