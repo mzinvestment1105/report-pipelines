@@ -51,8 +51,9 @@ jobs:
               SM_DATE="$YESTERDAY_JST"
             fi
             echo "scope=morning" >> $GITHUB_OUTPUT
-            echo "workflows=macro_report_daily.yml=${TODAY_JST},screening_master.yml=${SM_DATE},financial_history.yml=${YESTERDAY_JST},price_history.yml=${YESTERDAY_JST}" >> $GITHUB_OUTPUT
-            echo "label=朝刊 + 前日 ETL 3 本" >> $GITHUB_OUTPUT
+            # pts_mover_report は平日 21:00 JST 発火のため前日日付で判定（月曜朝は前週金曜分＝SM_DATE と同ロジック）
+            echo "workflows=macro_report_daily.yml=${TODAY_JST},screening_master.yml=${SM_DATE},financial_history.yml=${YESTERDAY_JST},price_history.yml=${YESTERDAY_JST},pts_mover_report.yml=${SM_DATE}" >> $GITHUB_OUTPUT
+            echo "label=朝刊 + 前日 ETL 3 本 + 前夜PTS" >> $GITHUB_OUTPUT
           elif [ "$DOW_JST" -eq 5 ] && [ "$HOUR_JST" -ge 22 ]; then
             # 金曜夜スコープ: 金曜 21:00 JST 発火の週次 3 本を同日（金曜）日付で判定
             echo "scope=friday_weekly" >> $GITHUB_OUTPUT

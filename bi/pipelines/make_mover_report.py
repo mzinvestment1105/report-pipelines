@@ -176,7 +176,9 @@ def fetch_ohlc_history(
         try:
             cached = pd.read_parquet(cache_path)
             cached["Code"] = cached["Code"].astype(str).str[:4]
-            return cached[cached["Code"].isin(target_codes)].copy()
+            # 旧キー名バグで Code が全行空のキャッシュ（汚染キャッシュ）は使わず再取得する
+            if cached["Code"].str.strip().str.len().gt(0).any():
+                return cached[cached["Code"].isin(target_codes)].copy()
         except Exception:
             pass
 
@@ -194,15 +196,17 @@ def fetch_ohlc_history(
             sleep_seconds=0.6,
         )
         if rows:
+            # JQuants v2 の実キーは CamelCase（Code/O/H/L/C/Vo）。旧小文字キー固定で全行 Code='' と
+            # なり株価水準ブロックが全滅していたバグの修正（2026-07-20・大小両対応フォールバック）。
             for r in rows:
                 rows_all.append({
-                    "Code": str(r.get("code", ""))[:4],
+                    "Code": str(r.get("code", r.get("Code", "")))[:4],
                     "Date": cursor.isoformat(),
-                    "Open":   r.get("o", r.get("Open")),
-                    "High":   r.get("h", r.get("High")),
-                    "Low":    r.get("l", r.get("Low")),
-                    "Close":  r.get("c", r.get("Close")),
-                    "Volume": r.get("v", r.get("Volume")),
+                    "Open":   r.get("o", r.get("O", r.get("Open"))),
+                    "High":   r.get("h", r.get("H", r.get("High"))),
+                    "Low":    r.get("l", r.get("L", r.get("Low"))),
+                    "Close":  r.get("c", r.get("C", r.get("Close"))),
+                    "Volume": r.get("v", r.get("Vo", r.get("Volume"))),
                 })
             days_found += 1
         cursor -= timedelta(days=1)
