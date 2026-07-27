@@ -249,12 +249,12 @@ jobs:
         uses: anthropics/claude-code-base-action@beta
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          model: claude-opus-4-7
+          model: claude-opus-5
           prompt_file: report-pipelines/prompts/sector-report-full.md
           allowed_tools: "Read,Edit,Bash,Grep,Glob"
           timeout_minutes: "20"
           claude_env: |
-            MAX_THINKING_TOKENS: 32000
+            CLAUDE_CODE_EFFORT_LEVEL: high
             CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
         env:
           TARGET_DATE: ${{ steps.date.outputs.value }}

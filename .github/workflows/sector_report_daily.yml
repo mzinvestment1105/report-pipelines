@@ -207,19 +207,19 @@ jobs:
             rm -f "$TARGET_FILE"
           fi
 
-      - name: Generate sector report via Claude Code (Opus 4.7 + max thinking・Deep Research 内包)
+      - name: Generate sector report via Claude Code (Opus 5 + effort high・Deep Research 内包)
         # PM 2026-05-23 確定: ローカルと全く同じ精度を担保する。Deep Research は GHA 内で
         # Claude Code Action が WebSearch を使って実施 → make_sector_raw.py に --deep-research-file
         # で渡す → メインレポート生成、までを 1 Action で完結する。
         uses: anthropics/claude-code-base-action@beta
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          model: claude-opus-4-7
+          model: claude-opus-5
           prompt_file: report-pipelines/prompts/sector-report.md
           allowed_tools: "Read,Write,Edit,Bash,Grep,Glob,WebSearch,WebFetch"
           timeout_minutes: "60"
           claude_env: |
-            MAX_THINKING_TOKENS: 32000
+            CLAUDE_CODE_EFFORT_LEVEL: high
             CLAUDE_CODE_MAX_OUTPUT_TOKENS: 64000
         env:
           TARGET_DATE: ${{ steps.date.outputs.value }}

@@ -210,19 +210,19 @@ jobs:
             rm -f "$TARGET_FILE"
           fi
 
-      - name: Generate largecap weekly report via Claude Code (Opus 4.7 + max thinking)
+      - name: Generate largecap weekly report via Claude Code (Opus 5 + effort high)
         # Claude が private クローンから最新 macro/sector/theme + 台帳 + セクターマップを読み、
         # 二軸でセクター約3つを選定 → weekly_largecap_sectors.py --survey/--select で素材取得
         # （市場系数値は yfinance ライブ・HTTP のみで GHA でも動く）→ 本文生成 → 保存。
         uses: anthropics/claude-code-base-action@beta
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          model: claude-opus-4-7
+          model: claude-opus-5
           prompt_file: report-pipelines/prompts/largecap-weekly.md
           allowed_tools: "Read,Write,Edit,Bash,Grep,Glob"
           timeout_minutes: "50"
           claude_env: |
-            MAX_THINKING_TOKENS: 32000
+            CLAUDE_CODE_EFFORT_LEVEL: high
             CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
         env:
           TARGET_DATE: ${{ steps.date.outputs.value }}
