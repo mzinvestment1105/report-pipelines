@@ -46,6 +46,8 @@ from jq_client_utils import (
     fetch_paginated_v2,
     latest_trading_day_date_v2,
 )
+from universe_utils import universe_codes, load_screening_master_codes, RE_LETTER
+from data_guards import check_adjustment_factor_consistency
 
 try:
     from dotenv import load_dotenv
@@ -59,6 +61,12 @@ SCREENING_MASTER = REPO_ROOT / "bi" / "outputs" / "screening_master.parquet"
 
 REQUEST_SLEEP = 1.0
 MAX_RETRIES = 6
+
+#: 取得対象の母集団モード（universe_utils の唯一の正本に委譲）。
+#: "equity" は 4桁数字コードに加えて英字コード（^[0-9]{3}[A-Z]$。2024年以降採番の
+#: 285A 等）も取り込む。以前はここが 4桁数字だけを通していたため、英字コードが
+#: price_history に一度も入らなかった。
+UNIVERSE_MODE = "equity"
 
 
 def _is_4digit_code(code4: str) -> bool:
@@ -106,13 +114,24 @@ def _fetch_daily_with_backoff(client, code4: str, from_date: str | None = None) 
 
 
 def load_universe() -> list[str]:
+    """screening_master から取得対象コードを、出現順・重複排除済みで返す。
+
+    形状の判定は universe_utils（母集団判定の唯一の正本）へ委譲する。UNIVERSE_MODE
+    が "equity" なので 4桁数字コードに加えて英字コードも通る。以前はここに
+    ``_is_4digit_code`` のインライン判定を持っていて英字コードを落としていた。
+
+    universe_codes() は集合を返すため順序を持たない。screening_master の並びが
+    そのまま取得順（=リトライ・進捗ログの並び）になるよう、元のリスト順で絞り直す。
+    これにより 4桁コードの取得順・重複排除は従来と完全に一致する。
+    """
     if not SCREENING_MASTER.exists():
         raise FileNotFoundError(
             f"{SCREENING_MASTER} が存在しません。screening_master を先に実行してください。"
         )
     df = pd.read_parquet(SCREENING_MASTER, columns=["Code"])
     codes = df["Code"].astype(str).map(normalize_code_4).drop_duplicates().tolist()
-    return [c for c in codes if _is_4digit_code(c)]
+    allowed = universe_codes(codes, mode=UNIVERSE_MODE)
+    return [c for c in codes if c in allowed]
 
 
 def _detect_columns(df: pd.DataFrame) -> dict[str, str]:
@@ -239,17 +258,27 @@ def enrich_price_data(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def save_year_partition(df: pd.DataFrame, merge_existing: bool = True) -> None:
+    """年別 partition へ保存する。書き込みは一時ファイル + os.replace で原子的に行う。
+
+    途中でプロセスが落ちても partition が半端な状態で残らないようにするため、直接
+    to_parquet せず同一ディレクトリの .tmp へ書いてから置換する（別ドライブを跨がない
+    ので os.replace は原子的に働く）。
+    """
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     for year, year_df in df.groupby("Year"):
         path = OUT_DIR / f"{int(year)}.parquet"
         if merge_existing and path.exists():
             existing = pd.read_parquet(path)
+            # 既存の列順を正とし、新規行を同じ並びへ揃えてから連結する。
+            year_df = year_df.reindex(columns=list(existing.columns))
             combined = pd.concat([existing, year_df], ignore_index=True)
             combined = combined.drop_duplicates(subset=["Code", "Date"], keep="last")
             combined = combined.sort_values(["Code", "Date"]).reset_index(drop=True)
         else:
             combined = year_df.sort_values(["Code", "Date"]).reset_index(drop=True)
-        combined.to_parquet(path, index=False)
+        tmp = path.with_suffix(".parquet.tmp")
+        combined.to_parquet(tmp, index=False)
+        os.replace(tmp, path)
         size_mb = path.stat().st_size / 1024 / 1024
         print(f"  saved: {path.name} ({len(combined):,} rows, {size_mb:.1f} MB)")
 
@@ -303,7 +332,56 @@ def cmd_initial(args) -> int:
     return 0
 
 
+#: 派生指標として enrich_price_data() が生成する列（= API 由来ではない列）。
+#: 日次更新で「API から埋めるべき素の列」を partition のスキーマから逆算するのに使う。
+DERIVED_COLS: frozenset[str] = frozenset({
+    "PrevDayClose", "GapPct", "IntradayRangePct",
+    "Return_1d", "Return_5d", "Return_20d", "Return_60d", "Return_120d", "Return_252d",
+    "Year", "YearHigh", "YearLow", "QuarterHigh", "QuarterLow", "MonthHigh", "MonthLow",
+    "YTDHigh", "YTDLow", "High52w", "Low52w", "DistFromHigh52w", "DistFromLow52w",
+    "AllTimeHigh", "AllTimeLow", "Volume_vs_SMA20Ratio",
+    "SMA20", "SMA50", "SMA200", "BB_Upper2sigma", "BB_Lower2sigma",
+})
+
+#: partition の列名 -> J-Quants 日足 API の列名候補（先に見つかったものを採る）。
+#: partition は年によって調整済株価が短縮形（AdjO/AdjC）と長形（AdjustmentOpen/Close）に
+#: 割れているため、どちらの並びにも同じ実データを流し込めるよう両方を張ってある。
+API_COL_CANDIDATES: dict[str, list[str]] = {
+    "Date": ["Date"], "Code": ["Code"],
+    "Open": ["O", "Open"], "High": ["H", "High"], "Low": ["L", "Low"], "Close": ["C", "Close"],
+    "Volume": ["Vo", "Volume"], "Value": ["Va", "TurnoverValue", "Value"],
+    "AdjustmentFactor": ["AdjFactor", "AdjustmentFactor"],
+    "AdjO": ["AdjO"], "AdjH": ["AdjH"], "AdjL": ["AdjL"], "AdjC": ["AdjC"], "AdjVo": ["AdjVo"],
+    "AdjustmentOpen": ["AdjO", "AdjustmentOpen"], "AdjustmentHigh": ["AdjH", "AdjustmentHigh"],
+    "AdjustmentLow": ["AdjL", "AdjustmentLow"], "AdjustmentClose": ["AdjC", "AdjustmentClose"],
+    "UL": ["UL"], "LL": ["LL"],
+}
+
+
 def cmd_daily(args) -> int:
+    """最新営業日 1 日分を年別 partition へ **追記** する（既存行は一切書き換えない）。
+
+    【2026-08 に修理した3点】
+    旧実装は (1) 4桁数字コードだけを通す (2) partition を素の OHLCV だけから作り直す
+    (3) merge_existing=False で partition 全体を置換する、という作りだった。このため
+    日次更新が走るたびに
+
+        - 英字コード（285A 等）が 1 行も入らない
+        - 売買代金 Value が API の実値 Va ではなく round(Close x Volume) の近似で
+          上書きされる（実測: 2026.parquet の4桁行 508,025 行すべてが近似値）
+        - AdjustmentFactor が 1.0 に、AdjustmentClose が Close に潰される
+          （API が返す AdjO/AdjC を _detect_columns が拾えず捏造側の枝に落ちるため）
+
+    が起きていた。本実装は素の列を **partition の実スキーマから逆算** して API の実値を
+    そのまま流し込み、派生指標を計算したあと **当日分の行だけ** を切り出して追記する。
+    既存行に触れないので、過去に投入済みの実データ（英字コードの調整済株価など）が
+    日次更新で潰れることはない。値の推定・補完は一切しない（欠損は欠損のまま）。
+
+    【母集団】
+    4桁コードは従来どおり形状のみで通す（screening_master と積を取ると既存 partition に
+    居る銘柄を日次更新のたびに追い出してしまうため）。英字コードは screening_master との
+    積集合に限る（ETF・投資信託など個別株でないものの混入を防ぐ）。
+    """
     api_key = os.environ.get("JQUANTS_API_KEY", "").strip()
     if not api_key:
         raise ValueError("JQUANTS_API_KEY 未設定")
@@ -322,47 +400,81 @@ def cmd_daily(args) -> int:
 
     new_df = pd.DataFrame(rows)
     new_df["Code"] = new_df["Code"].map(normalize_code_4)
-    new_df = new_df[new_df["Code"].map(_is_4digit_code)].copy()
-    print(f"  取得: {len(new_df):,} 銘柄 × 1 日")
+    n_all = len(new_df)
+
+    sm_codes = load_screening_master_codes(SCREENING_MASTER)
+    keep = new_df["Code"].map(
+        lambda c: _is_4digit_code(c) or (bool(RE_LETTER.match(c)) and c in sm_codes))
+    new_df = new_df[keep].copy()
+    n_letter = int(new_df["Code"].map(lambda c: bool(RE_LETTER.match(c))).sum())
+    print(f"  取得: API {n_all:,} 行 -> 採用 {len(new_df):,} 銘柄 × 1 日"
+          f"（うち英字コード {n_letter}）")
 
     year = latest.year
-    existing_paths = [
-        OUT_DIR / f"{year}.parquet",
-        OUT_DIR / f"{year - 1}.parquet",
-    ]
+    target_path = OUT_DIR / f"{year}.parquet"
+    if not target_path.exists():
+        raise FileNotFoundError(f"{target_path} がありません。initial を先に実行してください。")
 
-    base_cols = ["Date", "Code", "Open", "High", "Low", "Close", "Volume"]
-    existing_frames = []
-    for p in existing_paths:
-        if p.exists():
-            df = pd.read_parquet(p)
-            cols_present = [c for c in base_cols if c in df.columns]
-            if len(cols_present) == len(base_cols):
-                existing_frames.append(df[base_cols])
+    target = pd.read_parquet(target_path)
+    part_cols = list(target.columns)
+    src_cols = [c for c in part_cols if c not in DERIVED_COLS]
+    print(f"  partition スキーマ: {len(part_cols)} 列（うち素の列 {len(src_cols)}）")
 
-    if existing_frames:
-        existing_base = pd.concat(existing_frames, ignore_index=True)
-    else:
-        existing_base = pd.DataFrame(columns=base_cols)
-
-    col_map_new = _detect_columns(new_df)
-    rename_new = {col_map_new[k]: k for k in col_map_new if k in base_cols[2:]}
-    new_raw = new_df.rename(columns=rename_new)
-    for c in base_cols:
-        if c not in new_raw.columns and c != "Date" and c != "Code":
-            new_raw[c] = None
-    new_raw = new_raw[base_cols]
+    # --- API の1日分を partition の素の列へ写像する（実値のみ・捏造しない） ---------
+    new_raw = pd.DataFrame()
+    unmapped = []
+    for col in src_cols:
+        api_col = next((a for a in API_COL_CANDIDATES.get(col, [col]) if a in new_df.columns), None)
+        if api_col is None:
+            unmapped.append(col)
+            continue
+        new_raw[col] = new_df[api_col].to_numpy()
+    if unmapped:
+        # 対応する API 列が無い素の列は欠損のまま残す（推定値で埋めない）。
+        print(f"  警告: API に対応列が無く欠損のまま残す素の列: {unmapped}")
+        for col in unmapped:
+            new_raw[col] = pd.NA
     new_raw["Date"] = pd.to_datetime(new_raw["Date"])
 
-    combined_raw = pd.concat([existing_base, new_raw], ignore_index=True)
+    # --- 派生指標のローリング窓を埋めるための助走データ（当年 + 前年） ---------------
+    warm = [target[src_cols]]
+    prev_path = OUT_DIR / f"{year - 1}.parquet"
+    if prev_path.exists():
+        prev = pd.read_parquet(prev_path)
+        base_cols = ["Date", "Code", "Open", "High", "Low", "Close", "Volume"]
+        if all(c in prev.columns for c in base_cols):
+            warm.append(prev[base_cols])
+
+    combined_raw = pd.concat([*warm, new_raw], ignore_index=True)
     combined_raw["Date"] = pd.to_datetime(combined_raw["Date"])
     combined_raw = combined_raw.drop_duplicates(subset=["Code", "Date"], keep="last")
 
-    print(f"\n=== 派生指標計算 ===")
+    print(f"\n=== 派生指標計算（助走 {len(combined_raw):,} 行） ===")
     enriched = enrich_price_data(combined_raw)
-    new_year_df = enriched[enriched["Year"] == year]
-    print(f"\n=== 年別 partition 保存 ===")
-    save_year_partition(new_year_df, merge_existing=False)
+
+    # 当日分の行だけを取り出して追記する（既存行は触らない）。
+    day_df = enriched[enriched["Date"] == pd.Timestamp(latest)].copy()
+    if day_df.empty:
+        print(f"  {latest.isoformat()} の行が派生指標計算後に消えました（想定外）")
+        return 1
+    for col in part_cols:
+        if col not in day_df.columns:
+            day_df[col] = pd.NA
+    # 既存ファイルの dtype に合わせる（UL/LL は既存が文字列 '0'/'1'）。
+    for col in part_cols:
+        want = str(target[col].dtype)
+        if want == "object" and str(day_df[col].dtype) != "object":
+            day_df[col] = day_df[col].astype("Int64").astype(str)
+    day_df = day_df[part_cols]
+    print(f"  追記対象: {len(day_df):,} 行 ({latest.isoformat()})")
+
+    print(f"\n=== 年別 partition 保存（追記） ===")
+    save_year_partition(day_df, merge_existing=True)
+
+    # --- ガード: 分割・併合係数と生の終値比の整合 --------------------------------
+    print(f"\n=== ガード: check_adjustment_factor_consistency ({year}.parquet) ===")
+    check = pd.read_parquet(target_path, columns=["Date", "Code", "Close", "AdjustmentFactor"])
+    print(check_adjustment_factor_consistency(check))
     return 0
 
 
