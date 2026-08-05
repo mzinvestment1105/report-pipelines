@@ -44,7 +44,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TODAY_JST=$(TZ=Asia/Tokyo date +%Y-%m-%d)
-          TODAY_START="${TODAY_JST}T00:00:00+09:00"
           MY_RUN_ID=${{ github.run_id }}
           EVENT="${{ github.event_name }}"
 
