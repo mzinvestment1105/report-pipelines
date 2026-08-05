@@ -43,14 +43,13 @@ jobs:
           MY_RUN_ID=${{ github.run_id }}
           EVENT="${{ github.event_name }}"
 
-          RUNS=$(gh api -X GET \
-            "repos/${{ github.repository }}/actions/workflows/financial_history.yml/runs" \
-            -f "created=>=${TODAY_START}" \
-            --jq "[.workflow_runs[] | select(.id != ${MY_RUN_ID})]")
-
-          ACTIVE=$(echo "$RUNS" | jq '[.[] | select(.status=="in_progress" or .status=="queued" or .status=="waiting" or .status=="action_required" or .status=="pending")] | length')
-          DONE_OK=$(echo "$RUNS" | jq '[.[] | select(.conclusion=="success" or .conclusion=="neutral")] | length')
-          DONE_FAIL=$(echo "$RUNS" | jq '[.[] | select(.conclusion=="failure" or .conclusion=="cancelled" or .conclusion=="startup_failure" or .conclusion=="timed_out" or .conclusion=="stale")] | length')
+          # 2026-08-05 修正: run 単位の conclusion は「guard が本体ジョブを skip した run」まで
+          # success と数えてしまい、本命の発火を「本日配信済み」と誤認して無言 skip させる。
+          # 実際に配信/更新を行うジョブ（update）の結果だけで判定する。
+          STATS=$(bash .github/scripts/check_delivery.sh financial_history.yml update "${MY_RUN_ID}")
+          DONE_OK=$(echo "$STATS" | jq -r '.delivered')
+          DONE_FAIL=$(echo "$STATS" | jq -r '.failed')
+          ACTIVE=$(( $(echo "$STATS" | jq -r '.sending') + $(echo "$STATS" | jq -r '.dispatch_pending') + $(echo "$STATS" | jq -r '.schedule_pending') ))
 
           echo "Today (${TODAY_JST}): active=${ACTIVE} done_ok=${DONE_OK} done_fail=${DONE_FAIL} event=${EVENT}"
 

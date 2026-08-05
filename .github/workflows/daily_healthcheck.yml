@@ -34,9 +34,12 @@ jobs:
       - name: Determine check scope (morning / evening / friday-weekly)
         id: scope
         run: |
-          # workflows 出力は「<workflow ファイル名>=<判定基準時刻>」のカンマ区切り。
+          # workflows 出力は「<workflow ファイル名>=<判定基準時刻>=<配信ジョブ名>」のカンマ区切り。
           # 基準時刻は日付（YYYY-MM-DD → その日 00:00 JST）または日時（…T12:00:00+09:00）。
-          # 基準時刻以降に success / 実行中 run があるかを check step が見る。
+          # 基準時刻以降に「配信ジョブが success」または「実行中」の run があるかを check step が見る。
+          # 2026-08-05 修正: 以前は run 単位の conclusion==success を見ていたため、guard が本体を
+          # skip して終わった run（run 自体は success）を「発行済み」と誤判定し、夜間PTS が 3 週間
+          # 未配信でも無警報だった。配信ジョブの結果だけを見るよう変更。
           HOUR_JST=$(TZ=Asia/Tokyo date +%H)
           DOW_JST=$(TZ=Asia/Tokyo date +%u)   # 1=月 ... 7=日
           TODAY_JST=$(TZ=Asia/Tokyo date +%Y-%m-%d)
@@ -52,18 +55,18 @@ jobs:
             fi
             echo "scope=morning" >> $GITHUB_OUTPUT
             # pts_mover_report は平日 21:00 JST 発火のため前日日付で判定（月曜朝は前週金曜分＝SM_DATE と同ロジック）
-            echo "workflows=macro_report_daily.yml=${TODAY_JST},screening_master.yml=${SM_DATE},financial_history.yml=${YESTERDAY_JST},price_history.yml=${YESTERDAY_JST},pts_mover_report.yml=${SM_DATE}" >> $GITHUB_OUTPUT
+            echo "workflows=macro_report_daily.yml=${TODAY_JST}=generate,screening_master.yml=${SM_DATE}=update,financial_history.yml=${YESTERDAY_JST}=update,price_history.yml=${YESTERDAY_JST}=update,pts_mover_report.yml=${SM_DATE}=build-and-send" >> $GITHUB_OUTPUT
             echo "label=朝刊 + 前日 ETL 3 本 + 前夜PTS" >> $GITHUB_OUTPUT
           elif [ "$DOW_JST" -eq 5 ] && [ "$HOUR_JST" -ge 22 ]; then
             # 金曜夜スコープ: 金曜 21:00 JST 発火の週次 3 本を同日（金曜）日付で判定
             echo "scope=friday_weekly" >> $GITHUB_OUTPUT
-            echo "workflows=largecap_weekly.yml=${TODAY_JST},mover_weekly.yml=${TODAY_JST},sector_report_weekly_full.yml=${TODAY_JST}" >> $GITHUB_OUTPUT
+            echo "workflows=largecap_weekly.yml=${TODAY_JST}=generate,mover_weekly.yml=${TODAY_JST}=merge-and-send,sector_report_weekly_full.yml=${TODAY_JST}=generate" >> $GITHUB_OUTPUT
             echo "label=金曜週次 3 本" >> $GITHUB_OUTPUT
           else
             # 夕方スコープ: 夕方 3 レポート（当日 12:00 JST 以降で判定）
             # sector_report_daily（PM 2026-07-08）・position_check（PM 2026-07-09）はレーン抹消のため監視対象外
             echo "scope=evening" >> $GITHUB_OUTPUT
-            echo "workflows=mover_report_daily.yml=${TODAY_JST},macro_report_evening.yml=${TODAY_JST},theme_report_daily.yml=${TODAY_JST}" >> $GITHUB_OUTPUT
+            echo "workflows=mover_report_daily.yml=${TODAY_JST}=merge-and-send,macro_report_evening.yml=${TODAY_JST}=generate,theme_report_daily.yml=${TODAY_JST}=generate" >> $GITHUB_OUTPUT
             echo "label=夕方 3 本" >> $GITHUB_OUTPUT
           fi
           echo "today_jst=${TODAY_JST}" >> $GITHUB_OUTPUT
@@ -80,18 +83,18 @@ jobs:
           for entry in "${ENTRIES[@]}"; do
             entry=$(echo "$entry" | tr -d ' ')
             wf="${entry%%=*}"
-            since="${entry#*=}"
+            rest="${entry#*=}"
+            since="${rest%%=*}"
+            send_job="${rest#*=}"
             case "$since" in
               *T*) SINCE_START="$since" ;;
               *)   SINCE_START="${since}T00:00:00+09:00" ;;
             esac
-            RUNS_JSON=$(gh api -X GET \
-              "repos/${{ github.repository }}/actions/workflows/${wf}/runs" \
-              -f "created=>=${SINCE_START}")
-            TOTAL=$(echo "$RUNS_JSON" | jq '.workflow_runs | length')
-            SUCCESS=$(echo "$RUNS_JSON" | jq '[.workflow_runs[] | select(.conclusion=="success")] | length')
-            ACTIVE=$(echo "$RUNS_JSON" | jq '[.workflow_runs[] | select(.status=="in_progress" or .status=="queued" or .status=="waiting" or .status=="pending")] | length')
-            echo "${wf} (since ${SINCE_START}): total=${TOTAL} success=${SUCCESS} active=${ACTIVE}"
+            STATS=$(bash .github/scripts/check_delivery.sh "$wf" "$send_job" 0 "$SINCE_START")
+            TOTAL=$(echo "$STATS" | jq -r '.total')
+            SUCCESS=$(echo "$STATS" | jq -r '.delivered')
+            ACTIVE=$(( $(echo "$STATS" | jq -r '.sending') + $(echo "$STATS" | jq -r '.dispatch_pending') + $(echo "$STATS" | jq -r '.schedule_pending') ))
+            echo "${wf} (since ${SINCE_START} / send_job=${send_job}): total=${TOTAL} delivered=${SUCCESS} active=${ACTIVE}"
             if [ "$SUCCESS" -gt 0 ] || [ "$ACTIVE" -gt 0 ]; then
               continue
             fi
@@ -114,7 +117,7 @@ jobs:
             MEANING="未起動（run ゼロ＝Worker と GHA cron の両方が不発）: ${NORUN}。"
           fi
           if [ -n "$FAILED" ]; then
-            MEANING="${MEANING}失敗のまま未復旧（当日成功 run なし・個別の❌通知済みのはず）: ${FAILED}。"
+            MEANING="${MEANING}未配信（run はあるが配信ジョブが成功していない＝失敗または skip のまま）: ${FAILED}。"
           fi
           echo "meaning=${MEANING}" >> $GITHUB_OUTPUT
 

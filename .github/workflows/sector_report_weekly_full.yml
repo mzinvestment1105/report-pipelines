@@ -4,6 +4,11 @@ name: セクター週次レポート（フルバージョン）
   # PM 2026-05-27 確定: Cloudflare Worker (mizuki-fund-scheduler-1) からの workflow_dispatch がメイン経路。
   # PM 2026-06-06 追加: Worker SPOF 回避のため GHA cron をフェイルセーフ併用。
   # PM 2026-06-29: 金曜 21:00 JST = UTC 金 12:00 へ変更（Worker と同枠・金曜終値の price_history 更新完了後）。
+  # 2026-08-05 修正: 旧 cron は Worker と同じ UTC 金 12:00 に起票していたが、GitHub cron は実測
+  #   +1h45m〜+3h15m 遅れて着火するため実際の配信は JST 22:16〜23:19 に落ちていた（Worker との
+  #   前後関係も不定）。予備 cron を UTC 金 08:30（JST 17:30）へ前倒しし、guard 側で JST 21:10 まで
+  #   待機してから判定する方式に変更（本命 Worker の JST 21:00 発火を必ず先に通し、届かなければ
+  #   予備が 21:10 に起きて配信する）。金曜配信という仕様自体は変更していない。
   workflow_dispatch:
     inputs:
       target_date:
@@ -15,72 +20,60 @@ name: セクター週次レポート（フルバージョン）
         required: false
         default: 'false'
   schedule:
-    - cron: '0 12 * * 5'
+    - cron: '30 8 * * 5'
 
-concurrency:
-  group: sector_report_weekly_full-weekly
-  cancel-in-progress: false
+# workflow 単位の concurrency は置かない（予備 run が JST 21:10 まで待機している間に
+# 本命 Worker の workflow_dispatch が pending へ回されるのを避けるため）。
+# 二重配信の最終防波堤は generate ジョブ単位の concurrency で担保する。
 
 jobs:
   guard:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # 予備 cron は JST 21:10 まで sleep してから判定するため長め（最大 sleep 3h40m + 本命待ち 30 分）。
+    timeout-minutes: 300
     outputs:
       proceed: ${{ steps.check.outputs.proceed }}
       reason: ${{ steps.check.outputs.reason }}
+      target_date: ${{ steps.check.outputs.target_date }}
     steps:
-      # 通知 composite action（.github/actions/notify-discord）を使うため checkout が必要
-      - name: Checkout report-pipelines (通知 action 用)
+      # 通知 composite action（.github/actions/notify-discord）と判定スクリプトを使うため checkout が必要
+      - name: Checkout report-pipelines (通知 action / 配信判定スクリプト用)
         uses: actions/checkout@v4
 
-      - name: Check today's runs
+      - name: 予備タイマー待機 + 当日配信判定（generate ジョブ単位）
         id: check
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          TODAY_JST=$(TZ=Asia/Tokyo date +%Y-%m-%d)
-          TODAY_START="${TODAY_JST}T00:00:00+09:00"
-          MY_RUN_ID=${{ github.run_id }}
-          EVENT="${{ github.event_name }}"
-
-          # force_rerun は「手動 workflow_dispatch かつ明示 true」の時のみ有効（誤再発火防止）。
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.force_rerun }}" = "true" ]; then
-            echo "proceed=true" >> $GITHUB_OUTPUT
-            echo "reason=force_rerun (manual guard bypass)" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
-          RUNS=$(gh api -X GET \
-            "repos/${{ github.repository }}/actions/workflows/sector_report_weekly_full.yml/runs" \
-            -f "created=>=${TODAY_START}" \
-            --jq "[.workflow_runs[] | select(.id != ${MY_RUN_ID})]")
-
-          ACTIVE=$(echo "$RUNS" | jq '[.[] | select(.status=="in_progress" or .status=="queued" or .status=="waiting" or .status=="action_required" or .status=="pending")] | length')
-          DONE_OK=$(echo "$RUNS" | jq '[.[] | select(.conclusion=="success" or .conclusion=="neutral")] | length')
-          DONE_FAIL=$(echo "$RUNS" | jq '[.[] | select(.conclusion=="failure" or .conclusion=="cancelled" or .conclusion=="startup_failure" or .conclusion=="timed_out" or .conclusion=="stale" or .conclusion=="action_required")] | length')
-
-          echo "Today (${TODAY_JST}): active=${ACTIVE} done_ok=${DONE_OK} done_fail=${DONE_FAIL} event=${EVENT}"
-
-          if [ "$DONE_OK" -gt 0 ]; then
-            echo "proceed=false" >> $GITHUB_OUTPUT
-            echo "reason=skip (already succeeded today: done_ok=${DONE_OK})" >> $GITHUB_OUTPUT
-          elif [ "$ACTIVE" -gt 0 ]; then
-            echo "proceed=false" >> $GITHUB_OUTPUT
-            echo "reason=skip (active run exists: active=${ACTIVE})" >> $GITHUB_OUTPUT
-          elif [ "$EVENT" = "schedule" ] && [ "$DONE_FAIL" -ge 2 ]; then
-            echo "proceed=false" >> $GITHUB_OUTPUT
-            echo "reason=retry_cap (cron stopped: done_fail=${DONE_FAIL} >= 2)" >> $GITHUB_OUTPUT
-          else
-            echo "proceed=true" >> $GITHUB_OUTPUT
-            if [ "$DONE_FAIL" -gt 0 ]; then
-              echo "reason=recovery (done_fail=${DONE_FAIL})" >> $GITHUB_OUTPUT
-            else
-              echo "reason=initial" >> $GITHUB_OUTPUT
-            fi
-          fi
+          WF_FILE: sector_report_weekly_full.yml
+          SEND_JOB: generate
+          MY_RUN_ID: ${{ github.run_id }}
+          EVENT: ${{ github.event_name }}
+          FORCE_RERUN: ${{ github.event.inputs.force_rerun }}
+          INPUT_DATE: ${{ github.event.inputs.target_date }}
+          # 本命（Worker）は金曜 JST 21:00 発火。予備は 21:10 に起床して本命へ道を譲る。
+          WAKE_JST: '21:10'
+          WINDOW_START_JST: '12:00'
+          WINDOW_END_JST: '23:30'
+          WAIT_MINUTES: '30'
+          LANE_LABEL: 予備タイマー
+        run: bash .github/scripts/standby_guard.sh
 
       # ⏱予備タイマー起動通知は削除（PM 2026-07-09）: Worker が週次を発火しておらず cron が
       # 実質本経路のため「Worker未達」案内が毎週金曜に誤発報していた。レポート生成・送信は継続。
+      # 2026-08-05 復活: Cloudflare cron の曜日フィールドが 1=日曜だったため金曜が発火せず、
+      # cron が実質本経路になっていた（Worker 側で修正済み）。以後は Worker が金曜も発火するため
+      # 「予備が起きた＝本当に Worker 未達」となり通知が正しい情報になる（無言 skip の禁止）。
+      - name: Discord 通知（⏱ 予備タイマー起動）
+        if: github.event_name == 'schedule' && steps.check.outputs.proceed == 'true'
+        uses: ./.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_SECTOR }}
+          state: timer
+          label: セクター週次レポート 予備タイマー起動
+          date: ${{ steps.check.outputs.target_date }}
+          meaning: 定時の Cloudflare Worker 発火（金曜 21 時）が届かなかったため、GHA 側の予備タイマーが代わりに生成を開始しました。レポートはこのあと通常どおり届きます。
+          action_required: 不要（毎週続く場合のみ Worker 点検）
+
       - name: Discord 通知（🚨 自動リトライ停止）
         if: contains(steps.check.outputs.reason, 'retry_cap')
         uses: ./.github/actions/notify-discord
@@ -106,16 +99,18 @@ jobs:
     if: needs.guard.outputs.proceed == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 90  # PM 2026-05-31: 40 -> 90 拡張（JQuants 429 リトライ + Deep Research 含むフル版で 55+ 分実績あり）
+    # 実生成ジョブだけを直列化する（workflow 単位の concurrency は本命の金曜 21 時発火を塞ぐため置かない）。
+    concurrency:
+      group: sector_report_weekly_full-generate
+      cancel-in-progress: false
 
     steps:
       - name: Determine target date
         id: date
+        env:
+          GUARD_DATE: ${{ needs.guard.outputs.target_date }}
         run: |
-          if [ -n "${{ github.event.inputs.target_date }}" ]; then
-            echo "value=${{ github.event.inputs.target_date }}" >> $GITHUB_OUTPUT
-          else
-            echo "value=$(TZ=Asia/Tokyo date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
-          fi
+          echo "value=${GUARD_DATE}" >> $GITHUB_OUTPUT
 
       - name: Checkout report-pipelines
         uses: actions/checkout@v4

@@ -1,9 +1,21 @@
 name: 夜間PTS動意レポート
 
 "on":
-  # メイン経路: Cloudflare Worker (mizuki-fund-scheduler-1) からの workflow_dispatch（平日 21:00 JST = UTC 12:00）。
-  # SPOF 回避のため GHA cron をフェイルセーフとして併用（平日 UTC 13:00 = JST 22:00・Worker の約1時間後）。
-  # guard ジョブで当日既存 run を検知して重複発火を防ぐ。
+  # 配信目標（PM 2026-08-05）: 平日 JST 21:00〜21:30 着。最悪でも 22:00 まで。23 時着は不可。
+  #
+  # 経路1（本命）: Cloudflare Worker (mizuki-fund-scheduler-1) からの workflow_dispatch（平日 21:00 JST）。
+  # 経路2（予備）: cron '30 8 * * 1-5'（UTC 08:30 = JST 17:30 起票）。
+  #   GitHub の cron は実測 +1h45m〜+3h15m 遅れて着火するため実着火は JST 19:15〜20:45。
+  #   guard ジョブが JST 21:08 まで待機し、本命が動いていなければ自分で配信する（着地 21:20 前後）。
+  # 経路3（三段目）: cron '0 9 * * 1-5'（UTC 09:00 = JST 18:00 起票）。
+  #   経路2 の run が GitHub 側で丸ごと欠落した日の保険。起床は JST 21:25 と経路2 からずらし、
+  #   経路2 が先に配信していれば skip する（二重配信防止）。
+  #
+  # 旧構成（cron '0 13 * * 1-5' = JST 22:00 起票）は遅延で JST 23:52〜00:44 に着火し、
+  # 時間帯ゲートで本体 skip → run 自体は success → 翌日の本命発火がその残骸を「本日配信済み」と
+  # 誤認して無言 skip、という連鎖で平日のほとんどが未配信になっていた（2026-08-05 実測・修正）。
+  # 重複判定は run 単位の conclusion ではなく build-and-send ジョブの結果で行う
+  # （.github/scripts/check_delivery.sh）。
   workflow_dispatch:
     inputs:
       target_date:
@@ -15,74 +27,54 @@ name: 夜間PTS動意レポート
         required: false
         default: 'false'
   schedule:
-    - cron: '0 13 * * 1-5'
+    - cron: '30 8 * * 1-5'
+    - cron: '0 9 * * 1-5'
 
-concurrency:
-  group: pts_mover_report-daily
-  cancel-in-progress: false
+# workflow 単位の concurrency は置かない。予備 run が JST 21:08 まで待機している間に
+# 本命（Worker 21:00 の workflow_dispatch）が pending へ回されると 21 時配信が壊れるため。
+# 二重配信の最終防波堤は build-and-send ジョブ単位の concurrency で担保する。
 
 jobs:
   guard:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # 予備 cron は JST 21:08 / 21:25 まで sleep してから判定するため長め（最大 sleep 3h40m + 本命待ち 30 分）。
+    timeout-minutes: 300
     outputs:
       proceed: ${{ steps.check.outputs.proceed }}
       reason: ${{ steps.check.outputs.reason }}
+      target_date: ${{ steps.check.outputs.target_date }}
     steps:
-      - name: Checkout report-pipelines (通知 action 用)
+      - name: Checkout report-pipelines (通知 action / 配信判定スクリプト用)
         uses: actions/checkout@v4
 
-      - name: Check today's runs
+      - name: 予備タイマー待機 + 当日配信判定（build-and-send ジョブ単位）
         id: check
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.force_rerun }}" = "true" ]; then
-            echo "proceed=true" >> $GITHUB_OUTPUT
-            echo "reason=force_rerun (manual guard bypass)" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-          TODAY_JST=$(TZ=Asia/Tokyo date +%Y-%m-%d)
-          TODAY_START="${TODAY_JST}T00:00:00+09:00"
-          MY_RUN_ID=${{ github.run_id }}
-          EVENT="${{ github.event_name }}"
+          WF_FILE: pts_mover_report.yml
+          SEND_JOB: build-and-send
+          MY_RUN_ID: ${{ github.run_id }}
+          EVENT: ${{ github.event_name }}
+          FORCE_RERUN: ${{ github.event.inputs.force_rerun }}
+          INPUT_DATE: ${{ github.event.inputs.target_date }}
+          # 本命（Worker）は JST 21:00 発火。予備は 21:08、三段目は 21:25 に起床して本命へ道を譲る。
+          WAKE_JST: ${{ github.event.schedule == '0 9 * * 1-5' && '21:25' || '21:08' }}
+          LANE_LABEL: ${{ github.event.schedule == '0 9 * * 1-5' && '経路3(三段目)' || '経路2(予備)' }}
+          WINDOW_START_JST: '12:00'
+          WINDOW_END_JST: '23:30'
+          WAIT_MINUTES: '30'
+        run: bash .github/scripts/standby_guard.sh
 
-          # 夜間帯のレポートのため cron 起動は JST 18〜23 時の外なら skip（深夜遅延着火の日付ズレ防止）。
-          HOUR_JST=$((10#$(TZ=Asia/Tokyo date +%H)))
-          if [ "$EVENT" = "schedule" ] && { [ "$HOUR_JST" -lt 18 ] || [ "$HOUR_JST" -gt 23 ]; }; then
-            echo "proceed=false" >> $GITHUB_OUTPUT
-            echo "reason=skip (cron outside evening window: ${HOUR_JST}h JST)" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
-          RUNS=$(gh api -X GET \
-            "repos/${{ github.repository }}/actions/workflows/pts_mover_report.yml/runs" \
-            -f "created=>=${TODAY_START}" \
-            --jq "[.workflow_runs[] | select(.id != ${MY_RUN_ID})]")
-
-          ACTIVE=$(echo "$RUNS" | jq '[.[] | select(.status=="in_progress" or .status=="queued" or .status=="waiting" or .status=="action_required" or .status=="pending")] | length')
-          DONE_OK=$(echo "$RUNS" | jq '[.[] | select(.conclusion=="success" or .conclusion=="neutral")] | length')
-          DONE_FAIL=$(echo "$RUNS" | jq '[.[] | select(.conclusion=="failure" or .conclusion=="cancelled" or .conclusion=="startup_failure" or .conclusion=="timed_out" or .conclusion=="stale" or .conclusion=="action_required")] | length')
-
-          echo "Today (${TODAY_JST}): active=${ACTIVE} done_ok=${DONE_OK} done_fail=${DONE_FAIL} event=${EVENT} (excluding self ${MY_RUN_ID})"
-
-          if [ "$DONE_OK" -gt 0 ]; then
-            echo "proceed=false" >> $GITHUB_OUTPUT
-            echo "reason=skip (already succeeded today)" >> $GITHUB_OUTPUT
-          elif [ "$ACTIVE" -gt 0 ]; then
-            echo "proceed=false" >> $GITHUB_OUTPUT
-            echo "reason=skip (active run exists)" >> $GITHUB_OUTPUT
-          elif [ "$EVENT" = "schedule" ] && [ "$DONE_FAIL" -ge 2 ]; then
-            echo "proceed=false" >> $GITHUB_OUTPUT
-            echo "reason=retry_cap (cron stopped: done_fail=${DONE_FAIL})" >> $GITHUB_OUTPUT
-          else
-            echo "proceed=true" >> $GITHUB_OUTPUT
-            if [ "$DONE_FAIL" -gt 0 ]; then
-              echo "reason=recovery" >> $GITHUB_OUTPUT
-            else
-              echo "reason=initial" >> $GITHUB_OUTPUT
-            fi
-          fi
+      - name: Discord 通知（⏱ 予備タイマー起動）
+        if: github.event_name == 'schedule' && steps.check.outputs.proceed == 'true'
+        uses: ./.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
+          state: timer
+          label: 夜間PTS動意レポート 予備タイマー起動
+          date: ${{ steps.check.outputs.target_date }}
+          meaning: 定時の Cloudflare Worker 発火が届かなかったため、GHA 側の予備タイマーが代わりに生成を開始しました。レポートはこのあと 15 分ほどで届きます。
+          action_required: 不要（毎日続く場合のみ Worker 点検）
 
       - name: Discord 通知（🚨 自動リトライ停止）
         if: contains(steps.check.outputs.reason, 'retry_cap')
@@ -94,20 +86,32 @@ jobs:
           meaning: 当日 2 回以上失敗したため cron の自動再実行を停止しました。本日未配信です。
           action_required: run ログ確認 → 原因解消後に手動 dispatch（force_rerun=true）で再実行
 
+      - name: Discord 通知（guard 失敗）
+        if: failure() || cancelled()
+        uses: ./.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS || secrets.DISCORD_WEBHOOK_URL }}
+          state: failed
+          label: 夜間PTS動意レポート guard 失敗
+          meaning: 実行前チェック（当日配信済み判定）自体がエラーになり、生成ジョブが起動していません。
+          action_required: run ログ確認 → 手動 dispatch（force_rerun=true）で再実行
+
   build-and-send:
     needs: guard
     if: needs.guard.outputs.proceed == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    # 実配信ジョブだけを直列化する（workflow 単位の concurrency は本命の 21 時発火を塞ぐため置かない）。
+    concurrency:
+      group: pts_mover_report-send
+      cancel-in-progress: false
     steps:
       - name: Determine target date
         id: date
+        env:
+          GUARD_DATE: ${{ needs.guard.outputs.target_date }}
         run: |
-          if [ -n "${{ github.event.inputs.target_date }}" ]; then
-            echo "value=${{ github.event.inputs.target_date }}" >> $GITHUB_OUTPUT
-          else
-            echo "value=$(TZ=Asia/Tokyo date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
-          fi
+          echo "value=${GUARD_DATE}" >> $GITHUB_OUTPUT
 
       - name: Checkout report-pipelines
         uses: actions/checkout@v4
