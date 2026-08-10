@@ -317,14 +317,14 @@ def main() -> int:
         if args.skip_send:
             for label, md_part in markets:
                 p = out_dir / f"{prefix}_{identifier}_{label.lower()}.jpg"
-                render_markdown_to_jpeg(md_part, p, kind=args.kind, footer="@noctra_jp / Mizuki Fund")
+                render_markdown_to_jpeg(md_part, p, kind=args.kind, footer="Market Report")
                 print(f"  saved: {p}  size={p.stat().st_size:,} bytes")
             return 0
 
         for label, md_part in markets:
             p = out_dir / f"{prefix}_{identifier}_{label.lower()}.jpg"
             print(f"[render] movers/{label} → {p.name}")
-            render_markdown_to_jpeg(md_part, p, kind=args.kind, footer="@noctra_jp / Mizuki Fund")
+            render_markdown_to_jpeg(md_part, p, kind=args.kind, footer="Market Report")
             print(f"  saved: {p}  size={p.stat().st_size:,} bytes")
             ensure_under_discord_limit(p)
 
@@ -350,7 +350,7 @@ def main() -> int:
 
     # PM 2026-05-26 確定: 画像分割は絶対禁止・単一ページ JPEG に統一（CLAUDE.md §画像分割絶対禁止 準拠）
     print(f"[1/3] rendering {args.kind} -> JPEG")
-    render_markdown_to_jpeg(md_text, out_path, kind=args.kind, footer="@noctra_jp / Mizuki Fund")
+    render_markdown_to_jpeg(md_text, out_path, kind=args.kind, footer="Market Report")
     print(f"  saved: {out_path}  size={out_path.stat().st_size:,} bytes")
 
     if args.skip_send:

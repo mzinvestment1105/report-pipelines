@@ -262,7 +262,7 @@ def render_markdown_to_jpeg(md_text: str, out_path: Path, kind: str = "macro", q
     """Markdown を JPEG に変換して保存。
 
     身バレ防止：footer は **デフォルト None**（非表示）。
-    Discord 内部送信時のみ呼び出し側で明示的に footer="@noctra_jp / Mizuki Fund" を指定する。
+    Discord 内部送信時のみ呼び出し側で明示的に footer="Market Report" を指定する。
     SNS 用画像生成時の指定忘れによる身バレを構造的に防ぐ設計。
 
     Args:

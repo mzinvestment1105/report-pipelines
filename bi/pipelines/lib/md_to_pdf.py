@@ -266,7 +266,7 @@ def render_markdown_to_pdf(
     out_path: Path,
     kind: str = "macro",
     target_date: str | None = None,
-    brand: str = "MIZUKI FUND",
+    brand: str = "Market Report",
     font_theme: str = "noto",
 ) -> Path:
     """Markdown を A4 PDF にレンダリングして保存し、パスを返す。

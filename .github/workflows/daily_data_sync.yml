@@ -1,0 +1,248 @@
+name: SNS デイリーデータ同期
+
+# PM 2026-08-10 承認（Phase 1）: 運用 X アカウントの日次スナップショットを無人で取得し、
+# Private リポ（生成物の置き場）へ commit back する。PM の手作業はゼロ。
+#
+# 実行内容（毎日 06:00 JST）:
+#   1. プロフィール + フォロワー全件取得   → profile_daily_{date}.json
+#   2. 前日比 churn（lost / new / retained）→ churn_{date}.csv / churn_summary_{date}.json
+#   3. 自アカウントのタイムライン実績取得   → user_tl_daily_{date}.json
+#   4. バズ収集                            → buzz_{date}.json
+#
+# 設計上の注意（このリポジトリは Public のため）:
+#   - 対象ハンドルは Secrets（X_DAILY_TARGETS・カンマ区切り）で渡し、yml 本文に書かない。
+#     ハンドルから派生した文字列（先頭1件など）も **絶対に echo しない**
+#     （Secrets 本体は GitHub がマスクするが、部分文字列はマスクされないため）
+#   - 各スクリプトの stdout/stderr は *.log へ隔離する。log の中身は cat しない
+#     （スクリプトは "navigate: https://x.com/{handle}" 等をそのまま出力するため）
+#   - 公開ログへ出すのは exit code・出力ファイルの有無（bool）・件数のみ
+#   - artifact のアップロードはしない（Public リポの artifact は第三者が取得可能）
+#   - Public 側のスクリプトを private-repo へ上書きコピーしない。X 系スクリプトは
+#     Private にしか存在しないため、clone した Private の実物をそのまま実行する
+#
+# 続行性:
+#   取得系の各ステップは continue-on-error で、1本落ちても後続を止めない。
+#   日次 KPI（1〜3）を先に commit し、所要時間の長いバズ収集（4）は後段で別 commit する。
+#   バズが step timeout で切れても KPI は必ず Private に残る。
+"on":
+  schedule:
+    # UTC 21:00 = JST 翌 06:00
+    - cron: '0 21 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: daily_data_sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Resolve date (JST)
+        id: date
+        run: echo "value=$(TZ=Asia/Tokyo date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+
+      - name: Checkout report-pipelines
+        uses: actions/checkout@v4
+        with:
+          path: report-pipelines
+
+      - name: Setup SSH for private repo
+        env:
+          PRIVATE_REPO_DEPLOY_KEY: ${{ secrets.PRIVATE_REPO_DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$PRIVATE_REPO_DEPLOY_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+      - name: Clone private repo (mizuki-fund)
+        run: |
+          git clone git@github.com:mzinvestment1105/mizuki-fund.git private-repo
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install playwright python-dotenv pyyaml
+          # fingerprint 偽装。ローカル実装では import ガード付きの任意依存なので
+          # 解決に失敗しても続行させる。
+          pip install playwright-stealth || echo "[INFO] playwright-stealth 未導入（任意依存・続行）"
+          playwright install chromium --with-deps
+
+      - name: Preflight (Secrets の有無を bool で確認)
+        id: preflight
+        env:
+          X_BURNER_AUTH_TOKEN: ${{ secrets.X_BURNER_AUTH_TOKEN }}
+          X_BURNER_CT0: ${{ secrets.X_BURNER_CT0 }}
+          X_DAILY_TARGETS: ${{ secrets.X_DAILY_TARGETS }}
+        run: |
+          # 値そのものは出さず、設定済みかどうかと対象件数だけを出す
+          [ -n "$X_BURNER_AUTH_TOKEN" ] && echo "auth_token_set=true" || echo "auth_token_set=false"
+          [ -n "$X_BURNER_CT0" ] && echo "ct0_set=true" || echo "ct0_set=false"
+          if [ -n "$X_DAILY_TARGETS" ]; then
+            n=$(echo "$X_DAILY_TARGETS" | tr ',' '\n' | grep -c '[^[:space:]]')
+            echo "targets_set=true"
+            echo "targets_count=${n}"
+          else
+            echo "targets_set=false"
+            echo "targets_count=0"
+          fi
+
+      - name: 1/4 プロフィール + フォロワー全件取得
+        id: profile
+        continue-on-error: true
+        timeout-minutes: 10
+        working-directory: ./private-repo/bi/pipelines
+        env:
+          X_BURNER_AUTH_TOKEN: ${{ secrets.X_BURNER_AUTH_TOKEN }}
+          X_BURNER_CT0: ${{ secrets.X_BURNER_CT0 }}
+          X_DAILY_TARGETS: ${{ secrets.X_DAILY_TARGETS }}
+          PYTHONIOENCODING: utf-8
+        run: |
+          set +e
+          python fetch_x_profile.py \
+            --users "$X_DAILY_TARGETS" \
+            --followers --followers-max 1000 \
+            --slug daily \
+            --out-dir bi/outputs/x_posts/gha \
+            > profile.log 2>&1
+          ec=$?
+          set -e
+          echo "exit_code=${ec}"
+          echo "exit_code=${ec}" >> $GITHUB_OUTPUT
+          if ls ../outputs/x_posts/gha/profile_daily_*.json >/dev/null 2>&1; then
+            echo "profile_json_exists=true"
+          else
+            echo "profile_json_exists=false"
+          fi
+
+      - name: 2/4 前日比 churn 算出
+        id: churn
+        continue-on-error: true
+        timeout-minutes: 3
+        working-directory: ./private-repo/bi/pipelines
+        env:
+          PYTHONIOENCODING: utf-8
+        run: |
+          set +e
+          python analyze_follower_churn.py \
+            --date "${{ steps.date.outputs.value }}" \
+            --in-dir bi/outputs/x_posts/gha \
+            --out-dir bi/outputs/x_posts/gha \
+            > churn.log 2>&1
+          ec=$?
+          set -e
+          echo "exit_code=${ec}"
+          # 件数のみを summary JSON から読んで出す（ハンドルは出さない）
+          python - <<'PY'
+          import glob, json, os
+          files = sorted(glob.glob("../outputs/x_posts/gha/churn_summary_*.json"))
+          if not files:
+              print("summary_exists=false")
+              raise SystemExit(0)
+          print("summary_exists=true")
+          d = json.load(open(files[-1], encoding="utf-8"))
+          print(f"compared={str(bool(d.get('compared'))).lower()}")
+          print(f"days_since_previous={d.get('days_since_previous')}")
+          for i, a in enumerate(d.get("accounts", [])):
+              print(f"account{i}: followers={a.get('followers_count')} friends={a.get('friends_count')} "
+                    f"ff_ratio={a.get('ff_ratio')} statuses={a.get('statuses_count')} "
+                    f"lost={a.get('lost')} new={a.get('new')} retained={a.get('retained')}")
+          print(f"churn_csv_exists={str(bool(glob.glob('../outputs/x_posts/gha/churn_2*.csv'))).lower()}")
+          PY
+
+      - name: 3/4 自アカウントのタイムライン実績取得
+        id: timeline
+        continue-on-error: true
+        timeout-minutes: 5
+        working-directory: ./private-repo/bi/pipelines
+        env:
+          X_BURNER_AUTH_TOKEN: ${{ secrets.X_BURNER_AUTH_TOKEN }}
+          X_BURNER_CT0: ${{ secrets.X_BURNER_CT0 }}
+          X_DAILY_TARGETS: ${{ secrets.X_DAILY_TARGETS }}
+          PYTHONIOENCODING: utf-8
+        run: |
+          # 対象は X_DAILY_TARGETS の1件目。派生文字列は echo しない
+          TARGET1="${X_DAILY_TARGETS%%,*}"
+          if [ -z "$TARGET1" ]; then
+            echo "target_resolved=false"
+            exit 1
+          fi
+          echo "target_resolved=true"
+          set +e
+          python fetch_x_posts.py \
+            --user "$TARGET1" \
+            --count 40 \
+            --slug tl_daily \
+            --out-dir bi/outputs/x_posts/gha \
+            > timeline.log 2>&1
+          ec=$?
+          set -e
+          echo "exit_code=${ec}"
+          if ls ../outputs/x_posts/gha/user_tl_daily_*.json >/dev/null 2>&1; then
+            echo "timeline_json_exists=true"
+            python -c "import glob,json;f=sorted(glob.glob('../outputs/x_posts/gha/user_tl_daily_*.json'))[-1];print('timeline_posts='+str(json.load(open(f,encoding='utf-8')).get('count')))"
+          else
+            echo "timeline_json_exists=false"
+          fi
+
+      - name: 日次 KPI を Private へ commit（バズ収集より前に確定させる）
+        id: commit_kpi
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 4
+        working-directory: ./private-repo
+        run: |
+          bash ../report-pipelines/bi/pipelines/ops/ci_commit_push.sh \
+            -m "data: sns daily ${{ steps.date.outputs.value }}" \
+            bi/outputs/x_posts/gha
+
+      - name: 4/4 バズ収集
+        id: buzz
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 12
+        working-directory: ./private-repo/bi/pipelines
+        env:
+          X_BURNER_AUTH_TOKEN: ${{ secrets.X_BURNER_AUTH_TOKEN }}
+          X_BURNER_CT0: ${{ secrets.X_BURNER_CT0 }}
+          PYTHONIOENCODING: utf-8
+        run: |
+          set +e
+          python fetch_x_buzz.py --out-dir bi/outputs/x_posts/gha > buzz.log 2>&1
+          ec=$?
+          set -e
+          echo "exit_code=${ec}"
+          if ls ../outputs/x_posts/gha/buzz_*.json >/dev/null 2>&1; then
+            echo "buzz_json_exists=true"
+          else
+            echo "buzz_json_exists=false"
+          fi
+
+      - name: バズ収集分を Private へ commit
+        id: commit_buzz
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 4
+        working-directory: ./private-repo
+        run: |
+          bash ../report-pipelines/bi/pipelines/ops/ci_commit_push.sh \
+            -m "data: sns buzz ${{ steps.date.outputs.value }}" \
+            bi/outputs/x_posts/gha
+
+      - name: 成否サマリ（bool のみ）
+        if: always()
+        run: |
+          echo "date=${{ steps.date.outputs.value }}"
+          echo "profile_ok=${{ steps.profile.outcome == 'success' }}"
+          echo "churn_ok=${{ steps.churn.outcome == 'success' }}"
+          echo "timeline_ok=${{ steps.timeline.outcome == 'success' }}"
+          echo "buzz_ok=${{ steps.buzz.outcome == 'success' }}"
+          echo "commit_kpi_ok=${{ steps.commit_kpi.outcome == 'success' }}"
+          echo "commit_buzz_ok=${{ steps.commit_buzz.outcome == 'success' }}"
