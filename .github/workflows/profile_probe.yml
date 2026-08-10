@@ -1,0 +1,318 @@
+name: X プロフィール取得カナリア（GHA 疎通判定）
+
+# PM 2026-08-10 承認: Phase 1 の前提確認として「GitHub Actions の runner から
+# X のプロフィール取得（cookie 注入 + Playwright）が通るか」を1回の実測で判定する。
+#
+# 設計上の注意（公開リポのため）:
+#   - schedule なし・workflow_dispatch のみ（意図した1回だけ動く）
+#   - 対象ハンドルは secret（X_PROBE_TARGET）経由で渡し、yml 本文に書かない
+#   - スクリプトの stdout/stderr は probe.log に落とし、ログには出さない
+#   - ログへ出すのは「exit code」「出力 JSON の有無」「followers を数値で取れたか(bool)」
+#     「失敗分類ラベル（固定 enum）」の4点のみ。実数値・ハンドル・cookie は出さない
+#   - artifact のアップロードはしない（公開リポの artifact は第三者が取得可能）
+#   - private リポへの commit はしない（runner は使い捨てのため出力は破棄される）
+"on":
+  workflow_dispatch:
+
+concurrency:
+  group: profile_probe
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Setup SSH for private repo
+        env:
+          PRIVATE_REPO_DEPLOY_KEY: ${{ secrets.PRIVATE_REPO_DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$PRIVATE_REPO_DEPLOY_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+      - name: Clone private repo (mizuki-fund)
+        run: |
+          git clone git@github.com:mzinvestment1105/mizuki-fund.git private-repo
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install playwright python-dotenv
+          # fingerprint 偽装。ローカル実装では import ガード付きの任意依存なので
+          # 解決に失敗してもカナリアは続行させる（無しでも判定自体は成立する）。
+          pip install playwright-stealth || echo "[INFO] playwright-stealth 未導入（任意依存・続行）"
+          playwright install chromium --with-deps
+
+      - name: Write probe script
+        # fetch_x_profile.py は現時点でどちらのリポの remote にも未コミットのため、
+        # その中核（cookie 注入コンテキスト → プロフィールページ遷移 → GraphQL 傍受 →
+        # followers_count 抽出）だけを最小構成で再現する。cookie 注入・UA・stealth は
+        # private リポの fetch_x_posts._new_context をそのまま流用する（= 判定対象の本体）。
+        working-directory: ./private-repo/bi/pipelines
+        run: |
+          cat > x_profile_probe.py <<'PY'
+          """GHA runner から X のプロフィール取得が通るかを判定するカナリア（読み取り専用）。
+
+          page.goto とスクロールのみを行い、投稿・いいね・フォロー等の書き込みは一切しない。
+          判定結果は probe_result.json（bool と固定ラベルのみ）に書き、対象ハンドル・実数値は
+          標準出力（= probe.log）側にしか出さない。
+          """
+          from __future__ import annotations
+
+          import argparse
+          import asyncio
+          import json
+          import os
+          import sys
+          from datetime import datetime, timedelta, timezone
+          from pathlib import Path
+
+          from playwright.async_api import async_playwright
+
+          sys.path.insert(0, str(Path(__file__).resolve().parent))
+          import fetch_x_posts as fx  # noqa: E402
+
+          JST = timezone(timedelta(hours=9))
+          REPO_ROOT = Path(__file__).resolve().parents[2]
+          OUT_DIR = REPO_ROOT / "bi" / "outputs" / "x_posts"
+          RESULT_PATH = Path(__file__).resolve().parent / "probe_result.json"
+          PROFILE_HOSTS = ("UserByScreenName", "UserByRestId")
+
+
+          def _d(node, key):
+              v = node.get(key) if isinstance(node, dict) else None
+              return v if isinstance(v, dict) else {}
+
+
+          def _find_users(node, acc):
+              """GraphQL レスポンスを再帰走査して User オブジェクトを集める。"""
+              if isinstance(node, dict):
+                  for key in ("user_results", "user"):
+                      v = node.get(key)
+                      if isinstance(v, dict) and isinstance(v.get("result"), dict):
+                          r = v["result"]
+                          if r.get("__typename") == "User" or "rest_id" in r:
+                              acc.append(r)
+                  for v in node.values():
+                      _find_users(v, acc)
+              elif isinstance(node, list):
+                  for v in node:
+                      _find_users(v, acc)
+
+
+          def _followers_of(r):
+              """新旧2系統のキー配置の両方から followers_count を取る。"""
+              legacy = _d(r, "legacy")
+              rel = _d(r, "relationship_counts")
+              for v in (legacy.get("followers_count"), rel.get("followers")):
+                  if v is not None:
+                      return v
+              return None
+
+
+          def _screen_name_of(r):
+              legacy = _d(r, "legacy")
+              core = _d(r, "core")
+              return legacy.get("screen_name") or core.get("screen_name")
+
+
+          async def run(target: str, slug: str) -> dict:
+              state = {
+                  "followers_numeric": False,
+                  "json_written": False,
+                  "category": "ERROR",
+              }
+              users: list[dict] = []
+              statuses: list[int] = []
+              final_url = ""
+
+              async with async_playwright() as p:
+                  browser, context = await fx._new_context(p, False)
+                  page = await context.new_page()
+
+                  async def on_response(response):
+                      url = response.url
+                      if "/i/api/graphql" not in url and "/graphql/" not in url:
+                          return
+                      statuses.append(response.status)
+                      if response.status != 200:
+                          return
+                      if any(h in url for h in PROFILE_HOSTS):
+                          try:
+                              _find_users(await response.json(), users)
+                          except Exception as e:  # noqa: BLE001
+                              print(f"[probe] parse_fail: {e}")
+
+                  page.on("response", on_response)
+                  try:
+                      await page.goto(
+                          f"https://x.com/{target}",
+                          wait_until="domcontentloaded",
+                          timeout=60000,
+                      )
+                      await asyncio.sleep(8)
+                      await page.evaluate("window.scrollBy(0, 1200)")
+                      await asyncio.sleep(4)
+                      final_url = page.url
+                  except Exception as e:  # noqa: BLE001
+                      print(f"[probe] nav error: {type(e).__name__}: {e}")
+                      state["category"] = "TIMEOUT" if "Timeout" in type(e).__name__ else "NAV_ERROR"
+                  finally:
+                      await page.close()
+                      await context.close()
+                      await browser.close()
+
+              profile = None
+              for r in users:
+                  if (_screen_name_of(r) or "").lower() == target.lower():
+                      profile = r
+                      break
+              if profile is None and users:
+                  profile = users[0]
+
+              followers = _followers_of(profile) if profile else None
+              if isinstance(followers, bool):
+                  followers = None
+              state["followers_numeric"] = isinstance(followers, int) or (
+                  isinstance(followers, str) and followers.isdigit()
+              )
+
+              # 分類（固定ラベルのみ。生レスポンス・実数値はここに載せない）
+              if state["followers_numeric"]:
+                  state["category"] = "OK"
+              elif 429 in statuses:
+                  state["category"] = "HTTP_429_RATE_LIMITED"
+              elif 403 in statuses:
+                  state["category"] = "HTTP_403_FORBIDDEN"
+              elif any(s >= 400 for s in statuses):
+                  state["category"] = "HTTP_4XX_5XX"
+              elif "/i/flow/login" in final_url or "/login" in final_url:
+                  state["category"] = "REDIRECT_TO_LOGIN"
+              elif not statuses:
+                  state["category"] = "NO_GRAPHQL_RESPONSE"
+              elif not users:
+                  state["category"] = "EMPTY_PROFILE_RESPONSE"
+              elif state["category"] == "ERROR":
+                  state["category"] = "PARSED_BUT_NO_COUNT"
+
+              print(f"[probe] graphql statuses={sorted(set(statuses))} users={len(users)}")
+              print(f"[probe] followers_raw={followers!r} final_url={final_url}")
+
+              if profile is not None:
+                  OUT_DIR.mkdir(parents=True, exist_ok=True)
+                  stamp = datetime.now(JST)
+                  out_path = OUT_DIR / f"profile_{slug}_{stamp.strftime('%Y-%m-%d')}.json"
+                  n = 2
+                  while out_path.exists():
+                      out_path = OUT_DIR / f"profile_{slug}_{stamp.strftime('%Y-%m-%d')}_r{n}.json"
+                      n += 1
+                  out_path.write_text(
+                      json.dumps(
+                          {"fetched_at": stamp.isoformat(), "slug": slug, "profile": profile},
+                          ensure_ascii=False,
+                          indent=2,
+                          default=str,
+                      ),
+                      encoding="utf-8",
+                  )
+                  state["json_written"] = out_path.exists()
+                  print(f"[probe] saved: {out_path}")
+
+              return state
+
+
+          def main() -> int:
+              parser = argparse.ArgumentParser()
+              parser.add_argument("--users", required=True)
+              parser.add_argument("--slug", required=True)
+              args = parser.parse_args()
+
+              target = next(
+                  (u.strip().lstrip("@") for u in args.users.split(",") if u.strip()), ""
+              )
+              if not target:
+                  RESULT_PATH.write_text(
+                      json.dumps({"followers_numeric": False, "json_written": False,
+                                  "category": "NO_TARGET"}),
+                      encoding="utf-8",
+                  )
+                  return 2
+              if not (os.getenv("X_BURNER_AUTH_TOKEN") and os.getenv("X_BURNER_CT0")):
+                  RESULT_PATH.write_text(
+                      json.dumps({"followers_numeric": False, "json_written": False,
+                                  "category": "NO_COOKIES"}),
+                      encoding="utf-8",
+                  )
+                  return 2
+
+              try:
+                  state = asyncio.run(run(target, args.slug))
+              except Exception as e:  # noqa: BLE001
+                  print(f"[probe] fatal: {type(e).__name__}: {e}")
+                  state = {"followers_numeric": False, "json_written": False,
+                           "category": f"FATAL_{type(e).__name__}"[:48]}
+
+              RESULT_PATH.write_text(json.dumps(state), encoding="utf-8")
+              return 0 if state["followers_numeric"] else 3
+
+
+          if __name__ == "__main__":
+              raise SystemExit(main())
+          PY
+          python -c "import ast,pathlib; ast.parse(pathlib.Path('x_profile_probe.py').read_text(encoding='utf-8')); print('probe script syntax OK')"
+
+      - name: Run probe (stdout/stderr は probe.log へ隔離)
+        id: probe
+        working-directory: ./private-repo/bi/pipelines
+        env:
+          X_BURNER_AUTH_TOKEN: ${{ secrets.X_BURNER_AUTH_TOKEN }}
+          X_BURNER_CT0: ${{ secrets.X_BURNER_CT0 }}
+          X_PROBE_TARGET: ${{ secrets.X_PROBE_TARGET }}
+          PYTHONIOENCODING: utf-8
+        run: |
+          set +e
+          python x_profile_probe.py --users "$X_PROBE_TARGET" --slug ghprobe > probe.log 2>&1
+          ec=$?
+          set -e
+          echo "exit_code=${ec}"
+          echo "exit_code=${ec}" >> $GITHUB_OUTPUT
+
+          # 出力 JSON の有無（ファイル名・中身は出さず bool のみ）
+          if ls ../outputs/x_posts/profile_ghprobe_*.json >/dev/null 2>&1; then
+            echo "output_json_exists=true"
+          else
+            echo "output_json_exists=false"
+          fi
+
+          # followers を数値で取れたか（bool のみ）＋ 失敗分類（固定ラベルのみ）
+          if [ -f probe_result.json ]; then
+            python - <<'PY'
+          import json
+          r = json.load(open("probe_result.json", encoding="utf-8"))
+          print(f"followers_numeric={str(bool(r.get('followers_numeric'))).lower()}")
+          print(f"category={r.get('category')}")
+          PY
+          else
+            echo "followers_numeric=false"
+            echo "category=NO_RESULT_FILE"
+            # probe_result.json が書かれる前に落ちたケースのみ、既知シグネチャを
+            # 固定ラベルへ写して出す（probe.log の生内容は出さない）。
+            for pat in "ModuleNotFoundError" "ImportError" "Executable doesn't exist" \
+                       "Timeout" "429" "403" "ERR_CONNECTION" "SyntaxError"; do
+              if grep -qF "$pat" probe.log 2>/dev/null; then
+                echo "log_signature_present=$(echo "$pat" | tr ' ' '_')"
+              fi
+            done
+          fi
+
+      - name: Verdict
+        if: always()
+        run: |
+          echo "canary exit_code=${{ steps.probe.outputs.exit_code }} (0=通った / 3=弾かれた / 2=前提不備)"
