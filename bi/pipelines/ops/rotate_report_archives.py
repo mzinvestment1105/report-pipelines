@@ -39,7 +39,8 @@ import sys
 from pathlib import Path
 
 KEEP_COUNT = 5
-TARGET_FOLDERS = ["macro", "movers", "theme", "ideas", "largecap", "scout", "positions"]
+TARGET_FOLDERS = ["macro", "movers", "theme", "ideas", "largecap", "scout", "positions",
+                  "money_flow"]
 DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
 
 # market/daily/ 直下の raw ファイル（{YYYY-MM-DD}_{source}_raw.md）ローテーション設定

@@ -1,4 +1,4 @@
-# 当ファンド 全レポート共通品質ルール（GHA 自動レポート必読・単一の真実）
+# Mizuki Fund 全レポート共通品質ルール（GHA 自動レポート必読・単一の真実）
 
 本ファイルは GitHub Actions で自動生成される全レポート（マクロ・動意・セクター・テーマ・決算・アイデア・銘柄等）が Step 0 で必ず Read する共通品質ルール。GHA runner はローカル `.claude/commands/*.md`・memory・[CLAUDE.md](../CLAUDE.md) を読まないため、品質ルールは全て本ファイルに自己完結する。各 prompts ファイル冒頭で本ファイルを Read し全ルールを遵守する。
 

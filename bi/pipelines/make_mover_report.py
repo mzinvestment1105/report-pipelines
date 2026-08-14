@@ -39,7 +39,7 @@ import os
 import re
 import sys
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
@@ -99,6 +99,23 @@ _MINKABU_HEADERS = {
     )
 }
 
+# bot 判定回避用のブラウザ相当ヘッダー（UA だけだとデータセンター帯から弾かれやすい）
+_BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "same-origin",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+    "Connection": "keep-alive",
+}
+
 _BBS_NOISE = re.compile(
     r"(JavaScript|ポートフォリオ|ランキング|ログイン|VIP倶楽部|掲示板マイページ"
     r"|前のページ|変更点|リニューアル|^返信|投資の参考|^はい\d|^いいえ\d"
@@ -117,6 +134,12 @@ _BBS_NOISE = re.compile(
 _BBS_POST_LIKE = re.compile(r"[。！？ねよわだます]")
 # 引用付き投稿（>>番号）は引用なし版が直後に来るため除外
 _BBS_QUOTE = re.compile(r"^>>\d+")
+
+# 取得失敗の記録（呼び出し側が品質注記に使う）。
+# 例外を握り潰して空配列を返すだけだと無警告で材料が欠落するため、失敗理由をここに積む。
+FETCH_ERRORS: dict[str, list[str]] = {"minkabu": [], "yahoo_disclosure": []}
+
+JST = timezone(timedelta(hours=9))
 
 
 # ---------------------------------------------------------------------------
@@ -755,11 +778,50 @@ def fetch_tdnet_batch(codes: list[str], no_pdf: bool = False) -> dict[str, dict]
 # Step 5: みんかぶ ニューススクレイピング（Yahoo Finance Japan 代替）
 # ---------------------------------------------------------------------------
 
+_MINKABU_SESSION: requests.Session | None = None
+
+
+def _get_minkabu_session() -> requests.Session:
+    """みんかぶ用 requests.Session（ブラウザ相当ヘッダー + トップ訪問で cookie 取得）。"""
+    global _MINKABU_SESSION
+    if _MINKABU_SESSION is not None:
+        return _MINKABU_SESSION
+    s = requests.Session()
+    s.headers.update(_BROWSER_HEADERS | {"Referer": "https://minkabu.jp/"})
+    try:
+        s.get("https://minkabu.jp/", timeout=15)
+    except Exception as e:
+        print(f"  [WARN] minkabu top page session init failed: {e}")
+    _MINKABU_SESSION = s
+    return s
+
+
+def _get_with_retry(session: requests.Session, url: str, referer: str = "",
+                    timeout: int = 15, tries: int = 2) -> requests.Response:
+    """セッション付き GET（指数バックオフで少数回リトライ）。最後のレスポンスを返す。
+
+    連打は相手負荷になるため tries は 2 まで・待機は 2秒→4秒。
+    """
+    last = None
+    for i in range(tries):
+        if i:
+            time.sleep(2 ** i)
+        headers = {"Referer": referer} if referer else None
+        last = session.get(url, headers=headers, timeout=timeout)
+        if last.status_code == 200:
+            return last
+    return last
+
+
 def fetch_minkabu_news(code4: str, max_items: int = 8) -> list[dict]:
+    """銘柄別ニュース見出しを取得する（みんかぶ→取得不可なら Yahoo!ファイナンス）。
+
+    戻り値は従来どおり [{"title","date","source"}...]。source に実際の取得元が入る。
+    """
     from bs4 import BeautifulSoup
     url = f"https://minkabu.jp/stock/{code4}/news"
     try:
-        r = requests.get(url, headers=_MINKABU_HEADERS, timeout=15)
+        r = _get_with_retry(_get_minkabu_session(), url, referer=f"https://minkabu.jp/stock/{code4}")
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
         items = []
@@ -777,10 +839,96 @@ def fetch_minkabu_news(code4: str, max_items: int = 8) -> list[dict]:
             items.append({"title": title, "date": "", "source": "みんかぶ"})
             if len(items) >= max_items:
                 break
-        return items
+        if items:
+            return items
+        FETCH_ERRORS["minkabu"].append(f"{code4}: 記事0件（ブロック疑い）")
     except Exception as e:
         print(f"  [WARN] {code4} minkabu news fetch failed: {e}")
+        FETCH_ERRORS["minkabu"].append(f"{code4}: {e}")
+    # 代替ソース: Yahoo!ファイナンス ニュースタブ（同一 runner から到達実績のある経路）
+    return fetch_yahoo_news(code4, max_items)
+
+
+def fetch_yahoo_news(code4: str, max_items: int = 8) -> list[dict]:
+    """Yahoo!ファイナンス ニュースタブから銘柄別ニュース見出しを取得する（みんかぶ代替）。
+
+    埋め込み JSON（newsTopics.articles）を優先し、無ければ HTML の記事リンクから拾う。
+    """
+    import json
+    url = f"https://finance.yahoo.co.jp/quote/{code4}.T/news"
+    try:
+        r = _get_with_retry(_get_yahoo_session(), url, timeout=20)
+        r.raise_for_status()
+        html = r.text
+    except Exception as e:
+        print(f"  [WARN] {code4} yahoo news fetch failed: {e}")
+        FETCH_ERRORS["minkabu"].append(f"{code4}: Yahooニュースも失敗 {e}")
         return []
+
+    items: list[dict] = []
+    seen: set[str] = set()
+
+    def _add(title: str, when: str, media: str) -> None:
+        # source は「どこから取ったか」（＝Yahoo!ファイナンス）。media は記事の配信元。
+        title = re.sub(r"\s+", " ", str(title)).strip()
+        if not title or len(title) < 8 or title in seen:
+            return
+        seen.add(title)
+        items.append({"title": title, "date": when, "source": "Yahoo!ファイナンス", "media": media})
+
+    try:
+        chunks = []
+        for m in _NEXT_FLIGHT_RE.finditer(html):
+            try:
+                chunks.append(json.loads(m.group(1)))
+            except Exception:
+                continue
+        flight = "".join(chunks)
+        for m in re.finditer(r'"newsTopics"\s*:\s*', flight):
+            brace = flight.find("{", m.end())
+            if brace < 0:
+                continue
+            blob = _extract_json_object(flight, brace)
+            try:
+                arts = json.loads(blob).get("articles", []) if blob else []
+            except Exception:
+                arts = []
+            for a in arts:
+                if isinstance(a, dict) and a.get("headline"):
+                    _add(a["headline"], str(a.get("createTime", "")), str(a.get("mediaName", "")))
+            if items:
+                break
+    except Exception as e:
+        print(f"  [WARN] {code4} yahoo news json parse failed: {e}")
+
+    if not items:
+        try:
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(html, "html.parser")
+            for a in soup.find_all("a", href=True):
+                if not a["href"].startswith("/news/detail/"):
+                    continue
+                txt = re.sub(r"\s+", " ", a.get_text(" ", strip=True)).strip()
+                # 「タイトル HH:MM 提供元」の並びから時刻・提供元を切り離す
+                m = re.search(r"^(.*?)\s+(\d{1,2}:\d{2})\s+(\S+)$", txt)
+                if m:
+                    _add(m.group(1), m.group(2), m.group(3))
+                else:
+                    _add(txt, "", "")
+        except Exception as e:
+            print(f"  [WARN] {code4} yahoo news html parse failed: {e}")
+
+    if not items:
+        FETCH_ERRORS["minkabu"].append(f"{code4}: Yahooニュースも0件")
+    return items[:max_items]
+
+
+def news_block_label(news: list[dict]) -> str:
+    """ニュースブロックの見出し（実際の取得元を反映。みんかぶのみなら従来表記）。"""
+    srcs = list(dict.fromkeys((n.get("source") or "みんかぶ") for n in (news or [])))
+    if not srcs or srcs == ["みんかぶ"]:
+        return "みんかぶニュース"
+    return "／".join(srcs) + " ニュース"
 
 
 _YAHOO_BBS_HEADERS = {
@@ -973,6 +1121,250 @@ def fetch_company_description(client: EdinetDBClient, code4: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Step 5a: Yahoo!ファイナンス 適時開示タブ（時刻付き開示・TDnetミラーの欠落補完）
+# ---------------------------------------------------------------------------
+
+_YAHOO_DISCLOSURE_URL = "https://finance.yahoo.co.jp/quote/{code}.T/disclosure"
+# Next.js RSC ペイロード（self.__next_f.push([N,"...JSON文字列..."])）を拾う
+_NEXT_FLIGHT_RE = re.compile(r'self\.__next_f\.push\(\s*\[\s*\d+\s*,\s*("(?:[^"\\]|\\.)*")')
+_ISO_TIME_RE = re.compile(r"T\d{2}:\d{2}")
+
+
+def _parse_iso_jst(iso: str) -> datetime | None:
+    """ISO8601 文字列を JST の naive datetime にして返す（失敗時 None）。"""
+    if not iso:
+        return None
+    try:
+        dt = datetime.fromisoformat(iso.strip().replace("Z", "+00:00"))
+    except Exception:
+        return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(JST).replace(tzinfo=None)
+    return dt
+
+
+def disclosure_time_info(published: str) -> tuple[bool, str]:
+    """開示の published(ISO) から (時刻情報を持つか, "M/D HH:MM" ラベル) を返す。
+
+    時刻を持たない（日付のみ）場合はラベルを "M/D" だけにする。
+    """
+    dt = _parse_iso_jst(published)
+    if dt is None:
+        return False, ""
+    if _ISO_TIME_RE.search(published):
+        return True, f"{dt.month}/{dt.day} {dt.hour}:{dt.minute:02d}"
+    return False, f"{dt.month}/{dt.day}"
+
+
+def _extract_json_object(text: str, start: int) -> str:
+    """text[start] の '{' から対応する '}' までを切り出す（文字列内の括弧は無視）。"""
+    depth, in_str, esc = 0, False, False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if esc:
+            esc = False
+            continue
+        if ch == "\\":
+            esc = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return ""
+
+
+def _parse_yahoo_disclosure_json(html: str) -> list[dict]:
+    """埋め込み JSON（RSC ペイロード）から適時開示リストを取り出す。"""
+    import json
+    chunks = []
+    for m in _NEXT_FLIGHT_RE.finditer(html):
+        try:
+            chunks.append(json.loads(m.group(1)))
+        except Exception:
+            continue
+    flight = "".join(chunks)
+    if not flight:
+        return []
+    items: list = []
+    for m in re.finditer(r'"disclosure"\s*:\s*', flight):
+        brace = flight.find("{", m.end())
+        if brace < 0:
+            continue
+        blob = _extract_json_object(flight, brace)
+        if not blob:
+            continue
+        try:
+            obj = json.loads(blob)
+        except Exception:
+            continue
+        cand = obj.get("items") if isinstance(obj, dict) else None
+        if isinstance(cand, list) and cand:
+            items = cand
+            break
+    out = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        title = str(it.get("headline") or it.get("title") or "").strip()
+        iso = str(it.get("createdDateTime") or it.get("publishedDateTime") or "").strip()
+        if not title or not iso:
+            continue
+        out.append({"title": title, "published": iso,
+                    "pdf_url": str(it.get("link") or "").strip(),
+                    "media": str(it.get("mediaName") or "").strip()})
+    return out
+
+
+def _parse_yahoo_disclosure_html(html: str) -> list[dict]:
+    """HTML DOM から適時開示リストを取り出す（JSON 経路が壊れた時の保険）。
+
+    構造（2026-08 時点）: <a href="...pdf"><h3>タイトル</h3><ul><li><time datetime="ISO">M/D HH:MM</time>
+    クラス名はビルドごとに変わるため、a > (h3|h2) + time の関係だけに依存する。
+    """
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(html, "html.parser")
+    out, seen = [], set()
+    for a in soup.find_all("a", href=True):
+        head = a.find(["h3", "h2", "h4"])
+        if head is None:
+            continue
+        t = a.find("time")
+        if t is None:
+            parent = a.parent
+            t = parent.find("time") if parent is not None else None
+        if t is None:
+            continue
+        iso = (t.get("datetime") or "").strip()
+        title = head.get_text(" ", strip=True)
+        if not title or not iso:
+            continue
+        key = (iso, title)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"title": title, "published": iso,
+                    "pdf_url": a.get("href", "").strip(), "media": ""})
+    return out
+
+
+def fetch_yahoo_disclosures(code4: str, max_items: int = 30) -> dict:
+    """Yahoo!ファイナンスの適時開示タブから開示（日付・時刻付き）を取得する。
+
+    yanoshin の TDnet ミラーは銘柄単位で当日分を落とすことがあるため、
+    「当日の開示があったか」を機械判定できる時刻付きソースとして併用する。
+
+    Returns:
+        {"entries": [{"title","published","pdf_url","pdf_text","has_time",
+                      "time_label","source"}...],
+         "error": "" or 失敗理由（HTTP status / パース失敗）,
+         "parser": "json" | "html" | ""}
+        例外は投げず、失敗理由を error に載せて返す（呼び出し側が品質注記に使う）。
+    """
+    url = _YAHOO_DISCLOSURE_URL.format(code=code4)
+    try:
+        s = _get_yahoo_session()
+        r = s.get(url, timeout=20)
+        if r.status_code != 200:
+            err = f"HTTP {r.status_code}"
+            FETCH_ERRORS["yahoo_disclosure"].append(f"{code4}: {err}")
+            print(f"  [WARN] {code4} yahoo disclosure fetch failed: {err}")
+            return {"entries": [], "error": err, "parser": ""}
+        r.encoding = r.encoding or "utf-8"
+        html = r.text
+    except Exception as e:
+        err = f"取得例外: {e}"
+        FETCH_ERRORS["yahoo_disclosure"].append(f"{code4}: {e}")
+        print(f"  [WARN] {code4} yahoo disclosure fetch failed: {e}")
+        return {"entries": [], "error": err, "parser": ""}
+
+    parser = "json"
+    try:
+        raw_items = _parse_yahoo_disclosure_json(html)
+    except Exception as e:
+        print(f"  [WARN] {code4} yahoo disclosure json parse failed: {e}")
+        raw_items = []
+    if not raw_items:
+        parser = "html"
+        try:
+            raw_items = _parse_yahoo_disclosure_html(html)
+        except Exception as e:
+            print(f"  [WARN] {code4} yahoo disclosure html parse failed: {e}")
+            raw_items = []
+    if not raw_items:
+        err = "パース失敗（開示0件・DOM変更の可能性）"
+        FETCH_ERRORS["yahoo_disclosure"].append(f"{code4}: {err}")
+        print(f"  [WARN] {code4} yahoo disclosure: {err}")
+        return {"entries": [], "error": err, "parser": ""}
+
+    entries = []
+    for it in raw_items[:max_items]:
+        has_time, label = disclosure_time_info(it["published"])
+        entries.append({"title": it["title"], "published": it["published"],
+                        "pdf_url": it.get("pdf_url", ""), "pdf_text": "",
+                        "has_time": has_time, "time_label": label, "source": "Yahoo"})
+    return {"entries": entries, "error": "", "parser": parser}
+
+
+def _dedupe_key(title: str, published: str) -> tuple[str, str]:
+    import unicodedata
+    norm = re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(title))).lower()
+    dt = _parse_iso_jst(published)
+    return (dt.strftime("%Y-%m-%d") if dt else str(published)[:10], norm)
+
+
+def merge_disclosure_entries(tdnet_entries: list[dict], yahoo_entries: list[dict]) -> list[dict]:
+    """TDnet（yanoshin）と Yahoo 適時開示タブを「日付＋タイトル」で重複除去してマージする。
+
+    TDnet 側を優先（PDF本文を持つため）。時刻情報の有無は has_time で保持する。
+    """
+    merged: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for e in (tdnet_entries or []):
+        has_time, label = disclosure_time_info(e.get("published", ""))
+        item = dict(e)
+        item.setdefault("pdf_text", "")
+        item["has_time"] = has_time
+        item["time_label"] = label
+        item["source"] = e.get("source", "TDnet")
+        key = _dedupe_key(item.get("title", ""), item.get("published", ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(item)
+    for e in (yahoo_entries or []):
+        key = _dedupe_key(e.get("title", ""), e.get("published", ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(dict(e))
+    merged.sort(key=lambda x: (_parse_iso_jst(x.get("published", "")) or datetime.min), reverse=True)
+    return merged
+
+
+def filter_same_day_disclosures(entries: list[dict], target: date, since_hour: int = 15) -> list[dict]:
+    """対象日の since_hour 以降に出た開示だけを返す（時刻が取れているものに限る）。"""
+    out = []
+    for e in (entries or []):
+        if not e.get("has_time"):
+            continue
+        dt = _parse_iso_jst(e.get("published", ""))
+        if dt is None:
+            continue
+        if dt.date() == target and dt.hour >= since_hour:
+            out.append(e)
+    out.sort(key=lambda x: _parse_iso_jst(x.get("published", "")) or datetime.min)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Step 5b: research/ からDeep Dive・マクロコンテキストを読み込む
 # ---------------------------------------------------------------------------
 
@@ -1099,10 +1491,10 @@ def _append_detail(
     else:
         lines += [f"**TDNet（直近{DEFAULT_TDNET_DAYS}日）:** なし", ""]
 
-    # みんかぶ ニュース
+    # 銘柄別ニュース（みんかぶ／取得不可時は Yahoo!ファイナンス）
     news = yahoo.get("news", [])
     if news:
-        lines.append(f"**みんかぶニュース（{len(news)}件）:**")
+        lines.append(f"**{news_block_label(news)}（{len(news)}件）:**")
         lines.append("")
         for n in news:
             lines.append(f"- {n['title']}")
@@ -1282,7 +1674,7 @@ def build_report(
         f"# 動意銘柄レポート 生データ ({today.strftime('%Y-%m-%d')})",
         f"",
         f"> JQuants + TDNet + Yahoo Finance から自動取得。Claude が「なぜ動いたか」を推論してレポートを生成する。",
-        f"- **生成日時**: {datetime.now().strftime('%Y-%m-%d %H:%M')} JST",
+        f"- **生成日時**: {datetime.now(JST).strftime('%Y-%m-%d %H:%M')} JST",
         f"- **価格比較**: {prev} → {today}（前営業日比）",
         f"- **TDNet対象期間**: 直近{DEFAULT_TDNET_DAYS}日",
         f"- **推定トークン数**: （レポート末尾参照）",
