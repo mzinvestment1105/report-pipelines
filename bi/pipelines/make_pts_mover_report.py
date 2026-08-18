@@ -4,21 +4,27 @@
 日次動意レポート（make_mover_report.py）の**材料生成プロセスをそのまま流用**し、
 差し替えるのは「値動きデータ」だけ：
   動意 = JQuants EOD の前日比ランキング
-  PTS  = カブラボ（値上がり・材料解説）+ 株探（値下がり・売買代金実額）の当日終値比ランキング
+  PTS  = カブラボ（値上がり表・値下がり表・AI材料解説）の当日終値比ランキング
+
+値動きデータ元は**カブラボ1本**（値上がり表・値下がり表の2表を取る）。株探は GHA の
+クラウド IP から 405 で恒常的に弾かれ、値下がり・売買代金・テーマが全滅していたため、
+値下がりはカブラボの値下がり表へ移し、売買代金 Top セクションと事業テーマ欄は廃止した。
 
 材料（＝動意と完全に同じ関数を流用）:
   - TDNet 銘柄別 atom + PDF本文 …… make_mover_report.fetch_tdnet_batch
   - EDINET事業内容 + みんかぶニュース + Yahoo掲示板 …… make_mover_report.fetch_yahoo_batch
   - 過去リサーチ（Deep Dive）…… make_mover_report.load_research_context
   - 需給ブロック（信用残・機関空売り・株価水準）…… make_mover_report.build_supply_block（60営業日OHLC）
-  - 事業テーマ（何の会社の厚み用・株探）…… 本モジュール fetch_kabutan_theme
   - 時価総額 …… screening_master（当日終値×発行済株数）
 
 指標は「当日終値比」のみ（前日比は使わない）。3市場を1本に束ねるため各銘柄行に市場を付す。
 本文（何の会社/なぜ動いた）はローカルの Claude が prompts/pts-mover-report.md に従い執筆し、
 send_report_pdf_discord.py --kind pts_movers で PDF 配信する。
 
-出力: market/daily/YYYY-MM-DD_pts_movers_raw.md
+出力:
+  market/daily/YYYY-MM-DD_pts_movers_raw.md          …… raw 本体
+  market/daily/YYYY-MM-DD_pts_quality_flags.txt      …… 誌面へ転記する品質注記のみ（階層1）
+  market/daily/YYYY-MM-DD_pts_internal_flags.txt     …… 内部フラグのみ（階層2・誌面へ出さない）
 
 実行:
   cd bi/pipelines
@@ -73,11 +79,11 @@ DOWN_PCT_MAX = -3.0
 VALUE_MIN = 3_000_000
 UP_MAX = 10
 DOWN_MAX = 5
-TURNOVER_MAX = 5
 
 KABURABO_URL = "https://kabu-lab.com/pts/"
+# 株探は GHA のクラウド IP から 405（WAF 拒否）が常態のため値下がりの予備経路にのみ残す。
+# 通常はカブラボの値下がり表で満たされるためアクセス自体が発生しない。
 _KABUTAN_DOWN_URL = "https://kabutan.jp/warning/pts_night_price_decrease"
-_KABUTAN_VALUE_URL = "https://kabutan.jp/warning/pts_night_trading_value_ranking"
 
 _HEADERS = {
     "User-Agent": (
@@ -119,6 +125,8 @@ DISCLOSURE_SINCE_HOUR = 15
 # 株探の取得失敗（GHA からは 405 で弾かれる）を無警告にしないための記録
 _KABUTAN_ERRORS: list[str] = []
 _KABUTAN_SESSION: requests.Session | None = None
+# 一度ブロックされたら以降の株探アクセスを丸ごと止める（405 へのリトライで raw 生成が伸びるため）
+_KABUTAN_BLOCKED = False
 
 
 def _get_kabutan_session() -> requests.Session:
@@ -127,16 +135,20 @@ def _get_kabutan_session() -> requests.Session:
     GHA からの 405 は WAF による拒否であり GET/URL 自体は正しい（ローカルからは 200）。
     セッション cookie とブラウザ相当ヘッダーで bot 判定を回避できるかを試す経路。
     """
-    global _KABUTAN_SESSION
+    global _KABUTAN_SESSION, _KABUTAN_BLOCKED
     if _KABUTAN_SESSION is not None:
         return _KABUTAN_SESSION
     s = requests.Session()
     s.headers.update(_BROWSER_HEADERS | {"Referer": "https://kabutan.jp/"})
     try:
-        s.get("https://kabutan.jp/", timeout=20)
+        r = s.get("https://kabutan.jp/", timeout=20)
+        if r.status_code != 200:
+            _KABUTAN_BLOCKED = True
+            _KABUTAN_ERRORS.append(f"top: HTTP {r.status_code}")
     except Exception as e:
         print(f"  [WARN] 株探トップのセッション初期化失敗: {e}")
         _KABUTAN_ERRORS.append(f"top: {e}")
+        _KABUTAN_BLOCKED = True
     _KABUTAN_SESSION = s
     return s
 
@@ -161,23 +173,12 @@ class SourceError(RuntimeError):
 # 値動きデータ（PTS）: カブラボ + 株探
 # ---------------------------------------------------------------------------
 
-def scrape_kaburabo() -> tuple[pd.DataFrame, str]:
-    try:
-        r = requests.get(KABURABO_URL, headers=_HEADERS, timeout=25)
-        r.raise_for_status()
-        r.encoding = r.apparent_encoding
-    except Exception as e:
-        raise SourceError(f"カブラボ取得失敗: {e}") from e
-    ts_m = re.search(r"20\d\d/\d\d/\d\d\s*\d\d:\d\d\s*更新", r.text)
-    updated = ts_m.group().strip() if ts_m else ""
-    try:
-        tables = pd.read_html(io.StringIO(r.text))
-    except ValueError as e:
-        raise SourceError(f"カブラボ解析失敗: {e}") from e
-    table = next((t for t in tables if "コード" in "".join(str(c) for c in t.columns)
-                  and ("騰落率" in "".join(str(c) for c in t.columns) or "PTS" in "".join(str(c) for c in t.columns))), None)
-    if table is None or table.empty:
-        raise SourceError("カブラボ ランキングテーブルなし")
+def _parse_kaburabo_table(table: pd.DataFrame) -> pd.DataFrame:
+    """カブラボのランキング表1本を共通スキーマへ変換する。
+
+    値上がり表・値下がり表はカラム構成が同一（順位 / 市場・コード・銘柄名 / 当日終値 /
+    PTS価格 / 値上がり(値下がり) / 騰落率 / 出来高 / 上昇(下落)の理由）のため同じ位置指定で読める。
+    """
     rows = []
     for _, r0 in table.iterrows():
         cell = str(r0.iloc[1])
@@ -193,23 +194,80 @@ def scrape_kaburabo() -> tuple[pd.DataFrame, str]:
                      "Close": _num(r0.iloc[2]), "PtsPrice": _num(r0.iloc[3]),
                      "DiffPct": _num(r0.iloc[5]), "Volume": _num(r0.iloc[6]),
                      "Reason": str(r0.iloc[7]).strip() if pd.notna(r0.iloc[7]) else ""})
-    df = pd.DataFrame(rows)
-    if df.empty:
+    return pd.DataFrame(rows)
+
+
+def _kaburabo_direction(table: pd.DataFrame, parsed: pd.DataFrame) -> str:
+    """ランキング表が値上がり／値下がりのどちらかを判定する（見出し優先・騰落率符号で保険）。"""
+    joined = "".join(str(c) for c in table.columns)
+    if "値下がり" in joined or "下落" in joined:
+        return "down"
+    if "値上がり" in joined or "上昇" in joined:
+        return "up"
+    s = pd.to_numeric(parsed.get("DiffPct"), errors="coerce").dropna()
+    return "down" if (not s.empty and s.median() < 0) else "up"
+
+
+def scrape_kaburabo() -> tuple[pd.DataFrame, pd.DataFrame, str]:
+    """カブラボ PTS ページから値上がり表・値下がり表の両方を取得する。
+
+    戻り値: (値上がり df, 値下がり df, 更新時刻)。値下がり表が無い日は空 df を返す。
+    """
+    try:
+        r = requests.get(KABURABO_URL, headers=_HEADERS, timeout=25)
+        r.raise_for_status()
+        r.encoding = r.apparent_encoding
+    except Exception as e:
+        raise SourceError(f"カブラボ取得失敗: {e}") from e
+    ts_m = re.search(r"20\d\d/\d\d/\d\d\s*\d\d:\d\d\s*更新", r.text)
+    updated = ts_m.group().strip() if ts_m else ""
+    try:
+        tables = pd.read_html(io.StringIO(r.text))
+    except ValueError as e:
+        raise SourceError(f"カブラボ解析失敗: {e}") from e
+    cands = [t for t in tables
+             if not t.empty
+             and "コード" in "".join(str(c) for c in t.columns)
+             and ("騰落率" in "".join(str(c) for c in t.columns) or "PTS" in "".join(str(c) for c in t.columns))]
+    if not cands:
+        raise SourceError("カブラボ ランキングテーブルなし")
+    up_df, down_df = pd.DataFrame(), pd.DataFrame()
+    for t in cands:
+        parsed = _parse_kaburabo_table(t)
+        if parsed.empty:
+            continue
+        if _kaburabo_direction(t, parsed) == "down":
+            if down_df.empty:
+                down_df = parsed
+        elif up_df.empty:
+            up_df = parsed
+    if up_df.empty:
         raise SourceError("カブラボ 行解析0件")
-    return df, updated
+    return up_df, down_df, updated
 
 
-def scrape_kabutan(url: str, value_col: bool, max_pages: int = 3) -> tuple[pd.DataFrame, str]:
+def scrape_kabutan(url: str, max_pages: int = 3) -> tuple[pd.DataFrame, str]:
+    """株探のPTSランキングを取得する（カブラボの値下がり表が取れない日の予備経路）。
+
+    GHA のクラウド IP からは WAF に 405 で弾かれるのが常態のため、一度ブロックを検知したら
+    以降は即座に空を返してリトライ・ページ送りを打ち切る（raw 生成時間の無駄を作らない）。
+    """
+    global _KABUTAN_BLOCKED
     rows, stamp = [], ""
+    if _KABUTAN_BLOCKED:
+        return pd.DataFrame(), ""
     for page in range(1, max_pages + 1):
         u = url if page == 1 else f"{url}?page={page}"
         try:
-            r = _get_with_retry(_get_kabutan_session(), u, referer=url, timeout=20)
+            r = _get_with_retry(_get_kabutan_session(), u, referer=url, timeout=20, tries=1)
             r.raise_for_status()
             r.encoding = r.apparent_encoding
         except Exception as e:
             print(f"  [WARN] 株探取得失敗 {u}: {e}")
             _KABUTAN_ERRORS.append(f"{u}: {e}")
+            _KABUTAN_BLOCKED = True
+            break
+        if _KABUTAN_BLOCKED:
             break
         if not stamp:
             mt = re.search(r"(\d{1,2})月(\d{1,2})日.*?(\d{1,2}:\d{2})現在", r.text, re.S)
@@ -233,16 +291,9 @@ def scrape_kabutan(url: str, value_col: bool, max_pages: int = 3) -> tuple[pd.Da
             code = str(row.iloc[0]).strip().upper()[:4]
             if not re.match(r"^[0-9A-Z]{4}$", code):
                 continue
-            d = {"Code": code, "Name": str(row.iloc[1]).strip(), "MarketRaw": str(row.iloc[2]).strip(),
-                 "Close": _num(row.iloc[5]), "PtsPrice": _num(row.iloc[6]), "DiffPct": _num(row.iloc[8]),
-                 "Reason": ""}
-            v = _num(row.iloc[9])
-            if value_col:
-                d["ValueYen"] = v * 1e6 if v is not None else None
-                d["Volume"] = None
-            else:
-                d["Volume"] = v
-            rows.append(d)
+            rows.append({"Code": code, "Name": str(row.iloc[1]).strip(), "MarketRaw": str(row.iloc[2]).strip(),
+                         "Close": _num(row.iloc[5]), "PtsPrice": _num(row.iloc[6]), "DiffPct": _num(row.iloc[8]),
+                         "Volume": _num(row.iloc[9]), "Reason": ""})
             added += 1
         time.sleep(1.0)
         if added == 0:
@@ -250,25 +301,8 @@ def scrape_kabutan(url: str, value_col: bool, max_pages: int = 3) -> tuple[pd.Da
     return pd.DataFrame(rows), stamp
 
 
-def fetch_kabutan_theme(code: str) -> str:
-    """株探個別ページの「テーマ」（何の会社の出典材料）。"""
-    from bs4 import BeautifulSoup
-    try:
-        r = _get_with_retry(_get_kabutan_session(), f"https://kabutan.jp/stock/?code={code}",
-                            referer="https://kabutan.jp/", timeout=15)
-        r.raise_for_status()
-        r.encoding = r.apparent_encoding
-        soup = BeautifulSoup(r.text, "html.parser")
-        el = soup.find(string=re.compile("テーマ"))
-        if el:
-            p = el.find_parent(["th", "h3", "div", "dt"])
-            nx = p.find_next(["td", "dd", "p", "div"]) if p else None
-            if nx:
-                return re.sub(r"\s+", " ", nx.get_text(" ", strip=True))[:200]
-    except Exception as e:
-        _KABUTAN_ERRORS.append(f"theme {code}: {e}")
-        return ""
-    return ""
+# 事業テーマ欄（株探個別ページ）は廃止。株探が GHA から取得できず全銘柄で空振りしていた上、
+# 「何の会社」は EDINET の事業内容で賄えるため、テーマ取得の HTTP アクセスごと止めた。
 
 
 # ---------------------------------------------------------------------------
@@ -294,7 +328,7 @@ def _reason_lines(errors: list[str], limit: int = 5) -> list[str]:
 
 
 def _stock_block(rec: dict, srow, hist_df, tdnet_data: dict, yahoo_data: dict,
-                 theme: str, real_value, fast: bool,
+                 real_value, fast: bool,
                  disc_ctx: dict | None = None, target: date | None = None) -> list[str]:
     code4 = normalize_code_4(rec["Code"])
     name = rec.get("CompanyName") if srow is not None and pd.notna(rec.get("CompanyName")) else rec["Name"]
@@ -341,10 +375,9 @@ def _stock_block(rec: dict, srow, hist_df, tdnet_data: dict, yahoo_data: dict,
     desc = yahoo_data.get(code4, {}).get("description", "")
     if desc:
         lines.append(f"- 事業内容(EDINET): {desc}")
-    if theme:
-        lines.append(f"- 事業テーマ(株探): {theme}")
     if rec.get("Reason"):
-        lines.append(f"- カブラボ解説（夜間上昇の理由）: {rec['Reason']}")
+        _dir = "下落" if (rec.get("DiffPct") or 0) < 0 else "上昇"
+        lines.append(f"- カブラボ解説（夜間{_dir}の理由）: {rec['Reason']}")
     lines.append("")
 
     # 需給ブロック（動意と同一関数）
@@ -405,7 +438,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="夜間PTS動意レポート raw 生成 v5（動意と同一プロセス）")
     parser.add_argument("--date", default=None, help="対象取引日 YYYY-MM-DD（省略時: 午前7時まで=前日）")
     parser.add_argument("--fast", action="store_true", help="PDF本文・掲示板・OHLC等の重い取得をスキップ")
+    parser.add_argument("--out-dir", default=None,
+                        help="出力先ディレクトリ（省略時 market/daily・検証時に本番を汚さないため）")
     args = parser.parse_args()
+    out_dir = Path(args.out_dir) if args.out_dir else MARKET_DAILY_DIR
 
     if args.date:
         target = date.fromisoformat(args.date)
@@ -414,18 +450,21 @@ def main() -> None:
         target = now.date() - timedelta(days=1) if now.time() < dtime(7, 0) else now.date()
     print(f"対象取引日: {target}")
 
-    # 階層1: 誌面へ転記する品質注記（raw 冒頭の ⚠️ 行。誌面の根幹が欠けた時だけ）
+    # 階層1: 誌面へ転記する品質注記（raw 冒頭の ⚠️ 行 + {date}_pts_quality_flags.txt）。
+    #   顧客提出水準の定型文のみ。例外文字列・URL・HTTPステータス・取得元名を入れてはならない
+    #   （内部フラグが誌面へ漏出した 2026-08-17/18 の再発防止）。
     quality_notes: list[str] = []
-    # 階層2: 内部フラグのみ（raw 末尾セクション + _pts_quality_flags.txt。誌面へは出さない）
+    # 階層2: 内部フラグのみ（raw 末尾セクション + {date}_pts_internal_flags.txt。誌面へは出さない）
     internal_flags: list[str] = []
 
-    # === 値動きデータ（PTS）===
+    # === 値動きデータ（PTS）= カブラボ1本（値上がり表 + 値下がり表）===
     try:
-        up_raw, kb_updated = scrape_kaburabo()
-        print(f"カブラボ: {len(up_raw)} 件（{kb_updated}）")
+        up_raw, down_kb, kb_updated = scrape_kaburabo()
+        print(f"カブラボ: 値上がり {len(up_raw)} 件 / 値下がり {len(down_kb)} 件（{kb_updated}）")
     except SourceError as e:
-        up_raw, kb_updated = pd.DataFrame(), ""
-        quality_notes.append(f"値上がりデータ元（カブラボ）取得失敗: {e}")
+        up_raw, down_kb, kb_updated = pd.DataFrame(), pd.DataFrame(), ""
+        quality_notes.append("値上がりランキングを取得できず、本日は掲載銘柄が通常より少なくなっています。")
+        internal_flags.append(f"- 値上がりデータ元（カブラボ）取得失敗: {str(e)[:200]}")
         print(f"  [ERROR] {e}")
 
     up_df = up_raw.copy()
@@ -437,7 +476,11 @@ def main() -> None:
             .sort_values("DiffPct", ascending=False).head(UP_MAX).reset_index(drop=True)
     print(f"値上がり: {len(up_df)} 件")
 
-    down_raw, kt_stamp = scrape_kabutan(_KABUTAN_DOWN_URL, value_col=False)
+    # 値下がりはカブラボの値下がり表を正とする。株探は GHA から 405 で恒常的に取れないため、
+    # カブラボ側が空の日だけ予備として叩く（ブロック検知後は即スキップ）。
+    down_raw, kt_stamp = down_kb.copy(), ""
+    if down_raw.empty:
+        down_raw, kt_stamp = scrape_kabutan(_KABUTAN_DOWN_URL)
     down_df = down_raw.copy()
     if not down_df.empty:
         down_df["_etf"] = down_df.apply(lambda r: is_etf_reit(r["MarketRaw"], r["Name"]), axis=1)
@@ -445,26 +488,15 @@ def main() -> None:
         down_df = down_df[(pd.to_numeric(down_df["DiffPct"], errors="coerce") <= DOWN_PCT_MAX)
                           & (down_df["_val"].fillna(0) >= VALUE_MIN) & (~down_df["_etf"])] \
             .sort_values("DiffPct").head(DOWN_MAX).reset_index(drop=True)
-    # 株探（値下がり）は best-effort。GHAのIPは株探に405で弾かれるため、取得失敗しても
-    # ⚠️品質注記は出さず該当セクションを省略する（主役の値上がり＝カブラボは確実に取れる）。
+    # 値下がりが 0 件でも誌面注記は出さず該当セクションを省略する（主役は値上がり）。
     print(f"値下がり: {len(down_df)} 件")
 
-    val_raw, _ = scrape_kabutan(_KABUTAN_VALUE_URL, value_col=True)
+    # 売買代金 Top セクションは廃止（円建て実額の唯一の取得元だった株探が GHA から取れず、
+    # カブラボに売買代金の列が無いため。夜間売買代金は各銘柄行の「PTS価格×出来高」の概算で出す）。
     value_lookup: dict[str, float] = {}
-    val_df = pd.DataFrame()
-    if not val_raw.empty:
-        for _, r0 in val_raw.iterrows():
-            if pd.notna(r0.get("ValueYen")):
-                value_lookup[r0["Code"]] = float(r0["ValueYen"])
-        v = val_raw.copy()
-        v["_etf"] = v.apply(lambda r: is_etf_reit(r["MarketRaw"], r["Name"]), axis=1)
-        val_df = v[~v["_etf"]].sort_values("ValueYen", ascending=False).head(TURNOVER_MAX).reset_index(drop=True)
-    # 株探（売買代金）も best-effort（値下がりと同様・405で弾かれても⚠️は出さない）。
-    print(f"売買代金 Top: {len(val_df)} 件 / 実額 {len(value_lookup)} 銘柄")
 
-    sections = [("値上がり", up_df), ("値下がり", down_df), ("売買代金", val_df)]
-    all_codes = []
-    for _, d in sections:
+    all_codes: list[str] = []
+    for d in (up_df, down_df):
         if not d.empty:
             all_codes += d["Code"].tolist()
     all_codes = list(dict.fromkeys(all_codes))
@@ -496,10 +528,6 @@ def main() -> None:
     tdnet_data = fetch_tdnet_batch(codes4, no_pdf=args.fast) if codes4 else {}
     print("EDINET/みんかぶ/Yahoo掲示板 取得中...")
     yahoo_data = fetch_yahoo_batch(codes4) if (codes4 and not args.fast) else {}
-    themes = {c: fetch_kabutan_theme(c) for c in (all_codes if not args.fast else [])}
-    if not args.fast:
-        for _ in range(0):
-            pass
 
     # Yahoo適時開示タブ（時刻付き）。yanoshin の TDnet ミラーは銘柄単位で当日分を
     # 落とすことがあるため、当日開示の有無はこちらで裏取りする。
@@ -520,16 +548,26 @@ def main() -> None:
 
     # === 品質注記（無警告劣化の可視化・2階層）===
     # 階層1（誌面転記）: 当日開示の有無を判定できない＝今回の再発防止の要。通常は成功する。
+    # 顧客提出水準のため取得元名・URL・HTTPステータス・例外文字列を書かない（詳細は階層2へ）。
     n_disc_err = len({e.split(":")[0] for e in FETCH_ERRORS["yahoo_disclosure"]})
     if n_disc_err:
-        quality_notes.append(f"Yahoo適時開示タブ取得失敗 {n_disc_err}銘柄（当日開示の裏取り不可）")
+        quality_notes.append(f"当日の開示情報を確認できなかった銘柄が{n_disc_err}件あります。")
+        internal_flags.append(f"- Yahoo適時開示タブ取得失敗 {n_disc_err}銘柄（当日開示の裏取り不可）")
+        internal_flags += _reason_lines(FETCH_ERRORS["yahoo_disclosure"])
 
     # 階層2（内部フラグのみ）: みんかぶ403・株探405・当日開示0件は常態のため誌面に出すと
     # ノイズになり、本当に材料が欠けた日の警告が埋もれる。運用追跡用に理由付きで残す。
     if FETCH_ERRORS["minkabu"]:
-        n_minkabu_err = len({e.split(":")[0] for e in FETCH_ERRORS["minkabu"]})
-        internal_flags.append(f"- みんかぶニュース取得失敗 {n_minkabu_err}銘柄（材料が一部欠落）")
-        internal_flags += _reason_lines(FETCH_ERRORS["minkabu"])
+        err_codes = {e.split(":")[0].strip() for e in FETCH_ERRORS["minkabu"]}
+        recovered = set(FETCH_ERRORS.get("news_recovered", [])) & err_codes
+        lost = err_codes - recovered
+        if recovered:
+            internal_flags.append(
+                f"- みんかぶ不通→Yahoo!ファイナンスで代替取得 {len(recovered)}銘柄（材料の欠落なし）")
+        if lost:
+            internal_flags.append(f"- 銘柄別ニュース未取得 {len(lost)}銘柄（材料が一部欠落）")
+            internal_flags += _reason_lines(
+                [e for e in FETCH_ERRORS["minkabu"] if e.split(":")[0].strip() in lost])
     if _KABUTAN_ERRORS:
         internal_flags.append(f"- 株探取得失敗 {len(_KABUTAN_ERRORS)}件")
         internal_flags += _reason_lines(_KABUTAN_ERRORS)
@@ -543,11 +581,11 @@ def main() -> None:
     lines = [
         f"# 夜間PTS動意レポート 生データ ({target})",
         "",
-        "> 値動きデータ＝カブラボ（値上がり+材料解説）+ 株探（値下がり・売買代金実額）の当日終値比。",
+        "> 値動きデータ＝カブラボ（値上がり表・値下がり表・AI材料解説）の当日終値比。",
         "> 材料（TDNet銘柄別/EDINET/みんかぶ/Yahoo掲示板/過去リサーチ/需給）は日次動意と同一プロセス。",
         "> Claude が prompts/pts-mover-report.md に従い「何の会社」「なぜ動いた」を執筆する。",
         f"- **生成日時**: {datetime.now(JST).strftime('%Y-%m-%d %H:%M')} JST",
-        f"- **PTSデータ時点**: カブラボ {kb_updated or '─'} / 株探 {kt_stamp or '─'}",
+        f"- **PTSデータ時点**: カブラボ {kb_updated or '─'}" + (f" / 株探 {kt_stamp}" if kt_stamp else ""),
         f"- **対象取引日**: {target}（当日終値比・ナイトタイムセッション17:00〜翌6:00）",
         "",
     ]
@@ -574,20 +612,17 @@ def main() -> None:
             else:
                 rec["MarketCapOku"] = pd.NA
             out += _stock_block(rec, srow, hist_df, tdnet_data, yahoo_data,
-                                themes.get(rec["Code"], ""), value_lookup.get(rec["Code"]), args.fast,
+                                value_lookup.get(rec["Code"]), args.fast,
                                 disc_ctx, target)
         return out
 
-    # 値上がり（カブラボ・主役）は必ず出す。値下がり・売買代金（株探・best-effort）は
-    # 取得できた時だけセクションを出す（GHAで株探が405の日はセクションごと省略＝⚠️も空セクションも出さない）。
+    # 値上がり（主役）は必ず出す。値下がりは取得できた時だけセクションを出す
+    # （空セクションも⚠️も出さない）。売買代金 Top セクションは廃止済み。
     lines += [f"## 夜間PTS 値上がり（当日終値比 +{UP_PCT_MIN:.0f}%以上・上位{UP_MAX}件）", ""]
     lines += _emit(up_df) if not up_df.empty else ["（該当なし）", ""]
     if not down_df.empty:
         lines += [f"## 夜間PTS 値下がり（当日終値比 {DOWN_PCT_MAX:.0f}%以下・下位{DOWN_MAX}件）", ""]
         lines += _emit(down_df)
-    if not val_df.empty:
-        lines += [f"## 夜間PTS 売買代金 Top{TURNOVER_MAX}（実額・ETF除外）", ""]
-        lines += _emit(val_df)
 
     # 内部フラグは raw 末尾の専用セクションに置く（誌面へ転記させないため冒頭には出さない）
     if internal_flags:
@@ -595,14 +630,17 @@ def main() -> None:
         lines += internal_flags + [""]
 
     body = "\n".join(lines)
-    MARKET_DAILY_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = MARKET_DAILY_DIR / f"{target}_pts_movers_raw.md"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{target}_pts_movers_raw.md"
     out_path.write_text(body, encoding="utf-8")
+    # 誌面用フラグ（階層1のみ）と内部フラグ（階層2のみ）を**別ファイル**に分ける。
+    # 同一ファイルへ [internal] 区切りで連結すると workflow が全文を誌面へ挿入して
+    # 内部情報が配信される（2026-08-17/18 の障害）。連結は恒久禁止。
     flag_text = "／".join(quality_notes)
-    if internal_flags:
-        flag_text += ("\n" if flag_text else "") + "[internal]\n" + "\n".join(internal_flags)
-    (MARKET_DAILY_DIR / f"{target}_pts_quality_flags.txt").write_text(
+    (out_dir / f"{target}_pts_quality_flags.txt").write_text(
         (flag_text + "\n") if flag_text else "", encoding="utf-8")
+    (out_dir / f"{target}_pts_internal_flags.txt").write_text(
+        ("\n".join(internal_flags) + "\n") if internal_flags else "", encoding="utf-8")
     tokens = estimate_tokens(body)
     log_token_usage(target, "make_pts_mover_report", tokens, len(body))
     print(f"\n出力: {out_path}")

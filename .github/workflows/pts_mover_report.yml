@@ -153,9 +153,10 @@ jobs:
       - name: Install dependencies
         run: pip install -r report-pipelines/bi/pipelines/requirements.txt
 
-      - name: Generate PTS movers raw (v5 カブラボと株探の当日終値比・動意と同一材料プロセス)
-        # 値動きデータ＝カブラボ/株探（当日終値比）。材料はTDNet/EDINET/みんかぶ/Yahoo掲示板/需給で動意と同一。
-        # 取得失敗は品質注記として raw 冒頭と {date}_pts_quality_flags.txt に出力し配信は止めない（絶対配信）。
+      - name: Generate PTS movers raw (v5 カブラボの当日終値比・動意と同一材料プロセス)
+        # 値動きデータ＝カブラボ（値上がり表・値下がり表）の当日終値比。材料はTDNet/EDINET/みんかぶ/
+        # Yahoo掲示板/需給で動意と同一。取得失敗は誌面用の {date}_pts_quality_flags.txt（階層1のみ）と
+        # 内部追跡用の {date}_pts_internal_flags.txt（誌面へ出さない）に分けて出力し配信は止めない（絶対配信）。
         # 本 step の失敗（exit 非0）はインフラ失敗のみ。
         working-directory: ./private-repo/bi/pipelines
         env:
@@ -190,20 +191,32 @@ jobs:
           CLAUDE_CODE_MAX_OUTPUT_TOKENS: 64000
 
       - name: 品質注記の機械挿入（フラグ検知時のみ・タイトル直後）
-        # 絶対配信原則: make_pts_mover_report.py --date-gate が出力する {date}_pts_quality_flags.txt を
+        # 絶対配信原則: make_pts_mover_report.py が出力する {date}_pts_quality_flags.txt（誌面用・階層1のみ）を
         # レポート冒頭（# 夜間PTS動意レポート …）直後へ挿入。Claude 側の注記と重複しても機械挿入を正とする。
+        #
+        # 多層防御（2026-08-17/18 の内部フラグ漏出の再発防止）: 内部フラグは
+        # {date}_pts_internal_flags.txt へ分離済みだが、この step 側でも
+        #   (1) [internal] 以降を切り落とす
+        #   (2) URL・例外語（Error/Exception/Traceback）を含むなら注記ごと捨てる
+        #   (3) 全角60字で打ち切る
+        #   (4) 空になったら注記自体を挿入しない（空の「⚠️ 品質注記:」を誌面へ出さない）
+        # を行う。注記処理の失敗で配信を止めない（|| NOTE="" で握る）。
         id: annotate
         working-directory: ./private-repo
         env:
           TARGET_DATE: ${{ steps.date.outputs.value }}
+          PYTHONIOENCODING: utf-8
         run: |
           F=market/daily/pts_movers/${TARGET_DATE}.md
           FLAGS=market/daily/${TARGET_DATE}_pts_quality_flags.txt
           if [ ! -f "$F" ]; then
             echo "ERROR: report not found: $F"; exit 1
           fi
+          NOTE=""
           if [ -s "$FLAGS" ]; then
-            NOTE="$(tr '\n' ' ' < "$FLAGS" | sed 's/ *$//')"
+            NOTE="$(FLAGS="$FLAGS" python3 -c 'import os,re;t=open(os.environ["FLAGS"],encoding="utf-8").read().split("[internal]")[0];t=re.sub(r"\s+"," ",t).strip();t="" if re.search(r"https?://|Error|Exception|Traceback",t) else t;print(t[:59]+"…" if len(t)>60 else t)')" || NOTE=""
+          fi
+          if [ -n "$NOTE" ]; then
             awk -v note="> ⚠️ **品質注記**: ${NOTE}" '{print} /^# 夜間PTS動意レポート /{print ""; print note}' "$F" > "${F}.tmp" && mv "${F}.tmp" "$F"
             echo "annotated=true" >> $GITHUB_OUTPUT
             echo "note=${NOTE}" >> $GITHUB_OUTPUT

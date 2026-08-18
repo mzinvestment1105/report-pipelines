@@ -137,7 +137,9 @@ _BBS_QUOTE = re.compile(r"^>>\d+")
 
 # 取得失敗の記録（呼び出し側が品質注記に使う）。
 # 例外を握り潰して空配列を返すだけだと無警告で材料が欠落するため、失敗理由をここに積む。
-FETCH_ERRORS: dict[str, list[str]] = {"minkabu": [], "yahoo_disclosure": []}
+# news_recovered: みんかぶが失敗しても Yahoo!ファイナンスで見出しを確保できた銘柄コード。
+#   これを見ないと「みんかぶ失敗＝材料欠落」と誤判定して事実と異なる品質注記が出る。
+FETCH_ERRORS: dict[str, list[str]] = {"minkabu": [], "yahoo_disclosure": [], "news_recovered": []}
 
 JST = timezone(timedelta(hours=9))
 
@@ -846,7 +848,12 @@ def fetch_minkabu_news(code4: str, max_items: int = 8) -> list[dict]:
         print(f"  [WARN] {code4} minkabu news fetch failed: {e}")
         FETCH_ERRORS["minkabu"].append(f"{code4}: {e}")
     # 代替ソース: Yahoo!ファイナンス ニュースタブ（同一 runner から到達実績のある経路）
-    return fetch_yahoo_news(code4, max_items)
+    fallback = fetch_yahoo_news(code4, max_items)
+    if fallback:
+        # みんかぶは落ちたが見出しは確保できた＝材料は欠落していない。
+        # 呼び出し側がこの銘柄を「材料欠落」と数えないための記録。
+        FETCH_ERRORS["news_recovered"].append(code4)
+    return fallback
 
 
 def fetch_yahoo_news(code4: str, max_items: int = 8) -> list[dict]:
