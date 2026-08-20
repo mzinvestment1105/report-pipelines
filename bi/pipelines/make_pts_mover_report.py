@@ -12,7 +12,7 @@
 
 材料（＝動意と完全に同じ関数を流用）:
   - TDNet 銘柄別 atom + PDF本文 …… make_mover_report.fetch_tdnet_batch
-  - EDINET事業内容 + みんかぶニュース + Yahoo掲示板 …… make_mover_report.fetch_yahoo_batch
+  - EDINET事業内容 + Yahoo!ファイナンス ニュース + Yahoo掲示板 …… make_mover_report.fetch_yahoo_batch
   - 過去リサーチ（Deep Dive）…… make_mover_report.load_research_context
   - 需給ブロック（信用残・機関空売り・株価水準）…… make_mover_report.build_supply_block（60営業日OHLC）
   - 時価総額 …… screening_master（当日終値×発行済株数）
@@ -406,7 +406,7 @@ def _stock_block(rec: dict, srow, hist_df, tdnet_data: dict, yahoo_data: dict,
     else:
         lines += [f"**TDNet（直近{DEFAULT_TDNET_DAYS}日）:** なし", ""]
 
-    # 銘柄別ニュース（みんかぶ／取得不可時は Yahoo!ファイナンス）
+    # 銘柄別ニュース（Yahoo!ファイナンス ニュースタブ）
     news = yahoo_data.get(code4, {}).get("news", [])
     if news:
         lines.append(f"**{news_block_label(news)}（{len(news)}件）:**")
@@ -415,7 +415,7 @@ def _stock_block(rec: dict, srow, hist_df, tdnet_data: dict, yahoo_data: dict,
             lines.append(f"- {n['title']}")
         lines.append("")
     else:
-        lines += ["**みんかぶニュース:** なし", ""]
+        lines += ["**Yahoo!ファイナンス ニュース:** なし", ""]
 
     # Yahoo掲示板（材料の裏取り用）
     bbs = yahoo_data.get(code4, {}).get("bbs", {})
@@ -526,7 +526,7 @@ def main() -> None:
 
     print("TDNet 銘柄別取得中...")
     tdnet_data = fetch_tdnet_batch(codes4, no_pdf=args.fast) if codes4 else {}
-    print("EDINET/みんかぶ/Yahoo掲示板 取得中...")
+    print("EDINET/Yahoo!ファイナンス ニュース/Yahoo掲示板 取得中...")
     yahoo_data = fetch_yahoo_batch(codes4) if (codes4 and not args.fast) else {}
 
     # Yahoo適時開示タブ（時刻付き）。yanoshin の TDnet ミラーは銘柄単位で当日分を
@@ -555,19 +555,12 @@ def main() -> None:
         internal_flags.append(f"- Yahoo適時開示タブ取得失敗 {n_disc_err}銘柄（当日開示の裏取り不可）")
         internal_flags += _reason_lines(FETCH_ERRORS["yahoo_disclosure"])
 
-    # 階層2（内部フラグのみ）: みんかぶ403・株探405・当日開示0件は常態のため誌面に出すと
-    # ノイズになり、本当に材料が欠けた日の警告が埋もれる。運用追跡用に理由付きで残す。
-    if FETCH_ERRORS["minkabu"]:
-        err_codes = {e.split(":")[0].strip() for e in FETCH_ERRORS["minkabu"]}
-        recovered = set(FETCH_ERRORS.get("news_recovered", [])) & err_codes
-        lost = err_codes - recovered
-        if recovered:
-            internal_flags.append(
-                f"- みんかぶ不通→Yahoo!ファイナンスで代替取得 {len(recovered)}銘柄（材料の欠落なし）")
-        if lost:
-            internal_flags.append(f"- 銘柄別ニュース未取得 {len(lost)}銘柄（材料が一部欠落）")
-            internal_flags += _reason_lines(
-                [e for e in FETCH_ERRORS["minkabu"] if e.split(":")[0].strip() in lost])
+    # 階層2（内部フラグのみ）: 株探405・当日開示0件は常態のため誌面に出すとノイズになり、
+    # 本当に材料が欠けた日の警告が埋もれる。運用追跡用に理由付きで残す。
+    if FETCH_ERRORS["news"]:
+        lost = {e.split(":")[0].strip() for e in FETCH_ERRORS["news"]}
+        internal_flags.append(f"- 銘柄別ニュース未取得 {len(lost)}銘柄（材料が一部欠落）")
+        internal_flags += _reason_lines(FETCH_ERRORS["news"])
     if _KABUTAN_ERRORS:
         internal_flags.append(f"- 株探取得失敗 {len(_KABUTAN_ERRORS)}件")
         internal_flags += _reason_lines(_KABUTAN_ERRORS)
@@ -582,7 +575,7 @@ def main() -> None:
         f"# 夜間PTS動意レポート 生データ ({target})",
         "",
         "> 値動きデータ＝カブラボ（値上がり表・値下がり表・AI材料解説）の当日終値比。",
-        "> 材料（TDNet銘柄別/EDINET/みんかぶ/Yahoo掲示板/過去リサーチ/需給）は日次動意と同一プロセス。",
+        "> 材料（TDNet銘柄別/EDINET/Yahoo!ファイナンス/Yahoo掲示板/過去リサーチ/需給）は日次動意と同一プロセス。",
         "> Claude が prompts/pts-mover-report.md に従い「何の会社」「なぜ動いた」を執筆する。",
         f"- **生成日時**: {datetime.now(JST).strftime('%Y-%m-%d %H:%M')} JST",
         f"- **PTSデータ時点**: カブラボ {kb_updated or '─'}" + (f" / 株探 {kt_stamp}" if kt_stamp else ""),

@@ -2,12 +2,12 @@
 動意銘柄レポート 生データ生成
 ==============================
 市場区分（プライム/スタンダード/グロース）ごとに動意銘柄を抽出し、
-TDNet・みんかぶニュースと組み合わせた生データMarkdownを出力する。
+TDNet・Yahoo!ファイナンス ニュースと組み合わせた生データMarkdownを出力する。
 
 レポート構成:
   Layer 1: セクター別フロー（17セクター）
   Layer 2: 全動意銘柄リスト（上位100銘柄・基本情報のみ）
-  Layer 3: 注目銘柄詳細（TDNet+みんかぶニュース付き）
+  Layer 3: 注目銘柄詳細（TDNet+Yahoo!ファイナンス ニュース付き）
     プライム    値上がり5社 + 値下がり5社
     スタンダード  値上がり5社 + 値下がり5社
     グロース    値上がり5社 + 値下がり5社
@@ -137,9 +137,8 @@ _BBS_QUOTE = re.compile(r"^>>\d+")
 
 # 取得失敗の記録（呼び出し側が品質注記に使う）。
 # 例外を握り潰して空配列を返すだけだと無警告で材料が欠落するため、失敗理由をここに積む。
-# news_recovered: みんかぶが失敗しても Yahoo!ファイナンスで見出しを確保できた銘柄コード。
-#   これを見ないと「みんかぶ失敗＝材料欠落」と誤判定して事実と異なる品質注記が出る。
-FETCH_ERRORS: dict[str, list[str]] = {"minkabu": [], "yahoo_disclosure": [], "news_recovered": []}
+# news: 銘柄別ニュース（Yahoo!ファイナンス ニュースタブ）の取得失敗・0件。
+FETCH_ERRORS: dict[str, list[str]] = {"news": [], "yahoo_disclosure": []}
 
 JST = timezone(timedelta(hours=9))
 
@@ -777,7 +776,7 @@ def fetch_tdnet_batch(codes: list[str], no_pdf: bool = False) -> dict[str, dict]
 
 
 # ---------------------------------------------------------------------------
-# Step 5: みんかぶ ニューススクレイピング（Yahoo Finance Japan 代替）
+# Step 5: 銘柄別ニュース スクレイピング（Yahoo!ファイナンス ニュースタブに一本化）
 # ---------------------------------------------------------------------------
 
 _MINKABU_SESSION: requests.Session | None = None
@@ -816,8 +815,9 @@ def _get_with_retry(session: requests.Session, url: str, referer: str = "",
 
 
 def fetch_minkabu_news(code4: str, max_items: int = 8) -> list[dict]:
-    """銘柄別ニュース見出しを取得する（みんかぶ→取得不可なら Yahoo!ファイナンス）。
+    """銘柄別ニュース見出しをみんかぶから取得する（現在どこからも呼ばれない）。
 
+    GHA の IP からは 403 のため Yahoo へ一本化。2026-08-19 実測（IP 事情が変われば復帰用に関数のみ残置）。
     戻り値は従来どおり [{"title","date","source"}...]。source に実際の取得元が入る。
     """
     from bs4 import BeautifulSoup
@@ -843,21 +843,16 @@ def fetch_minkabu_news(code4: str, max_items: int = 8) -> list[dict]:
                 break
         if items:
             return items
-        FETCH_ERRORS["minkabu"].append(f"{code4}: 記事0件（ブロック疑い）")
+        FETCH_ERRORS["news"].append(f"{code4}: みんかぶ記事0件（ブロック疑い）")
     except Exception as e:
         print(f"  [WARN] {code4} minkabu news fetch failed: {e}")
-        FETCH_ERRORS["minkabu"].append(f"{code4}: {e}")
+        FETCH_ERRORS["news"].append(f"{code4}: みんかぶ {e}")
     # 代替ソース: Yahoo!ファイナンス ニュースタブ（同一 runner から到達実績のある経路）
-    fallback = fetch_yahoo_news(code4, max_items)
-    if fallback:
-        # みんかぶは落ちたが見出しは確保できた＝材料は欠落していない。
-        # 呼び出し側がこの銘柄を「材料欠落」と数えないための記録。
-        FETCH_ERRORS["news_recovered"].append(code4)
-    return fallback
+    return fetch_yahoo_news(code4, max_items)
 
 
 def fetch_yahoo_news(code4: str, max_items: int = 8) -> list[dict]:
-    """Yahoo!ファイナンス ニュースタブから銘柄別ニュース見出しを取得する（みんかぶ代替）。
+    """Yahoo!ファイナンス ニュースタブから銘柄別ニュース見出しを取得する（唯一のニュース取得元）。
 
     埋め込み JSON（newsTopics.articles）を優先し、無ければ HTML の記事リンクから拾う。
     """
@@ -869,7 +864,7 @@ def fetch_yahoo_news(code4: str, max_items: int = 8) -> list[dict]:
         html = r.text
     except Exception as e:
         print(f"  [WARN] {code4} yahoo news fetch failed: {e}")
-        FETCH_ERRORS["minkabu"].append(f"{code4}: Yahooニュースも失敗 {e}")
+        FETCH_ERRORS["news"].append(f"{code4}: Yahooニュース取得失敗 {e}")
         return []
 
     items: list[dict] = []
@@ -926,16 +921,19 @@ def fetch_yahoo_news(code4: str, max_items: int = 8) -> list[dict]:
             print(f"  [WARN] {code4} yahoo news html parse failed: {e}")
 
     if not items:
-        FETCH_ERRORS["minkabu"].append(f"{code4}: Yahooニュースも0件")
-    return items[:max_items]
+        FETCH_ERRORS["news"].append(f"{code4}: Yahooニュース0件")
+        print(f"  [WARN] {code4} yahoo news: 0件")
+        return []
+    out = items[:max_items]
+    # 成功時も1行残す（GHA ログだけで材料を取れたか判定できるようにする）。
+    print(f"  yahoo news {code4}: {len(out)}件")
+    return out
 
 
 def news_block_label(news: list[dict]) -> str:
-    """ニュースブロックの見出し（実際の取得元を反映。みんかぶのみなら従来表記）。"""
-    srcs = list(dict.fromkeys((n.get("source") or "みんかぶ") for n in (news or [])))
-    if not srcs or srcs == ["みんかぶ"]:
-        return "みんかぶニュース"
-    return "／".join(srcs) + " ニュース"
+    """ニュースブロックの見出し（実際の取得元を反映）。取得元は Yahoo!ファイナンスに一本化済み。"""
+    srcs = list(dict.fromkeys((n.get("source") or "Yahoo!ファイナンス") for n in (news or [])))
+    return "／".join(srcs or ["Yahoo!ファイナンス"]) + " ニュース"
 
 
 _YAHOO_BBS_HEADERS = {
@@ -1097,10 +1095,11 @@ def fetch_yahoo_batch(codes: list[str]) -> dict[str, dict]:
     total = len(codes)
     for i, code in enumerate(codes, 1):
         code4 = normalize_code_4(code)
-        print(f"  minkabu [{i}/{total}] {code4}")
+        print(f"  news/bbs [{i}/{total}] {code4}")
         description = fetch_company_description(edinet_client, code4) if edinet_client else ""
         result[code4] = {
-            "news":        fetch_minkabu_news(code4),
+            # GHA の IP からは 403 のため Yahoo へ一本化。2026-08-19 実測（fetch_minkabu_news は復帰用に残置）。
+            "news":        fetch_yahoo_news(code4),
             "bbs":         fetch_yahoo_bbs(code4),
             "description": description,
         }
@@ -1498,7 +1497,7 @@ def _append_detail(
     else:
         lines += [f"**TDNet（直近{DEFAULT_TDNET_DAYS}日）:** なし", ""]
 
-    # 銘柄別ニュース（みんかぶ／取得不可時は Yahoo!ファイナンス）
+    # 銘柄別ニュース（Yahoo!ファイナンス ニュースタブ）
     news = yahoo.get("news", [])
     if news:
         lines.append(f"**{news_block_label(news)}（{len(news)}件）:**")
@@ -1507,7 +1506,7 @@ def _append_detail(
             lines.append(f"- {n['title']}")
         lines.append("")
     else:
-        lines += ["**みんかぶニュース:** なし", ""]
+        lines += ["**Yahoo!ファイナンス ニュース:** なし", ""]
 
     # Yahoo 掲示板
     bbs       = yahoo.get("bbs", {})
