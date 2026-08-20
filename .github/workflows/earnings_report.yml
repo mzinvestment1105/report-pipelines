@@ -114,7 +114,10 @@ jobs:
     runs-on: ubuntu-latest
     # ETL（JQuants 全カバレッジ逐次取得 約10-20分 + yfinance 一括2回 + TDNet ループ）
     # + Claude 生成 50 分目安 + setup/送信マージン。
-    timeout-minutes: 110
+    # PM 2026-08-19: 529 自動リトライ（2 回・待機 60/180 秒）を足したため枠を再計算して拡張。
+    # 最悪ケース = 前段（clone/setup/fonts/playwright + ETL 5 段）50 分 + 1 回目 50 分 + 待機 1 分
+    #            + 2 回目 30 分 + 待機 3 分 + 3 回目 30 分 + 検証/artifact/送信/commit 8 分 = 172 分 → 180 分。
+    timeout-minutes: 180
 
     steps:
       - name: Determine target month
@@ -167,9 +170,38 @@ jobs:
         run: pip install -r report-pipelines/bi/pipelines/requirements.txt
 
       - name: Install Japanese fonts (Noto Sans CJK JP)
+        # PM 2026-08-19 承認（動意日次 mover_report_daily.yml からの横展開）: `sudo apt-get update -qq`
+        # が出力ゼロのまま数十分ハングし、ジョブ枠に到達して配信ごと落ちる事故（GitHub 側の一時事象）の
+        # 恒久対策。①ステップ単位 timeout ②各コマンドを timeout コマンドで打ち切り ③待機つき 3 回リトライ。
+        #
+        # 【最終失敗ならジョブを落とす理由】本 workflow の誌面生成は send_report_jpeg_discord.py →
+        # bi/pipelines/lib/md_to_jpeg.py で行い、同モジュールは font-family に "Yu Gothic" /
+        # "Noto Sans CJK JP" 等の**システムフォント名**を指定する（PDF 経路のような base64 埋め込みを
+        # 持たない）。日本語フォントが無い runner では誌面が豆腐（文字化け）のまま配信されるため、
+        # 3 回とも失敗した場合は配信せずジョブを落とす（PDF 経路の他 workflow とはここだけ方針が異なる）。
+        # 時間予算: 1 試行 = update 75 秒 + install 120 秒 = 最大 195 秒。新規試行は開始 280 秒までに
+        # 限るので最悪 475 秒で自己終了し、ステップ枠 8 分（480 秒）内に必ず結果を出して抜ける。
+        timeout-minutes: 8
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq fonts-noto-cjk fonts-noto-cjk-extra
+          set -u
+          DEADLINE=$(( $(date +%s) + 280 ))
+          for i in 1 2 3; do
+            if [ "$i" -gt 1 ] && [ "$(date +%s)" -ge "$DEADLINE" ]; then
+              echo "時間予算を超過したため再試行を打ち切ります"
+              break
+            fi
+            if timeout 75 sudo apt-get update -qq \
+               && timeout 120 sudo apt-get install -y -qq fonts-noto-cjk fonts-noto-cjk-extra; then
+              echo "日本語フォント導入に成功しました（${i} 回目）"
+              exit 0
+            fi
+            echo "日本語フォント導入に失敗またはハングしました（${i}/3 回目）"
+            if [ "$i" -lt 3 ]; then
+              sleep $((i * 15))
+            fi
+          done
+          echo "::error::日本語フォントの apt 導入に 3 回とも失敗しました。JPEG 誌面はシステムフォント（md_to_jpeg.py の font-family 指定）に依存するため、このまま生成すると文字化け誌面を配信することになります。文字化け配信を避けるためジョブを中止します"
+          exit 1
 
       - name: Install Playwright Chromium
         run: |
@@ -258,9 +290,30 @@ jobs:
 
       # ---- Claude 生成段 ----
 
+      - name: 既存 overview の原本を退避（再試行時の復元用）
+        # 累積スナップショット運用のため overview は削除せず引き継ぐ。再試行時に「1 回目が途中まで
+        # 書いた不完全ファイル」を引き継がせないよう、生成前の原本を /tmp に控えておく。
+        env:
+          TARGET_MONTH: ${{ steps.month.outputs.value }}
+        run: |
+          F="private-repo/research/earnings/${TARGET_MONTH}_overview.md"
+          if [ -f "$F" ]; then
+            cp -f "$F" "/tmp/${TARGET_MONTH}_overview.pristine.md"
+            echo "原本を退避しました: /tmp/${TARGET_MONTH}_overview.pristine.md"
+          else
+            echo "既存 overview なし（初回生成）"
+          fi
+
+      # PM 2026-08-19 承認（動意日次 mover_report_daily.yml からの横展開）: Anthropic 側の過負荷応答
+      # （API Error: 529 overloaded_error）を初回 API 呼び出しで受けて即 exit 1 する事故の恒久対策。
+      # 第三者製の新規 action を足さず、continue-on-error + outcome 判定の再試行ステップだけで構成する。
+      # 529 は即時再試行が無意味なため待機を指数的に伸ばす（60 秒 → 180 秒）。3 ステップとも
+      # continue-on-error のため、成否は最後の Verify ステップ 1 箇所（成果物ファイルが非空か）で決まる。
       - name: Generate earnings overview via Claude Code (Opus 5 + effort high)
         # 既存 {month}_overview.md は削除しない（累積スナップショット運用・
         # 更新履歴 v1/v2/v3 をプロンプト側で引き継がせるため）。
+        id: gen1
+        continue-on-error: true
         uses: anthropics/claude-code-base-action@beta
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -275,6 +328,97 @@ jobs:
           TARGET_MONTH: ${{ steps.month.outputs.value }}
           PRIVATE_REPO_ROOT: private-repo
           CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+
+      - name: Wait before retry 2 (Claude overloaded 等の一時エラー)
+        if: success() && steps.gen1.outcome == 'failure'
+        env:
+          TARGET_MONTH: ${{ steps.month.outputs.value }}
+        run: |
+          F="private-repo/research/earnings/${TARGET_MONTH}_overview.md"
+          # 途中まで書かれた不完全ファイルは退避（削除しない）。直後に生成前の原本を書き戻し、
+          # 再試行が「不完全な自分の出力」ではなく累積スナップショットの原本から始まるようにする。
+          if [ -f "$F" ]; then
+            mv "$F" "/tmp/${TARGET_MONTH}_overview.attempt1.partial.md"
+            echo "1 回目の不完全な出力を /tmp へ退避しました（再試行が白紙から書き直せるようにするため）"
+          fi
+          if [ -f "/tmp/${TARGET_MONTH}_overview.pristine.md" ]; then
+            cp -f "/tmp/${TARGET_MONTH}_overview.pristine.md" "$F"
+            echo "退避しておいた原本を書き戻しました（累積スナップショットを次試行へ引き継ぐため）"
+          fi
+          echo "1 回目が失敗しました。60 秒待機して再試行します（529 は即時再試行が無意味なため）"
+          sleep 60
+
+      - name: Generate earnings overview via Claude Code (retry 2)
+        id: gen2
+        if: success() && steps.gen1.outcome == 'failure'
+        continue-on-error: true
+        uses: anthropics/claude-code-base-action@beta
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          model: claude-opus-5
+          prompt_file: report-pipelines/prompts/earnings-report.md
+          allowed_tools: "Read,Write,Edit,Bash,Grep,Glob"
+          timeout_minutes: "30"
+          claude_env: |
+            CLAUDE_CODE_EFFORT_LEVEL: high
+            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+        env:
+          TARGET_MONTH: ${{ steps.month.outputs.value }}
+          PRIVATE_REPO_ROOT: private-repo
+          CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+
+      - name: Wait before retry 3 (Claude overloaded 等の一時エラー)
+        if: success() && steps.gen2.outcome == 'failure'
+        env:
+          TARGET_MONTH: ${{ steps.month.outputs.value }}
+        run: |
+          F="private-repo/research/earnings/${TARGET_MONTH}_overview.md"
+          # 途中まで書かれた不完全ファイルは退避（削除しない）。直後に生成前の原本を書き戻し、
+          # 再試行が「不完全な自分の出力」ではなく累積スナップショットの原本から始まるようにする。
+          if [ -f "$F" ]; then
+            mv "$F" "/tmp/${TARGET_MONTH}_overview.attempt2.partial.md"
+            echo "2 回目の不完全な出力を /tmp へ退避しました（再試行が白紙から書き直せるようにするため）"
+          fi
+          if [ -f "/tmp/${TARGET_MONTH}_overview.pristine.md" ]; then
+            cp -f "/tmp/${TARGET_MONTH}_overview.pristine.md" "$F"
+            echo "退避しておいた原本を書き戻しました（累積スナップショットを次試行へ引き継ぐため）"
+          fi
+          echo "2 回目も失敗しました。180 秒待機して最終再試行します"
+          sleep 180
+
+      - name: Generate earnings overview via Claude Code (retry 3)
+        id: gen3
+        if: success() && steps.gen2.outcome == 'failure'
+        continue-on-error: true
+        uses: anthropics/claude-code-base-action@beta
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          model: claude-opus-5
+          prompt_file: report-pipelines/prompts/earnings-report.md
+          allowed_tools: "Read,Write,Edit,Bash,Grep,Glob"
+          timeout_minutes: "30"
+          claude_env: |
+            CLAUDE_CODE_EFFORT_LEVEL: high
+            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+        env:
+          TARGET_MONTH: ${{ steps.month.outputs.value }}
+          PRIVATE_REPO_ROOT: private-repo
+          CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+
+      - name: Verify generated earnings overview (成否の一元判定)
+        # 上の 3 ステップは全て continue-on-error のため、ジョブの成否はここだけで決まる。
+        # 「どの試行で成功したか」に依存せず成果物の実在で判定するので、リトライ成功を失敗扱いする
+        # / 失敗を成功扱いする判定崩れが起きない。
+        env:
+          TARGET_MONTH: ${{ steps.month.outputs.value }}
+        run: |
+          F="private-repo/research/earnings/${TARGET_MONTH}_overview.md"
+          echo "attempt outcomes: gen1=${{ steps.gen1.outcome }} gen2=${{ steps.gen2.outcome }} gen3=${{ steps.gen3.outcome }}"
+          if [ ! -s "$F" ]; then
+            echo "::error::決算総括レポートが 3 回の試行で生成されませんでした: $F"
+            exit 1
+          fi
+          echo "生成成功: $F ($(wc -l < "$F") lines)"
 
       - name: レポート生成確認（欠落・極端に短い場合は fail・空配信防止）
         # exit 3 = 品質ゲート不合格（⛔ 通知へ分岐・生成物の欠落/不完全）

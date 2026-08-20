@@ -65,6 +65,22 @@ jobs:
           WAIT_MINUTES: '30'
         run: bash .github/scripts/standby_guard.sh
 
+      # 2026-08-19: 予備タイマー通知の文面へ実測値を埋めるためだけの補助ステップ。
+      # guard 本体（.github/scripts/standby_guard.sh）は 3 workflow 共用のため変更せず、
+      # 判定直後の当日実績をこの workflow 内で読み直す（数秒差のため判定材料と同値）。
+      # 取得に失敗しても通知・配信を止めない（0 件表示に落とすだけ）。
+      - name: 予備タイマー通知用の当日実績を取得
+        id: stats
+        if: github.event_name == 'schedule' && steps.check.outputs.proceed == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          STATS=$(bash .github/scripts/check_delivery.sh pts_mover_report.yml build-and-send "${{ github.run_id }}" || echo "{}")
+          echo "done_ok=$(echo "$STATS" | jq -r '.delivered // 0')" >> $GITHUB_OUTPUT
+          echo "done_fail=$(echo "$STATS" | jq -r '.failed // 0')" >> $GITHUB_OUTPUT
+          echo "active=$(( $(echo "$STATS" | jq -r '.sending // 0') + $(echo "$STATS" | jq -r '.dispatch_pending // 0') + $(echo "$STATS" | jq -r '.schedule_pending // 0') ))" >> $GITHUB_OUTPUT
+
       - name: Discord 通知（⏱ 予備タイマー起動）
         if: github.event_name == 'schedule' && steps.check.outputs.proceed == 'true'
         uses: ./.github/actions/notify-discord
@@ -73,8 +89,10 @@ jobs:
           state: timer
           label: 夜間PTS動意レポート 予備タイマー起動
           date: ${{ steps.check.outputs.target_date }}
-          meaning: 定時の Cloudflare Worker 発火が届かなかったため、GHA 側の予備タイマーが代わりに生成を開始しました。レポートはこのあと 15 分ほどで届きます。
-          action_required: 不要（毎日続く場合のみ Worker 点検）
+          # 2026-08-19 修正: 旧文面は「Worker 発火が届かなかった」と断定していたが、Worker が正常着弾し
+          # その run が失敗した場合も同じ通知が出る。guard が実際に把握している当日実績のみを述べる。
+          meaning: '本日の生成がまだ成功していないため、GHA 側の予備タイマーが救援起動しました（本日: 成功 ${{ steps.stats.outputs.done_ok }} 件・失敗 ${{ steps.stats.outputs.done_fail }} 件・実行中 ${{ steps.stats.outputs.active }} 件）。レポートはこのあと通常どおり届きます。'
+          action_required: 不要（このあとレポートが届けば復旧完了。届かない場合のみ run ログを確認）
 
       - name: Discord 通知（🚨 自動リトライ停止）
         if: contains(steps.check.outputs.reason, 'retry_cap')
@@ -100,7 +118,10 @@ jobs:
     needs: guard
     if: needs.guard.outputs.proceed == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # PM 2026-08-19: 529 自動リトライ（2 回・待機 60/180 秒）を足したため枠を再計算して拡張。
+    # 最悪ケース = 前段（clone/setup/raw 生成）15 分 + 1 回目 30 分 + 待機 1 分 + 2 回目 30 分
+    #            + 待機 3 分 + 3 回目 30 分 + 注記/フォント/playwright/送信/commit 16 分 = 125 分 → 135 分。
+    timeout-minutes: 135
     # 実配信ジョブだけを直列化する（workflow 単位の concurrency は本命の 21 時発火を塞ぐため置かない）。
     concurrency:
       group: pts_mover_report-send
@@ -174,7 +195,14 @@ jobs:
           mkdir -p market/daily/pts_movers
           rm -f "market/daily/pts_movers/${TARGET_DATE}.md"
 
+      # PM 2026-08-19 承認（動意日次 mover_report_daily.yml からの横展開）: Anthropic 側の過負荷応答
+      # （API Error: 529 overloaded_error）を初回 API 呼び出しで受けて即 exit 1 する事故の恒久対策。
+      # 第三者製の新規 action を足さず、continue-on-error + outcome 判定の再試行ステップだけで構成する。
+      # 529 は即時再試行が無意味なため待機を指数的に伸ばす（60 秒 → 180 秒）。3 ステップとも
+      # continue-on-error のため、成否は最後の Verify ステップ 1 箇所（成果物ファイルが非空か）で決まる。
       - name: Generate report via Claude Code (Opus 5 + effort high)
+        id: gen1
+        continue-on-error: true
         uses: anthropics/claude-code-base-action@beta
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -189,6 +217,87 @@ jobs:
           TARGET_DATE: ${{ steps.date.outputs.value }}
           PRIVATE_REPO_ROOT: private-repo
           CLAUDE_CODE_MAX_OUTPUT_TOKENS: 64000
+
+      - name: Wait before retry 2 (Claude overloaded 等の一時エラー)
+        if: success() && steps.gen1.outcome == 'failure'
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+        run: |
+          F="private-repo/market/daily/pts_movers/${TARGET_DATE}.md"
+          # 途中まで書かれた不完全ファイルは退避（削除しない）。再試行が白紙から書き直せるようにする。
+          if [ -f "$F" ]; then
+            mv "$F" "/tmp/${TARGET_DATE}_pts_movers.attempt1.partial.md"
+            echo "1 回目の不完全な出力を /tmp へ退避しました（再試行が白紙から書き直せるようにするため）"
+          fi
+          echo "1 回目が失敗しました。60 秒待機して再試行します（529 は即時再試行が無意味なため）"
+          sleep 60
+
+      - name: Generate report via Claude Code (retry 2)
+        id: gen2
+        if: success() && steps.gen1.outcome == 'failure'
+        continue-on-error: true
+        uses: anthropics/claude-code-base-action@beta
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          model: claude-opus-5
+          prompt_file: report-pipelines/prompts/pts-mover-report.md
+          allowed_tools: "Read,Write,Edit,Bash,Grep,Glob"
+          timeout_minutes: "30"
+          claude_env: |
+            CLAUDE_CODE_EFFORT_LEVEL: high
+            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 64000
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+          PRIVATE_REPO_ROOT: private-repo
+          CLAUDE_CODE_MAX_OUTPUT_TOKENS: 64000
+
+      - name: Wait before retry 3 (Claude overloaded 等の一時エラー)
+        if: success() && steps.gen2.outcome == 'failure'
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+        run: |
+          F="private-repo/market/daily/pts_movers/${TARGET_DATE}.md"
+          # 途中まで書かれた不完全ファイルは退避（削除しない）。再試行が白紙から書き直せるようにする。
+          if [ -f "$F" ]; then
+            mv "$F" "/tmp/${TARGET_DATE}_pts_movers.attempt2.partial.md"
+            echo "2 回目の不完全な出力を /tmp へ退避しました（再試行が白紙から書き直せるようにするため）"
+          fi
+          echo "2 回目も失敗しました。180 秒待機して最終再試行します"
+          sleep 180
+
+      - name: Generate report via Claude Code (retry 3)
+        id: gen3
+        if: success() && steps.gen2.outcome == 'failure'
+        continue-on-error: true
+        uses: anthropics/claude-code-base-action@beta
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          model: claude-opus-5
+          prompt_file: report-pipelines/prompts/pts-mover-report.md
+          allowed_tools: "Read,Write,Edit,Bash,Grep,Glob"
+          timeout_minutes: "30"
+          claude_env: |
+            CLAUDE_CODE_EFFORT_LEVEL: high
+            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 64000
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+          PRIVATE_REPO_ROOT: private-repo
+          CLAUDE_CODE_MAX_OUTPUT_TOKENS: 64000
+
+      - name: Verify generated PTS mover report (成否の一元判定)
+        # 上の 3 ステップは全て continue-on-error のため、ジョブの成否はここだけで決まる。
+        # 「どの試行で成功したか」に依存せず成果物の実在で判定するので、リトライ成功を失敗扱いする
+        # / 失敗を成功扱いする判定崩れが起きない。
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+        run: |
+          F="private-repo/market/daily/pts_movers/${TARGET_DATE}.md"
+          echo "attempt outcomes: gen1=${{ steps.gen1.outcome }} gen2=${{ steps.gen2.outcome }} gen3=${{ steps.gen3.outcome }}"
+          if [ ! -s "$F" ]; then
+            echo "::error::夜間PTS動意レポートが 3 回の試行で生成されませんでした: $F"
+            exit 1
+          fi
+          echo "生成成功: $F ($(wc -l < "$F") lines)"
 
       - name: 品質注記の機械挿入（フラグ検知時のみ・タイトル直後）
         # 絶対配信原則: make_pts_mover_report.py が出力する {date}_pts_quality_flags.txt（誌面用・階層1のみ）を
@@ -225,9 +334,39 @@ jobs:
           fi
 
       - name: Install Japanese fonts (Noto Sans CJK JP)
+        # PM 2026-08-19 承認（動意日次 mover_report_daily.yml からの横展開）: `sudo apt-get update -qq`
+        # が出力ゼロのまま数十分ハングし、ジョブ枠に到達して配信ごと落ちる事故（GitHub 側の一時事象）の
+        # 恒久対策。①ステップ単位 timeout ②各コマンドを timeout コマンドで打ち切り ③待機つき 3 回リトライ。
+        #
+        # 【失敗してもジョブを落とさない理由】本 workflow の誌面生成は send_report_pdf_discord.py →
+        # bi/pipelines/lib/md_to_pdf.py で行い、同モジュールは assets/fonts の日本語サブセット woff2
+        # （NotoSansJP / NotoSerifJP / BIZ UDPGothic）を base64 で @font-face 埋め込みする設計＝
+        # システムのフォント選択に一切依存しない。よって apt のフォントが無くても誌面が豆腐（文字化け）に
+        # なることはなく、ここで落とすと「配信できたはずの日を落とす」だけになる。
+        # 時間予算: 1 試行 = update 75 秒 + install 120 秒 = 最大 195 秒。新規試行は開始 280 秒までに
+        # 限るので最悪 475 秒で自己終了し、ステップ枠 8 分（480 秒）内に必ず警告を出して抜ける。
+        timeout-minutes: 8
+        continue-on-error: true
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq fonts-noto-cjk fonts-noto-cjk-extra
+          set -u
+          DEADLINE=$(( $(date +%s) + 280 ))
+          for i in 1 2 3; do
+            if [ "$i" -gt 1 ] && [ "$(date +%s)" -ge "$DEADLINE" ]; then
+              echo "時間予算を超過したため再試行を打ち切ります"
+              break
+            fi
+            if timeout 75 sudo apt-get update -qq \
+               && timeout 120 sudo apt-get install -y -qq fonts-noto-cjk fonts-noto-cjk-extra; then
+              echo "日本語フォント導入に成功しました（${i} 回目）"
+              exit 0
+            fi
+            echo "日本語フォント導入に失敗またはハングしました（${i}/3 回目）"
+            if [ "$i" -lt 3 ]; then
+              sleep $((i * 15))
+            fi
+          done
+          echo "::warning::日本語フォントの apt 導入をスキップしました。PDF は assets/fonts の埋め込みフォント（base64 @font-face）で描画するため誌面に影響はなく、配信を続行します"
+          exit 0
 
       - name: Install Playwright Chromium
         run: |

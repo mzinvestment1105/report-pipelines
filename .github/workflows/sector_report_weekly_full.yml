@@ -98,7 +98,12 @@ jobs:
     needs: guard
     if: needs.guard.outputs.proceed == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 90  # PM 2026-05-31: 40 -> 90 拡張（JQuants 429 リトライ + Deep Research 含むフル版で 55+ 分実績あり）
+    # PM 2026-05-31: 40 -> 90 拡張（JQuants 429 リトライ + Deep Research 含むフル版で 55+ 分実績あり）。
+    # PM 2026-08-19: 529 自動リトライ（2 回・待機 60/180 秒）を足したため枠を再計算して拡張。
+    # 最悪ケース = 前段（clone/setup/fonts/playwright）10 分 + Refresh 30 分 + 決定論生成 2 分
+    #            + 1 回目 20 分 + 待機 1 分 + 2 回目 20 分 + 待機 3 分 + 3 回目 20 分
+    #            + 検証/注記/送信/commit 8 分 = 114 分 → 125 分。
+    timeout-minutes: 125
     # 実生成ジョブだけを直列化する（workflow 単位の concurrency は本命の金曜 21 時発火を塞ぐため置かない）。
     concurrency:
       group: sector_report_weekly_full-generate
@@ -154,9 +159,39 @@ jobs:
         run: pip install -r report-pipelines/bi/pipelines/requirements.txt
 
       - name: Install Japanese fonts (Noto Sans CJK JP)
+        # PM 2026-08-19 承認（動意日次 mover_report_daily.yml からの横展開）: `sudo apt-get update -qq`
+        # が出力ゼロのまま数十分ハングし、ジョブ枠に到達して配信ごと落ちる事故（GitHub 側の一時事象）の
+        # 恒久対策。①ステップ単位 timeout ②各コマンドを timeout コマンドで打ち切り ③待機つき 3 回リトライ。
+        #
+        # 【失敗してもジョブを落とさない理由】本 workflow の誌面生成は send_report_pdf_discord.py →
+        # bi/pipelines/lib/md_to_pdf.py で行い、同モジュールは assets/fonts の日本語サブセット woff2
+        # （NotoSansJP / NotoSerifJP / BIZ UDPGothic）を base64 で @font-face 埋め込みする設計＝
+        # システムのフォント選択に一切依存しない。よって apt のフォントが無くても誌面が豆腐（文字化け）に
+        # なることはなく、ここで落とすと「配信できたはずの日を落とす」だけになる。
+        # 時間予算: 1 試行 = update 75 秒 + install 120 秒 = 最大 195 秒。新規試行は開始 280 秒までに
+        # 限るので最悪 475 秒で自己終了し、ステップ枠 8 分（480 秒）内に必ず警告を出して抜ける。
+        timeout-minutes: 8
+        continue-on-error: true
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq fonts-noto-cjk fonts-noto-cjk-extra
+          set -u
+          DEADLINE=$(( $(date +%s) + 280 ))
+          for i in 1 2 3; do
+            if [ "$i" -gt 1 ] && [ "$(date +%s)" -ge "$DEADLINE" ]; then
+              echo "時間予算を超過したため再試行を打ち切ります"
+              break
+            fi
+            if timeout 75 sudo apt-get update -qq \
+               && timeout 120 sudo apt-get install -y -qq fonts-noto-cjk fonts-noto-cjk-extra; then
+              echo "日本語フォント導入に成功しました（${i} 回目）"
+              exit 0
+            fi
+            echo "日本語フォント導入に失敗またはハングしました（${i}/3 回目）"
+            if [ "$i" -lt 3 ]; then
+              sleep $((i * 15))
+            fi
+          done
+          echo "::warning::日本語フォントの apt 導入をスキップしました。PDF は assets/fonts の埋め込みフォント（base64 @font-face）で描画するため誌面に影響はなく、配信を続行します"
+          exit 0
 
       - name: Install Playwright Chromium
         run: |
@@ -240,6 +275,15 @@ jobs:
         # continue-on-error: true ＝ 補完が失敗しても直前の決定論レポートをそのまま送信し、
         # 旧来の「Claude 生成失敗 → レポート欠落・parquet 凍結」事故を再発させない。
         # allowed_tools に Write/Web を含めず Read+Edit 中心＝数値・表の全文上書きを構造的に禁止。
+        #
+        # PM 2026-08-19 承認（動意日次 mover_report_daily.yml からの横展開）: Anthropic 側の過負荷応答
+        # （API Error: 529 overloaded_error）を初回 API 呼び出しで受けて即 exit 1 する事故の恒久対策。
+        # 第三者製の新規 action を足さず、continue-on-error + outcome 判定の再試行ステップだけで構成する。
+        # 529 は即時再試行が無意味なため待機を指数的に伸ばす（60 秒 → 180 秒）。3 ステップとも
+        # continue-on-error のため、成否は最後の Verify ステップ 1 箇所（成果物ファイルが非空か）で決まる。
+        # 本ジョブに限り Claude は「決定論生成済みレポートへの理由層追記」専用のため、Verify は
+        # レポート md の実在のみを必須とし、3 回とも追記に失敗した場合は警告のみで配信を続行する。
+        id: gen1
         continue-on-error: true
         uses: anthropics/claude-code-base-action@beta
         with:
@@ -254,6 +298,80 @@ jobs:
         env:
           TARGET_DATE: ${{ steps.date.outputs.value }}
           PRIVATE_REPO_ROOT: private-repo
+
+      - name: Wait before retry 2 (Claude overloaded 等の一時エラー)
+        if: success() && steps.gen1.outcome == 'failure'
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+        run: |
+          # このジョブの Claude は既存レポートへの追記（Edit）専用のため、ファイルを退避すると
+          # 決定論生成済みの本体まで失われる。よって退避はせず待機のみ行う。
+          echo "1 回目が失敗しました。60 秒待機して再試行します（529 は即時再試行が無意味なため）"
+          sleep 60
+
+      - name: セクター「なぜ動いた」理由補完（Claude・追記専用） (retry 2)
+        id: gen2
+        if: success() && steps.gen1.outcome == 'failure'
+        continue-on-error: true
+        uses: anthropics/claude-code-base-action@beta
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          model: claude-opus-5
+          prompt_file: report-pipelines/prompts/sector-report-full.md
+          allowed_tools: "Read,Edit,Bash,Grep,Glob"
+          timeout_minutes: "20"
+          claude_env: |
+            CLAUDE_CODE_EFFORT_LEVEL: high
+            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+          PRIVATE_REPO_ROOT: private-repo
+
+      - name: Wait before retry 3 (Claude overloaded 等の一時エラー)
+        if: success() && steps.gen2.outcome == 'failure'
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+        run: |
+          # このジョブの Claude は既存レポートへの追記（Edit）専用のため、ファイルを退避すると
+          # 決定論生成済みの本体まで失われる。よって退避はせず待機のみ行う。
+          echo "2 回目も失敗しました。180 秒待機して最終再試行します"
+          sleep 180
+
+      - name: セクター「なぜ動いた」理由補完（Claude・追記専用） (retry 3)
+        id: gen3
+        if: success() && steps.gen2.outcome == 'failure'
+        continue-on-error: true
+        uses: anthropics/claude-code-base-action@beta
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          model: claude-opus-5
+          prompt_file: report-pipelines/prompts/sector-report-full.md
+          allowed_tools: "Read,Edit,Bash,Grep,Glob"
+          timeout_minutes: "20"
+          claude_env: |
+            CLAUDE_CODE_EFFORT_LEVEL: high
+            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+          PRIVATE_REPO_ROOT: private-repo
+
+      - name: Verify sector full report (成否の一元判定)
+        # 上の 3 ステップは全て continue-on-error のため、ジョブの成否はここだけで決まる。
+        # 「どの試行で成功したか」に依存せず成果物の実在で判定するので、リトライ成功を失敗扱いする
+        # / 失敗を成功扱いする判定崩れが起きない。
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+        run: |
+          F="private-repo/market/daily/sector/${TARGET_DATE}_full.md"
+          echo "attempt outcomes: gen1=${{ steps.gen1.outcome }} gen2=${{ steps.gen2.outcome }} gen3=${{ steps.gen3.outcome }}"
+          if [ ! -s "$F" ]; then
+            echo "::error::セクター週次フルレポート（決定論生成）が見つかりません: $F"
+            exit 1
+          fi
+          if [ "${{ steps.gen3.outcome }}" = "failure" ]; then
+            echo "::warning::理由層の Claude 追記は 3 回とも失敗しました。決定論生成のレポートをそのまま配信します"
+          fi
+          echo "生成成功: $F ($(wc -l < "$F") lines)"
 
       - name: 品質注記の機械挿入（parquet 鮮度ずれ検知時のみ・タイトル行直後）
         # PM 2026-07-12（絶対配信原則）: Refresh の成否によらず、実際に使われた parquet の
