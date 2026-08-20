@@ -10,8 +10,12 @@ CLAUDE.md データ鮮度ルール:
   - 各フォルダ直下の *.md のうち、ファイル名に YYYY-MM-DD を含むものだけを対象
     （README.md 等の日付なしファイルは対象外・触らない）
   - 日付降順（同日はファイル名降順）に並べ、新しい 5 件を残す
-  - 超過分を同フォルダ内 archive/（無ければ作成）へ shutil.move で退避
+  - 超過分を退避先 archive（無ければ作成）へ shutil.move で退避
   - 削除は一切しない（移動のみ）。移動先に同名ファイルが既にあればスキップして警告
+
+退避先（2026-08-20 アーカイブ一本化）:
+  - CONSOLIDATED_LANES のレーンは market/archive/{レーン名}/ へ集約
+  - それ以外のレーンは従来どおり market/daily/{レーン名}/archive/
 
 raw ファイルのローテーション（2026-07-06 追加）:
   - market/daily/ 直下の `{YYYY-MM-DD}_{source}_raw.md`（例: 2026-07-06_macro_raw.md）
@@ -41,6 +45,9 @@ from pathlib import Path
 KEEP_COUNT = 5
 TARGET_FOLDERS = ["macro", "movers", "theme", "ideas", "largecap", "scout", "positions",
                   "money_flow"]
+#: 退避先を market/archive/{レーン名}/ に集約済みのレーン（2026-08-20 アーカイブ一本化）。
+#: ここに載っていないレーンは従来どおり market/daily/{レーン名}/archive/ へ退避する。
+CONSOLIDATED_LANES = {"macro", "movers", "ideas"}
 DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
 
 # market/daily/ 直下の raw ファイル（{YYYY-MM-DD}_{source}_raw.md）ローテーション設定
@@ -58,7 +65,18 @@ def resolve_repo_root() -> Path:
     return root
 
 
-def rotate_folder(folder: Path, dry_run: bool) -> int:
+def archive_dir_for(folder: Path, market: Path) -> Path:
+    """レーンフォルダの退避先 archive パスを返す。
+
+    CONSOLIDATED_LANES のレーンは market/archive/{レーン名}/、
+    それ以外は従来どおり {レーンフォルダ}/archive/。
+    """
+    if folder.name in CONSOLIDATED_LANES:
+        return market / "archive" / folder.name
+    return folder / "archive"
+
+
+def rotate_folder(folder: Path, market: Path, dry_run: bool) -> int:
     """1 フォルダをローテーションし、移動（予定）件数を返す。"""
     if not folder.is_dir():
         print(f"[SKIP] フォルダなし: {folder}")
@@ -81,7 +99,7 @@ def rotate_folder(folder: Path, dry_run: bool) -> int:
         print(f"[OK]   {folder.name}: {len(dated_files)} 件 <= {KEEP_COUNT} 件・移動なし")
         return 0
 
-    archive_dir = folder / "archive"
+    archive_dir = archive_dir_for(folder, market)
     moved = 0
     for _, _, src in excess:
         dst = archive_dir / src.name
@@ -98,7 +116,7 @@ def rotate_folder(folder: Path, dry_run: bool) -> int:
 
     print(
         f"[OK]   {folder.name}: 全 {len(dated_files)} 件中 新しい {KEEP_COUNT} 件を残し "
-        f"{moved} 件を archive/ へ{'移動予定 (dry-run)' if dry_run else '移動'}"
+        f"{moved} 件を {archive_dir} へ{'移動予定 (dry-run)' if dry_run else '移動'}"
     )
     return moved
 
@@ -157,7 +175,8 @@ def main() -> int:
     args = parser.parse_args()
 
     root = resolve_repo_root()
-    daily = root / "market" / "daily"
+    market = root / "market"
+    daily = market / "daily"
     if not daily.is_dir():
         print(f"[ERROR] market/daily が見つかりません: {daily}")
         print("        MIZUKI_FUND_ROOT 環境変数でリポルートを指定してください")
@@ -168,7 +187,7 @@ def main() -> int:
 
     total = 0
     for name in TARGET_FOLDERS:
-        total += rotate_folder(daily / name, args.dry_run)
+        total += rotate_folder(daily / name, market, args.dry_run)
     total += rotate_raw_files(daily, args.dry_run)
 
     print(f"合計: {total} 件{'（dry-run・実際には移動していない）' if args.dry_run else ' 移動'}")

@@ -10,21 +10,12 @@ PMから指定された銘柄を深掘りし、エントリー・見送りの判
 
 ---
 
-## 専門用語ルール（全セクション共通・原則の正本）
+## 専門用語ルール（全セクション共通）
 
-略語・業界用語・社内造語を使う場合は、初出時に必ず平易な説明を括弧内に付ける。
-例: SFA（営業支援ツール）、BPO（業務を外部委託するサービス）、ARR（年間経常収益）
-「初めて見た人が読める」を基準とする。説明なしの略語・専門用語の使用禁止。
+※誌面共通ルールは [prompts/_common_rules.md](../prompts/_common_rules.md) §5 を適用
 
-**原則（汎用ルール・列挙リスト方式は廃止・PM 2026-05-27 確定）**:
-
-- **投資クラスタ常用語**（PER・PBR・EPS・ROE・ROIC・GU・GD・ボリバン・3σ/2σ・RSI・MACD・MA・FOMC・FRB・日銀・CPI・S 高・FOMO・プライム/スタンダード/グロース・TOPIX・VIX 等）**には注釈絶対禁止**（読み手の知識を低く見積もる失礼な行為）
-- **それ以外の専門用語**（業界用語・技術用語・固有サービス名・会計略語・ビジネスモデル用語・カタカナ複合語・認定/プログラム名・M&A 用語等）**は初出時に括弧書きで中学生レベル注釈必須**
-- 判定基準：**「初めて読む人がこの 1 行を読んで意味が分かるか？」**を自問する
-- 同一レポート内で**初出時のみ**注釈（繰り返し不要）
-- 注釈の中で別の専門用語を使わない（注釈も中学生レベル）
-
-詳細 memory: [feedback_jargon_annotation_all_reports.md](../claude_memory/feedback_jargon_annotation_all_reports.md)。保存前の自己検証手順は [/stock-report](../.claude/commands/stock-report.md) Step 4.5 で実行する（スキップ即重大インシデント）。
+- 保存前の注釈自己検証は [/stock-report](../.claude/commands/stock-report.md) Step 4.5 で必ず実行する（スキップ即重大インシデント）。
+- 詳細 memory: [feedback_jargon_annotation.md](../claude_memory/feedback_jargon_annotation.md)
 
 ---
 
@@ -393,7 +384,7 @@ CF データは EDINET DB `get_financials` で実値取得必須（「未取得�
 
 ### 9. カタリスト
 
-**【🔴 記述フォーマット・絶対遵守（PM 2026-05-26 強調指示・[feedback_event_calendar_format.md](../claude_memory/feedback_event_calendar_format.md) を本セクションにも全レポート横断適用）】**
+**【🔴 記述フォーマット・絶対遵守（PM 2026-05-26 強調指示・[feedback_report_format_rules.md](../claude_memory/feedback_report_format_rules.md) を本セクションにも全レポート横断適用）】**
 
 1. **重要度は ★★★（最重要）/ ★★☆（中要）/ ★☆☆（軽微）の 3 段階で評価**し、降順に並べる
 2. **1 行 1 イベント・空行で区切って読みやすくする**（複数イベントを 1 行に詰め込まない・改行で分ける）
@@ -481,10 +472,8 @@ CF データは EDINET DB `get_financials` で実値取得必須（「未取得�
 
 ### 廃止セクション（絶対出力禁止・PM 2026-05-30 確定）
 
-- ~~Deep Research 候補セクション~~ → 全レポート種別で廃止（個別銘柄レポート含む）
+- ※誌面共通ルールは [prompts/_common_rules.md](../prompts/_common_rules.md) §13 を適用
 - ~~末尾の「出典」「References」「Sources」セクション~~（URL リスト・参照ファイル列挙）→ 廃止（[CLAUDE.md](../CLAUDE.md) §C）
-
-※ Deep Research プロンプト発行・`{date}_deep_research.md` 作成自体は個別銘柄レポート系スキル（/stock-report・/stock-update・/s-high-review）でのみ可（[CLAUDE.md](../CLAUDE.md) §C「Deep Research 運用」）。レポート本文への「候補セクション」出力は上記のとおり禁止。
 
 ---
 
@@ -607,5 +596,4 @@ PMが個別銘柄について見解を述べた場合、以下を必須とする
 
 - 銘柄名は全て銘柄コード併記（コードなし銘柄名ゼロ）
 - 推測語（可能性が高い・と思われる・と考えられる・だろう・のはず・とみられる 等）ゼロ
-- フォールバック表記（取得失敗・調査要・データ未取得 等）ゼロ
-- 信用倍率（買残÷売残の比率）記載ゼロ
+- ※誌面共通ルールは [prompts/_common_rules.md](../prompts/_common_rules.md) §25・§32 を適用

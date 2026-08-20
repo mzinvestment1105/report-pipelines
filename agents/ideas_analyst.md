@@ -12,7 +12,7 @@ PMの目的は「**検討開始の起点**」（PM 2026-05-20 確定）。即エ
 **頻度**: PM 起動時（[/ideas-report](../.claude/commands/ideas-report.md) 経由・手動）
 **PMは生データを直接見ない。このレポートが唯一の情報源として完結していなければならない。**
 
-**【専門用語ルール・全セクション共通】** [claude_memory/feedback_jargon_annotation_all_reports.md](../claude_memory/feedback_jargon_annotation_all_reports.md) に従い、投資クラスタ常用語（PER・PBR・EPS・ROE・GU・ボリバン・FOMC・S 高 等）には注釈絶対禁止・それ以外の専門用語（業界用語・固有サービス名・会計略語・ビジネスモデル用語）は初出時に括弧書きで中学生レベル注釈必須。「初めて見た人が読める」を基準とする。Write 前に必ず自己検証。
+※誌面共通ルールは [prompts/_common_rules.md](../prompts/_common_rules.md) §5 を適用
 
 ---
 
@@ -50,7 +50,7 @@ PMの目的は「**検討開始の起点**」（PM 2026-05-20 確定）。即エ
 
 ### 補助データ
 
-- [bi/outputs/screening_master.parquet](../bi/outputs/screening_master.parquet) — 時価総額・売買代金・信用買残の発行株数比の補完
+- [bi/outputs/screening_master.parquet](../bi/outputs/screening_master.parquet) — 時価総額・売買代金・信用買残の発行株数比の補完（[prompts/_common_rules.md](../prompts/_common_rules.md) §32）
 - [market/daily/ideas/](../market/daily/ideas/) 配下の直近 5 営業日 — フォロースルー追跡
 
 ---
@@ -96,7 +96,7 @@ PMの目的は「**検討開始の起点**」（PM 2026-05-20 確定）。即エ
 ## 2. ⭐ 自社株買い決議（発行済株式数比 % 順）
 ## 3. ⭐ 大量保有報告（変化幅 % 順）
 ## 4. 翌営業日 注目銘柄 Top 10（定量スコア順・メイン）
-   - 各銘柄に株価動意・5d 売買代金・信用買残の発行株数比・時価総額を併記
+   - 各銘柄に株価動意・5d 売買代金・信用買残の発行株数比・時価総額を併記（[prompts/_common_rules.md](../prompts/_common_rules.md) §32）
 ## 5. 定性ニュース注目銘柄 Top 5（試験運用・別枠）
    - 各銘柄に raw 引用根拠を必須併記
 ## 6. フォロースルー対象 ⏰（過去 5 営業日 Top 10 → 本日再登場銘柄）

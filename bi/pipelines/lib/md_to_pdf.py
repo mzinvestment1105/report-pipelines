@@ -227,7 +227,7 @@ def _colorize_numbers(html: str) -> str:
 # 時価総額サイズ目印（PM 2026-06-30 確定・LLM 非依存で renderer が付与）。
 # 個別株を列挙する見出し（### …（… 時価総額 X億/兆円 …））に対し時価総額で区分タグを挿入:
 #   100億以上=無印 / 50〜100億未満=〔小型 ◯◯億〕 / 50億未満=〔極小 ◯◯億・対象外〕（赤太字）。
-# PM は100億未満を基本回避・50億未満は禁止リスト（playbook/entry_exit_rules.md §3-6）。
+# PM は100億未満を基本回避・50億以下は禁止リスト（playbook/entry_exit_rules.md §3-6）。
 _SIZE_MCAP_RE = re.compile(r"時価総額\s*([\d,]+(?:\.\d+)?)\s*(兆|億)円")
 _SIZE_PCT_RE = re.compile(r"(\s*[+\-−][\d.]+\s*%\s*)(（)")
 
@@ -235,7 +235,7 @@ _SIZE_PCT_RE = re.compile(r"(\s*[+\-−][\d.]+\s*%\s*)(（)")
 def _size_tag(mcap_oku: float | None) -> str | None:
     if mcap_oku is None:
         return None
-    if mcap_oku < 50:
+    if mcap_oku <= 50:
         return f'<span style="color:{_NEG};font-weight:700">〔極小 {mcap_oku:.0f}億・対象外〕</span>'
     if mcap_oku < 100:
         return f'〔小型 {mcap_oku:.0f}億〕'

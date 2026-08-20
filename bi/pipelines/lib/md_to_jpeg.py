@@ -195,7 +195,7 @@ _SIZE_NEG = "#C0392B"
 def _size_tag(mcap_oku):
     if mcap_oku is None:
         return None
-    if mcap_oku < 50:
+    if mcap_oku <= 50:
         return f'<span style="color:{_SIZE_NEG};font-weight:700">〔極小 {mcap_oku:.0f}億・対象外〕</span>'
     if mcap_oku < 100:
         return f'〔小型 {mcap_oku:.0f}億〕'
