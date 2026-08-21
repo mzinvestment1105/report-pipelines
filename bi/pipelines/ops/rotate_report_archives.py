@@ -4,7 +4,7 @@
 CLAUDE.md データ鮮度ルール:
   「sector 以外のレポートフォルダは 5 件上限で超過分を archive/ へ移動」
 を自動化する。対象フォルダ: macro / movers / theme / ideas / largecap / scout / positions
-（sector は上限なしのため対象外）。
+/ money_flow / pts_movers（sector は上限なしのため対象外）。
 
 動作:
   - 各フォルダ直下の *.md のうち、ファイル名に YYYY-MM-DD を含むものだけを対象
@@ -13,7 +13,7 @@ CLAUDE.md データ鮮度ルール:
   - 超過分を退避先 archive（無ければ作成）へ shutil.move で退避
   - 削除は一切しない（移動のみ）。移動先に同名ファイルが既にあればスキップして警告
 
-退避先（2026-08-20 アーカイブ一本化）:
+退避先（2026-08-20 アーカイブ一本化・2026-08-21 に largecap / theme / pts_movers を追加）:
   - CONSOLIDATED_LANES のレーンは market/archive/{レーン名}/ へ集約
   - それ以外のレーンは従来どおり market/daily/{レーン名}/archive/
 
@@ -44,10 +44,11 @@ from pathlib import Path
 
 KEEP_COUNT = 5
 TARGET_FOLDERS = ["macro", "movers", "theme", "ideas", "largecap", "scout", "positions",
-                  "money_flow"]
-#: 退避先を market/archive/{レーン名}/ に集約済みのレーン（2026-08-20 アーカイブ一本化）。
+                  "money_flow", "pts_movers"]
+#: 退避先を market/archive/{レーン名}/ に集約済みのレーン（2026-08-20 アーカイブ一本化・
+#: 2026-08-21 に largecap / theme / pts_movers を追加して全レーン集約済み）。
 #: ここに載っていないレーンは従来どおり market/daily/{レーン名}/archive/ へ退避する。
-CONSOLIDATED_LANES = {"macro", "movers", "ideas"}
+CONSOLIDATED_LANES = {"macro", "movers", "ideas", "largecap", "theme", "pts_movers"}
 DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
 
 # market/daily/ 直下の raw ファイル（{YYYY-MM-DD}_{source}_raw.md）ローテーション設定

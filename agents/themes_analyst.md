@@ -103,7 +103,7 @@
 
 ## フル版（PM 明示指示時のみ・ローカル拡張仕様）
 
-PM が「テーマ名のフル版を作って」と明示指示した場合のみ生成する（日次 GHA では生成しない）。保存先：`market/daily/theme/{date}_{slug}_full.md`。半導体サンプル [market/daily/theme/archive/2026-05-16_semicon_sample.md](../market/daily/theme/archive/2026-05-16_semicon_sample.md) と同じ深さで以下を含む：
+PM が「テーマ名のフル版を作って」と明示指示した場合のみ生成する（日次 GHA では生成しない）。保存先：`market/daily/theme/{date}_{slug}_full.md`。半導体サンプル [market/archive/theme/2026-05-16_semicon_sample.md](../market/archive/theme/2026-05-16_semicon_sample.md) と同じ深さで以下を含む：
 
 1. テーマ概要
 2. 🔍 なぜ盛り上がっているか（詳細・複数項目）
