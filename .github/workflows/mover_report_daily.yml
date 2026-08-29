@@ -18,10 +18,11 @@ name: 動意銘柄レポート日次
   schedule:
     - cron: '45 8 * * 1-5'
 
-# PM 2026-05-25 確定: weekly と同じく 3 並列構造に変更（32K 出力上限対策）。
+# PM 2026-08-26 確定: 旧 4 並列（prime/standard/growth_a/growth_b）を 1 実行へ統合。
 # setup-raw ジョブが raw データ生成 + artifact upload。
-# generate-market ジョブが matrix で prime / standard / growth を 3 並列実行。
-# merge-and-send ジョブが 3 ファイル統合 + Discord 送信 + commit。
+# generate-market ジョブが market=all の 1 実行で全 3 市場を 1 ファイルへ生成。
+# merge-and-send ジョブが単一ファイルを配置 + Discord 送信 + commit。
+# 並び順はグロース → スタンダード → プライム（prompts/mover-report.md が制御）。
 
 # PM 2026-06-06 修正: target_date による group 分裂を防ぐため固定 group へ変更。
 concurrency:
@@ -289,16 +290,21 @@ jobs:
   generate-market:
     needs: setup-raw
     runs-on: ubuntu-latest
-    # PM 2026-08-19: 529 自動リトライ（2 回・待機 60/180 秒）を足したため枠を再計算して拡張。
-    # 最悪ケース = 前段 10 分 + 1 回目 45 分 + 待機 1 分 + 2 回目 30 分 + 待機 3 分 + 3 回目 30 分
-    #            + 検証/artifact 2 分 = 121 分 → 余裕を見て 130 分。
-    timeout-minutes: 130
+    # PM 2026-08-26: 4 並列を 1 実行へ統合し、1 ジョブが 3 市場 40 銘柄を書くため各試行の枠を拡張
+    # （gen1 45→60 分・gen2/gen3 30→45 分）。
+    # 最悪ケース = 前段 10 分 + 1 回目 60 分 + 待機 1 分 + 2 回目 45 分 + 待機 3 分 + 3 回目 45 分
+    #            + 検証/artifact 2 分 = 166 分 → 余裕を見て 175 分。
+    timeout-minutes: 175
     strategy:
       fail-fast: false
       matrix:
-        # PM 2026-06-14 確定: 銘柄数最多の growth を growth_a(6,7) / growth_b(8c) に2分割し
-        # 1実行あたりのコンテキスト負荷を下げ、文脈喪失による raw 再読ループ・コスト枠超過を防ぐ。
-        market: [prime, standard, growth_a, growth_b]
+        # PM 2026-08-26 確定: 固定プロンプト121KB×4重複を解消するため1実行へ統合。
+        # 並び順はグロース→スタンダード→プライム（prompts/mover-report.md が制御）。
+        # 旧構成 [prime, standard, growth_a, growth_b] の4分割は「出力32Kトークン上限」が根拠だったが、
+        # 2026-07-07 に CLAUDE_CODE_MAX_OUTPUT_TOKENS を 64000 へ引き上げ済みで根拠が消滅した
+        # （実績出力は4セクション合計で枠の約1/3）。matrix 構造自体は参照箇所の書き換えを
+        # 最小にするため残し、値だけを [all] の1値に畳む。
+        market: [all]
     steps:
       - name: Checkout report-pipelines
         uses: actions/checkout@v4
@@ -360,32 +366,11 @@ jobs:
           mkdir -p market/daily
           SRC=/tmp/movers-raw/${TARGET_DATE}_movers_raw.md
           DST=market/daily/${TARGET_DATE}_movers_raw.md
-          # PM 2026-06-13 確定: standard / growth ジョブには担当市場の節のみ渡し、
-          # 担当外市場（プライム/スタンダード ~1,960 行）の無駄読み・同一 offset 再読込ループを構造的に防ぐ。
-          # prime は Section 9 が全市場横断のため全 raw を保持する。
-          # PM 2026-07-12 確定: standard / growth にも raw ヘッダ（タイトル・価格比較・
-          # 「対象日市場概況」ブロック＝「## Layer 1」より前の全行）を前置する。
-          # 「本日の地合い」の引用元と対象日検証のアンカーを全 4 並列ジョブへ届けるため
-          # （2026-07-09 日付品質事故の再発防止）。
-          case "$TARGET_MARKET" in
-            growth_a|growth_b)
-              awk '/^## Layer 1/{exit} {print}' "$SRC" > "$DST"
-              awk '/^## グロース/{f=1} f' "$SRC" >> "$DST"
-              ;;
-            standard)
-              awk '/^## Layer 1/{exit} {print}' "$SRC" > "$DST"
-              awk '/^## スタンダード/{f=1} /^## グロース/{f=0} f' "$SRC" >> "$DST"
-              ;;
-            *)
-              cp "$SRC" "$DST"
-              ;;
-          esac
-          # 抽出失敗（見出し不一致等）の保険: 極端に短ければ全 raw にフォールバック
-          # （閾値 40: ヘッダ前置分 ~20 行があっても市場節の抽出失敗を検知できる値・PM 2026-07-12）
-          if [ "$(wc -l < "$DST")" -lt 40 ]; then
-            echo "Sliced raw too short for market=$TARGET_MARKET; falling back to full raw"
-            cp "$SRC" "$DST"
-          fi
+          # PM 2026-08-26 確定: 統合後は全市場を1実行が担当するため raw は無加工で全量を渡す
+          # （旧 case 文による市場別スライス〈standard / growth へ担当市場の節のみ渡す〉は統合により不要）。
+          # raw ヘッダ（タイトル・価格比較・「対象日市場概況」ブロック）も全量に含まれるため、
+          # 「本日の地合い」の引用元と対象日検証のアンカーはそのまま届く。
+          cp "$SRC" "$DST"
           echo "Placed $DST for market=$TARGET_MARKET ($(wc -l < "$DST") lines / source $(wc -l < "$SRC") lines)"
 
       - name: 既存日次レポートファイル群を削除（前回不良ファイル読込スキップ防止）
@@ -415,7 +400,7 @@ jobs:
           model: claude-opus-5
           prompt_file: report-pipelines/prompts/mover-report.md
           allowed_tools: "Read,Write,Edit,Bash,Grep,Glob,WebSearch,WebFetch"
-          timeout_minutes: "45"
+          timeout_minutes: "60"
           # PM 2026-07-07: 32001 出力トークン上限で市場セクションが途中終了する事故の予防で 64000 へ。
           claude_env: |
             CLAUDE_CODE_EFFORT_LEVEL: high
@@ -451,7 +436,7 @@ jobs:
           model: claude-opus-5
           prompt_file: report-pipelines/prompts/mover-report.md
           allowed_tools: "Read,Write,Edit,Bash,Grep,Glob,WebSearch,WebFetch"
-          timeout_minutes: "30"
+          timeout_minutes: "45"
           claude_env: |
             CLAUDE_CODE_EFFORT_LEVEL: high
             CLAUDE_CODE_MAX_OUTPUT_TOKENS: 64000
@@ -485,7 +470,7 @@ jobs:
           model: claude-opus-5
           prompt_file: report-pipelines/prompts/mover-report.md
           allowed_tools: "Read,Write,Edit,Bash,Grep,Glob,WebSearch,WebFetch"
-          timeout_minutes: "30"
+          timeout_minutes: "45"
           claude_env: |
             CLAUDE_CODE_EFFORT_LEVEL: high
             CLAUDE_CODE_MAX_OUTPUT_TOKENS: 64000
@@ -624,7 +609,7 @@ jobs:
           path: /tmp/market-artifacts
           merge-multiple: true
 
-      - name: Place market files and merge into {date}.md
+      - name: Place market file as {date}.md
         working-directory: ./private-repo
         env:
           TARGET_DATE: ${{ needs.setup-raw.outputs.target_date }}
@@ -632,28 +617,23 @@ jobs:
           MOVERS_DIR="market/daily/movers"
           mkdir -p "$MOVERS_DIR"
           rm -f "${MOVERS_DIR}/${TARGET_DATE}.md"
-          for MARKET in prime standard growth_a growth_b; do
-            SRC="/tmp/market-artifacts/${TARGET_DATE}_${MARKET}.md"
-            DST="${MOVERS_DIR}/${TARGET_DATE}_${MARKET}.md"
-            if [ ! -f "$SRC" ]; then
-              echo "ERROR: artifact not found: $SRC"
-              exit 1
-            fi
-            cp "$SRC" "$DST"
-            echo "Placed $DST ($(wc -l < "$DST") lines)"
-          done
-          # マージ順: prime(0,2,3,8a,9) → standard(4,5,8b) → growth_a(6,7) → growth_b(8c)
-          # send_report_pdf_discord.py はマージ後 {date}.md からセクション6/7/8cを集めて
-          # グロース PDF を生成するため、growth_a/growth_b を分割しても送信は透過的。
+          # PM 2026-08-26 確定: 4 並列統合により artifact は単一（{date}_all.md）。
+          # 旧 4 ファイル cat 結合は不要になり、そのまま cp する。
+          # ファイル内の市場並び順はグロース → スタンダード → プライム
+          # （prompts/mover-report.md が制御）。send_report_pdf_discord.py の
+          # split_movers_by_market() は市場タイトル行だけを見て 3 PDF へ再分割し、
+          # ファイル内の出現順のまま同一 webhook へ順次送るため、送信は無改修で透過する。
+          SRC="/tmp/market-artifacts/${TARGET_DATE}_all.md"
+          DST="${MOVERS_DIR}/${TARGET_DATE}_all.md"
+          if [ ! -f "$SRC" ]; then
+            echo "ERROR: artifact not found: $SRC"
+            exit 1
+          fi
+          cp "$SRC" "$DST"
+          echo "Placed $DST ($(wc -l < "$DST") lines)"
           OUTPUT="${MOVERS_DIR}/${TARGET_DATE}.md"
-          cat "${MOVERS_DIR}/${TARGET_DATE}_prime.md" > "$OUTPUT"
-          echo "" >> "$OUTPUT"
-          cat "${MOVERS_DIR}/${TARGET_DATE}_standard.md" >> "$OUTPUT"
-          echo "" >> "$OUTPUT"
-          cat "${MOVERS_DIR}/${TARGET_DATE}_growth_a.md" >> "$OUTPUT"
-          echo "" >> "$OUTPUT"
-          cat "${MOVERS_DIR}/${TARGET_DATE}_growth_b.md" >> "$OUTPUT"
-          echo "Merged into $OUTPUT ($(wc -l < "$OUTPUT") lines)"
+          cp "$DST" "$OUTPUT"
+          echo "Placed $OUTPUT ($(wc -l < "$OUTPUT") lines)"
 
       - name: Download movers raw artifact (品質フラグ取得用)
         # PM 2026-07-12（絶対配信原則）: setup-raw が出力した {date}_quality_flags.txt（対象日 EOD

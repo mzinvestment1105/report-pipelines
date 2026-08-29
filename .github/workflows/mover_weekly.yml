@@ -21,15 +21,54 @@ name: 動意銘柄レポート週次
         required: false
         default: 'false'
   schedule:
-    - cron: '30 10 * * 5'
+    # ---------------------------------------------------------------------------------
+    # PM 2026-08-29 確定（案3 + 自動再試行レーン）
+    #   「回らないまま週を終えるようなことがあってはならない／回らなかった場合にも必ず
+    #     数時間後に正しく回るようにしろ」
+    #
+    # 金曜 22 時台の生成は price_history.yml の当日分 commit（実測 JST 翌 04 時台着地）より
+    # 前に走るため、構造的に対象日 EOD が未着になる。そこで予備レーンを土曜以降へ移し、
+    # さらに「対象週が未配信のままなら時間をずらして何度でも回り直す」再試行レーンを敷く。
+    # 8/28 の実績では price_history の着地が起票から約 12 時間遅延しており、1 回きりの
+    # 予備では取りこぼす。対象週の翌週が始まる前に計 5 回のチャンスを置く。
+    #
+    #   UTC 01:00 土 → JST 土 10:00 起票 / 起床 11:00  … 第1試行（本命 Worker 未達の受け皿）
+    #   UTC 08:00 土 → JST 土 17:00 起票 / 起床 18:00  … 第2試行
+    #   UTC 00:00 日 → JST 日 09:00 起票 / 起床 10:00  … 第3試行
+    #   UTC 10:00 日 → JST 日 19:00 起票 / 起床 20:00  … 第4試行
+    #   UTC 21:00 日 → JST 月 06:00 起票 / 起床 07:00  … 第5試行（最終・月曜寄り付き前）
+    #
+    # GitHub cron は実測 +1h45m〜+3h15m 遅延するため、各レーンとも起票を 1 時間早めに置き
+    # guard 側の WAKE_JST まで待って判定する方式（standby_guard.sh）を踏襲する。
+    # 全レーンが weekcheck（対象週起点・delivered/sending 判定）を通るため、配信済み・
+    # 実行中なら即 skip され二重配信は起きない。
+    # 対象日データ未着なら price-gate ジョブが generate-market 以降を止める（二重防御）。
+    # ---------------------------------------------------------------------------------
+    - cron: '0 1 * * 6'
+    - cron: '0 8 * * 6'
+    - cron: '0 0 * * 0'
+    - cron: '0 10 * * 0'
+    - cron: '0 21 * * 0'
 
-# PM 2026-05-23 確定: プライム / スタンダード / グロースの 3 市場を並列ジョブで実行。
-# 直列実行 (~50 分) を並列化することで全体 ~22 分に短縮。
-# generate-market ジョブが matrix で 3 並列、merge-and-send ジョブが needs で 3 ジョブ完了を待つ。
+# PM 2026-08-26 確定: 旧 4 並列（prime/standard/growth_a/growth_b）を 1 実行へ統合。
+# generate-market ジョブが market=all の 1 実行で全 3 市場を 1 ファイルへ生成し、
+# merge-and-send ジョブが単一ファイルを配置して Discord 送信する。
+# 並び順はグロース → スタンダード → プライム（prompts/mover-weekly.md が制御）。
 
 # 2026-08-05: workflow 単位の concurrency は廃止（予備 run が JST 22:53 まで待機している間に
 # 本命 Worker の workflow_dispatch が pending へ回されるのを避けるため）。
 # 二重発火の最終防波堤は setup-raw ジョブ単位の concurrency で担保する。
+
+# ===================================================================================
+# 【配信原則の優先関係】PM 2026-08-29 確定
+#   PM 2026-07-12 の「絶対配信原則」（品質問題を理由に配信を止めない）は撤回していない。
+#   ただしそれは【データが揃っている前提での配信絶対】である。対象週金曜の株価データが
+#   price_history parquet に入っていない場合は、前週の窓の数値を「今週」として出すことに
+#   なるため、絶対配信原則より「対象日データ未着時は生成しない」が優先する
+#   （PM 指示: parquet の数値が出ていなかったら回らないように設計しろ）。
+#   実装: price-gate ジョブ（待機・補完・リトライつきハードゲート）と setup-raw の exit 3。
+#   これ以外の品質問題（件数不足・誌面の軽微な不備等）は従来どおり注記つきで必ず配信する。
+# ===================================================================================
 
 jobs:
   guard:
@@ -37,13 +76,63 @@ jobs:
     # 予備 cron は JST 22:53 まで sleep してから判定するため長め（最大 sleep 3h25m + 本命待ち 30 分）。
     timeout-minutes: 300
     outputs:
-      proceed: ${{ steps.check.outputs.proceed }}
-      reason: ${{ steps.check.outputs.reason }}
-      target_date: ${{ steps.check.outputs.target_date }}
+      # PM 2026-08-29 改定: 予備レーンが土曜へ移ったため、guard の生判定日（実行日 JST）を
+      # そのまま対象日にすると土曜日付でレポートを作ってしまう。normalize ステップで
+      # 「対象週の金曜」へ寄せた値を対象日として下流へ渡す。
+      # PM 2026-08-29 改定: schedule 起動（再試行レーン）では weekcheck が唯一の権威。
+      #   - 対象週が配信済み / 別 run 走行中 → weekcheck が false を返し必ず降りる（二重配信防止）
+      #   - 対象週が未配信 → standby_guard の当日スコープ retry_cap を上書きして回す
+      # workflow_dispatch（本命 Worker / 手動）では weekcheck は skip され check の判定を使う。
+      proceed: ${{ github.event_name == 'schedule' && steps.weekcheck.outputs.proceed == 'true' || github.event_name != 'schedule' && steps.check.outputs.proceed == 'true' }}
+      reason: ${{ steps.weekcheck.outputs.state || steps.check.outputs.reason }}
+      lane: ${{ steps.lane.outputs.label }}
+      lane_id: ${{ steps.lane.outputs.lane_id }}
+      target_date: ${{ steps.normalize.outputs.target_date }}
+      raw_date: ${{ steps.check.outputs.target_date }}
     steps:
       # 通知 composite action（.github/actions/notify-discord）と判定スクリプトを使うため checkout が必要
       - name: Checkout report-pipelines (通知 action / 配信判定スクリプト用)
         uses: actions/checkout@v4
+
+      - name: 再試行レーンの識別（起票時刻から起床時刻・受付窓を決める）
+        # PM 2026-08-29 追加: 再試行レーンが 5 本になったため、WAKE_JST を 1 つの固定値では
+        # 賄えない。cron の起票時刻（JST）からどのレーンかを判定し、そのレーンの起床時刻と
+        # 受付窓を出力する。GitHub cron の実測遅延（+1h45m〜+3h15m）を吸収するため、
+        # 受付窓は「起票予定時刻の 1 時間前 〜 起床時刻の 4 時間後」と広めに取り、
+        # 遅延着火でもレーンが死なないようにする（窓外 skip は日付ズレ防止の最終手段）。
+        id: lane
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" != "schedule" ]; then
+            # 手動 / Worker dispatch は待機せず即判定（従来どおり）
+            echo "wake=00:00" >> "$GITHUB_OUTPUT"
+            echo "win_start=00:00" >> "$GITHUB_OUTPUT"
+            echo "win_end=23:59" >> "$GITHUB_OUTPUT"
+            echo "label=本命" >> "$GITHUB_OUTPUT"
+            echo "lane_id=dispatch" >> "$GITHUB_OUTPUT"
+            echo "手動/dispatch 起動のためレーン判定をスキップします"
+            exit 0
+          fi
+          DOW=$(TZ=Asia/Tokyo date +%u)   # 1=月 … 6=土 7=日
+          HH=$(TZ=Asia/Tokyo date +%H)
+          H=$((10#$HH))
+          # 各レーンの起票予定 JST: 土10 / 土17 / 日09 / 日19 / 月06
+          # ID は ASCII 固定（GHA 式の startsWith 判定に使うため・表示名とは分離）
+          if   [ "$DOW" = "6" ] && [ "$H" -lt 14 ]; then WAKE=11:00; WS=09:00; WE=15:00; ID=retry1; L="再試行1(土11時)"
+          elif [ "$DOW" = "6" ];                     then WAKE=18:00; WS=16:00; WE=22:00; ID=retry2; L="再試行2(土18時)"
+          elif [ "$DOW" = "7" ] && [ "$H" -lt 14 ]; then WAKE=10:00; WS=08:00; WE=14:00; ID=retry3; L="再試行3(日10時)"
+          elif [ "$DOW" = "7" ];                     then WAKE=20:00; WS=18:00; WE=23:59; ID=retry4; L="再試行4(日20時)"
+          elif [ "$DOW" = "1" ];                     then WAKE=07:00; WS=05:00; WE=11:00; ID=retry5; L="再試行5(月7時・最終)"
+          else                                            WAKE=11:00; WS=00:00; WE=23:59; ID=retryX; L="再試行(想定外曜日)"
+          fi
+          echo "レーン判定: dow=${DOW} 現在 $(TZ=Asia/Tokyo date +%H:%M) JST → ${L} / 起床 ${WAKE} / 受付窓 ${WS}〜${WE}"
+          echo "wake=$WAKE"       >> "$GITHUB_OUTPUT"
+          echo "win_start=$WS"    >> "$GITHUB_OUTPUT"
+          echo "win_end=$WE"      >> "$GITHUB_OUTPUT"
+          echo "label=$L"         >> "$GITHUB_OUTPUT"
+          echo "lane_id=$ID"      >> "$GITHUB_OUTPUT"
 
       - name: 予備タイマー待機 + 当日配信判定（merge-and-send ジョブ単位）
         id: check
@@ -55,31 +144,128 @@ jobs:
           EVENT: ${{ github.event_name }}
           FORCE_RERUN: ${{ github.event.inputs.force_rerun }}
           INPUT_DATE: ${{ github.event.inputs.target_date }}
-          # 本命（Worker）は金曜 JST 22:43 発火。予備は 22:53 に起床して本命へ道を譲る。
-          WAKE_JST: '22:53'
-          WINDOW_START_JST: '12:00'
-          WINDOW_END_JST: '23:40'
+          # PM 2026-08-29 改定: 5 本の再試行レーンをまたぐため lane step の判定値を使う。
+          WAKE_JST: ${{ steps.lane.outputs.wake }}
+          WINDOW_START_JST: ${{ steps.lane.outputs.win_start }}
+          WINDOW_END_JST: ${{ steps.lane.outputs.win_end }}
           WAIT_MINUTES: '30'
-          LANE_LABEL: 予備タイマー
+          LANE_LABEL: ${{ steps.lane.outputs.label }}
         run: bash .github/scripts/standby_guard.sh
+
+      - name: 対象日を「対象週の金曜」へ正規化（土曜レーン対応）
+        # PM 2026-08-29 追加: standby_guard.sh の TARGET_DATE は実行日（JST）であり、
+        # 予備レーンを土曜へ移した結果そのままでは土曜日付になる。週次動意の対象日は常に
+        # 「対象週の金曜」なので、土曜なら 1 日前・日曜なら 2 日前へ寄せる（月〜金はそのまま）。
+        # workflow_dispatch で target_date を明示した場合はその値を尊重する。
+        id: normalize
+        env:
+          RAW_DATE: ${{ steps.check.outputs.target_date }}
+          INPUT_DATE: ${{ github.event.inputs.target_date }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_DATE:-}" ]; then
+            VALUE="$INPUT_DATE"
+            echo "手動指定の対象日をそのまま使用します: $VALUE"
+          else
+            DOW=$(date -u -d "$RAW_DATE" +%u)   # 1=月 … 6=土 7=日
+            case "$DOW" in
+              6) VALUE=$(date -u -d "$RAW_DATE -1 day" +%Y-%m-%d) ;;
+              7) VALUE=$(date -u -d "$RAW_DATE -2 day" +%Y-%m-%d) ;;
+              *) VALUE="$RAW_DATE" ;;
+            esac
+            echo "実行日 $RAW_DATE (dow=$DOW) → 対象日（対象週の金曜）= $VALUE"
+          fi
+          echo "value=$VALUE"
+          echo "target_date=$VALUE" >> "$GITHUB_OUTPUT"
+
+      - name: 対象週の重複配信チェック（金曜起点・再試行レーンの二重配信防止）
+        # ===============================================================================
+        # PM 2026-08-29: 再試行レーンが 5 本になったため、ここが二重配信を防ぐ唯一かつ
+        # 最重要の安全弁になる。check_delivery.sh は既定で「当日 JST 00:00 以降」しか見ず、
+        # 土日月に走る再試行レーンからは金曜の本命 run が見えない。since を対象日（金曜）
+        # 00:00 JST に指定して【対象週全体】を見る。
+        #
+        # 判定に使う 3 値（いずれか > 0 なら回さない）:
+        #   delivered        : merge-and-send が success で終わった run 数 = 配信済み
+        #   sending          : merge-and-send が queued/in_progress の run 数 = 今まさに配信中
+        #   dispatch_pending : dispatch 起点で未完了かつ未配信の run 数 = 本命が走行中
+        #   + schedule_pending: schedule 起点で未完了かつ未配信 = 別の再試行レーンが走行中
+        # sending / pending を見るのが要点。delivered だけを見ていると、先行レーンが生成中
+        # （60〜180 分かかる）の隙間に次のレーンが起きて 2 本同時に走り、両方が配信して
+        # 二重配信になる。走行中を検知したら後発レーンは必ず降りる。
+        #
+        # retry_cap との関係: standby_guard.sh は「当日 2 回失敗で cron 停止」の retry_cap を
+        # 持つが、これは日次レポート向けの当日スコープ判定であり、週をまたぐ再試行レーンには
+        # 適さない（PM 指示「回らないまま週を終えてはならない」に反する）。対象週が未配信で
+        # ある限り retry_cap は無視して回す（下の allow_retry_cap_override）。
+        # ===============================================================================
+        id: weekcheck
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET_DATE: ${{ steps.normalize.outputs.target_date }}
+          MY_RUN_ID: ${{ github.run_id }}
+          CHECK_PROCEED: ${{ steps.check.outputs.proceed }}
+          CHECK_REASON: ${{ steps.check.outputs.reason }}
+        run: |
+          set -euo pipefail
+          SINCE="${TARGET_DATE}T00:00:00+09:00"
+          STATS=$(bash .github/scripts/check_delivery.sh mover_weekly.yml merge-and-send "${MY_RUN_ID}" "${SINCE}")
+          echo "対象週の集計: ${STATS}"
+          DELIVERED=$(echo "$STATS" | jq -r '.delivered')
+          SENDING=$(echo "$STATS" | jq -r '.sending')
+          DPEND=$(echo "$STATS" | jq -r '.dispatch_pending')
+          SPEND=$(echo "$STATS" | jq -r '.schedule_pending')
+          RUNNING=$(( SENDING + DPEND + SPEND ))
+          echo "対象週 ${TARGET_DATE}: delivered=${DELIVERED} sending=${SENDING} dispatch_pending=${DPEND} schedule_pending=${SPEND} (running=${RUNNING})"
+
+          # --- 安全弁 1: すでに配信済みなら絶対に回さない ---
+          if [ "$DELIVERED" -gt 0 ]; then
+            echo "skip 理由: 対象週 ${TARGET_DATE} はすでに配信済み（merge-and-send success=${DELIVERED}）のため。二重配信を防止します。"
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            echo "state=delivered" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # --- 安全弁 2: 別 run が走行中なら降りる（生成は 60〜180 分かかるため必須） ---
+          if [ "$RUNNING" -gt 0 ]; then
+            echo "skip 理由: 対象週 ${TARGET_DATE} は別の run が走行中（running=${RUNNING}）のため。先行 run に配信を譲ります。"
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            echo "state=running" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # --- 未配信かつ走行中なし = このレーンが回る ---
+          # standby_guard.sh が当日スコープの retry_cap で降りていても、対象週が未配信である
+          # 限りここで復帰させる（PM 2026-08-29「回らないまま週を終えてはならない」）。
+          if [ "$CHECK_PROCEED" != "true" ]; then
+            echo "standby_guard は proceed=false（reason=${CHECK_REASON}）でしたが、対象週 ${TARGET_DATE} が未配信のため再試行レーンとして実行します。"
+            echo "override=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "対象週 ${TARGET_DATE} は未配信・走行中なし → このレーンで生成を実行します。"
+          echo "proceed=true" >> "$GITHUB_OUTPUT"
+          echo "state=retry" >> "$GITHUB_OUTPUT"
 
       # ⏱予備タイマー起動通知は 2026-07-09 に削除していたが 2026-08-05 に復活。
       # 削除理由だった「Worker が週次を発火しない」は Cloudflare cron の曜日フィールドが
       # 1=日曜だったことが原因で、Worker 側で修正済み。以後は「予備が起きた＝本当に Worker 未達」
       # となり通知が正しい情報になる（無言 skip の禁止）。
       - name: Discord 通知（⏱ 予備タイマー起動）
-        if: github.event_name == 'schedule' && steps.check.outputs.proceed == 'true'
+        if: github.event_name == 'schedule' && steps.weekcheck.outputs.proceed == 'true'
         uses: ./.github/actions/notify-discord
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
           state: timer
-          label: 動意銘柄レポート週次 予備タイマー起動
-          date: ${{ steps.check.outputs.target_date }}
-          meaning: 定時の Cloudflare Worker 発火（金曜 22 時 43 分）が届かなかったため、GHA 側の予備タイマーが代わりに生成を開始しました。レポートはこのあと通常どおり届きます。
-          action_required: 不要（毎週続く場合のみ Worker 点検）
+          label: 動意銘柄レポート週次 予備タイマー起動（${{ steps.lane.outputs.label }}）
+          date: ${{ steps.normalize.outputs.target_date }}
+          meaning: 対象週分がまだ配信されていないため、自動再試行レーンが代わりに生成を開始しました。価格データが揃っていればレポートはこのあと届きます。
+          action_required: 不要（この後の配信をお待ちください）
 
       - name: Discord 通知（🚨 自動リトライ停止）
-        if: contains(steps.check.outputs.reason, 'retry_cap')
+        # PM 2026-08-29: 週次では当日スコープの retry_cap を weekcheck が上書きして回し続けるため、
+        # この通知は「対象週が未配信なのにリトライ停止」という誤情報になる。schedule 起動では
+        # 発火させない（dispatch 経路のみ残す）。最終未配信のエスカレーションは escalate ジョブが担う。
+        if: contains(steps.check.outputs.reason, 'retry_cap') && github.event_name != 'schedule'
         uses: ./.github/actions/notify-discord
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
@@ -98,8 +284,215 @@ jobs:
           meaning: 実行前チェック（当日重複判定）自体がエラーになり、生成ジョブが起動していません。
           action_required: run ログ確認 → 手動 dispatch で再実行
 
-  setup-raw:
+  escalate:
+    # ===================================================================================
+    # PM 2026-08-29 確定（「回らないまま週を終えるようなことがあってはならない」）
+    # 最終再試行レーン（月曜 JST 07:00・cron '0 21 * * 0'）の run で、対象週が最後まで
+    # 未配信のまま終わった場合に PM へエスカレーション通知を出す。
+    #
+    # 発火条件（全て満たす時のみ）:
+    #   1. schedule 起動である
+    #   2. 最終レーン（lane=再試行5）である
+    #   3. merge-and-send が success で終わらなかった = 対象週が未配信のまま
+    # always() で常に評価し、内部で配信有無を再判定してから通知するため、
+    # 「途中レーンで配信できた週」に誤ってエスカレーションが飛ぶことはない。
+    # ===================================================================================
+    needs: [guard, price-gate, setup-raw, generate-market, merge-and-send]
+    if: always() && github.event_name == 'schedule' && needs.guard.outputs.lane_id == 'retry5'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout report-pipelines (通知 action / 判定スクリプト用)
+        uses: actions/checkout@v4
+
+      - name: 対象週が最終的に配信できたかを再判定
+        id: final
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET_DATE: ${{ needs.guard.outputs.target_date }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TARGET_DATE:-}" ]; then
+            # guard が skip 等で target_date を出せなかった場合は対象週の金曜を自力で算出
+            DOW=$(TZ=Asia/Tokyo date +%u)
+            case "$DOW" in
+              1) TARGET_DATE=$(TZ=Asia/Tokyo date -d "-3 day" +%Y-%m-%d) ;;
+              6) TARGET_DATE=$(TZ=Asia/Tokyo date -d "-1 day" +%Y-%m-%d) ;;
+              7) TARGET_DATE=$(TZ=Asia/Tokyo date -d "-2 day" +%Y-%m-%d) ;;
+              *) TARGET_DATE=$(TZ=Asia/Tokyo date +%Y-%m-%d) ;;
+            esac
+            echo "guard の target_date が空のため自力算出: ${TARGET_DATE}"
+          fi
+          echo "target_date=${TARGET_DATE}" >> "$GITHUB_OUTPUT"
+          SINCE="${TARGET_DATE}T00:00:00+09:00"
+          # 自分の run は除外しない（自 run の merge-and-send 成功も「配信できた」と数えるため）
+          STATS=$(bash .github/scripts/check_delivery.sh mover_weekly.yml merge-and-send 0 "${SINCE}")
+          echo "対象週の最終集計: ${STATS}"
+          DELIVERED=$(echo "$STATS" | jq -r '.delivered')
+          FAILED=$(echo "$STATS" | jq -r '.failed')
+          echo "failed=${FAILED}" >> "$GITHUB_OUTPUT"
+          if [ "$DELIVERED" -gt 0 ]; then
+            echo "対象週 ${TARGET_DATE} は配信済み（${DELIVERED} 件）。エスカレーション不要。"
+            echo "undelivered=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "対象週 ${TARGET_DATE} は全 5 レーンを使い切っても未配信。エスカレーションします。"
+            echo "undelivered=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 未配信の理由を要約
+        id: why
+        if: steps.final.outputs.undelivered == 'true'
+        env:
+          GATE: ${{ needs.price-gate.result }}
+          SETUP: ${{ needs.setup-raw.result }}
+          GEN: ${{ needs.generate-market.result }}
+          SEND: ${{ needs.merge-and-send.result }}
+        run: |
+          set -euo pipefail
+          if [ "$GATE" = "failure" ]; then
+            R="対象週金曜の株価データ（price_history）が最後まで着荷せず、価格データ着荷ゲートで停止しました"
+          elif [ "$SETUP" = "failure" ]; then
+            R="元データ（movers raw / 週間ランキング parquet）の生成に失敗しました"
+          elif [ "$GEN" = "failure" ]; then
+            R="市場セクションの生成（Claude 実行）が 3 回の試行で完了しませんでした"
+          elif [ "$SEND" = "failure" ]; then
+            R="統合または Discord 送信が失敗しました"
+          else
+            R="各ジョブの結果は price-gate=${GATE} / setup-raw=${SETUP} / generate-market=${GEN} / merge-and-send=${SEND} でした"
+          fi
+          echo "理由: $R"
+          echo "reason=$R" >> "$GITHUB_OUTPUT"
+
+      - name: Discord 通知（🚨 週を越えて未配信・エスカレーション）
+        if: steps.final.outputs.undelivered == 'true'
+        uses: ./.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
+          state: alert
+          label: 動意銘柄レポート週次 週を越えて未配信（自動復旧に失敗・要手動リカバリ）
+          date: ${{ steps.final.outputs.target_date }}
+          meaning: 対象週（金曜 ${{ steps.final.outputs.target_date }}）の週次動意レポートを、土曜から月曜朝までの自動再試行 5 回すべてで配信できないまま週を越えました。原因は「${{ steps.why.outputs.reason }}」です。自動での復旧手段は尽きており、以降は自動で回りません。
+          action_required: 手動リカバリをお願いします。(1) price_history.yml の run を確認し価格データを着荷させる (2) 本 workflow を手動 dispatch（force_rerun=true・target_date=${{ steps.final.outputs.target_date }}）で再実行、または (3) ローカルで /mover-report 系スキルを実行
+
+  price-gate:
+    # ===================================================================================
+    # PM 2026-08-29 確定（「parquet の数値が出ていなかったら回らないように設計しろ」）
+    # 対象週金曜の EOD が price_history parquet に入っていない状態では、週次動意レポートを
+    # 生成も配信もしない。旧挙動（品質注記を付けて配信続行・PM 2026-07-12 絶対配信原則）は
+    # 廃止する。yml 冒頭の「絶対配信原則」は【データが揃っている前提での配信絶対】であり、
+    # 対象日データ未着時は本ゲートが優先する（原則そのものは他の品質問題に対して有効）。
+    #
+    # 【なぜ必要か】price_history.yml は cron 起票 JST 16:00 だが実着地は翌 04 時台まで遅れる
+    # 実測がある。本命 Worker は金曜 22:43 に発火するため、金曜経路では対象日 EOD が構造的に
+    # 未着になりうる。予備レーンは土曜へ移した（案3）が、Worker 側は変更できないため二重防御。
+    #
+    # 【動作】private repo を clone し、bi/outputs/price_history/{YYYY}.parquet の最新日が
+    # 対象日以上かを判定する。未着なら JQuants で補完（make_price_history_master.py daily）を
+    # 試み、それでも未着なら 10 分間隔で最大 6 回まで再判定する（最悪 60 分 + 補完時間）。
+    # 最後まで揃わなければ exit 4 → 本ジョブ failure → setup-raw / generate-market /
+    # merge-and-send は needs で全て起動しない（レポート生成なし・Discord 本体送信なし）。
+    # ===================================================================================
     needs: guard
+    if: needs.guard.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    # 待機 30 分（10 分 × 3 回）+ 補完 4 回分（各最大 30 分だが実測は数分）+ clone/setup 10 分。
+    # 長時間の待機は本ジョブで抱えず、土日月の再試行レーン 5 本で時間軸をカバーする。
+    timeout-minutes: 90
+    outputs:
+      target_date: ${{ needs.guard.outputs.target_date }}
+    steps:
+      - name: Checkout report-pipelines
+        uses: actions/checkout@v4
+        with:
+          path: report-pipelines
+
+      - name: Setup SSH for private repo
+        env:
+          PRIVATE_REPO_DEPLOY_KEY: ${{ secrets.PRIVATE_REPO_DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$PRIVATE_REPO_DEPLOY_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+      - name: Clone private repo (mizuki-fund)
+        run: |
+          git clone git@github.com:mzinvestment1105/mizuki-fund.git private-repo
+
+      - name: Copy pipelines from Public into private working tree
+        run: |
+          cp -f report-pipelines/bi/pipelines/*.py private-repo/bi/pipelines/
+          cp -f report-pipelines/bi/pipelines/requirements.txt private-repo/bi/pipelines/
+          mkdir -p private-repo/bi/pipelines/lib private-repo/bi/pipelines/ops
+          cp -rf report-pipelines/bi/pipelines/lib/*.py private-repo/bi/pipelines/lib/ 2>/dev/null || true
+          cp -f report-pipelines/bi/pipelines/ops/check_price_history_date.py private-repo/bi/pipelines/ops/
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: report-pipelines/bi/pipelines/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r report-pipelines/bi/pipelines/requirements.txt
+
+      - name: 対象日の価格データ着荷ハードゲート（未着なら以降を実行しない）
+        id: gate
+        working-directory: ./private-repo
+        env:
+          JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
+          PYTHONIOENCODING: utf-8
+        run: |
+          set +e
+          # PM 2026-08-29 改定（実効性の再配分）: price-gate 単体の待機は 30 分（10 分 × 3 回）へ
+          # 短縮する。8/28 実績のように price_history の着地が 12 時間遅れるケースは、1 ジョブで
+          # 待ち続けるのではなく土日月の再試行レーン 5 本で時間軸をカバーする設計としたため、
+          # ここで GHA のジョブ枠を長時間占有する意味がない。
+          # ただし --topup（make_price_history_master.py daily による JQuants 直接取得）は
+          # 毎回・毎リトライで必ず試す。price_history.yml の着地を待たず自力で取りに行けるのが
+          # 最短経路であり、多くの場合ここで揃って当該レーン内で配信まで到達する。
+          python bi/pipelines/ops/check_price_history_date.py             --expect-date ${{ needs.guard.outputs.target_date }}             --retries 3 --interval-seconds 600 --topup
+          ec=$?
+          echo "exit_code=$ec" >> $GITHUB_OUTPUT
+          if [ "$ec" -eq 0 ]; then
+            echo "価格データ着荷を確認しました。生成へ進みます。"
+            exit 0
+          fi
+          if [ "$ec" -eq 4 ]; then
+            echo "::error::対象日 ${{ needs.guard.outputs.target_date }} の価格データが price_history に未着のため、週次動意レポートの生成・配信を見送ります"
+          else
+            echo "::error::価格データ着荷判定そのものが失敗しました (exit=$ec)"
+          fi
+          exit $ec
+
+      - name: Discord 通知（⛔ データ未着で生成見送り）
+        # PM 2026-08-29: レポート本体は送らない。運用通知のみを動意チャンネルへ出す
+        # （専用の運用チャンネル webhook が存在しないため、無言 skip 禁止の原則に従い
+        #  レポートと同じ DISCORD_WEBHOOK_MOVERS へ ⛔ 通知として送る）。
+        if: steps.gate.outputs.exit_code == '4'
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
+          state: blocked
+          label: 動意銘柄レポート週次 データ未着のため生成見送り
+          date: ${{ needs.guard.outputs.target_date }}
+          meaning: 対象週金曜の株価データ（price_history）が届かなかったため、前週の数値で誤ったレポートを出すことを避けて今週分の生成・配信を見送りました。レポートは配信していません。
+          action_required: price_history.yml の run を確認 → 価格データ着荷後に本 workflow を手動 dispatch（force_rerun=true・target_date に対象週の金曜を指定）
+
+      - name: Discord 通知（❌ 着荷判定の失敗）
+        if: (failure() || cancelled()) && steps.gate.outputs.exit_code != '4'
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
+          state: failed
+          label: 動意銘柄レポート週次 失敗（価格データ着荷判定）
+          date: ${{ needs.guard.outputs.target_date }}
+          meaning: 価格データの着荷判定そのものがエラーになり、生成ジョブが起動していないため今週分は未配信です。
+          action_required: run ログ確認 → 手動 dispatch（force_rerun=true）で再実行
+
+  setup-raw:
+    needs: [guard, price-gate]
     if: needs.guard.outputs.proceed == 'true'
     # PM 2026-05-30 確定: 週次 workflow にも raw 生成 step を追加。日次 workflow と同様、
     # 週次実行時に make_mover_report.py で当週分の raw を新規生成し artifact 共有する。
@@ -170,9 +563,11 @@ jobs:
         # せず、workflow の機械 step へ昇格する（2026-07-10 に 7/3 生成のコミット済み parquet を
         # 「当週」として全行誤配信・2986 -66.3%／4596 +55.4% 事故の再発防止）。
         # --expect-price-date: 価格データが対象日（当週金曜）に届いていなければ exit 3。
-        #   PM 2026-07-12 改定（絶対配信原則）: exit 3 でも中止しない（parquet は保存済み）。
-        #   品質フラグ（実際の PriceDataAsOf を明記）を書き出して続行し、merge-and-send が
-        #   レポート冒頭へ注記を機械挿入して必ず配信する（旧「⛔ 生成中止＝未配信」は PM 却下）。
+        #   PM 2026-08-29 改定: exit 3 は「生成中止」へ戻す。price-gate ジョブを通過している以上、
+        #   ここでの不一致は clone 済み parquet と JQuants 補完の両方が対象日に届かなかった
+        #   異常事態であり、前週の窓で作った数値を配信してはならない（旧「品質注記つきで
+        #   必ず配信」= PM 2026-07-12 は廃止）。yml 冒頭の絶対配信原則は「データが揃っている
+        #   前提での配信絶対」であり、対象日データ未着時は本ゲートが優先する。
         # --cold-lookback-days 90: price_history parquet が clone に無い場合の JQuants コールド
         #   フェッチを W01〜W08 計算に必要な約 13 週分へ短縮（3年分≈90分→数分）。
         # 生成した parquet は artifact で generate-market の 4 並列へ配布する（commit はしない＝
@@ -189,14 +584,15 @@ jobs:
           ec=$?
           echo "exit_code=$ec" >> $GITHUB_OUTPUT
           FLAGS=../../market/daily/${{ steps.date.outputs.value }}_weekly_quality_flags.txt
-          if [ "$ec" -eq 3 ]; then
-            ASOF=$(python -c "import pandas as pd; print(pd.read_parquet('../outputs/sector_stock_weekly.parquet')['PriceDataAsOf'].iloc[0])")
-            echo "週間ランキングの価格データが対象週の金曜（${{ steps.date.outputs.value }}）に未着。実際の価格最新日は ${ASOF} で、週間騰落・売買代金は ${ASOF} までの窓（前週の可能性）。" > "$FLAGS"
-            echo "品質フラグを出力し配信続行（PM 2026-07-12 絶対配信原則）"
-            exit 0
-          fi
-          # 正常時も空フラグを出力（artifact 収集・注記判定を単純化するため）
+          # PM 2026-08-29: EOD 未着注記による配信経路は廃止。フラグファイルは artifact の
+          # 収集対象に含まれるため空で作るが、内容を書くことはもう無い。
           : > "$FLAGS"
+          if [ "$ec" -eq 3 ]; then
+            ASOF=$(python -c "import pandas as pd; print(pd.read_parquet('../outputs/sector_stock_weekly.parquet')['PriceDataAsOf'].iloc[0])" 2>/dev/null || echo "取得不可")
+            echo "::error::週間ランキングの価格データが対象週の金曜（${{ steps.date.outputs.value }}）に未着（実際の価格最新日 ${ASOF}）。前週の窓で誤配信しないため生成を中止します"
+            echo "asof=${ASOF}" >> $GITHUB_OUTPUT
+            exit 3
+          fi
           exit $ec
 
       - name: Upload weekly ranking parquet as artifact
@@ -209,7 +605,7 @@ jobs:
 
       - name: Generate movers raw (make_mover_report.py --no-pdf)
         # 週次 workflow が当週分の raw を新規生成。3 並列の generate-market が artifact 経由で共有。
-        # PM 2026-07-12（絶対配信原則）: --date-gate（注記モード）を付与。対象日 EOD 未着でも中止せず
+        # PM 2026-07-12（絶対配信原則・日次 raw 側は維持）: --date-gate（注記モード）を付与。対象日 EOD 未着でも中止せず
         # 真のデータ日付のまま生成し、品質注記を raw 冒頭と {date}_quality_flags.txt に出力する。
         working-directory: ./private-repo/bi/pipelines
         env:
@@ -247,8 +643,21 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
+      - name: Discord 通知（⛔ データ未着で生成見送り・週間ランキング）
+        # PM 2026-08-29: price-gate 通過後に週間ランキング parquet 側で対象日不一致が出た場合も
+        # 「注記して配信」ではなく生成中止とする。レポート本体は送らず運用通知のみ。
+        if: failure() && steps.weekly_parquet.outputs.exit_code == '3'
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
+          state: blocked
+          label: 動意銘柄レポート週次 データ未着のため生成見送り
+          date: ${{ steps.date.outputs.value }}
+          meaning: 週間ランキングの価格データが対象週の金曜に届いておらず（実際の最新日 ${{ steps.weekly_parquet.outputs.asof }}）、前週の数値で誤ったレポートを出すことを避けて生成・配信を見送りました。レポートは配信していません。
+          action_required: price_history.yml の run を確認 → 価格データ着荷後に本 workflow を手動 dispatch（force_rerun=true・target_date に対象週の金曜を指定）
+
       - name: Discord 通知（❌ raw 生成失敗）
-        if: failure() || cancelled()
+        if: (failure() || cancelled()) && steps.weekly_parquet.outputs.exit_code != '3'
         uses: ./report-pipelines/.github/actions/notify-discord
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
@@ -261,16 +670,20 @@ jobs:
   generate-market:
     needs: setup-raw
     runs-on: ubuntu-latest
-    # PM 2026-08-19: 529 自動リトライ（2 回・待機 60/180 秒）を足したため枠を再計算して拡張。
-    # 最悪ケース = 前段（clone/setup/fonts/playwright/parquet 配布）12 分 + 1 回目 45 分 + 待機 1 分
-    #            + 2 回目 30 分 + 待機 3 分 + 3 回目 30 分 + 検証/artifact 3 分 = 124 分 → 135 分。
-    timeout-minutes: 135
+    # PM 2026-08-26: 4 並列を 1 実行へ統合し、1 ジョブが 3 市場 40 銘柄を書くため各試行の枠を拡張
+    # （gen1 45→60 分・gen2/gen3 30→45 分）。
+    # 最悪ケース = 前段（clone/setup/fonts/playwright/parquet 配布）12 分 + 1 回目 60 分 + 待機 1 分
+    #            + 2 回目 45 分 + 待機 3 分 + 3 回目 45 分 + 検証/artifact 3 分 = 169 分 → 180 分。
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
-        # PM 2026-06-14 確定: 日次と同様 growth を growth_a(6,7)/growth_b(8c) に2分割し
-        # 1実行あたりのコンテキスト負荷を下げる（将来 raw 肥大時の文脈喪失・再読ループ予防）。
-        market: [prime, standard, growth_a, growth_b]
+        # PM 2026-08-26 確定: 固定プロンプト121KB×4重複を解消するため1実行へ統合。
+        # 並び順はグロース→スタンダード→プライム（prompts/mover-weekly.md が制御）。
+        # 旧構成 [prime, standard, growth_a, growth_b] の4分割は「出力32Kトークン上限」が根拠だったが、
+        # 2026-07-07 に CLAUDE_CODE_MAX_OUTPUT_TOKENS を 64000 へ引き上げ済みで根拠が消滅した。
+        # matrix 構造自体は参照箇所の書き換えを最小にするため残し、値だけを [all] の1値に畳む。
+        market: [all]
     steps:
       - name: Checkout report-pipelines
         uses: actions/checkout@v4
@@ -381,25 +794,9 @@ jobs:
           mkdir -p market/daily
           SRC=/tmp/movers-raw/${TARGET_DATE}_movers_raw.md
           DST=market/daily/${TARGET_DATE}_movers_raw.md
-          # PM 2026-06-13 確定: standard / growth ジョブには担当市場の節のみ渡し、
-          # 担当外市場の無駄読み・同一 offset 再読込ループを構造的に防ぐ（トークン・コスト削減）。
-          # prime は Section 9 が全市場横断のため全 raw を保持する。
-          case "$TARGET_MARKET" in
-            growth_a|growth_b)
-              awk '/^## グロース/{f=1} f' "$SRC" > "$DST"
-              ;;
-            standard)
-              awk '/^## スタンダード/{f=1} /^## グロース/{f=0} f' "$SRC" > "$DST"
-              ;;
-            *)
-              cp "$SRC" "$DST"
-              ;;
-          esac
-          # 抽出失敗（見出し不一致等）の保険: 極端に短ければ全 raw にフォールバック
-          if [ "$(wc -l < "$DST")" -lt 20 ]; then
-            echo "Sliced raw too short for market=$TARGET_MARKET; falling back to full raw"
-            cp "$SRC" "$DST"
-          fi
+          # PM 2026-08-26 確定: 統合後は全市場を1実行が担当するため raw は無加工で全量を渡す
+          # （旧 case 文による市場別スライスは統合により不要）。
+          cp "$SRC" "$DST"
           echo "Placed $DST for market=$TARGET_MARKET ($(wc -l < "$DST") lines / source $(wc -l < "$SRC") lines)"
 
       - name: Check screening_master parquet existence (no update・PM 2026-05-23 確定)
@@ -451,7 +848,7 @@ jobs:
           model: claude-opus-5
           prompt_file: report-pipelines/prompts/mover-weekly.md
           allowed_tools: "Read,Write,Edit,Bash,Grep,Glob,WebSearch,WebFetch"
-          timeout_minutes: "45"
+          timeout_minutes: "60"
           # PM 2026-07-07: 32001 出力トークン上限で市場セクションが途中終了する事故の予防で 64000 へ。
           claude_env: |
             CLAUDE_CODE_EFFORT_LEVEL: high
@@ -488,7 +885,7 @@ jobs:
           model: claude-opus-5
           prompt_file: report-pipelines/prompts/mover-weekly.md
           allowed_tools: "Read,Write,Edit,Bash,Grep,Glob,WebSearch,WebFetch"
-          timeout_minutes: "30"
+          timeout_minutes: "45"
           claude_env: |
             CLAUDE_CODE_EFFORT_LEVEL: high
             CLAUDE_CODE_MAX_OUTPUT_TOKENS: 64000
@@ -524,7 +921,7 @@ jobs:
           model: claude-opus-5
           prompt_file: report-pipelines/prompts/mover-weekly.md
           allowed_tools: "Read,Write,Edit,Bash,Grep,Glob,WebSearch,WebFetch"
-          timeout_minutes: "30"
+          timeout_minutes: "45"
           claude_env: |
             CLAUDE_CODE_EFFORT_LEVEL: high
             CLAUDE_CODE_MAX_OUTPUT_TOKENS: 64000
@@ -662,7 +1059,7 @@ jobs:
           path: /tmp/market-artifacts
           merge-multiple: true
 
-      - name: Place market files and merge into {date}_weekly.md
+      - name: Place market file as {date}_weekly.md
         working-directory: ./private-repo
         env:
           TARGET_DATE: ${{ needs.setup-raw.outputs.target_date }}
@@ -671,33 +1068,28 @@ jobs:
           mkdir -p "$MOVERS_DIR"
           # 既存統合ファイルを削除
           rm -f "${MOVERS_DIR}/${TARGET_DATE}_weekly.md"
-          # 3 つの market artifact を配置
-          for MARKET in prime standard growth_a growth_b; do
-            SRC="/tmp/market-artifacts/${TARGET_DATE}_weekly_${MARKET}.md"
-            DST="${MOVERS_DIR}/${TARGET_DATE}_weekly_${MARKET}.md"
-            if [ ! -f "$SRC" ]; then
-              echo "ERROR: artifact not found: $SRC"
-              exit 1
-            fi
-            cp "$SRC" "$DST"
-            echo "Placed $DST ($(wc -l < "$DST") lines)"
-          done
-          # 統合: prime(0,1,2,3,8a,9) → standard(4,5,8b) → growth_a(6,7) → growth_b(8c)
-          # send_report_pdf_discord.py(--kind movers_weekly)はマージ後ファイルから6/7/8cを
-          # 集約してグロース PDF を生成するため、growth_a/growth_b 分割は送信に透過的。
+          # PM 2026-08-26 確定: 4 並列統合により artifact は単一（{date}_weekly_all.md）。
+          # 旧 4 ファイル cat 結合は不要になり、そのまま cp する。
+          # ファイル内の市場並び順はグロース → スタンダード → プライム
+          # （prompts/mover-weekly.md が制御）。send_report_pdf_discord.py
+          # （--kind movers_weekly）は市場タイトル行だけを見て 3 PDF へ再分割し、
+          # ファイル内の出現順のまま送るため、送信は無改修で透過する。
+          SRC="/tmp/market-artifacts/${TARGET_DATE}_weekly_all.md"
+          DST="${MOVERS_DIR}/${TARGET_DATE}_weekly_all.md"
+          if [ ! -f "$SRC" ]; then
+            echo "ERROR: artifact not found: $SRC"
+            exit 1
+          fi
+          cp "$SRC" "$DST"
+          echo "Placed $DST ($(wc -l < "$DST") lines)"
           OUTPUT="${MOVERS_DIR}/${TARGET_DATE}_weekly.md"
-          cat "${MOVERS_DIR}/${TARGET_DATE}_weekly_prime.md" > "$OUTPUT"
-          echo "" >> "$OUTPUT"
-          cat "${MOVERS_DIR}/${TARGET_DATE}_weekly_standard.md" >> "$OUTPUT"
-          echo "" >> "$OUTPUT"
-          cat "${MOVERS_DIR}/${TARGET_DATE}_weekly_growth_a.md" >> "$OUTPUT"
-          echo "" >> "$OUTPUT"
-          cat "${MOVERS_DIR}/${TARGET_DATE}_weekly_growth_b.md" >> "$OUTPUT"
-          echo "Merged into $OUTPUT ($(wc -l < "$OUTPUT") lines)"
+          cp "$DST" "$OUTPUT"
+          echo "Placed $OUTPUT ($(wc -l < "$OUTPUT") lines)"
 
       - name: Download movers raw artifact (品質フラグ取得用)
-        # PM 2026-07-12（絶対配信原則）: setup-raw が出力した品質フラグ 2 種（EOD 未着 /
-        # 週間ランキング窓ずれ）を注記挿入 step へ渡す。
+        # setup-raw が出力した品質フラグを注記挿入 step へ渡す。
+        # PM 2026-08-29: 週間ランキング窓ずれフラグ（{date}_weekly_quality_flags.txt）は
+        # 生成中止側へ移したため常に空。日次 raw 側フラグのみが注記対象。
         uses: actions/download-artifact@v4
         with:
           name: movers-raw-${{ needs.setup-raw.outputs.target_date }}
@@ -725,16 +1117,21 @@ jobs:
           exit $ec
 
       - name: 品質注記の機械挿入（フラグ検知時のみ・各市場タイトル直後）
-        # PM 2026-07-12（絶対配信原則）: EOD 未着注記・週間ランキング窓ずれ注記（setup-raw の
-        # フラグ 2 種）と品質検査の不合格内容を、市場別 PDF すべてに載るよう各タイトル行
-        # （# 動意銘柄レポート …）直後へ挿入する。Claude 側注記と重複しても可。
+        # PM 2026-08-29 改定: 「対象日の価格データ未着」を注記して配信する経路は廃止した
+        # （未着なら price-gate / setup-raw で生成ごと止まるため注記は不要）。
+        #   廃止した注記: {date}_weekly_quality_flags.txt（週間ランキングの対象日未着＝窓ずれ）
+        #   残した注記  : {date}_quality_flags.txt（make_mover_report.py --date-gate が出す
+        #                 日次 raw 側の軽微な品質フラグ）／品質検査 check_mover_counts.py の
+        #                 不合格内容（件数不足・タイトル日付ずれ等）。この 2 系統は「データは
+        #                 揃っているが誌面に軽微な問題がある」ケースであり、yml 冒頭の
+        #                 絶対配信原則どおり注記つきで配信を続ける。
         id: annotate
         working-directory: ./private-repo
         env:
           TARGET_DATE: ${{ needs.setup-raw.outputs.target_date }}
         run: |
           NOTE=""
-          for FLAGS in /tmp/movers-raw/${TARGET_DATE}_quality_flags.txt /tmp/movers-raw/${TARGET_DATE}_weekly_quality_flags.txt; do
+          for FLAGS in /tmp/movers-raw/${TARGET_DATE}_quality_flags.txt; do
             if [ -s "$FLAGS" ]; then
               PART="$(tr '\n' ' ' < "$FLAGS" | sed 's/ *$//')"
               NOTE="${NOTE}${NOTE:+ ／ }${PART}"
@@ -756,8 +1153,37 @@ jobs:
             echo "品質フラグなし・注記挿入なし"
           fi
 
+      - name: 送信直前の最終重複チェック（二重配信の最後の防波堤）
+        # ===============================================================================
+        # PM 2026-08-29 追加: guard の weekcheck は「起動時点」のスナップショットであり、
+        # 2 本のレーンがほぼ同時に起きた場合は両方とも weekcheck を通過しうる（互いにまだ
+        # running として見えないため）。setup-raw の concurrency group は
+        # cancel-in-progress: false のため後発を queue するだけで、順番に走って 2 回配信して
+        # しまう。そこで【送信の直前】にもう一度、対象週に配信済み run が無いかを確認する。
+        # ここは生成が終わった後なので判定は一瞬で済み、配信済みなら送信だけを skip する
+        # （生成物は commit されるため無駄にならない）。
+        # ===============================================================================
+        id: predup
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET_DATE: ${{ needs.setup-raw.outputs.target_date }}
+          MY_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          SINCE="${TARGET_DATE}T00:00:00+09:00"
+          STATS=$(bash ../report-pipelines/.github/scripts/check_delivery.sh mover_weekly.yml merge-and-send "${MY_RUN_ID}" "${SINCE}" || echo '{"delivered":0}')
+          DELIVERED=$(echo "$STATS" | jq -r '.delivered // 0')
+          echo "送信直前の対象週配信済み件数: ${DELIVERED}"
+          if [ "$DELIVERED" -gt 0 ]; then
+            echo "::warning::対象週 ${TARGET_DATE} は他の run が既に配信済み（${DELIVERED} 件）。二重配信を避けるため本 run の Discord 送信を skip します"
+            echo "skip_send=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip_send=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Send Discord (PDF・市場別 3 枚分割)
         id: send
+        if: steps.predup.outputs.skip_send != 'true'
         working-directory: ./private-repo/bi/pipelines
         env:
           DISCORD_WEBHOOK_MOVERS: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
@@ -808,9 +1234,22 @@ jobs:
           meaning: レポート本体は配信済みです。配信後のアーカイブ整理または commit だけが失敗しました。
           action_required: 不要（差分は次回 run が回収）
 
+      - name: Discord 通知（⏭ 二重配信回避で送信 skip）
+        # 無言 skip の禁止（PM）: 他 run が既に配信済みだったため本 run は送信しなかった旨を残す。
+        if: steps.predup.outputs.skip_send == 'true'
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
+          state: none
+          label: 動意銘柄レポート週次 送信 skip（二重配信回避）
+          date: ${{ needs.setup-raw.outputs.target_date }}
+          meaning: 対象週分は別の実行がすでに配信済みだったため、同じレポートを二重に送らないよう本実行の送信を見送りました。レポートは配信済みです。
+          action_required: 不要
+
       - name: Discord 通知（❌ merge/送信失敗）
         # 品質フラグ（exit_code=3）は step 成功で通し注記配信するため、ここに来るのはインフラ失敗のみ。
-        if: (failure() || cancelled()) && steps.send.outcome != 'success'
+        # predup で送信を skip した run は「他 run が配信済み」であり未配信ではないため除外する。
+        if: (failure() || cancelled()) && steps.send.outcome != 'success' && steps.predup.outputs.skip_send != 'true'
         uses: ./report-pipelines/.github/actions/notify-discord
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}

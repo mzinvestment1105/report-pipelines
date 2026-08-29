@@ -667,26 +667,54 @@ def main() -> None:
     # 算出し、営業日ベース（jpholiday で祝日除外・カレンダー日数では判定しない）で陳腐化を見る。
     # 古ければ「警告して古い値のまま」にはせず、JQuants で直近営業日を取得して補完する（＝何とかして
     # 最新値を取りに行く）。それでも届かない場合のみ警告を残すが、送付は止めない。
-    if is_stale_close(prices["Date"].max().date(), today) and not args.skip_price_fetch:
+    # PM 2026-08-29 追加（対象日ゲート強化）: 補完の発火条件を is_stale_close 単独から拡張する。
+    # is_stale_close は「実行日の直前営業日」を期待最新日とするため、金曜当日 22 時台に走る
+    # 週次動意では期待最新日＝木曜となり、木曜までしか無い parquet を陳腐化と判定せず補完が
+    # 発火しなかった（対象日である金曜 EOD が欠けたまま前週窓で生成される事故源）。
+    # --expect-price-date が指定されている場合は「prices の最新日 < 対象日」でも補完を発火させる。
+    _prices_latest = prices["Date"].max().date()
+    _expect_dt = None
+    if args.expect_price_date:
+        try:
+            _expect_dt = datetime.strptime(args.expect_price_date, "%Y-%m-%d").date()
+        except ValueError:
+            print(f"[WARN] --expect-price-date の形式が不正です（無視して従来判定）: {args.expect_price_date}")
+    _need_topup = is_stale_close(_prices_latest, today) or (
+        _expect_dt is not None and _prices_latest < _expect_dt
+    )
+    if _need_topup and not args.skip_price_fetch:
         print(
-            f"[INFO] 価格マスターが営業日基準で陳腐化（最新 {prices['Date'].max().date()}）"
+            f"[INFO] 価格マスターに対象日のデータが不足（最新 {_prices_latest}"
+            f"{f' / 対象日 {_expect_dt}' if _expect_dt else ''}）"
             " → JQuants で直近営業日を取得して補完します（週末・祝日は即空で返るため無駄打ちなし）"
         )
-        try:
-            topup = fetch_price_history(codes, limit_codes=args.limit_codes,
-                                        lookback_days=args.cold_lookback_days)
-            if topup is not None and not topup.empty:
-                topup = topup.copy()
-                topup["Code"] = topup["Code"].astype("string").str.strip().str[:4]
-                topup["Date"] = pd.to_datetime(topup["Date"])
-                prices = (
-                    pd.concat([prices, topup], ignore_index=True)
-                    .drop_duplicates(subset=["Date", "Code"], keep="last")
-                    .sort_values(["Code", "Date"])
-                    .reset_index(drop=True)
-                )
-        except Exception as e:
-            print(f"[WARN] JQuants 補完に失敗（既存マスターで続行・送付は止めない）: {type(e).__name__}: {e}")
+        # JQuants が空で返す事象（EOD 反映待ち）への短いリトライ。--expect-price-date 指定時のみ
+        # 対象日が揃うまで最大 3 回・60 秒間隔で再取得する（他レポートは従来どおり 1 回のみ）。
+        _topup_attempts = 3 if _expect_dt is not None else 1
+        for _attempt in range(1, _topup_attempts + 1):
+            try:
+                topup = fetch_price_history(codes, limit_codes=args.limit_codes,
+                                            lookback_days=args.cold_lookback_days)
+                if topup is not None and not topup.empty:
+                    topup = topup.copy()
+                    topup["Code"] = topup["Code"].astype("string").str.strip().str[:4]
+                    topup["Date"] = pd.to_datetime(topup["Date"])
+                    prices = (
+                        pd.concat([prices, topup], ignore_index=True)
+                        .drop_duplicates(subset=["Date", "Code"], keep="last")
+                        .sort_values(["Code", "Date"])
+                        .reset_index(drop=True)
+                    )
+                else:
+                    print(f"[INFO] JQuants 補完が空で返りました（{_attempt}/{_topup_attempts} 回目）")
+            except Exception as e:
+                print(f"[WARN] JQuants 補完に失敗（{_attempt}/{_topup_attempts} 回目）: {type(e).__name__}: {e}")
+            _prices_latest = prices["Date"].max().date()
+            if _expect_dt is None or _prices_latest >= _expect_dt:
+                break
+            if _attempt < _topup_attempts:
+                print(f"[WAIT] 対象日 {_expect_dt} が未着のため 60 秒待機して再取得します")
+                time.sleep(60)
 
     price_data_asof_ts = prices["Date"].max()
     price_data_asof = price_data_asof_ts.date().isoformat()
@@ -704,15 +732,16 @@ def main() -> None:
     # PM 2026-07-12 確定（絶対配信原則・同日改定）: 対象日ゲート（--expect-price-date 指定時のみ）。
     # 価格データが対象日（当週金曜）まで届いていないと Return_W01 等の「今週」の窓が丸ごと前週へ
     # ずれる（2026-07-10 週次動意で 6/29〜7/3 の値を当週として全行配信・2986 -66.3%／4596 +55.4%）。
-    # 不一致でも生成は中止しない。parquet を通常どおり生成・保存した上で main 末尾で exit 3 を返し、
-    # workflow が「品質注記つき配信」（真の窓の明記＋冒頭注記＋⚠️ 通知）へ分岐する検知シグナルとする
-    # （旧「書き出し前に exit 3 で中止＝未配信」は PM 却下）。土日の再実行は新規営業日が無く
+    # PM 2026-08-29 改定: 本スクリプトは従来どおり parquet を生成・保存した上で exit 3 を返すが、
+    # 週次動意 workflow 側の扱いが「品質注記つき配信」から「生成中止」へ変わった。exit 3 は
+    # mover_weekly.yml のハードゲート（generate-market へ進ませない）を発火させる検知シグナルであり、
+    # 品質注記を付けて配信する経路は廃止済み。土日の再実行は新規営業日が無く
     # PriceDataAsOf=金曜のまま一致する。--expect-price-date は週次動意 GHA（mover_weekly.yml）のみが
     # 指定する。セクター週次 GHA・ローカル実行は従来動作のまま（フラグなし＝ゲート不適用）。
     date_gate_mismatch = bool(args.expect_price_date and price_data_asof != args.expect_price_date)
     if date_gate_mismatch:
-        print(f"[QUALITY FLAG] 価格データ最新日 {price_data_asof} が対象日 {args.expect_price_date} と不一致。"
-              f"parquet は生成・保存した上で exit 3 を返す（workflow は品質注記つきで配信続行）")
+        print(f"[BLOCKING] 価格データ最新日 {price_data_asof} が対象日 {args.expect_price_date} と不一致。"
+              f"parquet は生成・保存した上で exit 3 を返す（週次動意 workflow は生成中止へ分岐）")
 
     # 投資主体別売買
     investor_df = fetch_investor_trading(skip=args.skip_investor_fetch)
@@ -743,9 +772,9 @@ def main() -> None:
     print(sector_df[cols].to_string(index=False))
     print("\n完了！")
 
-    # 対象日ゲート不一致の検知シグナル（生成・保存は完了済み・PM 2026-07-12 絶対配信原則）
+    # 対象日ゲート不一致の検知シグナル（生成・保存は完了済み・PM 2026-08-29 改定で workflow は生成中止）
     if date_gate_mismatch:
-        print(f"[QUALITY FLAG] PriceDataAsOf={price_data_asof} != 対象日 {args.expect_price_date} のため exit 3")
+        print(f"[BLOCKING] PriceDataAsOf={price_data_asof} != 対象日 {args.expect_price_date} のため exit 3")
         sys.exit(3)
 
 
