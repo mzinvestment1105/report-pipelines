@@ -95,16 +95,33 @@ def _layout_css(accent: str, sans: str, serif: str) -> str:
 
     本文 12pt・line-height 1.8・字間 0.04em・色 #222（純黒のハレーション回避）・日本語は両端
     揃え。1 行は左右 24mm マージンで全角≈38 字（CJK 最適 35〜40 字）。見出しは 1.25 スケール。
+
+    PM 2026-08-30 実測修正: 個別銘柄レポートだけ PDF 実測 8.0pt まで潰れ「小さくて読めない」
+    状態だった（動意・決算・週次大型株は同じ 12pt 指定で実測 12.0pt）。原因は table-layout:auto
+    で、和文の長文セルが列幅を押し広げ表の実幅が本文幅 612px を超えていた（実測 1035px）。
+    Chromium は最も広い表に合わせてページ全体を縮小するため本文まで道連れに潰れる。
+    table-layout:fixed + word-break:normal で表を本文幅に収め、全種別で実測 12.0pt に揃える。
     """
     return f"""
 * {{ box-sizing:border-box; }}
 html {{ -webkit-print-color-adjust:exact; print-color-adjust:exact; }}
+/* 字送りの均一化（PM 2026-08-30 実測修正）:
+   "palt" 1（プロポーショナル詰め）は和文の各字を字形固有の幅へ詰めるため、字送りが不均等になり
+   特に太字で「機 関 の 売り建 ては」のように見える。PDF テキストレイヤの実測で字送りのばらつきは
+   palt 1 = 1.44pt に対し palt 0 = 0.24pt（6分の1）と確定したため全要素で palt を無効化する。
+   font-synthesis:none は合成太字による字幅変化の予防（本フォントは実ボールド woff2 を埋め込み済み）。 */
+* {{
+  font-feature-settings:"palt" 0;
+  font-synthesis:none; -webkit-font-synthesis:none;
+}}
 body {{
   font-family:{sans};
   font-size:12pt; line-height:1.8; color:#222222;
   margin:0; padding:0;
-  letter-spacing:.04em; font-feature-settings:"palt" 1;
-  text-align:justify; word-break:normal; line-break:strict; overflow-wrap:break-word;
+  letter-spacing:.04em; font-feature-settings:"palt" 0;
+  font-synthesis:none; -webkit-font-synthesis:none;
+  font-kerning:none;
+  text-align:left; word-break:normal; line-break:strict; overflow-wrap:break-word;
 }}
 
 /* ── マストヘッド ── */
@@ -140,7 +157,14 @@ h5 {{
 }}
 
 p {{ margin:9px 0 11px; }}
-strong, b {{ color:#1A1A1A; font-weight:700; }}
+/* 太字は実ボールド字形（NotoSansJP-700 / BIZ UDPGothic-700 を @font-face 埋め込み済み）を使う。
+   合成太字を禁じ、字間は親の .04em を継承させて詰め処理を挟ませない。 */
+strong, b, th {{
+  font-family:{sans};
+  font-weight:700; font-synthesis:none; -webkit-font-synthesis:none;
+  font-feature-settings:"palt" 0; font-kerning:none;
+}}
+strong, b {{ color:#1A1A1A; }}
 
 /* ── リード（冒頭サマリー）= エディトリアルな前文 ── */
 blockquote {{
@@ -155,21 +179,51 @@ blockquote strong {{ color:{accent}; }}
 
 /* ── リスト ── */
 ul, ol {{ margin:9px 0 12px; padding-left:22px; }}
-li {{ margin:4px 0; padding-left:3px; text-align:justify; }}
-li::marker {{ color:{accent}; }}
+li {{ margin:5px 0; padding-left:4px; text-align:left; line-height:1.75; }}
+li::marker {{ color:#8A94A6; }}
 
 /* ── 表（金融レポート調・大きい表はページ分割を許可）── */
+/* table-layout:fixed が必須（PM 2026-08-30 判定・B 案採用で確定）。
+   auto では和文の長いセルが列幅を押し広げ、表の実幅が本文幅 612px を超えるため
+   （実測: 4011 の条件表が 1035px）、Chromium が最も広い表に合わせてページ全体を縮小し、
+   本文 12pt 指定が実測 8.0pt まで潰れていた。しかも縮小率は「その回のレポートで最も広い表」
+   に依存するため、同じ設定でも銘柄ごとに実測 8.0pt / 11.0pt とサイズが変動していた
+   （動意・決算・週次大型株は幅超過の表が無く実測 12.0pt だったため、個別銘柄だけが潰れていた）。
+   fixed + word-break:normal で列幅を本文幅内に固定し、全レポート種別・全銘柄で実測 12.0pt に揃える。 */
 table {{
   border-collapse:collapse; width:100%; margin:13px 0 17px;
-  font-size:10pt; line-height:1.6; font-variant-numeric:tabular-nums;
+  table-layout:fixed;
+  font-size:10.5pt; line-height:1.6; font-variant-numeric:tabular-nums;
   text-align:left;
 }}
+th {{ white-space:normal; word-break:normal; overflow-wrap:break-word; }}
 thead th {{
-  background:#1A2A44; color:#FFFFFF; font-weight:700; font-size:9.6pt;
+  background:#1A2A44; color:#FFFFFF; font-weight:700; font-size:10.5pt;
   text-align:left; padding:8px 11px; letter-spacing:.02em;
-  white-space:nowrap;
+  white-space:normal; word-break:normal; overflow-wrap:break-word;
 }}
-tbody td {{ padding:7px 11px; border-bottom:0.6pt solid #E3E8EF; vertical-align:top; }}
+/* ヘッダも文節単位で折り返す（nowrap はページ全体の縮小を招くため使わない） */
+thead th:first-child {{ white-space:normal; word-break:normal; overflow-wrap:break-word; }}
+tbody td {{
+  padding:7px 10px; border-bottom:0.6pt solid #E3E8EF; vertical-align:middle;
+  line-height:1.55;
+}}
+/* 先頭列（項目名）・数値セルの折り返し制御（PM 2026-08-30 実測修正）:
+   white-space:nowrap を全セルに掛けると、長いセルが1行に収まらない場合に Chromium が
+   ページ全体を縮小して辻褄を合わせるため、本文が実測 12pt → 8pt まで潰れる
+   （動意・決算レポートは実測 12.0pt なのに個別銘柄だけ 8.0pt だった原因）。
+   1文字改行の根絶は overflow-wrap:anywhere を使わないことで足り、nowrap は不要。
+   word-break:keep-all により和文は文節を割らずに折り返す。 */
+tbody td:first-child {{ white-space:normal; word-break:normal; overflow-wrap:break-word; }}
+/* 中間列は「短い数値なら折り返さない・長い和文なら文節で折り返す」を両立させる。
+   nowrap を一律に掛けると、条件表や観測方法など長文を中間列に持つ表で1行が page 幅を
+   超え、Chromium がページ全体を縮小する（本文 12pt → 実測 7pt）。max-width で
+   上限を与えたうえで文節折り返しを許可し、数値列は短いため実質的に折り返されない。 */
+tbody td:not(:first-child):not(:last-child) {{
+  white-space:normal; word-break:normal; overflow-wrap:break-word;
+}}
+/* 説明文など長文を含む最終列のみ折り返しを許可するが、文節は割らない */
+tbody td:last-child {{ white-space:normal; word-break:normal; overflow-wrap:break-word; }}
 tbody tr:nth-child(even) td {{ background:#F6F8FB; }}
 tbody tr:last-child td {{ border-bottom:1pt solid #C8D1DD; }}
 
@@ -197,17 +251,23 @@ hr {{ border:0; border-top:0.8pt solid #DBE1E9; margin:20px 0; }}
 
 _POS = "#1F8A4C"  # 上昇=緑
 _NEG = "#C0392B"  # 下落=赤
-# 符号付き数値（+12.3% / −4.0% / +1.39 / -3.03 / 全角＋％対応）。誤着色を抑えるため
-# 「% を伴う」か「小数点を含む」場合のみ着色し、符号付き整数（銘柄コード・年号・順位）は除外する。
-_RE_SIGNED = re.compile(r"([+＋−\-])(\d[\d,]*(?:\.\d+)?)(\s*[%％])?")
+# 符号付き数値（+12.3% / −4.0% / ▲22百万円 / +271百万円 / +1.39 / 全角＋％対応）。
+# 着色条件は「% を伴う」「小数点を含む」「金額・株数などの単位を伴う」のいずれか。
+# 単位も小数点も無い裸の符号付き整数（銘柄コード・年号・順位）のみ除外する
+# （PM 2026-08-30: ▲22百万円・+271百万円 が黒のままだった不具合の是正）。
+_SIGNED_UNIT = "百万円|千円|億円|兆円|円|株|口|件|社|倍|pt|ポイント|%|％"
+_RE_SIGNED = re.compile(
+    r"([+＋−\-▲△])(\d[\d,]*(?:\.\d+)?)(\s*(?:" + _SIGNED_UNIT + r"))?"
+)
 
 
 def _colorize_signed(m: "re.Match[str]") -> str:
-    sign, num, pct = m.group(1), m.group(2), m.group(3) or ""
-    if not pct and "." not in num:  # 符号付き整数（コード/年/順位）は着色しない
+    sign, num, unit = m.group(1), m.group(2), m.group(3) or ""
+    # 単位も小数点も無い符号付き整数（コード/年/順位）は着色しない
+    if not unit and "." not in num:
         return m.group(0)
-    color = _NEG if sign in "−-" else _POS
-    return f'<span style="color:{color};font-weight:700">{sign}{num}{pct}</span>'
+    color = _NEG if sign in "−-▲△" else _POS
+    return f'<span style="color:{color};font-weight:700">{sign}{num}{unit}</span>'
 
 
 def _colorize_numbers(html: str) -> str:
@@ -217,9 +277,9 @@ def _colorize_numbers(html: str) -> str:
     ▲▼ を色分けする。着色は render 後の HTML に対して行い、タグ属性へ符号付き数値は出ないため安全。
     """
     html = _RE_SIGNED.sub(_colorize_signed, html)
-    html = (html.replace("▲", f'<span style="color:{_POS}">▲</span>')
-                .replace("△", f'<span style="color:{_POS}">△</span>')
-                .replace("▼", f'<span style="color:{_NEG}">▼</span>')
+    # 単独の ▲△ は着色しない（和文会計では ▲12.3% がマイナスを意味するため、
+    # 上昇矢印として緑に塗ると増減を逆に読ませる）。▼▽ のみ下落として扱う。
+    html = (html.replace("▼", f'<span style="color:{_NEG}">▼</span>')
                 .replace("▽", f'<span style="color:{_NEG}">▽</span>'))
     return html
 

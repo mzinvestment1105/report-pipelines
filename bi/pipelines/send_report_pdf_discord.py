@@ -24,6 +24,7 @@ from dotenv import load_dotenv
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from gate_stock_report import run_gate  # noqa: E402
 from lib.md_to_pdf import render_markdown_to_pdf  # noqa: E402
 from lib.quality_gate import (  # noqa: E402
     find_duplication,
@@ -72,6 +73,11 @@ def main() -> int:
     parser.add_argument("--month", help="YYYY-MM（月次レポート用・earnings 等）")
     parser.add_argument("--code", help="銘柄コード（stock 用）")
     parser.add_argument("--skip-send", action="store_true")
+    parser.add_argument(
+        "--skip-gate",
+        action="store_true",
+        help="個別銘柄レポートの送信前機械ゲートを飛ばす（緊急時のバイパス）",
+    )
     args = parser.parse_args()
 
     cfg = KIND_CONFIG[args.kind]
@@ -107,6 +113,24 @@ def main() -> int:
     out_dir = REPO_ROOT / "bi" / "outputs" / "report_pdfs"
     out_dir.mkdir(parents=True, exist_ok=True)
     md_text = md_path.read_text(encoding="utf-8")
+
+    # 個別銘柄レポートの送信前機械ゲート（PM 2026-08-30 承認・gate_stock_report.py）
+    # errors があれば PDF を生成せずに中止する。warnings は表示のみで続行する。
+    if args.kind == "stock":
+        if args.skip_gate:
+            print("GATE: --skip-gate 指定のため送信前機械ゲートを飛ばしました（緊急バイパス）")
+        else:
+            errors, warnings, info = run_gate(md_text, args.code)
+            for m in info:
+                print("  OK   " + m)
+            for m in warnings:
+                print("  WARN " + m)
+            for m in errors:
+                print("  NG   " + m)
+            if errors:
+                print("GATE: FAIL（送信中止・PDF は生成しません）")
+                return 1
+            print("GATE: PASS")
 
     # 品質確定処理（非ブロッキング・PM 2026-06-28）: 「配信を止めない・token を使わない」を最優先
     # するため、送信のブロック（失敗）も自動再生成（token 増）も行わない。生成 LLM が無視する

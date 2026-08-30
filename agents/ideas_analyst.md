@@ -156,7 +156,7 @@ PMの目的は「**検討開始の起点**」（PM 2026-05-20 確定）。即エ
 ## Discord 送信先
 
 - `DISCORD_WEBHOOK_IDEAS` — #銘柄発掘アナリスト チャンネル
-- 送信: [bi/pipelines/send_report_jpeg_discord.py](../bi/pipelines/send_report_jpeg_discord.py) `--kind ideas`
+- 送信: [bi/pipelines/send_report_pdf_discord.py](../bi/pipelines/send_report_pdf_discord.py) `--kind ideas`
 
 ## 連動スキル
 
