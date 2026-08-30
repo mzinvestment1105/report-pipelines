@@ -174,11 +174,10 @@ jobs:
         # が出力ゼロのまま数十分ハングし、ジョブ枠に到達して配信ごと落ちる事故（GitHub 側の一時事象）の
         # 恒久対策。①ステップ単位 timeout ②各コマンドを timeout コマンドで打ち切り ③待機つき 3 回リトライ。
         #
-        # 【最終失敗ならジョブを落とす理由】本 workflow の誌面生成は send_report_jpeg_discord.py →
-        # bi/pipelines/lib/md_to_jpeg.py で行い、同モジュールは font-family に "Yu Gothic" /
-        # "Noto Sans CJK JP" 等の**システムフォント名**を指定する（PDF 経路のような base64 埋め込みを
-        # 持たない）。日本語フォントが無い runner では誌面が豆腐（文字化け）のまま配信されるため、
-        # 3 回とも失敗した場合は配信せずジョブを落とす（PDF 経路の他 workflow とはここだけ方針が異なる）。
+        # 【フォント導入について】本 workflow の誌面生成は send_report_pdf_discord.py →
+        # bi/pipelines/lib/md_to_pdf.py で行い、同モジュールはフォントを base64 で埋め込むため
+        # システムフォントに依存しない（2026-08-26 に JPEG 経路から PDF 経路へ移行済み）。
+        # 本ステップは念のためのフォント導入であり、失敗しても誌面は文字化けしない。
         # 時間予算: 1 試行 = update 75 秒 + install 120 秒 = 最大 195 秒。新規試行は開始 280 秒までに
         # 限るので最悪 475 秒で自己終了し、ステップ枠 8 分（480 秒）内に必ず結果を出して抜ける。
         timeout-minutes: 8
@@ -200,8 +199,8 @@ jobs:
               sleep $((i * 15))
             fi
           done
-          echo "::error::日本語フォントの apt 導入に 3 回とも失敗しました。JPEG 誌面はシステムフォント（md_to_jpeg.py の font-family 指定）に依存するため、このまま生成すると文字化け誌面を配信することになります。文字化け配信を避けるためジョブを中止します"
-          exit 1
+          echo "::warning::日本語フォントの apt 導入に 3 回とも失敗しましたが、PDF 経路（md_to_pdf.py）はフォントを base64 埋め込みするためシステムフォントに依存しません。配信を継続します"
+          exit 0
 
       - name: Install Playwright Chromium
         run: |
@@ -450,7 +449,7 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
-      - name: Send Discord (JPEG・DISCORD_WEBHOOK_EARNINGS)
+      - name: Send Discord (PDF・DISCORD_WEBHOOK_EARNINGS)
         id: send
         if: ${{ github.event.inputs.dry_run != 'true' }}
         working-directory: ./private-repo/bi/pipelines
@@ -458,7 +457,7 @@ jobs:
           DISCORD_WEBHOOK_EARNINGS: ${{ secrets.DISCORD_WEBHOOK_EARNINGS }}
           PYTHONIOENCODING: utf-8
         run: |
-          python send_report_jpeg_discord.py --kind earnings --month ${{ steps.month.outputs.value }}
+          python send_report_pdf_discord.py --kind earnings --month ${{ steps.month.outputs.value }}
 
       - name: Commit and push to private repo
         # dry_run=true では commit しない（過去月試運転で本番 overview を上書きしないため）。
