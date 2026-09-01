@@ -229,7 +229,18 @@ jobs:
           PYTHONIOENCODING: utf-8
         run: |
           python fetch_rss.py --category all
-          python fetch_finnhub.py --date ${{ steps.date.outputs.value }}
+          # Finnhub は補助ソース。取得ゼロ（exit 2）で朝刊全体を落とさない。
+          # 2026-08-31 に夕刊が Finnhub の 503（exit 2）で未発行になった。朝刊も同一の
+          # fetch ステップを持ち同じ地雷を踏み得るため、同じ防御を入れる。
+          # exit 2 以外（キー不正・想定外の例外）は従来どおり失敗させる。
+          python fetch_finnhub.py --date ${{ steps.date.outputs.value }} || {
+            ec=$?
+            if [ "$ec" = "2" ]; then
+              echo "::warning::Finnhub の取得件数がゼロのため補助データなしで続行します（他ソースで代替）"
+            else
+              exit $ec
+            fi
+          }
 
       - name: Fetch raw data (立花証券 e支店 API ニュース)
         # 立花証券から QUICK NQN / TDNet AI / AI 市況 500件を取得して
