@@ -429,49 +429,8 @@ jobs:
         run: |
           python send_report_pdf_discord.py --kind macro_evening --date ${{ steps.date.outputs.value }}
 
-      # PM 2026-09-02 承認: 夕刊本体の配信（上の Send Discord）より後に置き、ツイート生成が
-      # 失敗しても本体配信・commit を止めない（continue-on-error + 1 回のみ・リトライなし）。
-      # 起動条件は本体誌面の成否を一元判定する Verify ステップに揃える（build_prompt が
-      # exit 2 = 新着なしの日はツイートも作らない）。
-      - name: Generate macro tweet via Claude Code (Opus 5 + effort high)
-        id: gen_tweet
-        if: success() && steps.build_prompt.outputs.exit_code != '2'
-        continue-on-error: true
-        uses: anthropics/claude-code-base-action@beta
-        with:
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          model: claude-opus-5
-          prompt_file: report-pipelines/prompts/macro-tweet.md
-          allowed_tools: "Read,Write,Edit,Bash,Grep,Glob"
-          timeout_minutes: "20"
-          claude_env: |
-            CLAUDE_CODE_EFFORT_LEVEL: high
-            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
-        env:
-          TARGET_DATE: ${{ steps.date.outputs.value }}
-          PRIVATE_REPO_ROOT: private-repo
-
-      - name: Send macro tweet drafts to Discord (SNS)
-        id: send_tweet
-        if: success() && steps.build_prompt.outputs.exit_code != '2'
-        continue-on-error: true
-        env:
-          DISCORD_WEBHOOK_SNS: ${{ secrets.DISCORD_WEBHOOK_SNS }}
-          TARGET_DATE: ${{ steps.date.outputs.value }}
-          PYTHONIOENCODING: utf-8
-        run: |
-          F="private-repo/research/sns/${TARGET_DATE}_macro_tweet.md"
-          if [ ! -s "$F" ]; then
-            echo "::warning::マクロ市況ツイート案が生成されなかったため送信をスキップします: $F"
-            exit 0
-          fi
-          MD=$(TZ=Asia/Tokyo date -d "${TARGET_DATE}" '+%-m月%-d日')
-          cd private-repo/bi/pipelines
-          python send_sns_drafts_discord.py \
-            --file "../../research/sns/${TARGET_DATE}_macro_tweet.md" \
-            --header "**マクロ市況ツイート / ${MD} 大引け**" \
-            --hide-source
-
+      # マクロ市況ツイート案の生成は macro_tweet_daily.yml へ分離した（PM 2026-09-02 承認・当日分
+      # price_history parquet の着地を待つ必要があり、夕刊の時刻では構造的に間に合わないため）。
       - name: Rotate report archives (5 件超過分を archive/ へ退避)
         if: success() && steps.build_prompt.outputs.exit_code != '2'
         working-directory: ./private-repo
@@ -490,7 +449,7 @@ jobs:
         working-directory: ./private-repo
         run: |
           bash ../report-pipelines/bi/pipelines/ops/ci_commit_push.sh \
-            -m "data: macro evening report ${{ steps.date.outputs.value }}" market/daily research/sns
+            -m "data: macro evening report ${{ steps.date.outputs.value }}" market/daily
 
       - name: Discord 通知（⚠️ 配信済み・後処理のみ失敗）
         if: (failure() || cancelled()) && steps.send.outcome == 'success'

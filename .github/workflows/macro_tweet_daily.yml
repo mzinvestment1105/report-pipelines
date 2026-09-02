@@ -1,0 +1,338 @@
+name: マクロ市況ツイート日次
+
+"on":
+  # PM 2026-09-02 承認: マクロ市況ツイート案の生成を夕刊マクロ（macro_report_evening.yml）から分離した。
+  # 理由（2026-09-02 実測）: 夕刊は JST 17:45 に走るが、当日分 price_history parquet が Private へ
+  # 着地したのは JST 19:12 だった。ツイート生成は make_sector_daily.py に当日分 parquet を要求し、
+  # 無い場合はプロンプト §3-a（セクターを推測で埋めることの禁止）に従って自ら exit 1 で異常終了する。
+  # よって「固定時刻で夕刊と同時に走らせる」設計では構造的に間に合わない。
+  #
+  # トリガー設計:
+  #   (1) workflow_run（主経路）= 価格履歴 ETL の完走を受けて起動する。GitHub cron の実測遅延
+  #       （+1h45m〜+3h15m）で price_history の着地時刻が大きくぶれるため、時刻ではなく
+  #       「データが着地したという事実」を待つ。price_history 側が success の時のみ先へ進む。
+  #   (2) workflow_dispatch = 手動リカバリ用。
+  #   (3) schedule（フェイルセーフ）= UTC 12:00（JST 21:00 起票）。price_history が失敗した日でも
+  #       既に当日分データが揃っていれば拾える。guard で当日成功済みなら無害に skip される。
+  workflow_run:
+    workflows: ["Price History Daily Update"]
+    types:
+      - completed
+  workflow_dispatch:
+    inputs:
+      target_date:
+        description: '対象日付 (YYYY-MM-DD・空欄で当日)'
+        required: false
+        default: ''
+      force_rerun:
+        description: 'true で当日重複ガードを無視して強制実行（修正後の再テスト用）'
+        required: false
+        default: 'false'
+  schedule:
+    - cron: '0 12 * * 1-5'
+
+# 二重発火を GHA 内部ロックで防ぐ（macro_report_evening.yml と同じ固定 group 方式）。
+concurrency:
+  group: macro_tweet_daily
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    # 判定: (1) workflow_run 起点で price_history が success でない → skip
+    #       (2) cron 起動かつ JST 17 時未満 → skip（深夜着火が翌 JST 日の枠を消費する事故の防止）
+    #       (3) DONE_OK >= 1 → skip（当日すでに生成済み）
+    #       (4) ACTIVE >= 1 → skip（走行中の run あり）
+    #       (5) cron 起動かつ DONE_FAIL >= 2 → skip（連続失敗の課金暴走防止）
+    #       (6) それ以外 → proceed
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      proceed: ${{ steps.check.outputs.proceed }}
+      reason: ${{ steps.check.outputs.reason }}
+    steps:
+      # 通知 composite action（.github/actions/notify-discord）を使うため checkout が必要
+      - name: Checkout report-pipelines (通知 action 用)
+        uses: actions/checkout@v4
+
+      - name: Check today's runs
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TODAY_JST=$(TZ=Asia/Tokyo date +%Y-%m-%d)
+          MY_RUN_ID=${{ github.run_id }}
+          EVENT="${{ github.event_name }}"
+          UPSTREAM_CONCLUSION="${{ github.event.workflow_run.conclusion }}"
+
+          # force_rerun は「手動 workflow_dispatch かつ明示 true」の時のみ有効（誤再発火防止）。
+          if [ "$EVENT" = "workflow_dispatch" ] && [ "${{ github.event.inputs.force_rerun }}" = "true" ]; then
+            echo "proceed=true" >> $GITHUB_OUTPUT
+            echo "reason=force_rerun (manual guard bypass)" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # workflow_run 起点は、上流（価格履歴 ETL）が success した時のみ先へ進む。
+          # 失敗した日は当日分 parquet が無く、ツイート生成が §3-a に従って自ら異常終了するため。
+          if [ "$EVENT" = "workflow_run" ] && [ "$UPSTREAM_CONCLUSION" != "success" ]; then
+            echo "proceed=false" >> $GITHUB_OUTPUT
+            echo "reason=skip (upstream price_history conclusion=${UPSTREAM_CONCLUSION})" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # 実際に生成/送信を行うジョブ（generate）の結果だけで当日実績を判定する
+          # （guard が本体を skip した run まで success と数える誤認を避ける）。
+          STATS=$(bash .github/scripts/check_delivery.sh macro_tweet_daily.yml generate "${MY_RUN_ID}")
+          DONE_OK=$(echo "$STATS" | jq -r '.delivered')
+          DONE_FAIL=$(echo "$STATS" | jq -r '.failed')
+          ACTIVE=$(( $(echo "$STATS" | jq -r '.sending') + $(echo "$STATS" | jq -r '.dispatch_pending') + $(echo "$STATS" | jq -r '.schedule_pending') ))
+
+          echo "Today (${TODAY_JST}): active=${ACTIVE} done_ok=${DONE_OK} done_fail=${DONE_FAIL} event=${EVENT} upstream=${UPSTREAM_CONCLUSION} (excluding self ${MY_RUN_ID})"
+
+          echo "active=${ACTIVE}" >> $GITHUB_OUTPUT
+          echo "done_ok=${DONE_OK}" >> $GITHUB_OUTPUT
+          echo "done_fail=${DONE_FAIL}" >> $GITHUB_OUTPUT
+
+          # GitHub cron は数時間遅延し、深夜着火すると翌 JST 日の枠を誤って消費する。
+          # schedule(cron) 起動のみ時間帯ゲートで無害化する（ツイートの妥当な発行帯 = JST 17〜23 時）。
+          HOUR_JST=$((10#$(TZ=Asia/Tokyo date +%H)))
+
+          if [ "$EVENT" = "schedule" ] && [ "$HOUR_JST" -lt 17 ]; then
+            echo "proceed=false" >> $GITHUB_OUTPUT
+            echo "reason=skip (cron outside evening window: ${HOUR_JST}h JST)" >> $GITHUB_OUTPUT
+          elif [ "$DONE_OK" -gt 0 ]; then
+            echo "proceed=false" >> $GITHUB_OUTPUT
+            echo "reason=skip (already succeeded today: done_ok=${DONE_OK})" >> $GITHUB_OUTPUT
+          elif [ "$ACTIVE" -gt 0 ]; then
+            echo "proceed=false" >> $GITHUB_OUTPUT
+            echo "reason=skip (active run exists: active=${ACTIVE})" >> $GITHUB_OUTPUT
+          elif [ "$EVENT" = "schedule" ] && [ "$DONE_FAIL" -ge 2 ]; then
+            echo "proceed=false" >> $GITHUB_OUTPUT
+            echo "reason=retry_cap (cron stopped: done_fail=${DONE_FAIL} >= 2)" >> $GITHUB_OUTPUT
+          else
+            echo "proceed=true" >> $GITHUB_OUTPUT
+            if [ "$DONE_FAIL" -gt 0 ]; then
+              echo "reason=recovery (done_fail=${DONE_FAIL})" >> $GITHUB_OUTPUT
+            else
+              echo "reason=initial" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: Discord 通知（⏱ 予備タイマー起動）
+        if: github.event_name == 'schedule' && steps.check.outputs.proceed == 'true'
+        uses: ./.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_SNS || secrets.DISCORD_WEBHOOK_URL }}
+          state: timer
+          label: マクロ市況ツイート 予備タイマー起動
+          meaning: '本日のツイート案がまだ生成できていないため、GHA 側の予備タイマーが救援起動しました（本日: 成功 ${{ steps.check.outputs.done_ok }} 件・失敗 ${{ steps.check.outputs.done_fail }} 件・実行中 ${{ steps.check.outputs.active }} 件）。'
+          action_required: 不要（このあとツイート案が届けば復旧完了。届かない場合のみ run ログを確認）
+
+      - name: Discord 通知（🚨 自動リトライ停止）
+        if: contains(steps.check.outputs.reason, 'retry_cap')
+        uses: ./.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_SNS || secrets.DISCORD_WEBHOOK_URL }}
+          state: alert
+          label: マクロ市況ツイート 自動リトライ停止
+          meaning: 当日 2 回以上失敗したため cron の自動再実行を停止しました。本日ツイート案は未生成です。
+          action_required: run ログ確認 → 原因解消後に手動 dispatch（force_rerun=true）で再実行
+
+      - name: Discord 通知（guard 失敗）
+        if: failure() || cancelled()
+        uses: ./.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_SNS || secrets.DISCORD_WEBHOOK_URL }}
+          state: failed
+          label: マクロ市況ツイート guard 失敗
+          meaning: 実行前チェック（当日重複判定）自体がエラーになり、生成ジョブが起動していません。
+          action_required: run ログ確認 → 手動 dispatch で再実行
+
+  generate:
+    needs: guard
+    if: needs.guard.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    # 最悪ケース = 前段（clone/setup）5 分 + 1 回目 20 分 + 待機 1 分 + 2 回目 20 分 + 送信/commit 4 分 = 50 分。
+    timeout-minutes: 60
+
+    steps:
+      - name: Determine target date
+        id: date
+        run: |
+          if [ -n "${{ github.event.inputs.target_date }}" ]; then
+            echo "value=${{ github.event.inputs.target_date }}" >> $GITHUB_OUTPUT
+          else
+            echo "value=$(TZ=Asia/Tokyo date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout report-pipelines
+        uses: actions/checkout@v4
+        with:
+          path: report-pipelines
+
+      - name: Setup SSH for private repo
+        env:
+          PRIVATE_REPO_DEPLOY_KEY: ${{ secrets.PRIVATE_REPO_DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$PRIVATE_REPO_DEPLOY_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+      - name: Clone private repo (mizuki-fund)
+        run: |
+          git clone git@github.com:mzinvestment1105/mizuki-fund.git private-repo
+
+      - name: Copy pipelines and static files from Public into private working tree
+        # PM が Private 側への push を忘れた場合でも Public 側の最新ファイルで上書きし、自動化の品質を保つ。
+        # ツイートは PDF 化しないため、埋め込みフォント（assets/fonts）と Playwright は導入しない。
+        run: |
+          cp -f report-pipelines/bi/pipelines/*.py private-repo/bi/pipelines/
+          cp -f report-pipelines/bi/pipelines/requirements.txt private-repo/bi/pipelines/
+          mkdir -p private-repo/bi/pipelines/lib
+          cp -rf report-pipelines/bi/pipelines/lib/*.py private-repo/bi/pipelines/lib/ 2>/dev/null || true
+          mkdir -p private-repo/agents private-repo/playbook
+          cp -f report-pipelines/agents/*.md private-repo/agents/ 2>/dev/null || true
+          cp -f report-pipelines/playbook/*.md private-repo/playbook/ 2>/dev/null || true
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: report-pipelines/bi/pipelines/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r report-pipelines/bi/pipelines/requirements.txt
+
+      - name: Check prerequisite (夕刊マクロの存在確認)
+        id: precheck
+        # ツイートは夕刊マクロ本文を素材にするため、夕刊が出ていない日はツイートだけ作らない。
+        # 見つからない場合は warning のうえ以降を skip し、ジョブは成功扱いで終える
+        # （夕刊未発行は夕刊側の workflow が別途通知するため、ここで二重に失敗通知を出さない）。
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+        run: |
+          F="private-repo/market/daily/macro/${TARGET_DATE}_evening.md"
+          if [ ! -s "$F" ]; then
+            echo "::warning::夕刊マクロが存在しない（または空）ため、本日のマクロ市況ツイート生成をスキップします: $F"
+            echo "ready=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          echo "夕刊マクロを確認: $F ($(wc -l < "$F") lines)"
+          echo "ready=true" >> $GITHUB_OUTPUT
+
+      - name: Generate macro tweet via Claude Code (Opus 5 + effort high)
+        id: gen1
+        if: success() && steps.precheck.outputs.ready == 'true'
+        continue-on-error: true
+        uses: anthropics/claude-code-base-action@beta
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          model: claude-opus-5
+          prompt_file: report-pipelines/prompts/macro-tweet.md
+          allowed_tools: "Read,Write,Edit,Bash,Grep,Glob"
+          timeout_minutes: "20"
+          claude_env: |
+            CLAUDE_CODE_EFFORT_LEVEL: high
+            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+          PRIVATE_REPO_ROOT: private-repo
+
+      - name: Wait before retry 2 (Claude overloaded 等の一時エラー)
+        if: success() && steps.precheck.outputs.ready == 'true' && steps.gen1.outcome == 'failure'
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+        run: |
+          F="private-repo/research/sns/${TARGET_DATE}_macro_tweet.md"
+          # 途中まで書かれた不完全ファイルは退避（削除しない）。再試行が白紙から書き直せるようにする。
+          if [ -f "$F" ]; then
+            mv "$F" "/tmp/${TARGET_DATE}_macro_tweet.attempt1.partial.md"
+            echo "1 回目の不完全な出力を /tmp へ退避しました（再試行が白紙から書き直せるようにするため）"
+          fi
+          echo "1 回目が失敗しました。60 秒待機して再試行します（529 は即時再試行が無意味なため）"
+          sleep 60
+
+      - name: Generate macro tweet via Claude Code (retry 2)
+        id: gen2
+        if: success() && steps.precheck.outputs.ready == 'true' && steps.gen1.outcome == 'failure'
+        continue-on-error: true
+        uses: anthropics/claude-code-base-action@beta
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          model: claude-opus-5
+          prompt_file: report-pipelines/prompts/macro-tweet.md
+          allowed_tools: "Read,Write,Edit,Bash,Grep,Glob"
+          timeout_minutes: "20"
+          claude_env: |
+            CLAUDE_CODE_EFFORT_LEVEL: high
+            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+          PRIVATE_REPO_ROOT: private-repo
+
+      - name: Verify generated macro tweet (成否の一元判定)
+        # 上の 2 ステップは continue-on-error のため、ジョブの成否はここだけで決まる。
+        # 「どの試行で成功したか」に依存せず成果物の実在で判定する。
+        if: success() && steps.precheck.outputs.ready == 'true'
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+        run: |
+          F="private-repo/research/sns/${TARGET_DATE}_macro_tweet.md"
+          echo "attempt outcomes: gen1=${{ steps.gen1.outcome }} gen2=${{ steps.gen2.outcome }}"
+          if [ ! -s "$F" ]; then
+            echo "::error::マクロ市況ツイート案が 2 回の試行で生成されませんでした: $F"
+            exit 1
+          fi
+          echo "生成成功: $F ($(wc -l < "$F") lines)"
+
+      - name: Send macro tweet drafts to Discord (SNS)
+        id: send
+        if: success() && steps.precheck.outputs.ready == 'true'
+        env:
+          DISCORD_WEBHOOK_SNS: ${{ secrets.DISCORD_WEBHOOK_SNS }}
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+          PYTHONIOENCODING: utf-8
+        run: |
+          F="private-repo/research/sns/${TARGET_DATE}_macro_tweet.md"
+          if [ ! -s "$F" ]; then
+            echo "::warning::マクロ市況ツイート案が生成されなかったため送信をスキップします: $F"
+            exit 0
+          fi
+          MD=$(TZ=Asia/Tokyo date -d "${TARGET_DATE}" '+%-m月%-d日')
+          cd private-repo/bi/pipelines
+          python send_sns_drafts_discord.py \
+            --file "../../research/sns/${TARGET_DATE}_macro_tweet.md" \
+            --header "**マクロ市況ツイート / ${MD} 大引け**" \
+            --hide-source
+
+      - name: Commit and push to private repo
+        # rebase 方式は履歴書き換え・並行 push で index.lock 残留の構造的弱点があるため、
+        # fresh-base 方式の共通ヘルパー（Public 側から直接実行・repo 内コピー禁止）へ置換。
+        if: success() && steps.precheck.outputs.ready == 'true'
+        working-directory: ./private-repo
+        run: |
+          bash ../report-pipelines/bi/pipelines/ops/ci_commit_push.sh \
+            -m "data: macro tweet ${{ steps.date.outputs.value }}" research/sns
+
+      - name: Discord 通知（⚠️ 配信済み・後処理のみ失敗）
+        if: (failure() || cancelled()) && steps.send.outcome == 'success'
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_SNS || secrets.DISCORD_WEBHOOK_URL }}
+          state: partial
+          label: マクロ市況ツイート 後処理のみ失敗
+          date: ${{ steps.date.outputs.value }}
+          meaning: ツイート案は Discord へ配信済みです。配信後の commit だけが失敗しました。
+          action_required: 不要（差分は次回 run が回収）
+
+      - name: Discord 通知（❌ 失敗）
+        if: (failure() || cancelled()) && steps.send.outcome != 'success'
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_SNS || secrets.DISCORD_WEBHOOK_URL }}
+          state: failed
+          label: マクロ市況ツイート 失敗
+          date: ${{ steps.date.outputs.value }}
+          meaning: 生成または送信が完了せず、本日のツイート案は未配信です。
+          action_required: run ログ確認 → 手動 dispatch（force_rerun=true）で再実行。ログに「Spending cap reached」がある場合は Claude 利用枠切れ＝リセット時刻以降に force_rerun=true
