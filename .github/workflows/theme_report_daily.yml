@@ -5,6 +5,11 @@ name: テーマ動意レポート日次
   # PM 2026-06-05 追加: Worker 単一経路の SPOF 回避のため、Worker (17:43 JST) の約 1 時間後に
   # GHA cron をフェイルセーフとして併用。平日のみ（UTC 月-金 = 09:45）。
   # guard ジョブで当日既存 run を検知して重複発火を防ぐ。
+  #
+  # PM 2026-09-02 確定（誌面停止）: テーマレポートの誌面生成と Discord 送信を廃止。
+  # 本 workflow は「みんかぶ/株探ランキングの日次蓄積（bi/outputs/theme_momentum.parquet）」
+  # 専用のデータ収集 workflow となる（将来のバックテスト用・Claude 生成なし）。
+  # ワークフロー名・ファイル名・トリガーは Cloudflare Worker が名前で発火するため変更しない。
   workflow_dispatch:
     inputs:
       target_date:
@@ -26,7 +31,7 @@ jobs:
     # PM 2026-06-05/06: 当日 0:00 JST 以降の同 workflow の run を集計し、
     # status 全種類（cancelled / startup_failure / timed_out / stale 等）を漏れなく分類。
     # 判定: (1) DONE_OK >= 1 → skip / (2) ACTIVE >= 1 → skip
-    #       (3) cron 起動かつ DONE_FAIL >= 2 → skip（連続失敗の課金暴走防止）
+    #       (3) cron 起動かつ DONE_FAIL >= 2 → skip（連続失敗の暴走防止）
     #       (4) それ以外 → proceed（initial or recovery）
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -48,8 +53,8 @@ jobs:
           EVENT="${{ github.event_name }}"
 
           # 2026-07-07: GitHub cron は数時間遅延することがあり、深夜に遅延着火すると日付ズレ
-          # レポートを発行する事故源になる（macro/position_check と同方式の時間帯ゲートを移植）。
-          # schedule(cron) 起動のみ JST 15〜23 時の外なら skip。workflow_dispatch は常に通す。
+          # データを蓄積する事故源になる。schedule(cron) 起動のみ JST 15〜23 時の外なら skip。
+          # workflow_dispatch は常に通す。
           HOUR_JST=$((10#$(TZ=Asia/Tokyo date +%H)))
           if [ "$EVENT" = "schedule" ] && { [ "$HOUR_JST" -lt 15 ] || [ "$HOUR_JST" -gt 23 ]; }; then
             echo "proceed=false" >> $GITHUB_OUTPUT
@@ -57,9 +62,7 @@ jobs:
             exit 0
           fi
 
-          # 2026-08-05 修正: run 単位の conclusion は「guard が本体ジョブを skip した run」まで
-          # success と数えてしまい、本命の発火を「本日配信済み」と誤認して無言 skip させる。
-          # 実際に配信/更新を行うジョブ（generate）の結果だけで判定する。
+          # 実際に蓄積/更新を行うジョブ（generate）の結果だけで判定する。
           STATS=$(bash .github/scripts/check_delivery.sh theme_report_daily.yml generate "${MY_RUN_ID}")
           DONE_OK=$(echo "$STATS" | jq -r '.delivered')
           DONE_FAIL=$(echo "$STATS" | jq -r '.failed')
@@ -67,7 +70,6 @@ jobs:
 
           echo "Today (${TODAY_JST}): active=${ACTIVE} done_ok=${DONE_OK} done_fail=${DONE_FAIL} event=${EVENT} (excluding self ${MY_RUN_ID})"
 
-          # 2026-08-19: 予備タイマー通知の文面へ実測値を埋めるため、判定に使った当日実績を output 化。
           echo "active=${ACTIVE}" >> $GITHUB_OUTPUT
           echo "done_ok=${DONE_OK}" >> $GITHUB_OUTPUT
           echo "done_fail=${DONE_FAIL}" >> $GITHUB_OUTPUT
@@ -90,26 +92,14 @@ jobs:
             fi
           fi
 
-      - name: Discord 通知（⏱ 予備タイマー起動）
-        if: github.event_name == 'schedule' && steps.check.outputs.proceed == 'true'
-        uses: ./.github/actions/notify-discord
-        with:
-          webhook: ${{ secrets.DISCORD_WEBHOOK_THEME }}
-          state: timer
-          label: テーマ動意レポート 予備タイマー起動
-          # 2026-08-19 修正: 旧文面は「Worker 発火が届かなかった」と断定していたが、Worker が正常着弾し
-          # その run が失敗した場合も同じ通知が出る。guard が実際に把握している当日実績のみを述べる。
-          meaning: '本日の生成がまだ成功していないため、GHA 側の予備タイマーが救援起動しました（本日: 成功 ${{ steps.check.outputs.done_ok }} 件・失敗 ${{ steps.check.outputs.done_fail }} 件・実行中 ${{ steps.check.outputs.active }} 件）。レポートはこのあと通常どおり届きます。'
-          action_required: 不要（このあとレポートが届けば復旧完了。届かない場合のみ run ログを確認）
-
       - name: Discord 通知（🚨 自動リトライ停止）
         if: contains(steps.check.outputs.reason, 'retry_cap')
         uses: ./.github/actions/notify-discord
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_THEME }}
           state: alert
-          label: テーマ動意レポート 自動リトライ停止
-          meaning: 当日 2 回以上失敗したため cron の自動再実行を停止しました。本日未配信です。
+          label: テーマランキング蓄積 自動リトライ停止
+          meaning: 当日 2 回以上失敗したため cron の自動再実行を停止しました。本日分の theme_momentum.parquet が未蓄積です。
           action_required: run ログ確認 → 原因解消後に手動 dispatch で再実行
 
       - name: Discord 通知（guard 失敗）
@@ -118,18 +108,18 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_THEME || secrets.DISCORD_WEBHOOK_URL }}
           state: failed
-          label: テーマ動意レポート guard 失敗
-          meaning: 実行前チェック（当日重複判定）自体がエラーになり、生成ジョブが起動していません。
+          label: テーマランキング蓄積 guard 失敗
+          meaning: 実行前チェック（当日重複判定）自体がエラーになり、蓄積ジョブが起動していません。
           action_required: run ログ確認 → 手動 dispatch で再実行
 
   generate:
+    # job 名は check_delivery.sh の判定キー（guard が "generate" を参照）のため変更しない。
     needs: guard
     if: needs.guard.outputs.proceed == 'true'
     runs-on: ubuntu-latest
-    # PM 2026-08-19: 529 自動リトライ（2 回・待機 60/180 秒）を足したため枠を再計算して拡張。
-    # 最悪ケース = 前段（clone/setup/fonts/playwright/raw 取得）10 分 + 1 回目 45 分 + 待機 1 分
-    #            + 2 回目 30 分 + 待機 3 分 + 3 回目 30 分 + 検証/注記/送信/commit 6 分 = 125 分 → 135 分。
-    timeout-minutes: 135
+    # PM 2026-09-02: Claude 生成・PDF 化・Discord 送信を廃止したため、
+    # スクレイピング（リトライ込み最悪 ~15 分）と commit だけの枠へ縮小。
+    timeout-minutes: 30
 
     steps:
       - name: Determine target date
@@ -159,18 +149,14 @@ jobs:
         run: |
           git clone git@github.com:mzinvestment1105/mizuki-fund.git private-repo
 
-      - name: Copy pipelines and static files from Public into private working tree
+      - name: Copy pipelines from Public into private working tree
+        # PM 2026-09-02: 誌面生成を廃止したため、フォント（assets/fonts）・agents・playbook の
+        # overlay は不要（PDF を作らない・Claude を起動しない）。*.py と lib/ のみで足りる。
         run: |
           cp -f report-pipelines/bi/pipelines/*.py private-repo/bi/pipelines/
           cp -f report-pipelines/bi/pipelines/requirements.txt private-repo/bi/pipelines/
           mkdir -p private-repo/bi/pipelines/lib
           cp -rf report-pipelines/bi/pipelines/lib/*.py private-repo/bi/pipelines/lib/ 2>/dev/null || true
-          # PDF 配信用の埋め込みフォント（assets/fonts/*.woff2）を Public から overlay
-          mkdir -p private-repo/bi/pipelines/assets/fonts
-          cp -rf report-pipelines/bi/pipelines/assets/fonts/* private-repo/bi/pipelines/assets/fonts/ 2>/dev/null || true
-          mkdir -p private-repo/agents private-repo/playbook
-          cp -f report-pipelines/agents/*.md private-repo/agents/ 2>/dev/null || true
-          cp -f report-pipelines/playbook/*.md private-repo/playbook/ 2>/dev/null || true
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -182,50 +168,12 @@ jobs:
       - name: Install dependencies
         run: pip install -r report-pipelines/bi/pipelines/requirements.txt
 
-      - name: Install Japanese fonts (Noto Sans CJK JP)
-        # PM 2026-08-19 承認（動意日次 mover_report_daily.yml からの横展開）: `sudo apt-get update -qq`
-        # が出力ゼロのまま数十分ハングし、ジョブ枠に到達して配信ごと落ちる事故（GitHub 側の一時事象）の
-        # 恒久対策。①ステップ単位 timeout ②各コマンドを timeout コマンドで打ち切り ③待機つき 3 回リトライ。
-        #
-        # 【失敗してもジョブを落とさない理由】本 workflow の誌面生成は send_report_pdf_discord.py →
-        # bi/pipelines/lib/md_to_pdf.py で行い、同モジュールは assets/fonts の日本語サブセット woff2
-        # （NotoSansJP / NotoSerifJP / BIZ UDPGothic）を base64 で @font-face 埋め込みする設計＝
-        # システムのフォント選択に一切依存しない。よって apt のフォントが無くても誌面が豆腐（文字化け）に
-        # なることはなく、ここで落とすと「配信できたはずの日を落とす」だけになる。
-        # 時間予算: 1 試行 = update 75 秒 + install 120 秒 = 最大 195 秒。新規試行は開始 280 秒までに
-        # 限るので最悪 475 秒で自己終了し、ステップ枠 8 分（480 秒）内に必ず警告を出して抜ける。
-        timeout-minutes: 8
-        continue-on-error: true
-        run: |
-          set -u
-          DEADLINE=$(( $(date +%s) + 280 ))
-          for i in 1 2 3; do
-            if [ "$i" -gt 1 ] && [ "$(date +%s)" -ge "$DEADLINE" ]; then
-              echo "時間予算を超過したため再試行を打ち切ります"
-              break
-            fi
-            if timeout 75 sudo apt-get update -qq \
-               && timeout 120 sudo apt-get install -y -qq fonts-noto-cjk fonts-noto-cjk-extra; then
-              echo "日本語フォント導入に成功しました（${i} 回目）"
-              exit 0
-            fi
-            echo "日本語フォント導入に失敗またはハングしました（${i}/3 回目）"
-            if [ "$i" -lt 3 ]; then
-              sleep $((i * 15))
-            fi
-          done
-          echo "::warning::日本語フォントの apt 導入をスキップしました。PDF は assets/fonts の埋め込みフォント（base64 @font-face）で描画するため誌面に影響はなく、配信を続行します"
-          exit 0
-
-      - name: Install Playwright Chromium
-        run: |
-          playwright install chromium --with-deps
-
-      - name: Generate themes raw (fetch_theme_momentum.py)
-        # PM 2026-07-12 改定（絶対配信原則）: exit 3 = 当日の急上昇（rise）欠落の検知シグナル。
-        # 旧「exit 3 → ⛔ 生成中止＝未配信」は PM 却下。exit 3 でも step は成功で通し、送信前の
-        # 注記挿入 step がレポート冒頭へ品質注記（使用ランキングが当日でない旨）を機械挿入して
-        # 必ず配信する。exit 1（3ソース全滅等のインフラ失敗）のみ step 失敗（❌）。
+      - name: Fetch theme ranking (fetch_theme_momentum.py)
+        # PM 2026-09-02 確定: 本 workflow の唯一の実務。みんかぶ・株探のテーマランキングを
+        # スクレイプして bi/outputs/theme_momentum.parquet へ日次追記する（将来のバックテスト用）。
+        # 誌面生成・Discord 送信は廃止済のため、ここが失敗＝当日分の蓄積欠落のみ（配信影響なし）。
+        # exit 3（当日の急上昇 rise 欠落）は部分取得できているため成功扱いで通す。
+        # exit 1（3ソース全滅・IP ブロック等）のみ step 失敗（❌）。
         id: fetch_raw
         working-directory: ./private-repo/bi/pipelines
         env:
@@ -236,252 +184,41 @@ jobs:
           ec=$?
           echo "exit_code=$ec" >> $GITHUB_OUTPUT
           if [ "$ec" -eq 3 ]; then
-            echo "当日 rise 欠落 → 品質注記つき配信で続行（PM 2026-07-12 絶対配信原則）"
+            echo "当日の急上昇（rise）が欠落（exit 3）。取得できた分だけ蓄積して続行する"
             exit 0
           fi
           exit $ec
 
-      - name: 既存テーマレポートファイルを削除（前回不良ファイル読込スキップ防止）
-        # PM 2026-05-23 確定: Claude が前回ファイルを読んで「既に完成」と判定する
-        # 構造的失敗を防止（mover_weekly run 26325536581 で発生）。
-        working-directory: ./private-repo
-        env:
-          TARGET_DATE: ${{ steps.date.outputs.value }}
-        run: |
-          TARGET_FILE="market/daily/theme/${TARGET_DATE}_themes_summary.md"
-          if [ -f "$TARGET_FILE" ]; then
-            echo "Removing existing $TARGET_FILE before Claude run..."
-            rm -f "$TARGET_FILE"
-          fi
-
-      # PM 2026-08-19 承認（動意日次 mover_report_daily.yml からの横展開）: Anthropic 側の過負荷応答
-      # （API Error: 529 overloaded_error）を初回 API 呼び出しで受けて即 exit 1 する事故の恒久対策。
-      # 第三者製の新規 action を足さず、continue-on-error + outcome 判定の再試行ステップだけで構成する。
-      # 529 は即時再試行が無意味なため待機を指数的に伸ばす（60 秒 → 180 秒）。3 ステップとも
-      # continue-on-error のため、成否は最後の Verify ステップ 1 箇所（成果物ファイルが非空か）で決まる。
-      - name: Generate themes report via Claude Code (Opus 5 + effort high)
-        id: gen1
-        continue-on-error: true
-        uses: anthropics/claude-code-base-action@beta
-        with:
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          model: claude-opus-5
-          prompt_file: report-pipelines/prompts/themes-report.md
-          # PM 2026-06-28: WebSearch/WebFetch は GHA で 404（補助モデル解決不可）のため除去。
-          # 代表銘柄は fetch_theme_momentum.py がスクレイプ済（top_stocks 列）・動意理由はローカル
-          # 一次レポート（マクロ・動意・テーマ TDNet/掲示板 raw）＋構成銘柄の当日値動きから合成する。
-          allowed_tools: "Read,Write,Edit,Bash,Grep,Glob"
-          timeout_minutes: "45"
-          claude_env: |
-            CLAUDE_CODE_EFFORT_LEVEL: high
-            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 64000
-        env:
-          TARGET_DATE: ${{ steps.date.outputs.value }}
-          PRIVATE_REPO_ROOT: private-repo
-
-      - name: Wait before retry 2 (Claude overloaded 等の一時エラー)
-        if: success() && steps.gen1.outcome == 'failure'
-        env:
-          TARGET_DATE: ${{ steps.date.outputs.value }}
-        run: |
-          F="private-repo/market/daily/theme/${TARGET_DATE}_themes_summary.md"
-          # 途中まで書かれた不完全ファイルは退避（削除しない）。再試行が白紙から書き直せるようにする。
-          if [ -f "$F" ]; then
-            mv "$F" "/tmp/${TARGET_DATE}_themes_summary.attempt1.partial.md"
-            echo "1 回目の不完全な出力を /tmp へ退避しました（再試行が白紙から書き直せるようにするため）"
-          fi
-          echo "1 回目が失敗しました。60 秒待機して再試行します（529 は即時再試行が無意味なため）"
-          sleep 60
-
-      - name: Generate themes report via Claude Code (retry 2)
-        id: gen2
-        if: success() && steps.gen1.outcome == 'failure'
-        continue-on-error: true
-        uses: anthropics/claude-code-base-action@beta
-        with:
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          model: claude-opus-5
-          prompt_file: report-pipelines/prompts/themes-report.md
-          allowed_tools: "Read,Write,Edit,Bash,Grep,Glob"
-          timeout_minutes: "30"
-          claude_env: |
-            CLAUDE_CODE_EFFORT_LEVEL: high
-            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 64000
-        env:
-          TARGET_DATE: ${{ steps.date.outputs.value }}
-          PRIVATE_REPO_ROOT: private-repo
-
-      - name: Wait before retry 3 (Claude overloaded 等の一時エラー)
-        if: success() && steps.gen2.outcome == 'failure'
-        env:
-          TARGET_DATE: ${{ steps.date.outputs.value }}
-        run: |
-          F="private-repo/market/daily/theme/${TARGET_DATE}_themes_summary.md"
-          # 途中まで書かれた不完全ファイルは退避（削除しない）。再試行が白紙から書き直せるようにする。
-          if [ -f "$F" ]; then
-            mv "$F" "/tmp/${TARGET_DATE}_themes_summary.attempt2.partial.md"
-            echo "2 回目の不完全な出力を /tmp へ退避しました（再試行が白紙から書き直せるようにするため）"
-          fi
-          echo "2 回目も失敗しました。180 秒待機して最終再試行します"
-          sleep 180
-
-      - name: Generate themes report via Claude Code (retry 3)
-        id: gen3
-        if: success() && steps.gen2.outcome == 'failure'
-        continue-on-error: true
-        uses: anthropics/claude-code-base-action@beta
-        with:
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          model: claude-opus-5
-          prompt_file: report-pipelines/prompts/themes-report.md
-          allowed_tools: "Read,Write,Edit,Bash,Grep,Glob"
-          timeout_minutes: "30"
-          claude_env: |
-            CLAUDE_CODE_EFFORT_LEVEL: high
-            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 64000
-        env:
-          TARGET_DATE: ${{ steps.date.outputs.value }}
-          PRIVATE_REPO_ROOT: private-repo
-
-      - name: Verify generated themes report (成否の一元判定)
-        # 上の 3 ステップは全て continue-on-error のため、ジョブの成否はここだけで決まる。
-        # 「どの試行で成功したか」に依存せず成果物の実在で判定するので、リトライ成功を失敗扱いする
-        # / 失敗を成功扱いする判定崩れが起きない。
-        env:
-          TARGET_DATE: ${{ steps.date.outputs.value }}
-        run: |
-          F="private-repo/market/daily/theme/${TARGET_DATE}_themes_summary.md"
-          echo "attempt outcomes: gen1=${{ steps.gen1.outcome }} gen2=${{ steps.gen2.outcome }} gen3=${{ steps.gen3.outcome }}"
-          if [ ! -s "$F" ]; then
-            echo "::error::テーマ動意レポートが 3 回の試行で生成されませんでした: $F"
-            exit 1
-          fi
-          echo "生成成功: $F ($(wc -l < "$F") lines)"
-
-      - name: 対象日整合検査（タイトル日付・不一致でも送信は止めない）
-        # PM 2026-07-12 改定（絶対配信原則）: タイトル日付の対象日不一致は検知シグナル（exit_code=3）
-        # として次の注記挿入 step へ渡し、送信は止めない（旧「exit 3 → ⛔ 送信中止」は PM 却下）。
-        # レポート未生成（ファイル無し）のみインフラ失敗（exit 1・❌）。
-        id: title_gate
-        working-directory: ./private-repo
-        env:
-          TARGET_DATE: ${{ steps.date.outputs.value }}
-        run: |
-          F="market/daily/theme/${TARGET_DATE}_themes_summary.md"
-          if [ ! -f "$F" ]; then
-            echo "ERROR: レポート未生成: $F"
-            echo "exit_code=1" >> $GITHUB_OUTPUT
-            exit 1
-          fi
-          if ! head -1 "$F" | grep -q "${TARGET_DATE}"; then
-            echo "[QUALITY FLAG] タイトル行に対象日 ${TARGET_DATE} が無い → 注記を挿入して配信続行: $(head -1 "$F")"
-            echo "exit_code=3" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-          echo "[QUALITY FLAG] タイトル日付 OK: $(head -1 "$F")"
-          echo "exit_code=0" >> $GITHUB_OUTPUT
-
-      - name: 品質注記の機械挿入（フラグ検知時のみ・タイトル行直後）
-        # PM 2026-07-12（絶対配信原則）: rise 欠落・タイトル日付不一致を検知した場合、md の
-        # タイトル行直後へ品質注記を機械挿入して必ず配信する（Claude 側注記と重複しても可）。
-        id: annotate
-        working-directory: ./private-repo
-        env:
-          TARGET_DATE: ${{ steps.date.outputs.value }}
-          PYTHONIOENCODING: utf-8
-        run: |
-          NOTE=""
-          if [ "${{ steps.fetch_raw.outputs.exit_code }}" = "3" ]; then
-            SNAP=$(python -c "import pandas as pd; m=pd.read_parquet('bi/outputs/theme_momentum.parquet'); print(m[m['rank_type']=='rise']['snapshot_date'].max())" 2>/dev/null || echo "不明")
-            NOTE="急上昇テーマの当日ランキングが取得できず、掲載は取得済みの最新ランキング（${SNAP} 時点）に基づく"
-          fi
-          if [ "${{ steps.title_gate.outputs.exit_code }}" = "3" ]; then
-            NOTE="${NOTE}${NOTE:+ ／ }タイトル日付が対象日 ${TARGET_DATE} と不一致"
-          fi
-          if [ -n "$NOTE" ]; then
-            F=market/daily/theme/${TARGET_DATE}_themes_summary.md
-            awk -v note="> ⚠️ **品質注記**: ${NOTE}" 'NR==1{print; print ""; print note; next} {print}' "$F" > "${F}.tmp" && mv "${F}.tmp" "$F"
-            echo "annotated=true" >> $GITHUB_OUTPUT
-            echo "note=${NOTE}" >> $GITHUB_OUTPUT
-            echo "品質注記を挿入: ${NOTE}"
-          else
-            echo "annotated=false" >> $GITHUB_OUTPUT
-            echo "品質フラグなし・注記挿入なし"
-          fi
-
-      - name: Send Discord (PDF)
-        id: send
-        working-directory: ./private-repo/bi/pipelines
-        env:
-          DISCORD_WEBHOOK_THEME: ${{ secrets.DISCORD_WEBHOOK_THEME }}
-          PYTHONIOENCODING: utf-8
-        run: |
-          python send_report_pdf_discord.py --kind themes --date ${{ steps.date.outputs.value }}
-
-      - name: Rotate report archives (5 件超過分を archive/ へ退避)
-        working-directory: ./private-repo
-        env:
-          PYTHONIOENCODING: utf-8
-        run: |
-          # ops/ は Copy pipelines step の対象外のため Public 側から都度 overlay（最新版を保証）
-          mkdir -p bi/pipelines/ops
-          cp -f ../report-pipelines/bi/pipelines/ops/rotate_report_archives.py bi/pipelines/ops/
-          python bi/pipelines/ops/rotate_report_archives.py
-
       - name: Commit and push to private repo
         # rebase 方式は履歴書き換え・並行 push で index.lock 残留の構造的弱点があるため、
         # fresh-base 方式の共通ヘルパー（Public 側から直接実行・repo 内コピー禁止）へ置換。
+        # PM 2026-09-02: 誌面（market/daily）の commit は廃止。蓄積 parquet のみ push する。
         working-directory: ./private-repo
         run: |
           bash ../report-pipelines/bi/pipelines/ops/ci_commit_push.sh \
-            -m "data: themes daily ${{ steps.date.outputs.value }}" \
-            market/daily bi/outputs/theme_momentum.parquet
+            -m "data: theme momentum ${{ steps.date.outputs.value }}" \
+            bi/outputs/theme_momentum.parquet bi/outputs/theme_master_minkabu.parquet
 
-      - name: Discord 通知（⚠️ 配信済み・品質注記あり）
-        # PM 2026-07-12（絶対配信原則）: 品質問題があってもレポートは配信済み。何が注記されたかを PM へ通知。
-        if: steps.annotate.outputs.annotated == 'true' && steps.send.outcome == 'success'
-        uses: ./report-pipelines/.github/actions/notify-discord
-        with:
-          webhook: ${{ secrets.DISCORD_WEBHOOK_THEME }}
-          state: partial
-          label: テーマ動意レポート 配信済み（品質注記あり）
-          date: ${{ steps.date.outputs.value }}
-          meaning: レポートは配信済みです。品質注記（${{ steps.annotate.outputs.note }}）を冒頭に付けています。
-          action_required: レポート冒頭の品質注記を確認（数値を使う前に注記のデータ日付を参照）
-
-      - name: Discord 通知（❌ raw 取得ブロック）
+      - name: Discord 通知（❌ ランキング取得ブロック）
         # fetch_theme_momentum.py の失敗（exit 1 = 3ソース全滅）= 株探/みんかぶが GHA ランナー IP を
         # 弾いた（405 等・リトライ済み）とみられるため、専用文言でリカバリ手段を明示する。
-        # exit 3（rise 欠落）は step 成功で通し注記配信するため、ここには来ない。
         if: (failure() || cancelled()) && steps.fetch_raw.outcome == 'failure'
         uses: ./report-pipelines/.github/actions/notify-discord
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_THEME }}
           state: failed
-          label: テーマ動意レポート 失敗（raw 取得ブロック）
+          label: テーマランキング蓄積 失敗（取得ブロック）
           date: ${{ steps.date.outputs.value }}
-          meaning: テーマランキングの取得元（株探/みんかぶ）が GHA の接続を拒否し（IP ブロック起因・リトライ済み）、本日未配信です。
-          action_required: ローカルで /themes-report を実行してリカバリ（GHA の再実行は同じ IP 帯で失敗しやすい）
-
-      - name: Discord 通知（⚠️ 配信済み・後処理のみ失敗）
-        if: (failure() || cancelled()) && steps.send.outcome == 'success'
-        uses: ./report-pipelines/.github/actions/notify-discord
-        with:
-          webhook: ${{ secrets.DISCORD_WEBHOOK_THEME }}
-          state: partial
-          label: テーマ動意レポート 後処理のみ失敗
-          date: ${{ steps.date.outputs.value }}
-          meaning: レポート本体は配信済みです。配信後のアーカイブ整理または commit だけが失敗しました。
-          action_required: 不要（差分は次回 run が回収）
+          meaning: テーマランキングの取得元（株探/みんかぶ）が GHA の接続を拒否し（IP ブロック起因・リトライ済み）、本日分が未蓄積です。誌面配信は 2026-09-02 に廃止済のため配信影響はありません。
+          action_required: ローカルで bi/pipelines/fetch_theme_momentum.py を実行してリカバリ（GHA の再実行は同じ IP 帯で失敗しやすい）
 
       - name: Discord 通知（❌ 失敗）
-        # 品質フラグ（exit_code=3）は step 成功で通し注記配信するため、ここに来るのはインフラ失敗のみ。
-        if: (failure() || cancelled()) && steps.fetch_raw.outcome != 'failure' && steps.send.outcome != 'success'
+        if: (failure() || cancelled()) && steps.fetch_raw.outcome != 'failure'
         uses: ./report-pipelines/.github/actions/notify-discord
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_THEME }}
           state: failed
-          label: テーマ動意レポート 失敗
+          label: テーマランキング蓄積 失敗
           date: ${{ steps.date.outputs.value }}
-          meaning: 生成または送信が完了せず、本日未配信です。
-          action_required: run ログ確認 → 手動 dispatch で再実行。ログに「Spending cap reached」がある場合は Claude 利用枠切れ＝リセット時刻以降に再実行
+          meaning: theme_momentum.parquet の蓄積または commit が完了しませんでした。誌面配信は 2026-09-02 に廃止済のため配信影響はありません。
+          action_required: run ログ確認 → 手動 dispatch で再実行

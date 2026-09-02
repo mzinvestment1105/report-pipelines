@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -34,7 +35,6 @@ from lib.quality_gate import (  # noqa: E402
 from send_report_jpeg_discord import (  # noqa: E402
     KIND_CONFIG,
     _lookup_company_name,
-    split_movers_by_market,
 )
 
 JST = timezone(timedelta(hours=9))
@@ -49,6 +49,31 @@ _PDF_KIND = {
     "themes": "themes", "earnings": "earnings", "stock": "stock",
     "largecap_weekly": "largecap_weekly",
 }
+
+
+_MOVERS_MARKET_TITLE_RE = re.compile(
+    r"^#\s*動意銘柄レポート.*?[（(](?:プライム|スタンダード|グロース)[)）]", re.MULTILINE
+)
+
+
+def _ensure_movers_doc_title(md_text: str, identifier: str, doc_label: str) -> str:
+    """動意 md の先頭に文書タイトル H1 を必ず 1 本置く。
+
+    md_to_pdf は「最初に現れた H1」をマストヘッド見出しへ昇格し本文から除く。
+    統合 1 本化後の md は先頭がテーマ2部（`##`）で、最初の H1 が市場タイトル
+    `# 動意銘柄レポート {date}（グロース）` になるため、放置するとマストヘッドが
+    「（グロース）」を名乗りグロースの区切り帯も消える。文書タイトルを先頭へ足して
+    マストヘッド用に消費させ、3 本の市場タイトルは全て本文の区切り帯として残す。
+    既に市場名なしの H1 が先頭にある md には何もしない（二重付与しない）。
+    """
+    stripped = md_text.lstrip()
+    first_h1 = re.search(r"^#\s+(.*)$", md_text, re.MULTILINE)
+    if first_h1 and not _MOVERS_MARKET_TITLE_RE.match(first_h1.group(0)):
+        return md_text  # 既に文書タイトルがある
+    if not first_h1:
+        return md_text  # 市場タイトルすら無い（想定外）ので触らない
+    label = f"# {doc_label} {identifier}"
+    return label + "\n\n" + stripped
 
 
 def _post_pdf(webhook: str, pdf_path: Path, content: str) -> bool:
@@ -147,19 +172,14 @@ def main() -> int:
         if residual:
             print("QUALITY MONITOR WARNING (残注釈重複・配信は継続):", residual)
 
-    # 動意は市場別（プライム/スタンダード/グロース）に分割して 3 PDF 送信
+    # 動意（日次・週次）は 1 メッセージ・1 PDF で送る（PM 2026-09-02 確定）。
+    # 旧仕様は split_movers_by_market() で市場別 3 PDF へ分割し 3 メッセージ送っていたが、
+    # PM 判断で 1 本へ統一した（ファイル名も日本語市場名を含まない半角英数のみになる）。
+    # テーマ2部（## 本日のテーマ／## 直近2週間の熱いテーマ）は md 冒頭にあるため、
+    # 統合 PDF でも 1 ページ目の先頭に来る。市場タイトル（# …（グロース）等）は
+    # 本文中の h1 として市場区切り帯にレンダリングされる（lib/md_to_pdf.py の h1 スタイル）。
     if args.kind in ("movers", "movers_weekly"):
-        markets = split_movers_by_market(md_text) or [("ALL", md_text)]
-        prefix = "movers_weekly" if args.kind == "movers_weekly" else "movers"
-        ok = True
-        for label, part in markets:
-            p = out_dir / f"{prefix}_{identifier}_{label.lower()}.pdf"
-            print(f"[render] movers/{label} -> {p.name}")
-            render_markdown_to_pdf(part, p, kind=pdf_kind, target_date=date_str)
-            if not args.skip_send:
-                ok = _post_pdf(webhook, p, f"**{cfg['label']}（{label}）** {identifier}") and ok
-        print("DONE" if ok else "DONE WITH ERRORS")
-        return 0 if ok else 1
+        md_text = _ensure_movers_doc_title(md_text, identifier, cfg["label"])
 
     out_path = out_dir / f"{args.kind}_{identifier}.pdf"
     print(f"[1/2] rendering {args.kind} -> PDF")

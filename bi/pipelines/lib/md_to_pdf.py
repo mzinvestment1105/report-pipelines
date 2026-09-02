@@ -137,6 +137,17 @@ body {{
 .masthead .meta {{ font-size:10pt; color:#6B7686; font-weight:500; letter-spacing:.02em; }}
 .masthead .meta .brand {{ color:#1A1A1A; font-weight:700; letter-spacing:.06em; }}
 
+/* ── 市場区切り見出し（本文中の h1）──
+   PM 2026-09-02 確定: 動意レポートを 1 本の PDF へ統一したため、2 本目以降の
+   `# 動意銘柄レポート YYYY-MM-DD（市場名）` が本文中に残る（先頭 1 本だけがマストヘッドへ昇格）。
+   マストヘッドと紛れない「市場の区切り帯」として、アクセント色の塗り帯で明示する。
+   強制改ページ（break-before:page）は掛けない（_cr §39 の 1/3 空白禁止に抵触するため）。 */
+h1 {{
+  font-family:{serif}; font-weight:700; font-size:19pt; color:#FFFFFF;
+  background:{accent}; margin:30px 0 14px; padding:11px 14px;
+  line-height:1.35; letter-spacing:.02em; text-align:left;
+}}
+
 /* ── 見出し（1.25 タイポグラフィックスケール）── */
 h2 {{
   font-weight:700; font-size:17.5pt; color:#1A1A1A;
@@ -227,20 +238,94 @@ tbody td:last-child {{ white-space:normal; word-break:normal; overflow-wrap:brea
 tbody tr:nth-child(even) td {{ background:#F6F8FB; }}
 tbody tr:last-child td {{ border-bottom:1pt solid #C8D1DD; }}
 
+/* ── テーマ表の列幅（動意・夜間PTS の「本日のテーマ」「直近2週間の熱いテーマ」）──
+   table-layout:fixed は列幅を均等割りするため、6列の熱量表では「局面」「前2週比」等の
+   短い数値列と「主導銘柄」「動いた理由」の長文列が同じ幅になり、長文列が1銘柄名で
+   何行にも折り返して誌面が読めなくなる（2026-08-31 実測）。列数で表を判別し、
+   内容量に比例した幅を colgroup 相当の nth-child で与える。fixed は維持するため
+   ページ全体の縮小（本文 12pt → 8pt）は起きない。 */
+/* 3列＝本日のテーマ: テーマ / 主導銘柄 / 動いた理由 */
+table.theme-today th:nth-child(1), table.theme-today td:nth-child(1) {{ width:26%; }}
+table.theme-today th:nth-child(2), table.theme-today td:nth-child(2) {{ width:38%; }}
+table.theme-today th:nth-child(3), table.theme-today td:nth-child(3) {{ width:36%; }}
+/* 6列＝直近2週間: テーマ / 局面 / 熱量 / 前2週比 / 主導銘柄 / 動いた理由 */
+table.theme-heat th:nth-child(1), table.theme-heat td:nth-child(1) {{ width:17%; }}
+table.theme-heat th:nth-child(2), table.theme-heat td:nth-child(2) {{ width:9%; }}
+table.theme-heat th:nth-child(3), table.theme-heat td:nth-child(3) {{ width:9%; }}
+table.theme-heat th:nth-child(4), table.theme-heat td:nth-child(4) {{ width:11%; }}
+table.theme-heat th:nth-child(5), table.theme-heat td:nth-child(5) {{ width:28%; }}
+table.theme-heat th:nth-child(6), table.theme-heat td:nth-child(6) {{ width:26%; }}
+/* 短い数値列のヘッダ（局面・熱量・前2週比）だけは1行に収める。列幅を確保済みのため
+   nowrap にしてもページ全体の縮小は起きない（幅超過の原因は本文セル側にあった）。 */
+table.theme-heat thead th:nth-child(2), table.theme-heat thead th:nth-child(3),
+table.theme-heat thead th:nth-child(4) {{ white-space:nowrap; text-align:center; }}
+/* 局面（新規/加速/継続）も1行に収める */
+table.theme-heat tbody td:nth-child(2) {{ white-space:nowrap; }}
+/* 主導銘柄セルは <br> 区切りの銘柄リストのため行間を詰めて縦の嵩を抑える */
+table.theme-today td:nth-child(2), table.theme-heat td:nth-child(5) {{ line-height:1.45; }}
+table.theme-heat td:nth-child(2), table.theme-heat td:nth-child(3),
+table.theme-heat td:nth-child(4) {{ text-align:center; }}
+
+/* ── 主導銘柄の密な表（新形式・2026-08-31 PM 確定）──
+   旧形式は主導銘柄セルへ複数銘柄を <br> で縦積みしたため、長い銘柄名が折り返して
+   読みづらく、隣の理由セル（1文）との高さ差が大余白になっていた（PM 指摘: 主導銘柄が
+   読みづらい／スカスカの表が嫌い）。新形式は1銘柄=1行の4列表にして、
+   コード・騰落率は短い固定幅、銘柄名と「何の会社」に幅を配分し全セルを1行へ収める。
+   列: コード / 銘柄名 / 何の会社 / 騰落率 */
+/* 列幅は「1行に収まること」を実測で確認して決めた（2026-08-31）。本文幅 612px・9.5pt 時に
+   銘柄名は最長17字（ダイナミックマッププラットフォーム）、「何の会社」は15字前後が上限。 */
+table.theme-lead {{ margin:6px 0 15px; font-size:9.5pt; }}
+table.theme-lead th:nth-child(1), table.theme-lead td:nth-child(1) {{ width:9%; }}
+table.theme-lead th:nth-child(2), table.theme-lead td:nth-child(2) {{ width:42%; }}
+table.theme-lead th:nth-child(3), table.theme-lead td:nth-child(3) {{ width:37%; }}
+table.theme-lead th:nth-child(4), table.theme-lead td:nth-child(4) {{ width:12%; }}
+/* コード・騰落率は必ず1行（幅を確保済みのためページ全体の縮小は起きない） */
+table.theme-lead td:nth-child(1), table.theme-lead td:nth-child(4),
+table.theme-lead thead th:nth-child(1), table.theme-lead thead th:nth-child(4) {{
+  white-space:nowrap;
+}}
+table.theme-lead td:nth-child(4), table.theme-lead thead th:nth-child(4) {{ text-align:right; }}
+table.theme-lead tbody td {{ padding:5px 8px; line-height:1.45; }}
+table.theme-lead thead th {{ padding:5px 8px; font-size:9pt; }}
+
+/* テーマ見出し行（**テーマ名**｜局面 …）は h5 へ昇格されるため、表と密に接する余白にする */
+h5 + table.theme-lead, h5 + p + table.theme-lead {{ margin-top:4px; }}
+/* テーマブロック（見出し+理由文+主導銘柄表）を包む単位。余白は内側の要素が持つため
+   div 自身は余白を持たず、ブロック末尾の表の下マージンだけをブロック間の間隔にする。 */
+.theme-block {{ margin:0; }}
+.theme-block > h5:first-child {{ margin-top:14px; }}
+.theme-block > table.theme-lead:last-child {{ margin-bottom:15px; }}
+
 code {{
   background:#EEF1F5; padding:1px 5px; border-radius:3px; color:#B5483D;
   font-family:'Consolas','Courier New',monospace; font-size:10pt;
 }}
 hr {{ border:0; border-top:0.8pt solid #DBE1E9; margin:20px 0; }}
 
-/* ── 改ページ制御（1ページ目の谷間＝妙な空白を根絶）──
-   鉄則: 1ページより高くなり得るブロックには break-inside:avoid を付けない。
-   大きい表・リードは分割を許可し、見出しは後続本文と連結する。 */
+/* ── 改ページ制御（改ページ由来の空白をページの 1/3 以上作らない・_cr §39）──
+   鉄則（2026-09-01 PM 承認で改定）: **ブロックの塊送りより空白最小を優先する**。
+   `break-inside:avoid` を掛けた要素はページ末に入り切らないと丸ごと次ページへ送られ、
+   前ページに要素の高さぶんの空白が残る（v11 実測: 1ページ目の下 2/3 が空白）。
+   よって「見出しが単独でページ末に取り残される」ことだけを break-after:avoid で防ぎ、
+   表・ブロックは途中改ページを許可する。 */
 @media print {{
+  /* 表は常に分割可（theme-lead も含む。thead が次ページ先頭で再描画される） */
   table {{ break-inside:auto; }}
+  table.theme-lead {{ break-inside:auto; }}
+  /* テーマブロックも分割可。見出し→理由文→表の先頭までの連結だけを保証する
+     （2026-09-01 PM 承認・v11 の巨大余白の是正）。 */
+  .theme-block {{ break-inside:auto; }}
+  /* 見出しはその直後の要素と切り離さない（見出しだけがページ末に残る分断の防止）。
+     break-after:avoid は「次の1要素」との連結だけを保証するので大空白を生まない。
+     理由文の段落は**分割可**にする（2026-09-01）。長文の理由文へ break-inside:avoid を
+     掛けると段落まるごとが次ページへ送られ、前ページに 20% 級の空白が残る実測があった。
+     orphans/widows で行単位の孤立だけを抑え、段落は途中改ページを許す。 */
+  .theme-block > :first-child {{ break-after:avoid; }}
+  .theme-block > p {{ break-inside:auto; orphans:2; widows:2; }}
+  h5:has(+ p + table.theme-lead), h5:has(+ table.theme-lead) {{ break-after:avoid; }}
   thead {{ display:table-header-group; }}
   tr, img {{ break-inside:avoid; }}
-  h2, h3, h4, h5 {{ break-after:avoid; break-inside:avoid; }}
+  h1, h2, h3, h4, h5 {{ break-after:avoid; break-inside:avoid; }}
   p, li {{ orphans:2; widows:2; }}
   blockquote {{ break-inside:auto; }}
   .masthead {{ break-inside:avoid; break-after:avoid; }}
@@ -321,6 +406,87 @@ def _inject_size_tags(md_text: str) -> str:
     return "\n".join(out)
 
 
+def _wrap_theme_blocks(html: str) -> str:
+    """テーマブロック（見出し + 理由段落 + 主導銘柄表）を1つの div へ束ねる。
+
+    2026-09-01 PM 承認で役割を変更した。旧版はこの div へ `break-inside:avoid` を掛けて
+    ブロックを丸ごと1ページへ収めていたが、ブロックがページ末に入り切らないと**丸ごと
+    次ページへ送られ**、前ページにブロック高ぶんの空白が残った（v11 実測で1ページ目の
+    下 2/3 が空白）。_cr §39 は「改ページ由来の空白をページの 1/3 以上作らない」を
+    塊送りより優先すると定めるため、現在は div を**分割可**にしている。
+
+    この div の役割は、見出し・理由文が直後の要素と切り離されないよう CSS の
+    `break-after:avoid` を掛ける足場を作ることだけ（`.theme-block > :first-child`・
+    `.theme-block > p`）。表は途中改ページを許すので、ページ末に空白が残らない。
+
+    包む対象は「直後に table.theme-lead を持つ見出し」に限定する（テーマ2部のみ）。
+    """
+    # 見出し →（任意の理由段落）→ theme-lead 表 までを1ブロックとして包む。
+    # 2026-09-01: 見出しは h5 だけでなく `<p><strong>…</strong></p>`（誌面の
+    # `**1位 テーマ名**｜…` 行が変換された形）も対象にする。実際のテーマ2部の誌面は
+    # 太字段落で見出しを書いており、h5 限定だと本ラッパが一度も掛からず、見出し＋理由文
+    # だけがページ末に残る分断が v10 まで残っていた（8/28 実測で「仮想通貨」が分断）。
+    # `**1位 テーマ名**（10日中7日点灯）` のように太字の後ろに素の文字が続く形も見出しと
+    # みなす（v11 の点灯日数表記）。`</strong></p>` で閉じる形だけを見ていると掛からない。
+    _HEAD = r"(?:<h5[^>]*>.*?</h5>|<p><strong>(?:(?!</p>).)*?</strong>(?:(?!</p>).)*?</p>)"
+    pattern = re.compile(
+        r"(" + _HEAD + r")\s*"
+        r"((?:<p>(?!<strong>).*?</p>\s*)*?)"
+        r"(<table class=\"theme-lead\">.*?</table>)",
+        flags=re.DOTALL,
+    )
+
+    def _repl(m: re.Match) -> str:
+        return (
+            '<div class="theme-block">'
+            + m.group(1) + m.group(2) + m.group(3)
+            + "</div>"
+        )
+
+    return pattern.sub(_repl, html)
+
+
+def _tag_theme_tables(html: str) -> str:
+    """テーマ2部の表に列幅用のクラスを付ける（ヘッダ行の内容で機械判定する）。
+
+    新形式（2026-08-31 PM 確定・スカスカ表の解消）:
+      テーマごとに `**テーマ名**｜局面…` の見出し行を置き、その下へ主導銘柄の
+      4列表「コード / 銘柄名 / 何の会社 / 騰落率」を置く。1銘柄=1行で全セルが
+      1行に収まるため、旧形式のような結合セル縦積みと理由セルの大余白が出ない。
+      → クラス `theme-lead`
+
+    旧形式（互換のため判定を残す。過去 raw の再レンダリング用）:
+      「本日のテーマ」＝ テーマ/主導銘柄/動いた理由 の3列 → `theme-today`
+      「直近2週間」＝ テーマ/局面/熱量/前2週比/主導銘柄/動いた理由 の6列 → `theme-heat`
+
+    見出し文字列ではなく表自身のヘッダで判別するため、誌面の見出し表記が変わっても効く。
+    table-layout:fixed は維持する（外すと 12pt シュリンク回帰が再発するため）。
+    """
+
+    def _repl(m: re.Match) -> str:
+        table_html = m.group(0)
+        head = table_html[: table_html.find("</thead>") + 8] if "</thead>" in table_html else table_html
+        # `<thead>` 自体が部分文字列 "<th" を含むため `count("<th")` は列数+1 になる
+        # （2026-08-31 実測。旧 3列判定 `n_cols == 3` が一度も成立しておらず、
+        #  「本日のテーマ」表に列幅が当たっていなかった原因）。`<th>` で数える。
+        n_cols = head.count("<th>")
+        # 新形式: 主導銘柄の4列表（コード/銘柄名/何の会社/騰落率）
+        if n_cols == 4 and "コード" in head and "何の会社" in head and "騰落率" in head:
+            return table_html.replace("<table>", '<table class="theme-lead">', 1)
+        # 旧形式
+        if "動いた理由" not in head or "主導銘柄" not in head:
+            return table_html
+        if n_cols >= 6 and "局面" in head:
+            cls = "theme-heat"
+        elif n_cols == 3:
+            cls = "theme-today"
+        else:
+            return table_html
+        return table_html.replace("<table>", f'<table class="{cls}">', 1)
+
+    return re.sub(r"<table>.*?</table>", _repl, html, flags=re.DOTALL)
+
+
 def render_markdown_to_pdf(
     md_text: str,
     out_path: Path,
@@ -351,10 +517,22 @@ def render_markdown_to_pdf(
     # `**太字**` で書くため、ここで確定的に h5 へ昇格し、本文中のインライン強調太字と体裁を明確に
     # 分ける（PM 指示・LLM 出力に依存せず renderer 側で保証する）。
     _bold_only = re.compile(r"^\*\*([^*]+)\*\*$")
+    # テーマ2部の見出し行 `**テーマ名**｜局面 加速・熱量 171・前2週比 +146`（_cr §38）。
+    # 行全体が太字ではないため上の _bold_only では拾えないが、意味は同じ小見出しなので
+    # 併せて h5 へ昇格する（2026-08-31 追加）。全角縦棒の後ろはメタ情報として残す。
+    _bold_head_meta = re.compile(r"^\*\*([^*]+)\*\*(｜.+)$")
     promoted = []
     for ln in lines:
-        m2 = _bold_only.match(ln.strip())
-        promoted.append(f"##### {m2.group(1).strip()}" if m2 else ln)
+        stripped = ln.strip()
+        m2 = _bold_only.match(stripped)
+        if m2:
+            promoted.append(f"##### {m2.group(1).strip()}")
+            continue
+        m3 = _bold_head_meta.match(stripped)
+        if m3:
+            promoted.append(f"##### {m3.group(1).strip()}{m3.group(2).rstrip()}")
+            continue
+        promoted.append(ln)
     lines = promoted
 
     body_md = "\n".join(lines).strip()
@@ -364,6 +542,8 @@ def render_markdown_to_pdf(
 
     html_body = md.markdown(body_md, extensions=["tables", "fenced_code", "sane_lists"])
     html_body = _colorize_numbers(html_body)
+    html_body = _tag_theme_tables(html_body)
+    html_body = _wrap_theme_blocks(html_body)
 
     date_label = _date_label(target_date)
     masthead = f"""<header class="masthead">

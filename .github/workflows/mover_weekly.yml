@@ -1071,8 +1071,8 @@ jobs:
           # PM 2026-08-26 確定: 4 並列統合により artifact は単一（{date}_weekly_all.md）。
           # 旧 4 ファイル cat 結合は不要になり、そのまま cp する。
           # ファイル内の市場並び順はグロース → スタンダード → プライム
-          # （prompts/mover-weekly.md が制御）。send_report_pdf_discord.py
-          # （--kind movers_weekly）は市場タイトル行だけを見て 3 PDF へ再分割し、
+          # （prompts/mover-weekly.md が制御）。PM 2026-09-02 確定で send_report_pdf_discord.py
+          # （--kind movers_weekly）は分割せず 1 本の PDF にし、
           # ファイル内の出現順のまま送るため、送信は無改修で透過する。
           SRC="/tmp/market-artifacts/${TARGET_DATE}_weekly_all.md"
           DST="${MOVERS_DIR}/${TARGET_DATE}_weekly_all.md"
@@ -1181,7 +1181,7 @@ jobs:
             echo "skip_send=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Send Discord (PDF・市場別 3 枚分割)
+      - name: Send Discord (PDF・全市場 1 本)
         id: send
         if: steps.predup.outputs.skip_send != 'true'
         working-directory: ./private-repo/bi/pipelines

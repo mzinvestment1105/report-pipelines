@@ -145,6 +145,15 @@ class EdinetDBClient:
         data = self._call("get_shareholders", {"edinet_code": edinet_code})
         return data if isinstance(data, dict) else {}
 
+    def get_corporate_profile(self, corporate_number: str) -> dict:
+        """法人番号（13桁）→ 法人プロフィール（国税庁法人番号サイト + gBizINFO）。
+
+        get_company が返さない `business_summary`（事業概要の1〜2文）を持つ。動意／夜間PTS
+        レポートのテーマ表「何の会社」欄の一次情報源として使う（2026-08-31 追加）。
+        """
+        data = self._call("get_corporate_profile", {"corporate_number": str(corporate_number)})
+        return data if isinstance(data, dict) else {}
+
     def get_analysis(self, edinet_code: str) -> dict:
         """AI分析（健全性スコア・業界比較）。"""
         data = self._call("get_analysis", {"edinet_code": edinet_code})

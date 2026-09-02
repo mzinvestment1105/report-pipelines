@@ -276,6 +276,26 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
+      - name: Commit theme_radar accumulation to private repo
+        # PM 2026-09-02 配線修正: theme_radar の日次蓄積
+        # （bi/outputs/analysis/theme_radar/movers_top100_daily.parquet・stock_context_daily.parquet）は
+        # 直前の make_mover_report.py（append_movers_history / append_stock_context）が本ジョブの
+        # working tree に書き出すが、どの workflow の commit 対象にも入っておらず一度も push されて
+        # いなかった（merge-and-send は別ジョブの fresh clone のため、そちらでは検出できない）。
+        # PTS レポート workflow は Private を clone してこの蓄積を読む（make_pts_mover_report.py が
+        # theme_radar を import）ため、未 push だと PTS のテーマ欄・遡り材料が本番で機能しない。
+        # -f は gitignore 対象の未追跡 parquet を ci_commit_push.sh の差分検出（--ignored=matching）と
+        # git add -f に載せるために必須（Private .gitignore 側にも un-ignore 行を追加済み）。
+        # 蓄積の欠落は配信を止める理由にならないため continue-on-error（絶対配信原則）。
+        continue-on-error: true
+        working-directory: ./private-repo
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+        run: |
+          bash ../report-pipelines/bi/pipelines/ops/ci_commit_push.sh \
+            -m "data: theme_radar accumulation ${TARGET_DATE}" \
+            -f bi/outputs/analysis/theme_radar
+
       - name: Discord 通知（❌ raw 生成失敗）
         if: failure() || cancelled()
         uses: ./report-pipelines/.github/actions/notify-discord
@@ -620,19 +640,20 @@ jobs:
           # PM 2026-08-26 確定: 4 並列統合により artifact は単一（{date}_all.md）。
           # 旧 4 ファイル cat 結合は不要になり、そのまま cp する。
           # ファイル内の市場並び順はグロース → スタンダード → プライム
-          # （prompts/mover-report.md が制御）。send_report_pdf_discord.py の
-          # split_movers_by_market() は市場タイトル行だけを見て 3 PDF へ再分割し、
-          # ファイル内の出現順のまま同一 webhook へ順次送るため、送信は無改修で透過する。
+          # （prompts/mover-report.md が制御）。PM 2026-09-02 確定で送信は
+          # 1 メッセージ・1 PDF（movers_{date}.pdf）へ統一した。send_report_pdf_discord.py は
+          # ファイル全体をそのまま 1 本の PDF にし、市場タイトル行は本文中の区切り帯になる。
+          # PM 2026-09-02 確定: 同一内容の md を _all.md と {date}.md の 2 本 commit する
+          # 二重出力を廃止し、private repo へ配置するのは {date}.md の 1 本だけにする。
+          # （artifact 側のファイル名 {date}_all.md は generate-market の verify/retry が
+          #   その名前で成否判定しているため据え置く。）
           SRC="/tmp/market-artifacts/${TARGET_DATE}_all.md"
-          DST="${MOVERS_DIR}/${TARGET_DATE}_all.md"
+          OUTPUT="${MOVERS_DIR}/${TARGET_DATE}.md"
           if [ ! -f "$SRC" ]; then
             echo "ERROR: artifact not found: $SRC"
             exit 1
           fi
-          cp "$SRC" "$DST"
-          echo "Placed $DST ($(wc -l < "$DST") lines)"
-          OUTPUT="${MOVERS_DIR}/${TARGET_DATE}.md"
-          cp "$DST" "$OUTPUT"
+          cp "$SRC" "$OUTPUT"
           echo "Placed $OUTPUT ($(wc -l < "$OUTPUT") lines)"
 
       - name: Download movers raw artifact (品質フラグ取得用)
@@ -694,7 +715,7 @@ jobs:
             echo "品質フラグなし・注記挿入なし"
           fi
 
-      - name: Send Discord (PDF・市場別 3 枚分割)
+      - name: Send Discord (PDF・全市場 1 本)
         id: send
         working-directory: ./private-repo/bi/pipelines
         env:
@@ -716,6 +737,8 @@ jobs:
       - name: Commit and push to private repo
         # rebase 方式は履歴書き換え・並行 push で index.lock 残留の構造的弱点があるため、
         # fresh-base 方式の共通ヘルパー（Public 側から直接実行・repo 内コピー禁止）へ置換。
+        # PM 2026-09-02: theme_radar の蓄積 parquet は本ジョブの clone には存在しない
+        # （書き出しは setup-raw の make_mover_report.py）。そちらの専用 commit step が push する。
         working-directory: ./private-repo
         env:
           TARGET_DATE: ${{ needs.setup-raw.outputs.target_date }}

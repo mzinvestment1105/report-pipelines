@@ -49,6 +49,18 @@ from dotenv import load_dotenv
 
 from jq_client_utils import fetch_paginated_v2, normalize_code_4
 from edinetdb_client import EdinetDBClient
+from theme_radar import (
+    append_movers_history,
+    append_stock_context,
+    extract_radar_universe,
+    build_desc_lookup,
+    build_material_lookup,
+    compute_theme_heat_v2,
+    detect_today,
+    render_heat_section,
+    render_reason_material,
+    render_today_candidates,
+)
 
 # ---------------------------------------------------------------------------
 # パス定義
@@ -83,6 +95,15 @@ TURNOVER_CONFIG = {
 
 # Layer 2: 全動意銘柄リスト上位件数
 ALL_MOVERS_TOP_N = 100
+
+# テーマレーダー用の材料蓄積（stock_context_daily.parquet）の母集団上位件数。
+# 2026-09-01 PM 承認の改修2: 100 -> 200 へ拡大。
+# theme_radar の遡り材料（build_material_lookup・直近10営業日バックフィル）は
+# この parquet だけを原資とするため、母集団が狭いとテーマの主導銘柄に材料が付かず
+# _cr §38 の積極支持判定で行ごと落ちる。8/28 実測では動意上位100銘柄のうち
+# 当日材料を持つのは4銘柄にとどまり、当日テーマが1〜2件へ張り付いた。
+# 誌面の掲載件数（ALL_MOVERS_TOP_N）は 100 のまま変えない。蓄積の裾野だけを広げる。
+STOCK_CONTEXT_TOP_N = 200
 
 # TDNet設定
 DEFAULT_TDNET_DAYS   = 30
@@ -659,6 +680,39 @@ def extract_all_movers(full_df: pd.DataFrame, top_n: int = ALL_MOVERS_TOP_N) -> 
     return df.nlargest(top_n, "AbsReturn").reset_index(drop=True)
 
 
+def extract_context_universe(
+    full_df: pd.DataFrame, top_n: int = STOCK_CONTEXT_TOP_N
+) -> pd.DataFrame:
+    """テーマレーダーの材料蓄積（stock_context_daily.parquet）の母集団を返す。
+
+    2026-09-01 PM 承認の改修2。誌面の全動意リスト（ALL_MOVERS_TOP_N=100）とは
+    別枠で、値動き上位 top_n 銘柄（絶対値順・権利落ち除外）を蓄積の母集団にする。
+    theme_radar.build_material_lookup の遡り材料はこの parquet だけを原資とするため、
+    母集団が狭いとテーマの主導銘柄に材料が付かず _cr §38 の積極支持判定で行ごと落ちる。
+
+    v14（2026-09-02 PM 承認）: テーマ点灯の母集団が extract_radar_universe へ移ったため、
+    材料蓄積の母集団は「レーダー母集団 ∪ 従来の値動き上位 top_n」とする。レーダー母集団の
+    銘柄に材料が付かないと _cr §38 の積極支持判定で行ごと落ちるため、包含は必須。
+
+    誌面には一切影響しない（誌面の掲載件数は extract_all_movers のまま）。
+    """
+    legacy = extract_all_movers(full_df, top_n=top_n)
+    try:
+        radar = extract_radar_universe(full_df)
+    except Exception as e:  # 母集団の不調で材料蓄積自体を止めない
+        print(f"  [WARN] extract_radar_universe (context): {e}")
+        radar = pd.DataFrame()
+    if radar is None or radar.empty:
+        return legacy
+    radar = radar.drop(columns=[c for c in ("_radar_bucket", "_radar_score")
+                                if c in radar.columns])
+    if legacy is None or legacy.empty:
+        return radar.reset_index(drop=True)
+    return (pd.concat([legacy, radar], ignore_index=True)
+            .drop_duplicates("Code")
+            .reset_index(drop=True))
+
+
 def extract_turnover_ranking(full_df: pd.DataFrame) -> pd.DataFrame:
     """市場区分ごとに売買代金上位を返す。JQuants実績値(TurnoverJQ)を優先し、なければ終値×出来高で計算。"""
     df = full_df.copy()
@@ -1108,7 +1162,15 @@ def fetch_yahoo_batch(codes: list[str]) -> dict[str, dict]:
 
 
 def fetch_company_description(client: EdinetDBClient, code4: str) -> str:
-    """EDINET DB APIから事業内容を取得する。"""
+    """EDINET DB API から事業内容を取得する。
+
+    取得順（いずれも一次情報。取れなければ空文字を返し、推測で埋めない）:
+      1. get_company の事業概要フィールド（現状ほぼ空）
+      2. get_corporate_profile の `business_summary`
+         （国税庁法人番号サイト + gBizINFO 由来の事業概要1〜2文。2026-08-31 追加。
+          テーマ表「何の会社」欄がここで埋まる主経路）
+      3. 業種名のみ（1・2 とも取れない場合の最後の手段）
+    """
     try:
         edinet_code = client.code_to_edinet(code4)
         if not edinet_code:
@@ -1119,6 +1181,16 @@ def fetch_company_description(client: EdinetDBClient, code4: str) -> str:
             v = data.get(key, "")
             if v:
                 return str(v)[:300]
+        # 法人番号があれば法人プロフィールの business_summary を試す
+        corp_no = str(data.get("corporateNumber") or "").strip()
+        if corp_no:
+            try:
+                prof = client.get_corporate_profile(corp_no)
+                summary = str(prof.get("business_summary") or "").strip()
+                if summary:
+                    return summary[:300]
+            except Exception:
+                pass
         # フォールバック: 業種名のみ返す
         industry = data.get("industryName") or data.get("industry", "")
         return str(industry) if industry else ""
@@ -1420,6 +1492,25 @@ def _row_basic(row: pd.Series) -> str:
     ret_str = f"{ret:+.1f}%" if pd.notna(ret) else "IPO初日"
     return (f"| {code4} | {name} | {market} | {ret_str} | {close:,.0f}円 "
             f"| {vol_str} | {cap_str} | {sector} |")
+
+
+def _reason_material_for(code4: str, tdnet_data: dict, yahoo_data: dict) -> list[str]:
+    """テーマ表の主導銘柄について、raw 内に既にある動意理由テキストを集めて返す。
+
+    出典は raw の各銘柄ブロックと同一（TDNet 適時開示タイトル・Yahoo!ファイナンス
+    ニュース見出し）であり、新たな取得は行わない。Claude が「動いた理由」列を
+    1文で書くための素材として `### 理由素材` へ別掲する。
+    """
+    out: list[str] = []
+    for e in (tdnet_data.get(code4, {}) or {}).get("entries", [])[:3]:
+        title = str(e.get("title") or "").strip()
+        if title:
+            out.append(f"TDNet {str(e.get('published') or '')[:10]}　{title}")
+    for n in (yahoo_data.get(code4, {}) or {}).get("news", [])[:3]:
+        title = str(n.get("title") or "").strip()
+        if title:
+            out.append(f"ニュース　{title}")
+    return out
 
 
 def _append_detail(
@@ -1732,6 +1823,70 @@ def build_report(
     else:
         lines += ["（セクターデータなし）", ""]
 
+    # ---- テーマ2部（本日のテーマ / 直近2週間の熱いテーマ）----
+    # 動意上位銘柄をみんかぶテーマタグ（構成銘柄100以下・資金テーマでない括りは除外）へ
+    # 展開し、所属テーマ数で按分した資金量スコアでテーマを順位付けする。
+    # 「動いた理由」列は Claude が理由素材から1文で書くため raw では空欄にする。
+    # 失敗しても本体レポートは止めない（配信絶対の原則）。
+    _codes_today: list[dict] = []
+    try:
+        _codes_today = [
+            {
+                "code": normalize_code_4(r["Code"]),
+                "name": r.get("CompanyName"),
+                "return_pct": r.get("DailyReturn"),
+                "turnover": r.get("Turnover"),
+                "market": r.get("MarketCodeName"),
+            }
+            for _, r in all_movers_df.iterrows()
+        ]
+        _today_res = detect_today(_codes_today)
+        _heat_res = compute_theme_heat_v2(_codes_today, trade_date=today)
+        # 当日 raw から取れる素材（一次情報のみ）。
+        _material_today = lambda code: _reason_material_for(code, tdnet_data, yahoo_data)
+        # 「何の会社」欄の素材。出典は EDINET DB の事業概要（fetch_company_description が
+        # yahoo_data[code]["description"] へ格納済み）であり、新規取得も推測もしない。
+        _desc_today = lambda code: (
+            (yahoo_data.get(normalize_code_4(code), {}) or {}).get("description", "")
+        )
+        # 当日分を蓄積 parquet へ保存してから lookup を組む（当日銘柄は当日分が最優先で当たる）。
+        # 2026-08-31 PM 指示: 熱量テーマの主導銘柄が当日 Top100 圏外でも「何の会社」が
+        # 空欄にならず、材料も直近10営業日から日付付きで遡れるようにする。
+        # 2026-09-01 PM 承認の改修2: 蓄積の母集団は STOCK_CONTEXT_TOP_N(200) 件。
+        # yahoo_data のキーは detail + 売買代金 + 材料蓄積母集団の和集合であり、
+        # ここを絞ると遡り材料の裾野がそのまま狭まる（当日テーマが1〜2件へ張り付く原因）。
+        try:
+            _ctx_path = append_stock_context(
+                [
+                    {
+                        "code": _c,
+                        "name": (tdnet_data.get(_c, {}) or {}).get("company_name", ""),
+                        "desc": _desc_today(_c),
+                        "materials": _material_today(_c),
+                    }
+                    for _c in sorted(yahoo_data.keys())
+                ],
+                today,
+            )
+            print(f"銘柄コンテキスト蓄積: {_ctx_path}")
+        except Exception as _e:
+            print(f"  [WARN] append_stock_context: {_e}")
+        # フォールバック連鎖つき lookup（当日 → 直近10営業日の蓄積 → 業種名）。
+        _desc = build_desc_lookup(primary=_desc_today, trade_date=str(today))
+        _material = build_material_lookup(primary=_material_today, trade_date=str(today))
+        # 当日部は候補リスト（最大15件・主導銘柄ごとに材料テキスト＋事業概要付き）。
+        # テーマ名の付け直し・共通材料の判定・行の絞り込みは Claude が行う（_cr §38）。
+        lines += render_today_candidates(_today_res, _material, desc_lookup=_desc)
+        # 熱量部はテーマごとのブロック（見出し行＋主導銘柄の4列表）。熱量降順・当日1位を必ず含める。
+        lines += render_heat_section(
+            _heat_res, today_result=_today_res, desc_lookup=_desc, material_lookup=_material
+        )
+        # 理由素材: raw 内に既にある動意理由（TDNet 開示タイトル・Yahoo ニュース見出し）を
+        # 主導銘柄ごとに集めて別掲する。誌面には出さず Claude の「動いた理由」列の材料にする。
+        lines += render_reason_material(_today_res, _heat_res, _material)
+    except Exception as e:
+        print(f"  [WARN] theme_radar: {e}")
+
     # ---- Layer 2: 全動意銘柄リスト（アーカイブ・通常は出力しない） ----
     # 必要な時は以下のコメントを外す。トークン節約のため通常はスキップ。
     # lines += [f"## Layer 2: 全動意銘柄リスト（上位{len(all_movers_df)}銘柄・絶対値順）", ""]
@@ -1958,8 +2113,9 @@ def main() -> None:
 
     quality_note = ""
     if args.date_gate:
-        MARKET_DAILY_DIR.mkdir(parents=True, exist_ok=True)
-        flags_path = MARKET_DAILY_DIR / f"{target}_quality_flags.txt"
+        _flags_dir = Path(os.environ["MOVER_RAW_OUT_DIR"]) if os.environ.get("MOVER_RAW_OUT_DIR") else MARKET_DAILY_DIR
+        _flags_dir.mkdir(parents=True, exist_ok=True)
+        flags_path = _flags_dir / f"{target}_quality_flags.txt"
         if today_dt != target:
             quality_note = (
                 f"対象日 {target} の株価EODが未着（または休場）のため、"
@@ -2001,15 +2157,42 @@ def main() -> None:
     all_movers_df = extract_all_movers(full_df)
     volume_df     = extract_turnover_ranking(full_df)
     sector_df     = extract_sector_flow(full_df)
+    # テーマレーダーの材料蓄積の母集団（誌面には出さない・レーダー母集団 ∪ 上位 STOCK_CONTEXT_TOP_N 件）
+    context_df    = extract_context_universe(full_df)
+    # v14（2026-09-02 PM 承認）: テーマ点灯の母集団。売買代金5億円以上・時価総額100億円以上・
+    # 上昇銘柄のうち、グロース/スタンダードは全件・プライムは点数上位 RADAR_PRIME_TOP_N 件。
+    # 誌面（全市場動意上位・市場別値上がり/値下がり）には一切影響しない。
+    radar_df      = extract_radar_universe(full_df)
+
+    # --- テーマレーダー母集団を日次蓄積（同一日付は上書き・冪等） ---
+    try:
+        if radar_df is None or radar_df.empty:
+            print("  [WARN] テーマレーダー母集団が空。当日の蓄積をスキップ。")
+        else:
+            _hist_path = append_movers_history(radar_df, today_dt)
+            _bk = (radar_df["_radar_bucket"].value_counts().to_dict()
+                   if "_radar_bucket" in radar_df.columns else {})
+            print(f"テーマレーダー蓄積: {_hist_path} ({len(radar_df)}銘柄 {_bk})")
+    except Exception as e:
+        print(f"  [WARN] append_movers_history: {e}")
 
     total_detail = len(detail_df["Code"].unique())
     print(f"注目銘柄（TDNet+Yahoo対象）: {total_detail} 銘柄")
 
-    # --- TDNet/Yahoo取得対象: 注目銘柄 + 出来高ランキング（重複除去） ---
-    detail_codes = detail_df["Code"].astype(str).str[:4].unique().tolist()
-    volume_codes = volume_df["Code"].astype(str).str[:4].unique().tolist()
-    fetch_codes  = list(dict.fromkeys(detail_codes + volume_codes))  # 順序保持・重複除去
-    print(f"TDNet+Yahoo対象（出来高含む）: {len(fetch_codes)} 銘柄")
+    # --- TDNet/Yahoo取得対象: 注目銘柄 + 出来高ランキング + 材料蓄積母集団（重複除去） ---
+    # 2026-09-01 PM 承認の改修2: 材料蓄積の母集団（上位 STOCK_CONTEXT_TOP_N 件）も
+    # 取得対象へ入れる。誌面へは出さないが、この銘柄の TDNet/Yahoo 材料を parquet へ
+    # 貯めておかないと後日の遡り材料（build_material_lookup）が空になるため。
+    detail_codes  = detail_df["Code"].astype(str).str[:4].unique().tolist()
+    volume_codes  = volume_df["Code"].astype(str).str[:4].unique().tolist()
+    context_codes = context_df["Code"].astype(str).str[:4].unique().tolist()
+    fetch_codes   = list(
+        dict.fromkeys(detail_codes + volume_codes + context_codes)
+    )  # 順序保持・重複除去
+    print(
+        f"TDNet+Yahoo対象（出来高・材料蓄積母集団{len(context_codes)}件含む）: "
+        f"{len(fetch_codes)} 銘柄"
+    )
 
     # --- TDNet取得 ---
     print("TDNet取得中...")
@@ -2043,12 +2226,14 @@ def main() -> None:
         quality_note=quality_note,
     )
 
-    MARKET_DAILY_DIR.mkdir(parents=True, exist_ok=True)
+    # 検証時に本番 raw を上書きしないための逃がし口。未設定なら従来どおり market/daily/。
+    out_dir = Path(os.environ["MOVER_RAW_OUT_DIR"]) if os.environ.get("MOVER_RAW_OUT_DIR") else MARKET_DAILY_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
     # --date-gate（GHA）はパイプラインのキーが対象日のため対象日名で出力する（EOD 未着日でも
     # artifact 収集・後続 step が壊れない）。中身のデータ日付ラベル（タイトル・価格比較・
     # 対象日市場概況）は真の日付（today_dt）のまま＝虚偽ラベルにしない（PM 2026-07-12）。
     raw_name_date = target if args.date_gate else today_dt
-    out_path = MARKET_DAILY_DIR / f"{raw_name_date}_movers_raw.md"
+    out_path = out_dir / f"{raw_name_date}_movers_raw.md"
     out_path.write_text(report_md, encoding="utf-8")
 
     tokens = estimate_tokens(report_md)

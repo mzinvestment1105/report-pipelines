@@ -68,6 +68,16 @@ from make_mover_report import (
     MARKET_DAILY_DIR,
     SCREENING_MASTER_PATH,
 )
+from theme_radar import (
+    build_desc_lookup,
+    build_material_lookup,
+    compute_theme_heat_v2,
+    detect_night,
+    render_heat_section,
+    render_internal_flags,
+    render_reason_material,
+    render_today_candidates,
+)
 
 BASE_DIR = Path(__file__).parent
 
@@ -324,6 +334,34 @@ def _reason_lines(errors: list[str], limit: int = 5) -> list[str]:
     out = [f"  - {str(e).replace(chr(10), ' ')[:200]}" for e in errors[:limit]]
     if len(errors) > limit:
         out.append(f"  - …他{len(errors) - limit}件")
+    return out
+
+
+def _pts_reason_material_for(code4: str, disc_ctx: dict, tdnet_data: dict,
+                             yahoo_data: dict, reason_by_code: dict) -> list[str]:
+    """テーマ表の主導銘柄について、raw 内に既にある夜間の動意理由テキストを集めて返す。
+
+    出典は raw の各銘柄ブロックと同一（当日15時以降の適時開示・カブラボ解説・
+    TDNet 開示タイトル・Yahoo!ファイナンス ニュース見出し）で、新たな取得は行わない。
+    """
+    out: list[str] = []
+    ctx = (disc_ctx or {}).get(code4, {}) or {}
+    for e in (ctx.get("today") or [])[:3]:
+        title = str(e.get("title") or "").strip()
+        if title:
+            out.append(f"本日15時以降の開示　{str(e.get('time_label') or '')} {title}".strip())
+    kb = str(reason_by_code.get(code4) or "").strip()
+    if kb:
+        out.append(f"カブラボ解説　{kb}")
+    if not out:
+        for e in (ctx.get("recent") or (tdnet_data.get(code4, {}) or {}).get("entries", []))[:2]:
+            title = str(e.get("title") or "").strip()
+            if title:
+                out.append(f"TDNet {str(e.get('published') or '')[:10]}　{title}")
+        for n in ((yahoo_data.get(code4, {}) or {}).get("news", []))[:2]:
+            title = str(n.get("title") or "").strip()
+            if title:
+                out.append(f"ニュース　{title}")
     return out
 
 
@@ -608,6 +646,71 @@ def main() -> None:
                                 value_lookup.get(rec["Code"]), args.fast,
                                 disc_ctx, target)
         return out
+
+    # カブラボ解説（夜間の動意理由）をコード別に引けるようにする（理由素材の材料）
+    reason_by_code: dict[str, str] = {}
+    for _df in (up_df, down_df):
+        if _df is None or _df.empty:
+            continue
+        for _, _r in _df.iterrows():
+            _rs = str(_r.get("Reason") or "").strip()
+            if _rs:
+                reason_by_code.setdefault(normalize_code_4(_r["Code"]), _rs)
+
+    # === テーマ2部（値上がりセクションの前に置く）===
+    # 当日部 = 当夜の PTS 上昇銘柄。熱量部 = 昼の動意蓄積10営業日をそのまま使う
+    # （当夜の PTS を昼の蓄積へ合算しない）。誌面構成は昼の動意レポートと同一。
+    # テーマ表の鮮度警告は内部フラグへ回し、誌面には出さない（内部情報の誌面漏出を防ぐ）。
+    try:
+        pts_risers = []
+        if not up_df.empty:
+            for _, r in up_df.iterrows():
+                code4 = normalize_code_4(r["Code"])
+                name = r["Name"]
+                if code4 in meta.index:
+                    cn = meta.loc[code4].get("CompanyName")
+                    if pd.notna(cn):
+                        name = cn
+                _vol = r.get("Volume")
+                _px = r.get("PtsPrice")
+                _tv = (float(_px) * float(_vol)) if (pd.notna(_px) and pd.notna(_vol)) else None
+                pts_risers.append({
+                    "code": code4,
+                    "name": name,
+                    "pts_pct": float(r["DiffPct"]),
+                    "return_pct": float(r["DiffPct"]),
+                    "turnover": _tv,
+                    "market": _MARKET_MAP.get(str(r.get("MarketRaw", "")).strip(), r.get("MarketRaw")),
+                })
+        night = detect_night(pts_risers)
+        # 熱量は昼の蓄積のみ（当夜分を重ねない）
+        heat = compute_theme_heat_v2(codes_today=None, trade_date=str(target))
+        _material_today = lambda code: _pts_reason_material_for(
+            code, disc_ctx, tdnet_data, yahoo_data, reason_by_code
+        )
+        # 当夜部は候補リスト（最大15件・主導銘柄ごとに材料テキスト付き）。
+        # テーマ名の付け直し・共通材料の判定・行の絞り込みは Claude が行う（_cr §38）。
+        # PTS は当夜騰落率で並ぶため pct_key を pts_pct にする。
+        # 「何の会社」欄の素材。出典は EDINET DB の事業概要（yahoo_data の description）。
+        _desc_today = lambda code: (
+            (yahoo_data.get(normalize_code_4(code), {}) or {}).get("description", "")
+        )
+        # フォールバック連鎖つき lookup（当夜 → 直近10営業日の昼蓄積 → 業種名）。
+        # 夜間 PTS は昼の蓄積 parquet を読むだけで、当夜分の書き込みはしない
+        # （昼の動意レポートが同日分を既に保存しているため上書きしない）。
+        _desc = build_desc_lookup(primary=_desc_today, trade_date=str(target))
+        _material = build_material_lookup(primary=_material_today, trade_date=str(target))
+        lines += render_today_candidates(night, _material, pct_key="pts_pct", desc_lookup=_desc)
+        # 熱量表は熱量降順。当夜1位テーマは必ず含める（night を渡す）。
+        lines += render_heat_section(
+            heat, today_result=night, desc_lookup=_desc, material_lookup=_material
+        )
+        lines += render_reason_material(night, heat, _material)
+        internal_flags += render_internal_flags(night)
+    except Exception as e:
+        # テーマレーダーの失敗で本体レポートを止めない（配信絶対の原則）
+        internal_flags.append(f"- テーマスコアラーの生成に失敗: {str(e)[:200]}")
+        print(f"  [WARN] theme_radar: {e}")
 
     # 値上がり（主役）は必ず出す。値下がりは取得できた時だけセクションを出す
     # （空セクションも⚠️も出さない）。売買代金 Top セクションは廃止済み。

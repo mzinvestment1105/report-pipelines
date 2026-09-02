@@ -145,6 +145,39 @@ jobs:
           PYTHONIOENCODING: utf-8
         run: python convert_to_excel.py
 
+      # テーマ初動レーダー用のみんかぶテーマタグ表を月次更新する。
+      # 毎月第1営業日（=当月で最初に本 workflow が走った日）だけ実行。約15分（sleep 実装済み）。
+      # 失敗しても既存 parquet を残したまま後続を続行する（動意・PTS は古い表でも動く）。
+      - name: テーマタグ表 月次更新（毎月第1営業日のみ）
+        working-directory: ./private-repo/bi/pipelines
+        continue-on-error: true
+        env:
+          PYTHONIOENCODING: utf-8
+        run: |
+          set -o pipefail
+          OUT=../outputs/theme_master_minkabu.parquet
+          THIS_MONTH=$(TZ=Asia/Tokyo date +'%Y-%m')
+          # parquet の fetched_at が当月なら今月分は取得済み → スキップ
+          FETCHED_MONTH=$(python -c "
+          import pandas as pd, pathlib
+          p = pathlib.Path('$OUT')
+          if not p.exists():
+              print('none')
+          else:
+              try:
+                  s = pd.read_parquet(p, columns=['fetched_at'])['fetched_at']
+                  print(str(pd.to_datetime(s, utc=True).max().tz_convert('Asia/Tokyo'))[:7])
+              except Exception:
+                  print('none')
+          " 2>/dev/null || echo none)
+          echo "theme_master fetched_month=$FETCHED_MONTH / this_month=$THIS_MONTH"
+          if [ "$FETCHED_MONTH" = "$THIS_MONTH" ]; then
+            echo "当月分は取得済みのためスキップ"
+          else
+            echo "当月初回のためテーマタグ表を更新します（約15分）"
+            python fetch_minkabu_themes.py 2>&1 | tail -20
+          fi
+
       - name: Commit and push to private repo
         # rebase 方式は履歴書き換え・並行 push で index.lock 残留の構造的弱点があるため、
         # fresh-base 方式の共通ヘルパー（Public 側から直接実行・repo 内コピー禁止）へ置換。
