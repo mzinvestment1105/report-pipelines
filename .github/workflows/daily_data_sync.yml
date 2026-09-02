@@ -4,7 +4,7 @@ name: SNS デイリーデータ同期
 # Private リポ（生成物の置き場）へ commit back する。PM の手作業はゼロ。
 #
 # 実行内容（毎日 06:00 JST）:
-#   1. プロフィール + フォロワー全件取得   → profile_daily_{date}.json
+#   1. プロフィール + フォロワー/フォロー中 全件取得 → profile_daily_{date}.json
 #   2. 前日比 churn（lost / new / retained）→ churn_{date}.csv / churn_summary_{date}.json
 #   3. 自アカウントのタイムライン実績取得   → user_tl_daily_{date}.json
 #   4. バズ収集                            → buzz_{date}.json
@@ -94,10 +94,12 @@ jobs:
             echo "targets_count=0"
           fi
 
-      - name: 1/4 プロフィール + フォロワー全件取得
+      - name: 1/4 プロフィール + フォロワー/フォロー中 全件取得
         id: profile
         continue-on-error: true
-        timeout-minutes: 10
+        # following（GraphQL カーソル送り・50件/ページ）の取得分を上乗せして 10 → 18 分。
+        # 後続（churn 3 + timeline 5 + commit 4）と合わせても job timeout 30 分の内側。
+        timeout-minutes: 18
         working-directory: ./private-repo/bi/pipelines
         env:
           X_BURNER_AUTH_TOKEN: ${{ secrets.X_BURNER_AUTH_TOKEN }}
@@ -109,6 +111,7 @@ jobs:
           python fetch_x_profile.py \
             --users "$X_DAILY_TARGETS" \
             --followers --followers-max 1000 \
+            --following --following-max 500 \
             --slug daily \
             --out-dir bi/outputs/x_posts/gha \
             > profile.log 2>&1
@@ -121,6 +124,87 @@ jobs:
           else
             echo "profile_json_exists=false"
           fi
+
+      - name: 1/4 取得件数ゲート（cookie 失効のサイレント失敗検知）
+        # fetch_x_profile.py は cookie が「失効」している場合に例外を握り潰し、
+        # followers: [] / following: [] のまま exit 0 で正常終了する（未設定なら exit 1）。
+        # ファイル存在だけでは検知できないため、当日 JSON の実件数が 0 かどうかを見る。
+        # 閾値はハードコードせず「0 件のみ異常」とし、フォロワー数の増減では発火させない。
+        # ジョブは落とさない（データ収集は continue-on-error 方針）。
+        id: profile_gate
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 2
+        working-directory: ./private-repo/bi/pipelines
+        env:
+          PYTHONIOENCODING: utf-8
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+        run: |
+          # 出力は件数と bool のみ。ハンドル等の派生文字列は一切 echo しない
+          python - <<'PY' > gate_out.txt
+          import glob, json, os
+
+          date = os.environ.get("TARGET_DATE", "")
+          files = sorted(glob.glob(f"../outputs/x_posts/gha/profile_daily_{date}*.json"))
+          if not files:
+              print("json_exists=false")
+              print("empty=unknown")
+              raise SystemExit(0)
+          print("json_exists=true")
+
+          d = json.load(open(files[-1], encoding="utf-8"))
+          accounts = d.get("accounts", [])
+          want_followers = bool(d.get("followers_requested"))
+          want_following = bool(d.get("following_requested"))
+          print(f"account_count={len(accounts)}")
+          print(f"followers_requested={str(want_followers).lower()}")
+          print(f"following_requested={str(want_following).lower()}")
+
+          # 判定はアカウント単位で行う（合算しない）。
+          # X_DAILY_TARGETS は複数ハンドルを含むため、合算すると片方が 0 件でも
+          # もう片方の件数に隠れて検知漏れになる（2026-08-15 の実例）。
+          # ログにはハンドルを出さず index のみを使う。
+          empty = []
+          for i, a in enumerate(accounts):
+              fr = int(a.get("followers_count_fetched") or 0)
+              fg = int(a.get("following_count_fetched") or 0)
+              print(f"account{i}: followers_fetched={fr} following_fetched={fg} "
+                    f"fatal_error={str(bool(a.get('fatal_error'))).lower()}")
+              if want_followers and fr == 0:
+                  empty.append(f"account{i}.followers")
+              if want_following and fg == 0:
+                  empty.append(f"account{i}.following")
+          if not accounts:
+              empty.append("no_accounts")
+          print("empty=" + (",".join(empty) if empty else "none"))
+          PY
+          # 公開ログには全行（件数と bool のみ）を出す
+          cat gate_out.txt
+          # step output へは KEY=VALUE 形式の行だけを渡す
+          # （"account0: ..." の内訳行は KEY=VALUE ではないため除外する）
+          grep -E '^[A-Za-z_][A-Za-z0-9_]*=' gate_out.txt >> $GITHUB_OUTPUT || true
+          EMPTY=$(grep -E '^empty=' gate_out.txt | tail -1 | cut -d= -f2)
+          if [ "$EMPTY" = "none" ]; then
+            echo "::notice::X プロフィール取得は followers/following ともに 1 件以上（正常）"
+          elif [ "$EMPTY" = "unknown" ]; then
+            echo "::warning::当日の profile_daily_${TARGET_DATE}*.json が見つからず、取得件数を検査できませんでした"
+          else
+            echo "::warning::X プロフィール取得が 0 件（${EMPTY}）。cookie 失効によるサイレント失敗の可能性があります"
+          fi
+
+      - name: Discord 通知（🚨 X 取得 0 件・cookie 失効の疑い）
+        # 0 件（または当日 JSON なし）を検知した時のみ発火。
+        # ジョブは失敗させず、警告と通知に留める。
+        if: always() && steps.profile_gate.outputs.empty != 'none' && steps.profile_gate.outputs.empty != ''
+        continue-on-error: true
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_SNS || secrets.DISCORD_WEBHOOK_URL }}
+          state: alert
+          label: SNS デイリーデータ同期 X 取得 0 件
+          date: ${{ steps.date.outputs.value }}
+          meaning: 'X プロフィール取得の件数が 0 でした（0 件の対象: ${{ steps.profile_gate.outputs.empty }}）。スクリプトは正常終了しているため、バーナー垢の cookie 失効によるサイレント失敗が疑われます。当日のフォロワー増減・churn は信用できません。'
+          action_required: X バーナー垢へ再ログインして auth_token / ct0 を取り直し Secrets（X_BURNER_AUTH_TOKEN・X_BURNER_CT0）を更新 → 手動 dispatch で再実行
 
       - name: 2/4 前日比 churn 算出
         id: churn
