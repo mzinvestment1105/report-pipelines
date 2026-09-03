@@ -2,20 +2,27 @@ name: マクロ市況ツイート日次
 
 "on":
   # PM 2026-09-02 承認: マクロ市況ツイート案の生成を夕刊マクロ（macro_report_evening.yml）から分離した。
-  # 理由（2026-09-02 実測）: 夕刊は JST 17:45 に走るが、当日分 price_history parquet が Private へ
-  # 着地したのは JST 19:12 だった。ツイート生成は make_sector_daily.py に当日分 parquet を要求し、
-  # 無い場合はプロンプト §3-a（セクターを推測で埋めることの禁止）に従って自ら exit 1 で異常終了する。
-  # よって「固定時刻で夕刊と同時に走らせる」設計では構造的に間に合わない。
+  #
+  # PM 2026-09-03 修正（設計上の誤りの解消）:
+  #   旧設計は workflow_run で「Price History Daily Update」の完走を待っていたが、これは誤りだった。
+  #   実測（2026-09-02 / 09-03）: 9/2 は price_history の着地が JST 19:12 で夕刊 17:45 に間に合わず、
+  #   9/3 は price_history 日次 ETL 自体が未実行だったため、2 日連続でツイートが未発行になった。
+  #   一方で動意レポートは同じセクター騰落率を JQuants からライブ取得しており、両日とも正常に
+  #   発行されていた。つまり price_history の着地を待つ必然性は元々なかった。
+  #   これを受けて make_sector_daily.py に JQuants ライブ取得のフォールバックを追加し
+  #   （parquet が第一優先、対象日が無い場合のみライブ取得。算出ロジック・出力スキーマは同一で、
+  #   2026-09-02 の全 4,167 銘柄で parquet 経路と完全一致することを実測確認済み）、
+  #   本 workflow の待ち対象を本来の依存先である夕刊マクロへ戻す。
+  #   （ツイートの第一ソースは夕刊本文であり、price_history はセクター欄の補助入力にすぎない。）
   #
   # トリガー設計:
-  #   (1) workflow_run（主経路）= 価格履歴 ETL の完走を受けて起動する。GitHub cron の実測遅延
-  #       （+1h45m〜+3h15m）で price_history の着地時刻が大きくぶれるため、時刻ではなく
-  #       「データが着地したという事実」を待つ。price_history 側が success の時のみ先へ進む。
+  #   (1) workflow_run（主経路）= 夕刊マクロの完走を受けて起動する。夕刊本文がツイートの
+  #       素材なので、夕刊が出た直後が最短・最確実な発行タイミング。success の時のみ先へ進む。
   #   (2) workflow_dispatch = 手動リカバリ用。
-  #   (3) schedule（フェイルセーフ）= UTC 12:00（JST 21:00 起票）。price_history が失敗した日でも
-  #       既に当日分データが揃っていれば拾える。guard で当日成功済みなら無害に skip される。
+  #   (3) schedule（フェイルセーフ）= UTC 12:00（JST 21:00 起票）。夕刊が失敗した日でも
+  #       夕刊本文が揃っていれば拾える。guard で当日成功済みなら無害に skip される。
   workflow_run:
-    workflows: ["Price History Daily Update"]
+    workflows: ["マクロレポート夕刊"]
     types:
       - completed
   workflow_dispatch:
@@ -38,7 +45,7 @@ concurrency:
 
 jobs:
   guard:
-    # 判定: (1) workflow_run 起点で price_history が success でない → skip
+    # 判定: (1) workflow_run 起点で夕刊マクロが success でない → skip
     #       (2) cron 起動かつ JST 17 時未満 → skip（深夜着火が翌 JST 日の枠を消費する事故の防止）
     #       (3) DONE_OK >= 1 → skip（当日すでに生成済み）
     #       (4) ACTIVE >= 1 → skip（走行中の run あり）
@@ -71,11 +78,12 @@ jobs:
             exit 0
           fi
 
-          # workflow_run 起点は、上流（価格履歴 ETL）が success した時のみ先へ進む。
-          # 失敗した日は当日分 parquet が無く、ツイート生成が §3-a に従って自ら異常終了するため。
+          # workflow_run 起点は、上流（夕刊マクロ）が success した時のみ先へ進む。
+          # 失敗した日はツイートの第一ソースである夕刊本文が存在せず、
+          # 後段の precheck でどうせ skip されるため（無駄な Claude 起動を避ける）。
           if [ "$EVENT" = "workflow_run" ] && [ "$UPSTREAM_CONCLUSION" != "success" ]; then
             echo "proceed=false" >> $GITHUB_OUTPUT
-            echo "reason=skip (upstream price_history conclusion=${UPSTREAM_CONCLUSION})" >> $GITHUB_OUTPUT
+            echo "reason=skip (upstream macro_report_evening conclusion=${UPSTREAM_CONCLUSION})" >> $GITHUB_OUTPUT
             exit 0
           fi
 
@@ -238,6 +246,9 @@ jobs:
         env:
           TARGET_DATE: ${{ steps.date.outputs.value }}
           PRIVATE_REPO_ROOT: private-repo
+          # make_sector_daily.py の JQuants ライブ取得フォールバック用（プロンプト内から Bash で呼ぶ）。
+          # price_history の parquet に対象日が無い日でも 17 業種騰落率を取得できるようにする。
+          JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
 
       - name: Wait before retry 2 (Claude overloaded 等の一時エラー)
         if: success() && steps.precheck.outputs.ready == 'true' && steps.gen1.outcome == 'failure'
@@ -270,6 +281,9 @@ jobs:
         env:
           TARGET_DATE: ${{ steps.date.outputs.value }}
           PRIVATE_REPO_ROOT: private-repo
+          # make_sector_daily.py の JQuants ライブ取得フォールバック用（プロンプト内から Bash で呼ぶ）。
+          # price_history の parquet に対象日が無い日でも 17 業種騰落率を取得できるようにする。
+          JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
 
       - name: Verify generated macro tweet (成否の一元判定)
         # 上の 2 ステップは continue-on-error のため、ジョブの成否はここだけで決まる。
