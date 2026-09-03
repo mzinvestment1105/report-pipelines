@@ -1,10 +1,10 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""X 投稿 文体チェッカー（research/sns/style_rules_v1.md §6 の機械検査59項目）
+"""X 投稿 文体チェッカー（research/sns/style_rules_v1.md §6 の機械検査60項目）
 
-59項目の内訳:
-  §6-1 禁止語        32項目（NG_*・うち §1-8 の却下表現10項目・§1-9 の一人称過去/経歴語り2項目・
-                     §1-10 の丸括弧禁止1項目＝NG_PAREN）
+60項目の内訳:
+  §6-1 禁止語        33項目（NG_*・うち §1-8 の却下表現10項目・§1-9 の一人称過去/経歴語り2項目・
+                     §1-10 の注釈禁止2項目 NG_PAREN / NG_ANNOTATION）
   §6-2 数値レンジ    19項目（LEN_* / CNT_* / RATIO_*）
   §6-3 文末分布       3項目（DIST_*・2026-08-10 改定＝全文です・ます統一）
   §6-4 構成テンプレ   5項目（TPL_A〜TPL_E・宣言した型のみ判定・他は SKIP）
@@ -167,6 +167,12 @@ NG_CHECKS = [
     # 全角（）・半角() のみを対象とし、【】「」『』は構造上の見出し・引用記号のため対象外。
     # レポート誌面（prompts/_common_rules.md の中学生レベル注釈等）には本ルールを適用しない。
     ("NG_PAREN", r"[（）()]", "FAIL", False),
+    # X 投稿の本文に用語説明・注釈を一切書かない（PM 2026-09-03 指示・X 投稿の本文限定）。
+    # 括弧という記号の問題ではなく「注釈という行為」の禁止であり、`＝` `=` による言い換え接続も
+    # 注釈の手段であるため禁止対象に含める。イベント名・経済指標・専門用語は名称のみを書き、
+    # 読者に伝わらない語は注釈を足すのではなくその語自体を使わないか平易な語へ置き換える。
+    # レポート誌面（prompts/_common_rules.md の中学生レベル注釈等）には本ルールを適用しない。
+    ("NG_ANNOTATION", r"[＝=]", "FAIL", False),
 ]
 
 # NG_ACADEMIC_LABEL（§1-8・WARN）: 学問名ラベルが単体で置かれている場合のみ警告。
@@ -487,7 +493,7 @@ def report(post_id: str, text: str, tpl: str | None, frame: str | None, strict: 
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="X 投稿 文体チェッカー（style_rules_v1.md §6・59項目）")
+    ap = argparse.ArgumentParser(description="X 投稿 文体チェッカー（style_rules_v1.md §6・60項目）")
     ap.add_argument("path", nargs="?", help="投稿本文の .txt、または一括入力の .json")
     ap.add_argument("--text", help="本文を直接渡す")
     ap.add_argument("--type", dest="tpl", help="構成テンプレート A〜E（§6-4 の照合対象）")
