@@ -133,6 +133,10 @@ body {{
 .masthead h1 {{
   font-family:{serif}; font-weight:700; font-size:24pt; color:#1A1A1A;
   margin:0 0 8px; line-height:1.32; letter-spacing:.01em; text-align:left;
+  /* PM 2026-09-03 回帰修正: 本文中の h1（市場区切り帯）用のグローバル h1 ルールが
+     background/padding/border-left を持つため、マストヘッドのタイトルまで塗り帯化していた。
+     マストヘッドは帯装飾を明示的に打ち消す（グローバル h1 側は動意の区切り帯に必要なので変更しない）。 */
+  background:none; padding:0; border-left:none;
 }}
 .masthead .meta {{ font-size:10pt; color:#6B7686; font-weight:500; letter-spacing:.02em; }}
 .masthead .meta .brand {{ color:#1A1A1A; font-weight:700; letter-spacing:.06em; }}
