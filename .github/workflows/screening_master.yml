@@ -182,9 +182,16 @@ jobs:
         # rebase 方式は履歴書き換え・並行 push で index.lock 残留の構造的弱点があるため、
         # fresh-base 方式の共通ヘルパー（Public 側から直接実行・repo 内コピー禁止）へ置換。
         working-directory: ./private-repo
+        # 2026-09-03 PM 決定: 辞書（theme_master_minkabu）の日次スナップショットを
+        # 初動候補テーマの再検証用に残す。fetch_minkabu_themes.py が
+        # bi/outputs/analysis/theme_radar/theme_master_snapshots/{日付}.parquet と
+        # theme_master_snapshot_index.parquet を書くが、これらは Private .gitignore の
+        # bi/outputs/**/*.parquet に該当するため -f が無いと push されない
+        # （辞書更新は月次のため、内容が変わらない月はファイルが増えない）。
         run: |
           bash ../report-pipelines/bi/pipelines/ops/ci_commit_push.sh \
-            -m "data: screening master $(TZ=Asia/Tokyo date +'%Y-%m-%d')" bi/outputs
+            -m "data: screening master $(TZ=Asia/Tokyo date +'%Y-%m-%d')" \
+            -f bi/outputs/analysis/theme_radar
 
       - name: Discord 通知（✅ 完了）
         if: success()

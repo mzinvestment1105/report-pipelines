@@ -44,6 +44,15 @@ RESERVED_PATHS = {"popular_ranking", "rise_ranking", "new", ""}
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 OUT_PATH = REPO_ROOT / "bi" / "outputs" / "theme_master_minkabu.parquet"
+# 2026-09-03 PM 決定: 辞書を日次スナップショットで残し、3か月後に初動候補の再検証を行う。
+# 辞書更新は月次（screening_master.yml の第1営業日ゲート）なので、内容が変わった時だけ
+# ファイルを増やす。変化のない日はインデックスにも行を足さない。
+SNAPSHOT_DIR = (
+    REPO_ROOT / "bi" / "outputs" / "analysis" / "theme_radar" / "theme_master_snapshots"
+)
+SNAPSHOT_INDEX = (
+    REPO_ROOT / "bi" / "outputs" / "analysis" / "theme_radar" / "theme_master_snapshot_index.parquet"
+)
 
 
 def fetch_index_page(page: int) -> list[dict]:
@@ -116,6 +125,69 @@ def fetch_theme_detail(slug: str, max_pages: int = 10) -> list[dict]:
     return stocks
 
 
+
+def save_theme_master_snapshot(
+    df: pd.DataFrame,
+    snapshot_date: str | None = None,
+    snapshot_dir: Path | None = None,
+    index_path: Path | None = None,
+) -> Path | None:
+    """辞書のスナップショットを保存し、インデックスへ1行追記する。
+
+    2026-09-03 PM 決定。初動候補テーマの再検証には「その日どの辞書で判定したか」が要る
+    ため、辞書を更新したときの中身を残す。ただし辞書更新は月次であり毎日は変わらないので、
+    **直前スナップショットと内容ハッシュが同一なら保存しない**（ファイルを増やさない）。
+
+    Returns:
+        新規保存したスナップショットのパス。内容が変わっていなければ None。
+    """
+    import hashlib
+
+    if df is None or df.empty:
+        return None
+    sdir = Path(snapshot_dir) if snapshot_dir else SNAPSHOT_DIR
+    ipath = Path(index_path) if index_path else SNAPSHOT_INDEX
+    date_str = str(snapshot_date or datetime.now(JST).date().isoformat())
+
+    # 内容ハッシュ: 取得時刻列（毎回変わる）を除いた本体で判定する
+    body = df.drop(columns=[c for c in ("fetched_at",) if c in df.columns], errors="ignore")
+    body = body.sort_values(list(body.columns)).reset_index(drop=True)
+    sha = hashlib.sha256(
+        body.to_csv(index=False).encode("utf-8", errors="replace")
+    ).hexdigest()
+
+    idx = None
+    if ipath.exists():
+        try:
+            idx = pd.read_parquet(ipath)
+            if not idx.empty and str(idx.iloc[-1].get("sha256") or "") == sha:
+                print(f" snapshot: 内容が直前と同一のためスキップ（sha={sha[:12]}）")
+                return None
+        except Exception:
+            idx = None
+
+    sdir.mkdir(parents=True, exist_ok=True)
+    out = sdir / f"{date_str}.parquet"
+    if out.exists():
+        print(f" snapshot: {out.name} は既存のため上書きしません")
+        return None
+    df.to_parquet(out, index=False)
+
+    n_themes = int(df["slug"].nunique()) if "slug" in df.columns else 0
+    row = pd.DataFrame([{
+        "date": date_str,
+        "snapshot_file": out.name,
+        "sha256": sha,
+        "n_rows": int(len(df)),
+        "n_themes": n_themes,
+    }])
+    ipath.parent.mkdir(parents=True, exist_ok=True)
+    new = pd.concat([idx, row], ignore_index=True) if idx is not None else row
+    new.to_parquet(ipath, index=False)
+    print(f" snapshot: {out} ({len(df):,}行 / {n_themes:,}テーマ / sha={sha[:12]})")
+    return out
+
+
 def main() -> int:
     print("=== みんかぶ テーマ ETL ===")
     fetched_at = datetime.now(JST).isoformat(timespec="seconds")
@@ -181,6 +253,11 @@ def main() -> int:
     OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(OUT_PATH, index=False)
     print(f" saved: {OUT_PATH}")
+    # 辞書の日次スナップショット（内容が変わった時だけファイルを増やす）
+    try:
+        save_theme_master_snapshot(df)
+    except Exception as e:
+        print(f" [WARN] snapshot 保存に失敗: {e}")
     return 0
 
 

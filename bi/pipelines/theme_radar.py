@@ -20,7 +20,9 @@ Discord 送信は呼び出し側（make_mover_report.py / make_pts_mover_report.
 
 from __future__ import annotations
 
+import json
 import math
+import os
 import re
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -31,13 +33,21 @@ import pandas as pd
 BASE_DIR = Path(__file__).parent
 JST = timezone(timedelta(hours=9))
 
+# テーマ蓄積 parquet（movers_top100_daily / stock_context_daily / early_candidates_daily /
+# own_themes_daily）の出力先ディレクトリ。既定は本番 bi/outputs/analysis/theme_radar/。
+# 環境変数 THEME_RADAR_OUT_DIR が設定されている場合のみそちらへ差し替える（検証用のロー
+# カルコピーで本番 parquet を触らずに raw を再生成するため）。未設定時の挙動は不変。
+_THEME_RADAR_OUT_DIR = (
+    Path(os.environ["THEME_RADAR_OUT_DIR"])
+    if os.environ.get("THEME_RADAR_OUT_DIR")
+    else (BASE_DIR / ".." / "outputs" / "analysis" / "theme_radar")
+)
+
 # テーマタグ表（みんかぶ・月次更新）
 THEME_MASTER_PATH = BASE_DIR / ".." / "outputs" / "theme_master_minkabu.parquet"
 
 # 動意上位100銘柄の日次蓄積先
-MOVERS_HISTORY_PATH = (
-    BASE_DIR / ".." / "outputs" / "analysis" / "theme_radar" / "movers_top100_daily.parquet"
-)
+MOVERS_HISTORY_PATH = _THEME_RADAR_OUT_DIR / "movers_top100_daily.parquet"
 
 # 銘柄コンテキスト（「何の会社」＋「なぜ動いた」材料）の日次蓄積先。
 # 2026-08-31 PM 指示。当日の動意上位100銘柄しか EDINET 事業概要・材料テキストを取得しない
@@ -45,12 +55,19 @@ MOVERS_HISTORY_PATH = (
 # 取れず「材料不明」で一律除外されていた。本 parquet に日次で蓄積し、当日取れない銘柄は
 # 直近 CONTEXT_LOOKBACK_DAYS 営業日以内の記述を日付付きで再利用する。
 # 本番 parquet への列追加ではなく独立ファイル（file_safety_rules 準拠）。
-STOCK_CONTEXT_PATH = (
-    BASE_DIR / ".." / "outputs" / "analysis" / "theme_radar" / "stock_context_daily.parquet"
-)
+STOCK_CONTEXT_PATH = _THEME_RADAR_OUT_DIR / "stock_context_daily.parquet"
 
 # スクリーニングマスター（業種名の最終フォールバック用・読み取りのみ）
 SCREENING_MASTER_PATH = BASE_DIR / ".." / "outputs" / "screening_master.parquet"
+
+# 自前括りテーマ（GHA 側 Claude が材料から確定させた当日テーマ）の日次蓄積先。
+# 2026-09-02 PM 承認の改修4。辞書（みんかぶタグ）に無いテーマは辞書ベースの継続性計算に
+# 一切乗らないため、Claude が材料から作った括り（テーマ名＋銘柄コード集合＋共通材料）を
+# 誌面 md の機械可読ブロックから回収して日次で貯める。翌日以降、辞書ベースの熱量行の
+# 銘柄集合と一致する自前テーマがあれば、そのテーマ名を優先表示する（段階導入）。
+# 本番 parquet への列追加ではなく独立ファイル（file_safety_rules 準拠）。
+EARLY_CANDIDATES_PATH = _THEME_RADAR_OUT_DIR / "early_candidates_daily.parquet"
+OWN_THEMES_PATH = _THEME_RADAR_OUT_DIR / "own_themes_daily.parquet"
 
 # --- パラメータ ---
 # 構成銘柄がこれを超える巨大テーマは母数が大きく偶然の同時掲載が起きるため除外。
@@ -71,6 +88,10 @@ MERGE_MIN_OVERLAP = 2
 # 材料が積極的にテーマを支持する銘柄が2社未満のテーマは落とすため、材料が無い日は
 # 3件に届かなくてよい（水増し禁止）。
 MAX_ROWS_TODAY = 3
+# v15（2026-09-02 PM 承認・材料起点への転換）: 当日テーマは 3〜5 件を目標とする。
+# 辞書タグ起点では束ねられる候補がタグの粒度に縛られて 1〜3 件へ張り付いていたが、
+# 材料起点では同じ出来事で動いた銘柄を自由に束ねられるため上限を 5 へ広げる。
+MAX_ROWS_TODAY_MAX = 5
 TODAY_CANDIDATES = 15
 # 誌面の熱量テーマ**目標**件数（v12・2026-09-01 PM 承認で 5 → 3）。
 # 支持2銘柄未満のテーマを落として次候補へ繰り上げ、この件数に届くまで補充する。
@@ -125,6 +146,35 @@ SUSTAIN_MIN_CODES = 2
 # スコア）で並べ、当日掲載テーマが2週間側に出ることを許容する。点灯日数を掛ける構造は
 # 維持するため、単日急騰型（点灯日数 1 前後）は上位化しない。
 TODAY_SHOWN_PENALTY = 1.0  # 互換のため名前だけ残す（実質無効。新規コードで参照しない）
+
+# --- v16（2026-09-03）: 初動候補テーマ（機械抽出）の判定定数 ---
+# 「複数銘柄が同時に点灯し、かつそこへ実弾（売買代金）が入っているテーマ」だけを機械的に
+# 拾う欄。ティアフォー（593A）が 8/20 に単独点灯 → 8/27 に +20.4% → 8/28 に 336A・4667 と
+# 3銘柄同時点灯へ広がった動きを、当日中に「自動運転車」というテーマ名で拾えるかを基準に
+# バックテストして採用した条件（案E）。
+# 比率型（n_up 比・売買代金比・順位ジャンプ幅）は、構成銘柄が数社しかない無名テーマが
+# 分母の小ささで常に上位を占め、実弾の入っていないテーマばかりが並んだため採用しない。
+# 当日 score 降順で候補プールに入れる件数
+EARLY_TOP_POOL = 10
+# 候補プールから採るための最低点灯銘柄数（同時に動いていることの担保）
+EARLY_MIN_NUP = 4
+# --- E5（2026-09-03 PM 指示）: 判定を「実際に動いた銘柄」だけで見る形へ変更 ---
+# 旧条件（点灯銘柄全体の売買代金合計 >= 500億）は、ほぼ動いていない大型株が代金の大半を
+# 占めるテーマ（9/2 の防衛=1989億は伊藤忠+0.4%・グローバルサウス=1613億はニッスイ+0.5%
+# 等が寄与）を通してしまった。E5 は「+3%以上動いた銘柄」に絞って本数と実弾を見るため、
+# 8/27・8/28 の自動運転を維持したまま 9/2 の防衛・グローバルサウスを落とせる。
+# 「実際に動いた」とみなす騰落率の下限（%）。_cr §38 の本日のテーマ側と同じ基準。
+EARLY_MOVE_PCT = 3.0
+# +3%以上で動いた銘柄の最低本数（1社の急騰だけでテーマ扱いしないための担保）
+EARLY_MIN_NUP3 = 2
+# +3%以上で動いた銘柄の売買代金合計の下限（億円・実弾が入っていることの担保）
+EARLY_MIN_TURN3_OKU = 100
+# 誌面へ出す最大件数（2026-09-03 PM 決定で枠5。3か月後に early_candidates_daily.parquet で再検証）
+EARLY_MAX_ROWS = 5
+# 局面判定に使う直近営業日数（当日を除く）。既存の lit_days と同じ窓を使う。
+EARLY_HISTORY_WINDOW = HEAT_WINDOW_DAYS
+# 点灯銘柄セルへ並べる最大件数（売買代金順）
+EARLY_LEAD_CODES = 6
 
 # ---------------------------------------------------------------------------
 # v14（2026-09-02 PM 承認）: テーマ検知の母集団を「流動性・規模の足切り付き」へ刷新
@@ -778,6 +828,10 @@ def merge_overlapping_themes(entries: list[dict], theme_size: dict) -> list[dict
                 "theme_size": int(theme_size.get(rep["theme"], 0)),
                 "score": max(g["score"] for g in grp),
                 "codes": list(seen.values()),
+                # 統合前の構成テーマそれぞれの点灯銘柄数。初動候補テーマ（v16）の n_up は
+                # 和集合の件数ではなくこの最大値を使う（1銘柄ずつ点灯した無関係なテーマが
+                # 統合されただけの行が件数で通ってしまうのを防ぐ）。
+                "member_counts": [len(g["_set"]) for g in grp],
             }
         )
     return merged
@@ -1167,6 +1221,421 @@ def compute_theme_heat_v2(
 
 
 # --------------------------------------------------------------------------
+# 初動候補テーマ（機械抽出・v16 / 2026-09-03）
+# --------------------------------------------------------------------------
+def compute_lit_history(
+    history_parquet: Path | str | None = None,
+    trade_date=None,
+    theme_master_path: Path | str | None = None,
+    window: int = EARLY_HISTORY_WINDOW,
+) -> dict:
+    """テーマ -> 「当日を除く」直近 window 営業日の点灯日数 を返す。
+
+    compute_theme_heat_v2 が内部で持っている lit_days の計算をそのまま切り出したもの
+    （SUSTAIN_MIN_CODES 銘柄以上で点灯した日を1日と数える）。初動候補テーマの局面判定
+    （初出 / 継続N日目）が同じ定義で動くようにするための共有関数。
+    """
+    code_to_themes, _size, _stale, _exc = load_theme_map(theme_master_path)
+    if not code_to_themes:
+        return {}
+    hist = _load_history(history_parquet)
+    if hist.empty:
+        return {}
+    end = str(trade_date) if trade_date else datetime.now(JST).date().isoformat()
+    dates = sorted(d for d in hist["date"].unique() if d <= end)
+    past_dates = [d for d in dates if d != end][-int(window):]
+
+    lit_days: dict[str, int] = defaultdict(int)
+    for d in past_dates:
+        day = hist[hist["date"] == d].drop_duplicates(subset=["code"]).to_dict("records")
+        for t, v in score_one_day(day, code_to_themes).items():
+            if len(v.get("codes") or []) >= SUSTAIN_MIN_CODES:
+                lit_days[t] += 1
+    return dict(lit_days)
+
+
+def evaluate_early_pool(
+    entries_merged: list[dict],
+    lit_history: dict | None = None,
+    top_pool: int = EARLY_TOP_POOL,
+) -> list[dict]:
+    """当日 score 上位 `top_pool` 件を**ゲート判定前のまま**評価して返す（記録用）。
+
+    select_early_candidates と同じ指標（n_up / n3 / turn3_oku / 局面）を計算するが、
+    E5 のゲート（n_up・n3・turn3）で**落とさず**、通過可否を `passed_gate` に持たせる。
+    枠数や閾値を後から変えて再検証できるよう、日次 parquet へはこの全件を残す。
+    """
+    if not entries_merged:
+        return []
+    lit_history = lit_history or {}
+
+    def _turnover(rec: dict) -> float:
+        try:
+            return float(rec.get("turnover") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    ranked = sorted(
+        entries_merged,
+        key=lambda e: (-float(e.get("score") or 0.0), str(e.get("theme") or "")),
+    )
+    out: list[dict] = []
+    for rank, e in enumerate(ranked[: max(int(top_pool or 0), 0)], 1):
+        codes = [c for c in (e.get("codes") or []) if str(c.get("code") or "").strip()]
+        if not codes:
+            continue
+        member_counts = e.get("member_counts") or []
+        n_up = max([int(x) for x in member_counts], default=len(codes))
+        moved = []
+        for c in codes:
+            try:
+                if float(c.get("return_pct") or 0) >= EARLY_MOVE_PCT:
+                    moved.append(c)
+            except (TypeError, ValueError):
+                continue
+        n3 = len(moved)
+        turn3_oku = sum(_turnover(c) for c in moved) / 1e8
+        passed = (
+            n_up >= EARLY_MIN_NUP
+            and n3 >= EARLY_MIN_NUP3
+            and turn3_oku >= float(EARLY_MIN_TURN3_OKU)
+        )
+        group = {e.get("theme")} | set(e.get("merged_names") or [])
+        days = max((int(lit_history.get(t, 0) or 0) for t in group), default=0)
+        out.append({
+            "theme": e.get("theme"),
+            "label": format_theme_label(e),
+            "rank": rank,
+            "score": float(e.get("score") or 0.0),
+            "n_up": int(n_up),
+            "n3": int(n3),
+            "turn3_oku": float(turn3_oku),
+            "passed_gate": bool(passed),
+            "phase": "初出" if days <= 0 else f"継続{days + 1}日目",
+            "codes": sorted(codes, key=lambda c: -_turnover(c)),
+            "hot_codes": sorted(moved, key=lambda c: -_turnover(c)),
+        })
+    return out
+
+
+def append_early_candidates(
+    pool_rows: list[dict],
+    trade_date,
+    shown_themes=None,
+    lane: str = "mover",
+    path: Path | str | None = None,
+) -> Path | None:
+    """初動候補の日次記録を parquet へ追記する（同一 date+lane+theme は上書き）。
+
+    2026-09-03 PM 決定。枠5で誌面へ出しつつ、**ゲート通過前の上位10件全て**を残して
+    3か月後に枠数・閾値を変えた再検証ができるようにする。誌面へ出た行は shown=True。
+
+    列: date / lane / theme / rank / score / n_up / n3 / turn3_oku /
+        passed_gate / shown / phase / codes / hot_codes / hot_detail
+    """
+    if not pool_rows:
+        return None
+    date_str = str(trade_date)
+    shown = {str(s) for s in (shown_themes or set())}
+
+    def _codes_str(recs) -> str:
+        return ",".join(str(c.get("code") or "").strip() for c in (recs or [])
+                        if str(c.get("code") or "").strip())
+
+    def _detail(recs) -> str:
+        parts = []
+        for c in recs or []:
+            code = str(c.get("code") or "").strip()
+            if not code:
+                continue
+            try:
+                pct = f"{float(c.get('return_pct')):+.1f}%"
+            except (TypeError, ValueError):
+                pct = ""
+            try:
+                tn = f"{float(c.get('turnover') or 0) / 1e8:.0f}億"
+            except (TypeError, ValueError):
+                tn = ""
+            parts.append(f"{code}{pct}/{tn}")
+        return " ".join(parts)
+
+    rows = []
+    for r in pool_rows:
+        theme = str(r.get("theme") or "").strip()
+        if not theme:
+            continue
+        rows.append({
+            "date": date_str,
+            "lane": str(lane),
+            "theme": theme,
+            "rank": int(r.get("rank") or 0),
+            "score": float(r.get("score") or 0.0),
+            "n_up": int(r.get("n_up") or 0),
+            "n3": int(r.get("n3") or 0),
+            "turn3_oku": float(r.get("turn3_oku") or 0.0),
+            "passed_gate": bool(r.get("passed_gate")),
+            "shown": bool(theme in shown),
+            "phase": str(r.get("phase") or ""),
+            "codes": _codes_str(r.get("codes")),
+            "hot_codes": _codes_str(r.get("hot_codes")),
+            "hot_detail": _detail(r.get("hot_codes")),
+        })
+    if not rows:
+        return None
+
+    cols = ["date", "lane", "theme", "rank", "score", "n_up", "n3", "turn3_oku",
+            "passed_gate", "shown", "phase", "codes", "hot_codes", "hot_detail"]
+    p = Path(path) if path else EARLY_CANDIDATES_PATH
+    p.parent.mkdir(parents=True, exist_ok=True)
+    new = pd.DataFrame(rows, columns=cols)
+    if p.exists():
+        try:
+            old = pd.read_parquet(p)
+            # 同一 date/lane/theme を除いてから連結する（再実行の冪等性）
+            key_new = set(zip(new["date"], new["lane"], new["theme"]))
+            mask = [
+                (str(d), str(l), str(th)) not in key_new
+                for d, l, th in zip(old["date"], old["lane"], old["theme"])
+            ]
+            new = pd.concat([old[mask], new], ignore_index=True)
+        except Exception:
+            pass
+    new.to_parquet(p, index=False)
+    return p
+
+
+def select_early_candidates(
+    entries_merged: list[dict],
+    theme_size: dict | None = None,
+    lit_history: dict | None = None,
+    top_pool: int = EARLY_TOP_POOL,
+    min_nup: int = EARLY_MIN_NUP,
+    min_nup3: int = EARLY_MIN_NUP3,
+    min_turn3_oku: float = EARLY_MIN_TURN3_OKU,
+    max_rows: int = EARLY_MAX_ROWS,
+) -> list[dict]:
+    """当日の統合テーマ行から「初動候補テーマ」を機械抽出する（案E）。
+
+    判定は当日の一次データだけで閉じており、Claude の解釈も辞書の意味づけも入らない。
+        1. 当日 score 降順で上位 `top_pool` 件を候補プールにする
+        2. そのうち n_up >= `min_nup` かつ n3 >= `min_nup3` かつ turn3 >= `min_turn3_oku` 億円
+        3. 残りを score 順に最大 `max_rows` 件
+
+    E5（2026-09-03 PM 指示）で判定を「実際に動いた銘柄」だけで見る形へ変えた。
+        n3    … 点灯銘柄のうち騰落率 EARLY_MOVE_PCT(+3%) 以上の銘柄数
+        turn3 … その +3%以上の銘柄群の当日売買代金合計（億円）
+    旧条件（点灯銘柄**全体**の代金合計 >= 500億）は、ほぼ動いていない大型株が代金の
+    大半を占めるテーマを通した（9/2 の防衛=1989億の主因は伊藤忠+0.4%、グローバル
+    サウス=1613億の主因はニッスイ+0.5%）。E5 は 8/27・8/28 の自動運転を維持したまま
+    この2件を落とす。
+
+    n_up / turn の定義（統合行に対して）:
+        codes … 構成テーマの点灯銘柄の**和集合**（merge_overlapping_themes が既に和集合を
+                作っているため、統合行の "codes" をそのまま使う）
+        n_up  … 構成テーマそれぞれの点灯銘柄数の**最大値**。和集合の件数ではない。
+                和集合を使うと、たまたま1銘柄ずつ点灯した無関係なテーマが統合された行が
+                件数だけ膨らんで通ってしまうため、「単一のテーマとして何社同時に動いたか」
+                を表す最大値を採る。
+        turn  … 統合行の点灯銘柄（和集合）の当日売買代金の合計（億円）。
+
+    局面（既存の lit_days と同じ定義を流用する）:
+        直前 `EARLY_HISTORY_WINDOW` 営業日（**当日を除く**）のうち、そのテーマが
+        SUSTAIN_MIN_CODES 銘柄以上で点灯した日数 N から
+            N == 0 … 「初出」
+            N >= 1 … 「継続{N+1}日目」
+        統合行では構成テーマのうち最も継続しているものの日数を代表値にする
+        （compute_theme_heat_v2 の lit_days と同じ扱い）。
+
+    本日のテーマ欄・直近2週間欄との重複は**除外しない**（PM 指示）。重複していれば
+    誌面側で注記するため、行に "dup_today" / "dup_heat" のフラグを立てられるよう
+    呼び出し側が後から書き込める素の dict を返す。
+
+    Args:
+        entries_merged: merge_overlapping_themes の戻り値
+            [{"theme","merged_names","theme_size","score","codes"(list[rec])}, ...]
+        theme_size: theme -> 構成銘柄数（load_theme_map の戻り値の2番目）。表示には
+            使わないが将来の同点処理のため受け取る。
+        lit_history: theme -> 当日を除く直近窓の点灯日数。compute_theme_heat_v2 が
+            算出したものを渡す。None なら全テーマ 0 日（＝すべて「初出」）とみなす。
+
+    Returns:
+        [{"theme","merged_names","label","rank","score","n_up","n3","turn3_oku",
+          "lit_days","phase","codes"(売買代金降順), "theme_size"}, ...]
+    """
+    if not entries_merged:
+        return []
+    lit_history = lit_history or {}
+
+    def _turnover(rec: dict) -> float:
+        try:
+            return float(rec.get("turnover") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    # 1. 当日 score 降順の候補プール（順位は誌面の「当日順位」列へそのまま出す）
+    ranked = sorted(
+        entries_merged,
+        key=lambda e: (-float(e.get("score") or 0.0), str(e.get("theme") or "")),
+    )
+    pool = ranked[: max(int(top_pool or 0), 0)]
+
+    out: list[dict] = []
+    for rank, e in enumerate(pool, 1):
+        codes = [c for c in (e.get("codes") or []) if str(c.get("code") or "").strip()]
+        if not codes:
+            continue
+        # n_up: 構成テーマ単位の点灯銘柄数の最大値。merge_overlapping_themes は
+        # 構成テーマ別の内訳を残さないため、統合前の内訳が渡らない場合は和集合件数へ
+        # フォールバックする（呼び出し側が "member_counts" を積んでいればそれを使う）。
+        member_counts = e.get("member_counts") or []
+        n_up = max([int(x) for x in member_counts], default=len(codes))
+        # E5: 判定は「実際に +3%以上動いた銘柄」だけで行う（本数 n3 と実弾 turn3）。
+        moved = []
+        for c in codes:
+            try:
+                if float(c.get("return_pct") or 0) >= EARLY_MOVE_PCT:
+                    moved.append(c)
+            except (TypeError, ValueError):
+                continue
+        n3 = len(moved)
+        turn3_oku = sum(_turnover(c) for c in moved) / 1e8
+        if n_up < min_nup or n3 < int(min_nup3) or turn3_oku < float(min_turn3_oku):
+            continue
+        # 局面: 構成テーマのうち最も継続している日数を代表値にする
+        group = {e.get("theme")} | set(e.get("merged_names") or [])
+        days = max((int(lit_history.get(t, 0) or 0) for t in group), default=0)
+        phase = "初出" if days <= 0 else f"継続{days + 1}日目"
+        out.append(
+            {
+                "theme": e.get("theme"),
+                "merged_names": list(e.get("merged_names") or []),
+                "label": format_theme_label(e),
+                "rank": rank,
+                "score": float(e.get("score") or 0.0),
+                "n_up": int(n_up),
+                "n3": int(n3),
+                "turn3_oku": float(turn3_oku),
+                "lit_days": int(days),
+                "phase": phase,
+                "theme_size": int(
+                    e.get("theme_size")
+                    or (theme_size or {}).get(e.get("theme"), 0)
+                    or 0
+                ),
+                "codes": sorted(codes, key=lambda c: -_turnover(c)),
+            }
+        )
+        if len(out) >= max(int(max_rows or 0), 0):
+            break
+    return out
+
+
+_EARLY_FOOTER = (
+    "この欄は当日に複数銘柄が同時に動いたテーマを機械抽出したものであり、"
+    "売買を推奨するものではありません。"
+)
+
+
+def render_early_candidates(
+    rows: list[dict],
+    pct_key: str = "return_pct",
+    today_labels: set | None = None,
+    max_codes: int = EARLY_LEAD_CODES,
+) -> list[str]:
+    """`## 初動候補テーマ（機械抽出）` の raw ブロックを返す（v17・2026-09-03 PM 指示）。
+
+    旧形式は「テーマ名・当日順位・上昇銘柄数・+3%以上の売買代金合計・局面・点灯銘柄・
+    材料」の7列表で、テーマ名・点灯銘柄・材料の3列が長文のため table-layout:fixed の
+    均等7分割では全セルが折り返して縦長になり「読めない」と却下された（PM 2026-09-03）。
+
+    新形式はテーマごとのブロック（本日のテーマ・直近2週間と同じ体裁に統一）:
+        **{当日順位}位 {テーマ名} ｜ 上昇{n_up}銘柄 ｜ +3%以上の売買代金 {turn3_oku}億円 ｜ {局面}**
+        材料: {Claude が1文で書く。無ければ「材料なし（値動きのみ）」}
+
+        | コード | 銘柄名 | 何の会社 | 時価総額 | 騰落率 |
+        |---|---|---|---|---|
+        （+3%以上の点灯銘柄のみ・売買代金順・最大 max_codes 行）
+
+    見出し行・銘柄表は機械が出した確定値であり、Claude は**そのまま転記**する
+    （削除・並べ替え・銘柄の追加除外を禁止）。**材料の1文だけ**を Claude が書く。
+    表に「何の会社」列を新設したため、呼び出し側は codes の各レコードへ desc を
+    含めていない場合、誌面を書く Claude が raw 内の該当銘柄ブロックの記述で埋める
+    （§38 の「何の会社」空欄禁止の連鎖を流用）。
+
+    固定文（`_EARLY_FOOTER`）は欄末尾に1回だけ置く（テーマブロックごとには置かない）。
+
+    Args:
+        rows: select_early_candidates の戻り値。
+        today_labels: 当日テーマ欄にも載る見込みのテーマ名の集合（見出しの注記に使う）。
+        max_codes: 銘柄表に載せる最大行数（+3%以上の点灯銘柄を売買代金順に採る）。
+    """
+    lines = ["## 初動候補テーマ（機械抽出）", ""]
+    if not rows:
+        lines += [
+            "本日は基準（上位10位以内・上昇4銘柄以上・うち+3%以上が2銘柄以上・その売買代金合計100億円以上）を"
+            "満たすテーマがありません",
+            "",
+        ]
+        return lines
+
+    lines += [
+        "> **この欄は機械が出した確定値です。見出し行と銘柄表はそのまま誌面へ転記してください**"
+        f"（最大{EARLY_MAX_ROWS}テーマ）。"
+        "テーマ・銘柄行の削除・並べ替え・追加や除外を禁止します"
+        f"（判定は当日 score 上位{EARLY_TOP_POOL}位以内・上昇{EARLY_MIN_NUP}銘柄以上・"
+        f"うち+{EARLY_MOVE_PCT:.0f}%以上が{EARLY_MIN_NUP3}銘柄以上・その売買代金合計"
+        f"{EARLY_MIN_TURN3_OKU:.0f}億円以上の機械条件のみ）。",
+        "",
+        "> **`材料:` の1文だけをあなたが書きます**。raw の材料一覧にその行の点灯銘柄の"
+        "材料があれば「銘柄名（コード）」を主語にした**1文**を書き、無ければ"
+        "`材料なし（値動きのみ）` と書いてください。",
+        "",
+        "> **この欄は状況把握であり売買推奨ではありません**。「チャンス」「注目」"
+        "「狙い目」「初動」「先回り」等の推奨語と、「可能性が高い」「とみられる」等の"
+        "推測語を禁止します。固定文は欄の末尾に1回だけ置きます（テーマブロックごとに"
+        "繰り返さない）。",
+        "",
+    ]
+
+    labels = today_labels or set()
+    for r in rows:
+        note = ""
+        if r.get("theme") in labels or r.get("label") in labels:
+            note = "　（本日のテーマ欄にも掲載）"
+        head = (
+            f"**{int(r.get('rank') or 0)}位 {r.get('label') or r.get('theme') or ''} ｜ "
+            f"上昇{int(r.get('n_up') or 0)}銘柄 ｜ "
+            f"+3%以上の売買代金 {float(r.get('turn3_oku') or 0.0):.0f}億円 ｜ "
+            f"{r.get('phase') or ''}**{note}"
+        )
+        lines.append(head)
+        lines.append("")
+        lines.append("材料: （ここに1文）")
+        lines.append("")
+        lines.append("| コード | 銘柄名 | 何の会社 | 時価総額 | 騰落率 |")
+        lines.append("|---|---|---|---|---|")
+        moved = []
+        for c in (r.get("codes") or []):
+            try:
+                if float(c.get(pct_key) or 0) >= EARLY_MOVE_PCT:
+                    moved.append(c)
+            except (TypeError, ValueError):
+                continue
+        for c in moved[: max(int(max_codes or 0), 0)]:
+            code = str(c.get("code") or "").strip()
+            name = str(c.get("name") or "").strip()
+            lines.append(
+                f"| {code} | {name} | （要記入） | {_mcap_str(c) or '―'} | "
+                f"{_pct_str(c, pct_key)} |"
+            )
+        lines.append("")
+
+    lines.append(_EARLY_FOOTER)
+    lines.append("")
+    return lines
+
+
+# --------------------------------------------------------------------------
 # 夜間 PTS（当日部を PTS へ差し替え）
 # --------------------------------------------------------------------------
 def detect_night(pts_risers, theme_master_path: Path | str | None = None):
@@ -1246,6 +1715,25 @@ def _pct_str(rec: dict, pct_key: str = "return_pct") -> str:
         return f"{float(rec.get(pct_key)):+.1f}%"
     except (TypeError, ValueError):
         return ""
+
+
+def _mcap_str(rec: dict) -> str:
+    """時価総額を「1,234億円」「1.9兆円」形式で返す（取れなければ空文字）。
+
+    2026-09-03 PM 指示: テーマ系の全表に時価総額列を追加する。値の出所は
+    make_mover_report 側が組む記録の `mcap_oku`（当日終値×発行済株数の screening_master
+    MarketCapOku 由来・億円単位）。取れない銘柄は空欄にする（推計で埋めない・§0）。
+    他レポート（夜間PTS の cap_str 等）と同じ書式（10,000億円以上は兆円表記）に揃える。
+    """
+    try:
+        oku = float(rec.get("mcap_oku"))
+    except (TypeError, ValueError):
+        return ""
+    if oku != oku:  # NaN
+        return ""
+    if oku >= 10000:
+        return f"{oku / 10000:.1f}兆円"
+    return f"{oku:,.0f}億円"
 
 
 def order_lead_codes(
@@ -1360,10 +1848,12 @@ def _lead_stock_table(
     空になることは構造的に起きない。それでも空になった場合は行を必ず残し
     （§25 の銘柄除外禁止）、セルを `（要記入）` にして Claude が raw 内の該当銘柄
     ブロックと材料テキストから書く（誌面に `―` を出すことは _cr §38 で禁止）。
+
+    列: コード / 銘柄名 / 何の会社 / 時価総額 / 騰落率（2026-09-03 PM 指示で時価総額を追加）。
     """
     out = [
-        "| コード | 銘柄名 | 何の会社 | 騰落率 |",
-        "|---|---|---|---|",
+        "| コード | 銘柄名 | 何の会社 | 時価総額 | 騰落率 |",
+        "|---|---|---|---|---|",
     ]
     for c in order_lead_codes(codes, material_lookup, limit):
         code = str(c.get("code", ""))
@@ -1374,7 +1864,10 @@ def _lead_stock_table(
                 desc = clean_business_desc(desc_lookup(code) or "")
             except Exception:
                 desc = ""
-        out.append(f"| {code} | {name} | {desc or '（要記入）'} | {_pct_str(c, pct_key)} |")
+        out.append(
+            f"| {code} | {name} | {desc or '（要記入）'} | {_mcap_str(c) or '―'} | "
+            f"{_pct_str(c, pct_key)} |"
+        )
     out.append("")
     return out
 
@@ -1433,6 +1926,291 @@ def _dup_note(code: str, self_label: str, dup_map: dict[str, list[str]] | None) 
     if not others:
         return None
     return "重複掲載: " + " / ".join(others)
+
+
+def _tag_names_for(code, code_to_themes: dict, limit: int = 4) -> str:
+    """その銘柄が持つみんかぶタグ名を `/` 区切りで返す（資金テーマでない括りは除外済み）。
+
+    材料起点の当日テーマ判定では、タグは**同タグ複数点灯のヒント**としてのみ使う
+    （2026-09-02 PM 承認の改修2）。タグが付いていること自体は掲載根拠にしない。
+    """
+    c = str(code or "").strip()
+    names = list(code_to_themes.get(c) or code_to_themes.get(c[:4]) or [])
+    if not names:
+        return ""
+    return " / ".join(str(n) for n in names[:limit])
+
+
+def render_today_roster(
+    universe_records: list[dict],
+    material_lookup=None,
+    desc_lookup=None,
+    pct_key: str = "return_pct",
+    theme_master_path: Path | str | None = None,
+    max_material_items: int = 2,
+    heading: str = "## 本日の動意母集団（材料一覧・Claude がここからテーマを括る）",
+) -> list[str]:
+    """母集団全銘柄の1行表を返す（2026-09-02 PM 承認の改修1・2＝材料起点への転換）。
+
+    旧 `render_today_candidates` は「みんかぶ辞書タグ単位の候補15件」を出しており、
+    (a) タグに無いテーマは構造的に出せない (b) 材料がタグ名を名指ししないと落ちる
+    (c) 材料未取得の銘柄は候補にすら載らない、という3つの取りこぼしがあった
+    （9/2 の当日テーマは1件）。
+
+    本関数は辞書を**起点から外し**、母集団（extract_radar_universe の約100銘柄）を
+    そのまま1銘柄1行で並べる。Claude は材料テキストを読み、同じ出来事で動いた銘柄を
+    束ねてテーマ名を自由に付ける。タグ列は「同タグが複数点灯している」ヒントとしてのみ
+    参照する。
+
+    材料が取れない銘柄も**行ごと落とさず**「開示・報道なし（値動きのみ）」と明示する
+    （空欄禁止・§25 の銘柄除外禁止）。
+
+    Args:
+        universe_records: [{"code","name","return_pct"/pct_key,"turnover","market"}] のリスト。
+            呼び出し側（make_mover_report / make_pts_mover_report）が母集団から組む。
+        material_lookup: code -> list[str]（build_material_lookup 推奨・遡り材料つき）。
+        desc_lookup: code -> str（build_desc_lookup 推奨・業種名まで落ちるフォールバック連鎖）。
+    """
+    lines = [heading, ""]
+    recs = [r for r in (universe_records or []) if str(r.get("code") or "").strip()]
+    if not recs:
+        lines += ["本日の母集団なし", ""]
+        return lines
+
+    def _turn(r) -> float:
+        try:
+            return float(r.get("turnover") or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    recs = sorted(recs, key=lambda r: -_turn(r))
+
+    code_to_themes, _size, _stale, _exc = load_theme_map(theme_master_path)
+
+    lines += [
+        "> **これは機械が出した母集団であり、テーマではありません**。"
+        "下の全銘柄の `材料` 欄を読み、**同じ出来事・同じ材料で動いた銘柄を2社以上束ねて"
+        "テーマ名を付けて**ください（テーマ名は材料に即して自由に命名して構いません）。"
+        f"誌面の `## 本日のテーマ` は**{MAX_ROWS_TODAY}〜{MAX_ROWS_TODAY_MAX}テーマ**を"
+        "目標とし、束ねられなければ少ない件数で確定します（水増し禁止）。判定手順は prompts 側。",
+        "",
+        "> **`所属タグ` 列はヒントに過ぎません**。同じタグが複数行に出ていれば"
+        "「同じ括りの銘柄に資金が入った可能性を材料で確かめる」きっかけとして使い、"
+        "**タグが付いていることだけを掲載根拠にしないでください**"
+        "（タグは事業の一部が触れているだけで、その日の値動きの理由ではありません）。"
+        "タグに無いテーマ名を材料から作って構いません。",
+        "",
+        "> **材料欄の読み方**。`{M/D}時点の材料:` は直近"
+        f"{CONTEXT_LOOKBACK_DAYS}営業日以内にその銘柄が動意 raw に載った最新日の記述を"
+        "機械が遡って添えた一次情報です。当日テーマの根拠に使って構いませんが、"
+        "誌面の理由文で触れるときは `8/25に` のように日付を必ず明示してください。"
+        "`開示・報道なし（値動きのみ）` の銘柄は**テーマにも単独材料にも載せません**。",
+        "",
+        "> **1銘柄は1テーマにだけ帰属させます**。材料が実際に指している出来事の"
+        "テーマ1つへ入れ、同じ銘柄を複数テーマの主導銘柄として重複掲載しないでください。",
+        "",
+        "> **所属タグ列に `（母集団外・材料あり）` と付いた銘柄**は、時価総額・売買代金の"
+        "機械フィルタでは主母集団に入らなかったものの、動意誌面本体には掲載されており"
+        "材料テキストが確認できる銘柄です。テーマの起点・構成銘柄として通常どおり掲載して"
+        "構いません（初動候補欄・2週間の継続性集計はこの拡張の対象外で従来どおりです）。",
+        "",
+        "| コード | 銘柄名 | 何の会社 | 時価総額 | 騰落率 | 売買代金 | 所属タグ | 材料 |",
+        "|---|---|---|---|---|---|---|---|",
+    ]
+
+    for r in recs:
+        code = str(r.get("code") or "").strip()
+        name = str(r.get("name") or "").strip()
+        try:
+            pct = f"{float(r.get(pct_key)):+.1f}%"
+        except (TypeError, ValueError):
+            pct = ""
+        t = _turn(r)
+        turn_s = f"{t / 1e8:.1f}億円" if t > 0 else ""
+        mcap_s = _mcap_str(r)
+
+        desc = ""
+        if desc_lookup is not None:
+            try:
+                desc = clean_business_desc(desc_lookup(code) or "")
+            except Exception:
+                desc = ""
+
+        items: list = []
+        if material_lookup is not None:
+            try:
+                items = [str(m).strip() for m in (material_lookup(code) or []) if str(m).strip()]
+            except Exception:
+                items = []
+        if items:
+            mat = " ／ ".join(items[:max_material_items])
+        else:
+            # 空欄禁止（2026-09-02 PM 承認の改修1）。取れなかった事実を明示する。
+            mat = "開示・報道なし（値動きのみ）"
+
+        tags = _tag_names_for(code, code_to_themes)
+        if r.get("_out_of_radar"):
+            tags = (tags + " " if tags else "") + "（母集団外・材料あり）"
+
+        cells = [code, name, desc, mcap_s, pct, turn_s, tags, mat]
+        cells = [str(c).replace("|", "／").replace("\n", " ").strip() for c in cells]
+        lines.append("| " + " | ".join(cells) + " |")
+
+    lines.append("")
+    lines += [
+        f"> **単独材料**: 上の一覧で材料が明確（大型受注・提携・上場承認・大型開示等）"
+        "でありながら同じ出来事で動いた銘柄が2社に満たない銘柄は、"
+        "誌面の `## 単独材料（テーマ未満・観察）` へ最大5行で載せてください"
+        "（材料が `開示・報道なし（値動きのみ）` の銘柄は載せません）。",
+        "",
+    ]
+    return lines
+
+
+# --------------------------------------------------------------------------
+# 自前括りテーマの蓄積（2026-09-02 PM 承認の改修4）
+# --------------------------------------------------------------------------
+# 誌面 md の末尾に GHA 側 Claude が出力する機械可読ブロックの書式（HTML コメント内 JSON）。
+#   <!-- OWN_THEMES_JSON
+#   [{"theme": "自動運転", "codes": ["593A", "336A"], "material": "トヨタ28年市販車搭載報道"}]
+#   OWN_THEMES_JSON -->
+# 誌面には一切表示されない（PDF レンダラは HTML コメントを出力しない）ため §29 に反しない。
+OWN_THEMES_BLOCK_RE = re.compile(
+    r"<!--\s*OWN_THEMES_JSON\s*(.*?)\s*OWN_THEMES_JSON\s*-->",
+    re.DOTALL,
+)
+
+
+def parse_own_themes_block(md_text: str) -> list[dict]:
+    """誌面 md から自前括りテーマの機械可読ブロックを読み取る（失敗時は空リスト）。
+
+    Returns:
+        [{"theme": str, "codes": [str, ...], "material": str}] のリスト。
+    """
+    m = OWN_THEMES_BLOCK_RE.search(str(md_text or ""))
+    if not m:
+        return []
+    try:
+        data = json.loads(m.group(1))
+    except Exception:
+        return []
+    if not isinstance(data, list):
+        return []
+    out = []
+    for d in data:
+        if not isinstance(d, dict):
+            continue
+        theme = str(d.get("theme") or "").strip()
+        codes = [str(c).strip() for c in (d.get("codes") or []) if str(c).strip()]
+        if not theme or len(codes) < MIN_CODES_FOR_ALERT:
+            continue  # テーマ名なし・2社未満は貯めない
+        out.append({
+            "theme": theme,
+            "codes": sorted(set(codes)),
+            "material": str(d.get("material") or "").strip()[:60],
+        })
+    return out
+
+
+def append_own_themes(
+    entries: list[dict],
+    trade_date,
+    lane: str = "mover",
+    path: Path | str | None = None,
+) -> Path | None:
+    """自前括りテーマを日次 parquet へ追記する（同一 date+lane は上書き）。
+
+    列: date / lane / theme / codes（`,` 区切り文字列）/ n_codes / material
+
+    Returns:
+        書き出した parquet のパス（entries が空なら None）。
+    """
+    rows = []
+    date_str = str(trade_date)
+    for e in entries or []:
+        codes = [str(c).strip() for c in (e.get("codes") or []) if str(c).strip()]
+        theme = str(e.get("theme") or "").strip()
+        if not theme or len(codes) < MIN_CODES_FOR_ALERT:
+            continue
+        rows.append({
+            "date": date_str,
+            "lane": str(lane),
+            "theme": theme,
+            "codes": ",".join(sorted(set(codes))),
+            "n_codes": len(set(codes)),
+            "material": str(e.get("material") or "").strip()[:60],
+        })
+    if not rows:
+        return None
+
+    p = Path(path) if path else OWN_THEMES_PATH
+    p.parent.mkdir(parents=True, exist_ok=True)
+    new = pd.DataFrame(rows, columns=["date", "lane", "theme", "codes", "n_codes", "material"])
+    if p.exists():
+        try:
+            old = pd.read_parquet(p)
+            old = old[~(
+                (old["date"].astype(str) == date_str) & (old["lane"].astype(str) == str(lane))
+            )]
+            new = pd.concat([old, new], ignore_index=True)
+        except Exception:
+            pass
+    new.to_parquet(p, index=False)
+    return p
+
+
+def build_own_theme_lookup(
+    trade_date=None,
+    lookback_days: int = CONTEXT_LOOKBACK_DAYS,
+    min_overlap: float = 0.5,
+    path: Path | str | None = None,
+):
+    """辞書テーマの銘柄集合に一致する自前テーマ名を返す callable を組み立てる。
+
+    段階導入（2026-09-02 PM 承認の改修4）。継続性（熱量）の計算そのものは辞書ベースの
+    ままとし、**表示するテーマ名だけ**を自前括りへ寄せる。辞書テーマの主導銘柄集合と
+    自前テーマの銘柄集合の重なりが min_overlap 以上（Jaccard ではなく自前側の被覆率）
+    なら、直近で最も新しい自前テーマ名を返す。
+
+    Returns:
+        set[str] -> str|None の callable（該当なしは None）。
+    """
+    p = Path(path) if path else OWN_THEMES_PATH
+    if not Path(p).exists():
+        return lambda codes: None
+    try:
+        df = pd.read_parquet(p)
+    except Exception:
+        return lambda codes: None
+    if df.empty or "codes" not in df.columns:
+        return lambda codes: None
+
+    df = df.copy()
+    df["date"] = df["date"].astype(str)
+    if trade_date is not None:
+        dates = sorted({d for d in df["date"].unique() if d <= str(trade_date)})
+        df = df[df["date"].isin(set(dates[-lookback_days:]))]
+    df = df.sort_values("date")
+
+    entries = [
+        (str(t), {c.strip() for c in str(cs).split(",") if c.strip()})
+        for t, cs in zip(df["theme"], df["codes"])
+    ]
+
+    def _lookup(codes) -> str | None:
+        target = {str(c).strip() for c in (codes or []) if str(c).strip()}
+        if not target:
+            return None
+        best = None
+        for theme, own in entries:  # 後勝ち＝より新しい日付を優先
+            if not own:
+                continue
+            overlap = len(own & target) / len(own)
+            if overlap >= min_overlap:
+                best = theme
+        return best
+
+    return _lookup
 
 
 def render_today_candidates(
@@ -1667,6 +2445,7 @@ def render_heat_section(
     pct_key: str = "return_pct",
     candidates: int = HEAT_CANDIDATES,
     material_lookup=None,
+    own_theme_lookup=None,
 ) -> list[str]:
     """`## 直近2週間の熱いテーマ` をテーマごとのブロック形式で返す（2026-08-31 PM 確定）。
 
@@ -1721,6 +2500,16 @@ def render_heat_section(
     dup_map = build_duplicate_map(rows, material_lookup=material_lookup)
     for _rank, r in enumerate(rows, 1):
         label = format_theme_label(r)
+        # 2026-09-02 PM 承認の改修4（段階導入）: 継続性の計算は辞書ベースのままだが、
+        # 過去に Claude が材料から作った自前テーマと主導銘柄集合が一致する場合は
+        # 自前テーマ名を優先表示する（辞書タグ名は括弧で併記して出所を残す）。
+        if own_theme_lookup is not None:
+            try:
+                _own = own_theme_lookup([str(c.get("code")) for c in (r.get("codes") or [])])
+            except Exception:
+                _own = None
+            if _own and _own != label:
+                label = f"{_own}（辞書名: {label}）"
         # 見出し先頭に掲載順位（熱量降順・当日1位保証で割り込んだ行も掲載位置の順位）を付す。
         # 2026-08-31 PM 指示。誌面で行を落として繰り上げた場合は誌面の掲載位置で振り直す
         # （振り直しの指示は _cr §38）。

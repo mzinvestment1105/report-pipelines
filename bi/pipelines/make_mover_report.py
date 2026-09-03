@@ -50,16 +50,26 @@ from dotenv import load_dotenv
 from jq_client_utils import fetch_paginated_v2, normalize_code_4
 from edinetdb_client import EdinetDBClient
 from theme_radar import (
+    MAX_ROWS_TODAY_MAX,
+    append_early_candidates,
     append_movers_history,
+    append_own_themes,
     append_stock_context,
     extract_radar_universe,
     build_desc_lookup,
     build_material_lookup,
+    build_own_theme_lookup,
+    compute_lit_history,
     compute_theme_heat_v2,
+    evaluate_early_pool,
     detect_today,
+    parse_own_themes_block,
+    render_early_candidates,
     render_heat_section,
     render_reason_material,
     render_today_candidates,
+    render_today_roster,
+    select_early_candidates,
 )
 
 # ---------------------------------------------------------------------------
@@ -152,6 +162,36 @@ _BBS_NOISE = re.compile(
     r"|JASRAC|プライバシーポリシー|利用規約|免責事項|ヘルプ・お問い合わせ"
     r"|情報提供会社|東京証券取引所.*大阪取引所|最近見た銘柄.*ランキング)"
 )
+# 市場全体の集計・順位表・テクニカル一覧の見出し（2026-09-03 PM 指示で追加）。
+# Yahoo! ファイナンスの銘柄別ニュースタブには、その銘柄固有の材料ではない
+# 「本日のランキング【値上がり率】」「本日の【ボリンジャー｜±３σブレイク】」等の
+# 市場全体もの見出しが大量に混ざる。値上がり率上位の銘柄ほどこれらに枠を食われ、
+# 取得上限（従来 8 件）の内側に**その銘柄が動いた本当の理由**が入らなくなる
+# （9/2 実測: 593A・4667 は個別記事が上限外へ押し出され、336A のみ 8 件目に入った）。
+# 取得段階で落とし、上限を実質的に個別材料へ割り当てる。
+_MARKET_WIDE_NEWS_NOISE = re.compile(
+    r"^本日の【|^前場の【|^本日のランキング|^前場のランキング|^週間ランキング"
+    r"|ストップ高／ストップ安】|^《\d+日のストップ高|^〔ブル＆ベア〕|^グロース２５０"
+    r"|^出来高変化率ランキング|^話題株先取り|^スクリーニング分析|^先週の話題レポート"
+    r"|^分割実施・新株交付リスト|^公募・売出リスト|^ＴＯＢ銘柄一覧|^転換銘柄一覧"
+    r"|^銘柄カルテランキング|^証金残|^信用残ランキング|^レーティング日報|^レーティング週報"
+    r"|^証券各社レーティング|^レーティング情報|^今週の【上場来高値銘柄】|^本日の【上場来高値更新】"
+    r"|^本日の【業種】騰落|^動いた株・出来た株|^前日に動いた銘柄|^個別銘柄のスポット情報"
+    r"|^個別銘柄のひと口情報|^本日の【株主優待】情報|^雲抜け銘柄一覧|^ETF売買"
+    r"|＜テクニカル特集＞|＜割安株特集＞|^今週の注目トピック|^【本日の材料と銘柄】$"
+    r"|^前週末?\d*日?に「買われた株|^前日に「買われた株|^【明日の好悪材料】"
+    r"|^今週の【自社株買い】銘柄|^\d+月・\d+月の信用"
+    r"|^後場コメント|^前場コメント|^新興市場の注目リリース|^本日の注目個別銘柄"
+    r"|／本日の注目個別銘柄|^個別銘柄戦略|／新聞からの銘柄材料一覧|^今週の【話題株ダイジェスト】"
+    r"|^【ゲームエンタメ株|^【アナリスト予想】|^【アナリスト評価】|^\d+％ルール・取得"
+)
+
+
+def _is_market_wide_news(title: str) -> bool:
+    """その銘柄固有ではない市場全体もの見出しなら True。"""
+    return bool(_MARKET_WIDE_NEWS_NOISE.search(str(title or "").strip()))
+
+
 _BBS_POST_LIKE = re.compile(r"[。！？ねよわだます]")
 # 引用付き投稿（>>番号）は引用なし版が直後に来るため除外
 _BBS_QUOTE = re.compile(r"^>>\d+")
@@ -905,7 +945,7 @@ def fetch_minkabu_news(code4: str, max_items: int = 8) -> list[dict]:
     return fetch_yahoo_news(code4, max_items)
 
 
-def fetch_yahoo_news(code4: str, max_items: int = 8) -> list[dict]:
+def fetch_yahoo_news(code4: str, max_items: int = 20) -> list[dict]:
     """Yahoo!ファイナンス ニュースタブから銘柄別ニュース見出しを取得する（唯一のニュース取得元）。
 
     埋め込み JSON（newsTopics.articles）を優先し、無ければ HTML の記事リンクから拾う。
@@ -928,6 +968,10 @@ def fetch_yahoo_news(code4: str, max_items: int = 8) -> list[dict]:
         # source は「どこから取ったか」（＝Yahoo!ファイナンス）。media は記事の配信元。
         title = re.sub(r"\s+", " ", str(title)).strip()
         if not title or len(title) < 8 or title in seen:
+            return
+        # 市場全体もの・順位表・テクニカル一覧は個別材料ではないため取得段階で落とす
+        # （2026-09-03 PM 指示。上限枠を個別材料へ割り当てる）。
+        if _is_market_wide_news(title):
             return
         seen.add(title)
         items.append({"title": title, "date": when, "source": "Yahoo!ファイナンス", "media": media})
@@ -1642,6 +1686,47 @@ def load_recent_mover_codes(today: date, n: int = 2) -> set[str]:
     return codes
 
 
+def ingest_own_themes(today: date, lookback_files: int = 3) -> int:
+    """直近の完成レポート md から自前括りテーマを回収し parquet へ蓄積する。
+
+    2026-09-02 PM 承認の改修4。GHA 側 Claude は誌面 md の末尾へ機械可読ブロック
+    （`<!-- OWN_THEMES_JSON ... OWN_THEMES_JSON -->`）を出力する。翌日の本スクリプトが
+    それを読み、theme_radar.OWN_THEMES_PATH（own_themes_daily.parquet）へ日次で貯める。
+
+    辞書（みんかぶタグ）に無いテーマは辞書ベースの継続性計算に一切乗らないため、
+    Claude が材料から作った括りを別枠で蓄積して継続性の判断材料にする。
+    2週間の継続性計算そのものは当面辞書ベースを維持し、熱量行の銘柄集合と一致する
+    自前テーマがある場合にテーマ名だけを優先表示する（build_own_theme_lookup・段階導入）。
+
+    Returns:
+        蓄積したテーマ件数（0 なら未出力・書式不一致）。
+    """
+    movers_dir = MARKET_DAILY_DIR / "movers"
+    if not movers_dir.exists():
+        return 0
+    files = sorted(
+        [f for f in movers_dir.glob("????-??-??.md") if f.stem < today.isoformat()],
+        reverse=True,
+    )[:lookback_files]
+    total = 0
+    for f in files:
+        try:
+            entries = parse_own_themes_block(f.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not entries:
+            continue
+        try:
+            p = append_own_themes(entries, f.stem, lane="mover")
+        except Exception as e:
+            print(f"  [WARN] append_own_themes({f.stem}): {e}")
+            continue
+        if p is not None:
+            total += len(entries)
+            print(f"自前括りテーマ蓄積: {p} （{f.stem} {len(entries)}件）")
+    return total
+
+
 def pick_valuation_candidates(
     full_df: pd.DataFrame,
     volume_df: pd.DataFrame,
@@ -1766,6 +1851,7 @@ def build_report(
     prev: date,
     hist_df: pd.DataFrame | None = None,
     quality_note: str = "",
+    radar_df: pd.DataFrame | None = None,
 ) -> str:
     lines = [
         f"# 動意銘柄レポート 生データ ({today.strftime('%Y-%m-%d')})",
@@ -1837,13 +1923,56 @@ def build_report(
                 "return_pct": r.get("DailyReturn"),
                 "turnover": r.get("Turnover"),
                 "market": r.get("MarketCodeName"),
+                # 2026-09-03 PM 指示: テーマ系表の時価総額列は当日EOD（Close_T×発行済株数）
+                # で統一する（df["MarketCapOku"] は Step 6 手前で既に算出済み・§0 一次情報）。
+                # 株数が取れず算出できない銘柄は NaN のまま（§7 取れない数値は省略）。
+                "mcap_oku": r.get("MarketCapOku"),
             }
-            for _, r in all_movers_df.iterrows()
+            for _, r in (
+                # 2026-09-02 PM 承認の改修1・2: テーマ判定の母集団は
+                # extract_radar_universe（売買代金5億以上・時価総額100億以上・上昇）。
+                # 従来ここは all_movers_df（騰落率の絶対値上位100）を渡しており、
+                # _cr §38 が定義する母集団と実装が食い違っていた（下落銘柄も混入）。
+                radar_df if (radar_df is not None and not radar_df.empty) else all_movers_df
+            ).iterrows()
         ]
         _today_res = detect_today(_codes_today)
         _heat_res = compute_theme_heat_v2(_codes_today, trade_date=today)
         # 当日 raw から取れる素材（一次情報のみ）。
         _material_today = lambda code: _reason_material_for(code, tdnet_data, yahoo_data)
+        # 2026-09-03 PM 承認: 本日のテーマ「roster」の掲載母集団のみ拡張する
+        # （detect_today / compute_theme_heat_v2 / select_early_candidates / 2週間蓄積は
+        # 従来どおり radar_df ベースの _codes_today を使い、一切変更しない）。
+        # extract_radar_universe（売買代金5億円・時価総額100億円以上）は小型の起点銘柄を
+        # 機械的に落とす（9/3 実例: モルフォ3653・フィーチャ4052・ヴィッツ4440・原田工業6904
+        # はいずれも売買代金 or 時価総額のフィルタで脱落。詳細は git 履歴参照）。
+        # 動意誌面本体（extract_all_movers）の上昇側のうち、材料テキストを持つ銘柄を
+        # 追加候補として roster にだけ加える。追加分は所属タグ列へ目印を付けて区別する。
+        _radar_codes_today = {str(r.get("code") or "").strip() for r in _codes_today}
+        _roster_records = list(_codes_today)
+        try:
+            _extra_df = all_movers_df[all_movers_df["DailyReturn"] > 0] if (
+                all_movers_df is not None and not all_movers_df.empty
+                and "DailyReturn" in all_movers_df.columns
+            ) else all_movers_df.iloc[0:0]
+            for _, _r in _extra_df.iterrows():
+                _ec = normalize_code_4(_r["Code"])
+                if _ec in _radar_codes_today:
+                    continue
+                if not _reason_material_for(_ec, tdnet_data, yahoo_data):
+                    continue
+                _roster_records.append({
+                    "code": _ec,
+                    "name": _r.get("CompanyName"),
+                    "return_pct": _r.get("DailyReturn"),
+                    "turnover": _r.get("Turnover"),
+                    "market": _r.get("MarketCodeName"),
+                    "mcap_oku": _r.get("MarketCapOku"),
+                    "_out_of_radar": True,
+                })
+                _radar_codes_today.add(_ec)
+        except Exception as _e:
+            print(f"  [WARN] roster母集団拡張: {_e}")
         # 「何の会社」欄の素材。出典は EDINET DB の事業概要（fetch_company_description が
         # yahoo_data[code]["description"] へ格納済み）であり、新規取得も推測もしない。
         _desc_today = lambda code: (
@@ -1874,12 +2003,49 @@ def build_report(
         # フォールバック連鎖つき lookup（当日 → 直近10営業日の蓄積 → 業種名）。
         _desc = build_desc_lookup(primary=_desc_today, trade_date=str(today))
         _material = build_material_lookup(primary=_material_today, trade_date=str(today))
-        # 当日部は候補リスト（最大15件・主導銘柄ごとに材料テキスト＋事業概要付き）。
-        # テーマ名の付け直し・共通材料の判定・行の絞り込みは Claude が行う（_cr §38）。
-        lines += render_today_candidates(_today_res, _material, desc_lookup=_desc)
+        # 当日部は母集団全銘柄の1行表（2026-09-02 PM 承認の改修1・2＝材料起点への転換）。
+        # 旧 render_today_candidates は「みんかぶ辞書タグ単位の候補15件」であり、
+        # 辞書に無いテーマが構造的に出せず・材料がタグ名を名指ししないと落ち・
+        # 材料未取得の銘柄は候補にすら載らなかった（9/2 の当日テーマは1件）。
+        # 新形式は母集団を全件並べ、テーマの括りと命名を Claude が材料から行う（_cr §38）。
+        lines += render_today_roster(_roster_records, _material, desc_lookup=_desc)
+        # 初動候補テーマ（v16 / 2026-09-03）: 当日の統合テーマ行から「複数銘柄が同時に
+        # 点灯し、かつ実弾（売買代金）が入っている」ものだけを機械条件で拾う欄。
+        # 誌面位置は `## 本日のテーマ` の直後・`## 直近2週間の熱いテーマ` の前。
+        # 本日のテーマ欄・2週間欄との重複は除外せず、重複時は注記列で示す（PM 指示）。
+        # ここが失敗しても本体レポートは止めない（配信絶対の原則・_cr §36）。
+        try:
+            _lit_hist = compute_lit_history(trade_date=str(today))
+            _early = select_early_candidates(
+                _today_res.get("rows") or [], lit_history=_lit_hist
+            )
+            _today_labels = {
+                r.get("theme") for r in (_today_res.get("rows") or [])[:MAX_ROWS_TODAY_MAX]
+            }
+            lines += render_early_candidates(_early, today_labels=_today_labels)
+            # 2026-09-03 PM 決定: 枠5で誌面へ出しつつ、**ゲート通過前の上位10件全て**を
+            # 日次 parquet へ残す（3か月後に枠数・閾値を変えて再検証するため）。
+            try:
+                _pool = evaluate_early_pool(
+                    _today_res.get("rows") or [], lit_history=_lit_hist
+                )
+                _rec = append_early_candidates(
+                    _pool, today, shown_themes={r.get("theme") for r in _early}
+                )
+                if _rec:
+                    print(f"初動候補の日次記録: {_rec}（上位{len(_pool)}件）")
+            except Exception as _e:
+                print(f"  [WARN] append_early_candidates: {_e}")
+        except Exception as _e:
+            print(f"  [WARN] select_early_candidates: {_e}")
         # 熱量部はテーマごとのブロック（見出し行＋主導銘柄の4列表）。熱量降順・当日1位を必ず含める。
+        # own_theme_lookup: 過去に Claude が材料から作った自前テーマ名を優先表示する（改修4）。
         lines += render_heat_section(
-            _heat_res, today_result=_today_res, desc_lookup=_desc, material_lookup=_material
+            _heat_res,
+            today_result=_today_res,
+            desc_lookup=_desc,
+            material_lookup=_material,
+            own_theme_lookup=build_own_theme_lookup(trade_date=str(today)),
         )
         # 理由素材: raw 内に既にある動意理由（TDNet 開示タイトル・Yahoo ニュース見出し）を
         # 主導銘柄ごとに集めて別掲する。誌面には出さず Claude の「動いた理由」列の材料にする。
@@ -2176,6 +2342,15 @@ def main() -> None:
     except Exception as e:
         print(f"  [WARN] append_movers_history: {e}")
 
+    # 前日までの完成レポートから自前括りテーマを回収して蓄積（改修4）。
+    # 失敗しても本体レポートは止めない（配信絶対の原則）。
+    try:
+        _n_own = ingest_own_themes(today_dt)
+        if _n_own == 0:
+            print("自前括りテーマ: 直近レポートに OWN_THEMES_JSON ブロックなし")
+    except Exception as e:
+        print(f"  [WARN] ingest_own_themes: {e}")
+
     total_detail = len(detail_df["Code"].unique())
     print(f"注目銘柄（TDNet+Yahoo対象）: {total_detail} 銘柄")
 
@@ -2224,6 +2399,7 @@ def main() -> None:
         prev=prev_dt,
         hist_df=hist_df,
         quality_note=quality_note,
+        radar_df=radar_df,
     )
 
     # 検証時に本番 raw を上書きしないための逃がし口。未設定なら従来どおり market/daily/。

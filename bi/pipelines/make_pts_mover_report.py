@@ -71,12 +71,14 @@ from make_mover_report import (
 from theme_radar import (
     build_desc_lookup,
     build_material_lookup,
+    build_own_theme_lookup,
     compute_theme_heat_v2,
     detect_night,
     render_heat_section,
     render_internal_flags,
     render_reason_material,
     render_today_candidates,
+    render_today_roster,
 )
 
 BASE_DIR = Path(__file__).parent
@@ -700,10 +702,24 @@ def main() -> None:
         # （昼の動意レポートが同日分を既に保存しているため上書きしない）。
         _desc = build_desc_lookup(primary=_desc_today, trade_date=str(target))
         _material = build_material_lookup(primary=_material_today, trade_date=str(target))
-        lines += render_today_candidates(night, _material, pct_key="pts_pct", desc_lookup=_desc)
+        # 当夜部は母集団全銘柄の1行表（2026-09-02 PM 承認の改修1・2＝材料起点への転換）。
+        # 昼の動意レポートと同じ手順に揃える（辞書タグ起点の候補15件を廃止し、
+        # PTS 上昇銘柄を全件並べてテーマの括りと命名を Claude が材料から行う）。
+        lines += render_today_roster(
+            pts_risers,
+            _material,
+            desc_lookup=_desc,
+            pct_key="pts_pct",
+            heading="## 本夜の動意母集団（材料一覧・Claude がここからテーマを括る）",
+        )
         # 熱量表は熱量降順。当夜1位テーマは必ず含める（night を渡す）。
+        # own_theme_lookup: 過去に Claude が材料から作った自前テーマ名を優先表示する（改修4）。
         lines += render_heat_section(
-            heat, today_result=night, desc_lookup=_desc, material_lookup=_material
+            heat,
+            today_result=night,
+            desc_lookup=_desc,
+            material_lookup=_material,
+            own_theme_lookup=build_own_theme_lookup(trade_date=str(target)),
         )
         lines += render_reason_material(night, heat, _material)
         internal_flags += render_internal_flags(night)

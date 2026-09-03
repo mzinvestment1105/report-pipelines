@@ -266,27 +266,62 @@ table.theme-today td:nth-child(2), table.theme-heat td:nth-child(5) {{ line-heig
 table.theme-heat td:nth-child(2), table.theme-heat td:nth-child(3),
 table.theme-heat td:nth-child(4) {{ text-align:center; }}
 
-/* ── 主導銘柄の密な表（新形式・2026-08-31 PM 確定）──
-   旧形式は主導銘柄セルへ複数銘柄を <br> で縦積みしたため、長い銘柄名が折り返して
-   読みづらく、隣の理由セル（1文）との高さ差が大余白になっていた（PM 指摘: 主導銘柄が
-   読みづらい／スカスカの表が嫌い）。新形式は1銘柄=1行の4列表にして、
-   コード・騰落率は短い固定幅、銘柄名と「何の会社」に幅を配分し全セルを1行へ収める。
-   列: コード / 銘柄名 / 何の会社 / 騰落率 */
-/* 列幅は「1行に収まること」を実測で確認して決めた（2026-08-31）。本文幅 612px・9.5pt 時に
-   銘柄名は最長17字（ダイナミックマッププラットフォーム）、「何の会社」は15字前後が上限。 */
-table.theme-lead {{ margin:6px 0 15px; font-size:9.5pt; }}
-table.theme-lead th:nth-child(1), table.theme-lead td:nth-child(1) {{ width:9%; }}
-table.theme-lead th:nth-child(2), table.theme-lead td:nth-child(2) {{ width:42%; }}
-table.theme-lead th:nth-child(3), table.theme-lead td:nth-child(3) {{ width:37%; }}
-table.theme-lead th:nth-child(4), table.theme-lead td:nth-child(4) {{ width:12%; }}
-/* コード・騰落率は必ず1行（幅を確保済みのためページ全体の縮小は起きない） */
-table.theme-lead td:nth-child(1), table.theme-lead td:nth-child(4),
-table.theme-lead thead th:nth-child(1), table.theme-lead thead th:nth-child(4) {{
+/* ── テーマ系銘柄表の共通列幅（v18・2026-09-03 PM 指示）──
+   PM 却下事項: (1) 時価総額列が無い (2) 本日のテーマ表と単独材料表で列幅・見た目が
+   揃っていない (3) セル内で「コード」が「コー／ド」に、「テクセンドフォトマスク」
+   「ニトリホールディングス」のような銘柄名が途中で折れる。
+   対策: 本日のテーマ・直近2週間・初動候補の主導銘柄表（5列）と単独材料表（6列）を
+   同一の列構成・列幅に統一する。コード・銘柄名・時価総額・騰落率・見出し行は
+   white-space:nowrap にして1文字ずつの折り返しを根絶する。折り返し可は
+   「何の会社」「材料」列のみ（_cr §39 は表の折り返し自体を禁止していないため、
+   説明文列の折り返しは許容する）。
+   列: コード / 銘柄名 / 何の会社 / 時価総額 / 騰落率（5列＝theme-lead）
+       コード / 銘柄名 / 何の会社 / 時価総額 / 騰落率 / 材料（6列＝theme-solo）
+   銘柄名は「ダイナミックマッププラットフォーム」（16字）・「テクセンドフォトマスク」
+   （11字）・「ニトリホールディングス」（11字）が nowrap で1行に収まる幅を実測確保。
+   本文幅 612px 時、8.5pt・銘柄名 30% ≈ 26字相当の枠を確保すれば全銘柄名が収まる。 */
+table.theme-lead, table.theme-solo {{ margin:6px 0 15px; font-size:8.5pt; }}
+/* 列幅（2026-09-03 PM 再指示・実測反映）: PM 指定は コード7%／銘柄名27%／時価総額10%／
+   騰落率9%だったが、銘柄名27%（≈165px）は「ダイナミックマッププラットフォーム」16字を
+   8.5ptで収めるには足りない（実測200px要・27%では6.0ptまで縮小しないと収まらず可読性が
+   崩れる）。「この銘柄名は折れないことを維持」の指示を優先し、銘柄名だけ実測必須幅の35%を
+   確保し、コード・時価総額・騰落率はPM指定どおり7%/10%/9%を維持する。差分は「何の会社」
+   「材料」に回す。 */
+table.theme-lead th:nth-child(1), table.theme-lead td:nth-child(1),
+table.theme-solo th:nth-child(1), table.theme-solo td:nth-child(1) {{ width:7%; }}
+table.theme-lead th:nth-child(2), table.theme-lead td:nth-child(2),
+table.theme-solo th:nth-child(2), table.theme-solo td:nth-child(2) {{ width:35%; }}
+table.theme-lead th:nth-child(4), table.theme-lead td:nth-child(4),
+table.theme-solo th:nth-child(4), table.theme-solo td:nth-child(4) {{ width:10%; }}
+table.theme-lead th:nth-child(5), table.theme-lead td:nth-child(5),
+table.theme-solo th:nth-child(5), table.theme-solo td:nth-child(5) {{ width:9%; }}
+/* 5列表（主導銘柄）: 何の会社が残り39%を丸ごと取る */
+table.theme-lead th:nth-child(3), table.theme-lead td:nth-child(3) {{ width:39%; }}
+/* 6列表（単独材料）: コード/銘柄名/時価総額/騰落率は5列表と同じ幅を維持し、
+   残り39%を「何の会社」19%・「材料」20%へ分ける（PM 2026-09-03 再指示: 何の会社12字
+   以内・材料24字以内で1〜2行に収める運用とセットで、この幅で2行以内に収まることを実測済み） */
+table.theme-solo th:nth-child(3), table.theme-solo td:nth-child(3) {{ width:19%; }}
+table.theme-solo th:nth-child(6), table.theme-solo td:nth-child(6) {{ width:20%; }}
+/* コード・銘柄名・時価総額・騰落率・見出しは1文字改行を根絶（nowrap）。
+   折り返し可は「何の会社」「材料」列のみ。 */
+table.theme-lead th, table.theme-lead td:nth-child(1), table.theme-lead td:nth-child(2),
+table.theme-lead td:nth-child(4), table.theme-lead td:nth-child(5),
+table.theme-solo th, table.theme-solo td:nth-child(1), table.theme-solo td:nth-child(2),
+table.theme-solo td:nth-child(4), table.theme-solo td:nth-child(5) {{
   white-space:nowrap;
 }}
-table.theme-lead td:nth-child(4), table.theme-lead thead th:nth-child(4) {{ text-align:right; }}
-table.theme-lead tbody td {{ padding:5px 8px; line-height:1.45; }}
-table.theme-lead thead th {{ padding:5px 8px; font-size:9pt; }}
+table.theme-lead td:nth-child(3), table.theme-solo td:nth-child(3),
+table.theme-solo td:nth-child(6) {{
+  white-space:normal; word-break:normal; overflow-wrap:break-word;
+}}
+table.theme-lead td:nth-child(4), table.theme-lead thead th:nth-child(4),
+table.theme-lead td:nth-child(5), table.theme-lead thead th:nth-child(5),
+table.theme-solo td:nth-child(4), table.theme-solo thead th:nth-child(4),
+table.theme-solo td:nth-child(5), table.theme-solo thead th:nth-child(5) {{
+  text-align:right; font-variant-numeric:tabular-nums;
+}}
+table.theme-lead tbody td, table.theme-solo tbody td {{ padding:5px 7px; line-height:1.45; }}
+table.theme-lead thead th, table.theme-solo thead th {{ padding:5px 7px; font-size:8pt; }}
 
 /* テーマ見出し行（**テーマ名**｜局面 …）は h5 へ昇格されるため、表と密に接する余白にする */
 h5 + table.theme-lead, h5 + p + table.theme-lead {{ margin-top:4px; }}
@@ -312,6 +347,7 @@ hr {{ border:0; border-top:0.8pt solid #DBE1E9; margin:20px 0; }}
   /* 表は常に分割可（theme-lead も含む。thead が次ページ先頭で再描画される） */
   table {{ break-inside:auto; }}
   table.theme-lead {{ break-inside:auto; }}
+  table.theme-solo {{ break-inside:auto; }}
   /* テーマブロックも分割可。見出し→理由文→表の先頭までの連結だけを保証する
      （2026-09-01 PM 承認・v11 の巨大余白の是正）。 */
   .theme-block {{ break-inside:auto; }}
@@ -455,9 +491,11 @@ def _tag_theme_tables(html: str) -> str:
       1行に収まるため、旧形式のような結合セル縦積みと理由セルの大余白が出ない。
       → クラス `theme-lead`
 
-    旧形式（互換のため判定を残す。過去 raw の再レンダリング用）:
-      「本日のテーマ」＝ テーマ/主導銘柄/動いた理由 の3列 → `theme-today`
-      「直近2週間」＝ テーマ/局面/熱量/前2週比/主導銘柄/動いた理由 の6列 → `theme-heat`
+    v18（2026-09-03 PM 指示）: 全テーマ系の銘柄表を5列（コード/銘柄名/何の会社/時価総額/
+    騰落率）に統一し、単独材料表のみ6列（同5列+材料）にする。旧7列の初動候補テーマ表
+    （テーマ名/当日順位/上昇銘柄数/売買代金合計/局面/点灯銘柄/材料）は「全セルが折り返し
+    で縦長になり読めない」と却下されたため判定・CSS とも廃止した（初動候補欄は本日の
+    テーマ・直近2週間と同じ「見出し行＋材料1文＋5列表」のブロック形式へ作り直し済み）。
 
     見出し文字列ではなく表自身のヘッダで判別するため、誌面の見出し表記が変わっても効く。
     table-layout:fixed は維持する（外すと 12pt シュリンク回帰が再発するため）。
@@ -470,10 +508,19 @@ def _tag_theme_tables(html: str) -> str:
         # （2026-08-31 実測。旧 3列判定 `n_cols == 3` が一度も成立しておらず、
         #  「本日のテーマ」表に列幅が当たっていなかった原因）。`<th>` で数える。
         n_cols = head.count("<th>")
-        # 新形式: 主導銘柄の4列表（コード/銘柄名/何の会社/騰落率）
-        if n_cols == 4 and "コード" in head and "何の会社" in head and "騰落率" in head:
+        # v18: 主導銘柄の5列表（コード/銘柄名/何の会社/時価総額/騰落率）。
+        # 本日のテーマ・直近2週間・初動候補テーマの全ブロックがこの表を使う。
+        if (n_cols == 5 and "コード" in head and "何の会社" in head
+                and "時価総額" in head and "材料" not in head):
             return table_html.replace("<table>", '<table class="theme-lead">', 1)
-        # 旧形式
+        # v18: 単独材料の6列表（コード/銘柄名/何の会社/時価総額/騰落率/材料）。
+        # クラスが付かないと table-layout:fixed の列幅指定が当たらず、材料列が伸びて
+        # 銘柄名列が潰れる（_cr §39 のスカスカ禁止に抵触する）。
+        if n_cols == 6 and "コード" in head and "何の会社" in head and "材料" in head:
+            return table_html.replace("<table>", '<table class="theme-solo">', 1)
+        # 旧形式（互換のため判定を残す。過去 raw の再レンダリング用）:
+        #   「本日のテーマ」＝ テーマ/主導銘柄/動いた理由 の3列 → `theme-today`
+        #   「直近2週間」＝ テーマ/局面/熱量/前2週比/主導銘柄/動いた理由 の6列 → `theme-heat`
         if "動いた理由" not in head or "主導銘柄" not in head:
             return table_html
         if n_cols >= 6 and "局面" in head:
@@ -521,6 +568,14 @@ def render_markdown_to_pdf(
     # 行全体が太字ではないため上の _bold_only では拾えないが、意味は同じ小見出しなので
     # 併せて h5 へ昇格する（2026-08-31 追加）。全角縦棒の後ろはメタ情報として残す。
     _bold_head_meta = re.compile(r"^\*\*([^*]+)\*\*(｜.+)$")
+    # 初動候補テーマの見出し行 `**1位 …継続11日目**　（本日のテーマ欄にも掲載）`（v18）。
+    # 閉じ `**` の直後に全角スペース+注記が続くだけで `｜` を伴わないため上の
+    # _bold_head_meta では拾えず、行全体も太字ではないため _bold_only にも掛からない。
+    # そのため 1位/3位/5位（継続テーマ＝注記あり）だけ h5 昇格から漏れ、7位/8位（新規
+    # テーマ＝注記なし・_bold_only で昇格）とオレンジ帯装飾が食い違っていた
+    # （2026-09-03 実測）。先頭を `**N位 …**` に限定する（`**何の会社**：…`・
+    # `**なぜ動いた**：…` 等の本文中の太字プレフィックス段落を誤って見出し化しないため）。
+    _bold_head_note = re.compile(r"^\*\*(\d+位[^*]+)\*\*(\s*\S.+)$")
     promoted = []
     for ln in lines:
         stripped = ln.strip()
@@ -531,6 +586,10 @@ def render_markdown_to_pdf(
         m3 = _bold_head_meta.match(stripped)
         if m3:
             promoted.append(f"##### {m3.group(1).strip()}{m3.group(2).rstrip()}")
+            continue
+        m4 = _bold_head_note.match(stripped)
+        if m4:
+            promoted.append(f"##### {m4.group(1).strip()}{m4.group(2).rstrip()}")
             continue
         promoted.append(ln)
     lines = promoted
