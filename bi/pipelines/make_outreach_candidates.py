@@ -24,7 +24,7 @@
     C. 過去に自分がフォローしていて following から消えた相手（一度リム済み・反復禁止）
     D. friends_count >= 3000 / ff_ratio >= 2.0 / statuses_count <= 100 / bio 相互フォロー系 / 鍵 / influencers
     E. followers_count >= --max-followers（既定 600・PM 指示 2026-09-04）
-    E2. friends_count >= 300、フォロワーがフォロー数の 2 倍以上（ff_ratio <= 0.5）、
+    E2. friends_count >= 300、フォロワーがフォロー数の 1.1 倍を超える相手、
         またはフォロー数が取れていない相手（PM 指示 2026-09-04）
     E3. 名前・bio・投稿本文に日本語（ひらがな・カタカナ・漢字）が無い相手（海外アカウント）
     E4. 直近 14 日以内の活動（RT 者なら RT した投稿の投稿日時＝RT はそれ以降、バズ投稿者なら投稿日時）が
@@ -73,7 +73,9 @@ MAX_FRIENDS_OUTREACH = 300    # PM 指示 2026-09-04: フォロー数 300 以上
 DEFAULT_MAX_CANDIDATES = 30   # PM 指示 2026-09-04: 1 日の先行フォローは 30 件まで
                               # （実測で 39 件目まで成功し 40 件目に code=88 のレート制限へ到達したため）
 MAX_INACTIVE_DAYS = 14       # PM 指示 2026-09-04: 直近 2 週間に RT か投稿の実績が無い相手（動いていない）はフォローしない
-MIN_FF_RATIO = 0.5            # PM 指示 2026-09-04: フォロワーがフォロー数の 2 倍以上（FF比 0.5 以下）はフォローしない
+MIN_FF_RATIO = 1.0 / 1.1      # PM 指示 2026-09-04: フォロワーがフォロー数の 1.1 倍を超える相手は除外。
+                              # ff_ratio = フォロー数 ÷ フォロワー数 なので、この値（約 0.909）未満が除外。
+                              # 承認欲求の強い層を外し、フォロー数の方が多い相手を優先する。
 JP_RE = re.compile(r"[぀-ヿ一-鿿]")  # ひらがな・カタカナ・漢字
 
 # bio に含まれていたら金融・AI 系とみなすキーワード（小文字化して部分一致）
@@ -282,8 +284,8 @@ def judge_outreach(rec: dict, sn: str, followers_users: dict, following_users: d
         return "フォロー数不明（判定不能）", ""
     if friends >= MAX_FRIENDS_OUTREACH:
         return "フォロー数%d以上" % MAX_FRIENDS_OUTREACH, ""
-    if ratio <= MIN_FF_RATIO:
-        return "フォロワーがフォロー数の2倍以上", ""
+    if ratio < MIN_FF_RATIO:
+        return "フォロワーがフォロー数の1.1倍超", ""
     jp_text = " ".join([str(u.get("name") or ""), str(u.get("profile_bio") or "")] + list(rec.get("texts") or []))
     if not JP_RE.search(jp_text):
         return "日本語なし（海外アカウント）", ""
@@ -649,7 +651,7 @@ def build_js(account: str, target_date: str, targets: list, pool_n: int, exclude
         " * 【今回の対象】\n"
         " *   %s 時点の候補プール（金融キーワード投稿の RT 者・バズ投稿の投稿者）%d 件のうち、\n"
         " *   除外基準（既にフォロー関係あり・過去にリム済み・フォロー数 3000 以上・FF比 2.0 以上・\n"
-        " *   投稿数 100 以下・bio の相互フォロー狙い・鍵・別枠の情報源・フォロワー %d 以上・フォロー数 300 以上・フォロワーがフォロー数の 2 倍以上・海外・\n"
+        " *   投稿数 100 以下・bio の相互フォロー狙い・鍵・別枠の情報源・フォロワー %d 以上・フォロー数 300 以上・フォロワーがフォロー数の 1.1 倍超・海外・\n"
         " *   bio/投稿本文に金融/AI 語なし・前回対象済み）に触れた %d 件を外し、残る %d 件が対象です。\n"
         " *   並び順は FF比（フォロー数÷フォロワー数）の高い順＝フォロー返しの見込み順です。\n"
         " *\n"
@@ -769,7 +771,7 @@ def build_md(account: str, target_date: str, used_files: list, pool_n: int, foll
     a("- D. フォロー数 %d 以上・FF比 %s 以上・投稿数 %d 以下・bio の相互フォロー系語・鍵・x_influencers.yaml 記載 → 除外" % (
         fb.MAX_FRIENDS_COUNT, fb.MAX_FF_RATIO, fb.MIN_STATUSES_COUNT))
     a("- E. フォロワー %d 以上 → 除外（--max-followers で変更可）" % max_followers)
-    a("- E2. フォロー数 %d 以上、フォロワーがフォロー数の 2 倍以上、またはフォロー数が取れていない相手 → 除外" % MAX_FRIENDS_OUTREACH)
+    a("- E2. フォロー数 %d 以上、フォロワーがフォロー数の 1.1 倍を超える相手、またはフォロー数が取れていない相手 → 除外" % MAX_FRIENDS_OUTREACH)
     a("- E3. 名前・bio・投稿本文に日本語が無い相手（海外アカウント） → 除外")
     a("- E4. 直近 %d 日以内の活動（RT した投稿の投稿日以降に RT、または投稿）が確認できない相手 → 除外" % MAX_INACTIVE_DAYS)
     a("- F. bio（bio が無いバズ投稿者は投稿本文）に金融・AI のキーワードが無い → 除外。URL は除いて判定し、英数字の語は単語単位で一致させる")
