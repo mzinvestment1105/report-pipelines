@@ -270,8 +270,20 @@ jobs:
           EDINETDB_API_KEYS: ${{ secrets.EDINETDB_API_KEYS }}
           CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
 
-      - name: Wait before retry 2 (Claude overloaded 等の一時エラー)
+      # PM 2026-09-05 承認: 枠切れ（Spending cap reached）は待機しても同一 run 内では回復しない。
+      # 実測（2026-09-04 の夜間PTS動意 run）では枠切れ後の再試行が 1.5 秒で即時拒否されるだけで、
+      # 待機が枠のリセット（数十分先）に届かず、空振りが当日の自動リトライ上限を食い潰していた。
+      # よって枠切れを検出した試行の後続は打ち切る（一時障害のリトライは従来どおり残す）。
+      - name: Detect spending cap (attempt 1)
+        id: cap1
         if: success() && steps.gen1.outcome == 'failure'
+        env:
+          EXECUTION_FILE: ${{ steps.gen1.outputs.execution_file }}
+          ATTEMPT: '1'
+        run: bash report-pipelines/.github/scripts/detect_spending_cap.sh
+
+      - name: Wait before retry 2 (Claude overloaded 等の一時エラー)
+        if: success() && steps.gen1.outcome == 'failure' && steps.cap1.outputs.capped != 'true'
         env:
           TARGET_DATE: ${{ steps.date.outputs.value }}
         run: |
@@ -286,7 +298,7 @@ jobs:
 
       - name: Generate largecap weekly report via Claude Code (retry 2)
         id: gen2
-        if: success() && steps.gen1.outcome == 'failure'
+        if: success() && steps.gen1.outcome == 'failure' && steps.cap1.outputs.capped != 'true'
         continue-on-error: true
         uses: anthropics/claude-code-base-action@beta
         with:
@@ -305,8 +317,16 @@ jobs:
           EDINETDB_API_KEYS: ${{ secrets.EDINETDB_API_KEYS }}
           CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
 
-      - name: Wait before retry 3 (Claude overloaded 等の一時エラー)
+      - name: Detect spending cap (attempt 2)
+        id: cap2
         if: success() && steps.gen2.outcome == 'failure'
+        env:
+          EXECUTION_FILE: ${{ steps.gen2.outputs.execution_file }}
+          ATTEMPT: '2'
+        run: bash report-pipelines/.github/scripts/detect_spending_cap.sh
+
+      - name: Wait before retry 3 (Claude overloaded 等の一時エラー)
+        if: success() && steps.gen2.outcome == 'failure' && steps.cap2.outputs.capped != 'true'
         env:
           TARGET_DATE: ${{ steps.date.outputs.value }}
         run: |
@@ -321,7 +341,7 @@ jobs:
 
       - name: Generate largecap weekly report via Claude Code (retry 3)
         id: gen3
-        if: success() && steps.gen2.outcome == 'failure'
+        if: success() && steps.gen2.outcome == 'failure' && steps.cap2.outputs.capped != 'true'
         continue-on-error: true
         uses: anthropics/claude-code-base-action@beta
         with:
@@ -373,6 +393,19 @@ jobs:
             block "レポートが極端に短い（$LINES 行）・生成不完全とみなし送信中止"
           fi
           echo "exit_code=0" >> $GITHUB_OUTPUT
+
+      - name: 相互参照ゲート（警告のみ・配信は止めない）
+        # PM 2026-09-05 指示（_common_rules.md §40）: 誌面で他セクション・他順位・他銘柄行を
+        # 指し示す表記（「〜を参照」「前述」「上記の」「同上」「再掲」等）を全レポート種別で禁止する。
+        # 重複銘柄も各セクションで「何の会社」「なぜ動いた」を独立して書き切る。
+        # 検出は警告のみ（continue-on-error）で配信は止めない（§36 絶対配信原則との整合）。
+        # ログに残った検出は次回生成時に Claude が是正する。
+        continue-on-error: true
+        working-directory: ./private-repo
+        env:
+          PYTHONIOENCODING: utf-8
+        run: |
+          python bi/pipelines/lib/crossref_check.py --file market/daily/largecap/${{ steps.date.outputs.value }}.md || true
 
       - name: Send Discord (PDF)
         id: send

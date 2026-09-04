@@ -13,6 +13,10 @@ PM 2026-07-12 絶対配信原則: workflow は exit 3 でも送信を中止し�
 加えて各エントリ行に 終値・時価総額・売買代金 が全て揃っているかの完備ゲートも行うが、
 これは警告のみ（PM 2026-07-01・1銘柄の項目欠落で全体未達になる事故を回避）。
 数値欠落は make_mover_report の yfinance 補完で極力埋める。
+さらに誌面内の相互参照表記（「→ 値下がり N 位を参照」「前述」「上記の」等）を
+lib/crossref_check.py で機械検出する（_common_rules.md §40・PM 2026-09-05 指示）。
+これも警告のみで exit code を変えない（絶対配信原則）。重複銘柄は各セクションで
+「何の会社」「なぜ動いた」を独立して書き切る運用とし、検出はログで次回生成へ回す。
 
 規定数（日次・週次共通）:
   プライム  : 値上がり 5 / 値下がり 5 / 売買代金 5
@@ -30,6 +34,11 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+from pathlib import Path
+
+# lib/ を import path へ（bi/pipelines をどこから実行しても効くよう自ファイル基準）
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from lib.crossref_check import report_cross_references  # noqa: E402
 
 # Windows コンソール（cp932）でも日本語・記号で落ちないよう utf-8 へ寄せる
 for _s in (sys.stdout, sys.stderr):
@@ -45,7 +54,12 @@ EXPECTED = {
     "グロース":    {"値上がり": 5, "値下がり": 5, "売買代金": 10},
 }
 
-TITLE_RE   = re.compile(r"^#\s*動意銘柄レポート", )
+# 市場区切り h1（2026-09-04 PM 指示で `# 動意銘柄レポート {date}（グロース）` から
+# `# グロース市場` へ変更。誌面で「レポート題名」に見え、帯が2行に折れたため）。
+# 旧形式（動意銘柄レポート …（市場名））も受け付けて過去 md の再検査を壊さない。
+TITLE_RE   = re.compile(r"^#\s*(?:プライム|スタンダード|グロース)市場\s*$|^#\s*動意銘柄レポート")
+# 文書タイトル（マストヘッド用・日付ゲートの検査対象）。
+DOC_TITLE_RE = re.compile(r"^#\s*動意銘柄レポート")
 SECTION_RE = re.compile(r"^##\s*(値上がり|値下がり|売買代金)")
 ENTRY_RE   = re.compile(r"^###\s")
 
@@ -147,7 +161,17 @@ def main() -> int:
     # 統合 md の全タイトル行（# 動意銘柄レポート …）が対象日文字列を含むことを機械検査し、
     # 別日付レポートの誤配信を送信前に止める（exit 3 = ⛔ 送信中止）。
     if args.date:
-        title_lines = [ln for ln in text.splitlines() if TITLE_RE.match(ln)]
+        # 2026-09-04: 市場 h1 は `# グロース市場` で日付を持たないため、日付ゲートは
+        # 文書タイトル（`# 動意銘柄レポート {date}`）だけを検査する。統合 md では
+        # send_report_pdf_discord が先頭へ 1 本置く（旧形式の md では市場行が該当する）。
+        title_lines = [ln for ln in text.splitlines() if DOC_TITLE_RE.match(ln)]
+        if not title_lines:
+            # 市場 h1 が `# グロース市場` になった 2026-09-04 以降、誌面 md 自体には
+            # 日付を持つ行が無い場合がある。その場合は市場 h1 の存在で分割健全性だけを見て、
+            # 日付照合は raw 側の対象日ゲート（プロンプト §手順）に委ねる。
+            # 日付を持つ行が1本も無いこと自体は異常ではないため失敗にしない。
+            print(f"[日付ゲート] 文書タイトル行なし（市場 h1 は {len(parse_blocks(text))} 本）"
+                  f"→ 日付照合はスキップ")
         bad_titles = [ln for ln in title_lines if args.date not in ln]
         print(f"[日付ゲート] タイトル {len(title_lines)} 件中 対象日 {args.date} 一致 "
               f"{len(title_lines) - len(bad_titles)} 件")
@@ -182,6 +206,10 @@ def main() -> int:
             if fatal:
                 print(f"[完備ゲート] {market} 項目欠落[{'/'.join(fatal)}]: {head}", file=sys.stderr)
                 failures.append(f"{market} エントリ項目欠落[{'/'.join(fatal)}]: {head}")
+
+    # 相互参照ゲート（_common_rules.md §40・PM 2026-09-05）: 警告のみ・exit code は変えない。
+    # 「→ 値下がり N 位を参照」等の省略表記を検知してログへ出し、次回生成で是正させる。
+    report_cross_references(text)
 
     if failures:
         print("\n[件数ゲート] [NG] 品質ゲート不合格 (exit 3)。workflow が冒頭に品質注記を挿入して"

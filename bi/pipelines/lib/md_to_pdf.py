@@ -133,23 +133,24 @@ body {{
 .masthead h1 {{
   font-family:{serif}; font-weight:700; font-size:24pt; color:#1A1A1A;
   margin:0 0 8px; line-height:1.32; letter-spacing:.01em; text-align:left;
-  /* PM 2026-09-03 回帰修正: 本文中の h1（市場区切り帯）用のグローバル h1 ルールが
-     background/padding/border-left を持つため、マストヘッドのタイトルまで塗り帯化していた。
-     マストヘッドは帯装飾を明示的に打ち消す（グローバル h1 側は動意の区切り帯に必要なので変更しない）。 */
-  background:none; padding:0; border-left:none;
 }}
 .masthead .meta {{ font-size:10pt; color:#6B7686; font-weight:500; letter-spacing:.02em; }}
 .masthead .meta .brand {{ color:#1A1A1A; font-weight:700; letter-spacing:.06em; }}
 
 /* ── 市場区切り見出し（本文中の h1）──
-   PM 2026-09-02 確定: 動意レポートを 1 本の PDF へ統一したため、2 本目以降の
-   `# 動意銘柄レポート YYYY-MM-DD（市場名）` が本文中に残る（先頭 1 本だけがマストヘッドへ昇格）。
-   マストヘッドと紛れない「市場の区切り帯」として、アクセント色の塗り帯で明示する。
+   PM 2026-09-02 確定: 動意レポートを 1 本の PDF へ統一したため、市場区切りの h1 が
+   本文中に残る（先頭 1 本だけがマストヘッドへ昇格）。
+   PM 2026-09-04 指示: 文言を `# グロース市場` 等（市場名のみ・1 行）へ変更した。
+   旧 `# 動意銘柄レポート YYYY-MM-DD（グロース）` は「レポート題名」に見えるうえ
+   帯の中で 2 行に折れて読みにくかった。white-space:nowrap で 1 行に固定する。
+   PM 2026-09-05 指示: 見出しへの背景塗り帯・白抜き文字・装飾バーを全面廃止し、
+   素のタイトル表記（太字・サイズ・文字色のみ）へ戻す（_cr §41）。
    強制改ページ（break-before:page）は掛けない（_cr §39 の 1/3 空白禁止に抵触するため）。 */
 h1 {{
-  font-family:{serif}; font-weight:700; font-size:19pt; color:#FFFFFF;
-  background:{accent}; margin:30px 0 14px; padding:11px 14px;
-  line-height:1.35; letter-spacing:.02em; text-align:left;
+  font-family:{serif}; font-weight:700; font-size:22pt; color:#1A1A1A;
+  margin:32px 0 15px; padding:0;
+  line-height:1.25; letter-spacing:.04em; text-align:left;
+  white-space:nowrap; overflow:hidden;
 }}
 
 /* ── 見出し（1.25 タイポグラフィックスケール）── */
@@ -163,11 +164,11 @@ h3 {{
   letter-spacing:.02em; text-align:left;
 }}
 h4 {{ font-size:12pt; font-weight:700; color:#3C4A63; margin:13px 0 5px; text-align:left; }}
-/* ── h5 = テーマ内の小見出し（「何が起きたか」等）。色付き＋左バーでインライン太字と明確に区別 ── */
+/* ── h5 = テーマ内の小見出し（「何が起きたか」等）。色付きでインライン太字と区別する。
+   PM 2026-09-05 指示: 見出しの背景塗り・装飾バーは全面禁止（_cr §41）。 ── */
 h5 {{
   font-size:11pt; font-weight:700; color:{accent};
-  margin:17px 0 6px; padding:5px 11px;
-  background:#EEF3FA; border-left:4.5pt solid {accent};
+  margin:17px 0 6px; padding:0;
   letter-spacing:.06em; text-align:left;
 }}
 

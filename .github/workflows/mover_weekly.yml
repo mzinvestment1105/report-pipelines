@@ -500,8 +500,11 @@ jobs:
     # 流用してレポートを生成していたため、5/29 週次が 5/22 内容の使い回しになる事故が発生。
     # PM 2026-07-12: 週間ランキング parquet 生成 step（make_sector_report.py・約 5〜15 分）を
     # 追加したため 20 分では不足。movers raw 生成（スクレイピング遅延日あり）と合わせ 40 分へ。
+    # PM 2026-09-05: d0f7f85 で取得母集団が 50 銘柄 → 255 銘柄（5.1 倍）へ拡大したため 40 分では不足し、
+    # 9/5 週次が「Generate movers raw」step の 40 分ちょうどで強制打ち切り（191/255 銘柄目）となった。
+    # 同じ 255 銘柄で完走している日次（mover_report_daily.yml の setup-raw）と揃えて 90 分へ。
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 90
     # 実生成の入口だけを直列化する（workflow 単位の concurrency は本命の金曜 22:43 発火を塞ぐため置かない）。
     concurrency:
       group: mover_weekly-setup-raw
@@ -860,8 +863,20 @@ jobs:
           JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
           CLAUDE_CODE_MAX_OUTPUT_TOKENS: 64000
 
-      - name: Wait before retry 2 (Claude overloaded 等の一時エラー)
+      # PM 2026-09-05 承認: 枠切れ（Spending cap reached）は待機しても同一 run 内では回復しない。
+      # 実測（2026-09-04 の夜間PTS動意 run）では枠切れ後の再試行が 1.5 秒で即時拒否されるだけで、
+      # 待機が枠のリセット（数十分先）に届かず、空振りが当日の自動リトライ上限を食い潰していた。
+      # よって枠切れを検出した試行の後続は打ち切る（一時障害のリトライは従来どおり残す）。
+      - name: Detect spending cap (attempt 1)
+        id: cap1
         if: success() && steps.gen1.outcome == 'failure'
+        env:
+          EXECUTION_FILE: ${{ steps.gen1.outputs.execution_file }}
+          ATTEMPT: '1'
+        run: bash report-pipelines/.github/scripts/detect_spending_cap.sh
+
+      - name: Wait before retry 2 (Claude overloaded 等の一時エラー)
+        if: success() && steps.gen1.outcome == 'failure' && steps.cap1.outputs.capped != 'true'
         env:
           TARGET_DATE: ${{ needs.setup-raw.outputs.target_date }}
           TARGET_MARKET: ${{ matrix.market }}
@@ -877,7 +892,7 @@ jobs:
 
       - name: Generate ${{ matrix.market }} market section via Claude Code (retry 2)
         id: gen2
-        if: success() && steps.gen1.outcome == 'failure'
+        if: success() && steps.gen1.outcome == 'failure' && steps.cap1.outputs.capped != 'true'
         continue-on-error: true
         uses: anthropics/claude-code-base-action@beta
         with:
@@ -896,8 +911,16 @@ jobs:
           JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
           CLAUDE_CODE_MAX_OUTPUT_TOKENS: 64000
 
-      - name: Wait before retry 3 (Claude overloaded 等の一時エラー)
+      - name: Detect spending cap (attempt 2)
+        id: cap2
         if: success() && steps.gen2.outcome == 'failure'
+        env:
+          EXECUTION_FILE: ${{ steps.gen2.outputs.execution_file }}
+          ATTEMPT: '2'
+        run: bash report-pipelines/.github/scripts/detect_spending_cap.sh
+
+      - name: Wait before retry 3 (Claude overloaded 等の一時エラー)
+        if: success() && steps.gen2.outcome == 'failure' && steps.cap2.outputs.capped != 'true'
         env:
           TARGET_DATE: ${{ needs.setup-raw.outputs.target_date }}
           TARGET_MARKET: ${{ matrix.market }}
@@ -913,7 +936,7 @@ jobs:
 
       - name: Generate ${{ matrix.market }} market section via Claude Code (retry 3)
         id: gen3
-        if: success() && steps.gen2.outcome == 'failure'
+        if: success() && steps.gen2.outcome == 'failure' && steps.cap2.outputs.capped != 'true'
         continue-on-error: true
         uses: anthropics/claude-code-base-action@beta
         with:
@@ -1095,10 +1118,13 @@ jobs:
           name: movers-raw-${{ needs.setup-raw.outputs.target_date }}
           path: /tmp/movers-raw
 
-      - name: 品質検査（件数/タイトル日付・不合格でも送信は止めない）
+      - name: 品質検査（件数/タイトル日付/相互参照・不合格でも送信は止めない）
         # PM 2026-07-12 改定（絶対配信原則）: check_mover_counts の exit 3（品質不合格）は検知
         # シグナルとして受けて step は成功で通し、次の注記挿入 step が品質注記を機械挿入して
         # 必ず配信する（旧「⛔ 送信中止＝未配信」は PM 却下）。--date でタイトル日付検知も適用。
+        # PM 2026-09-05 追加: check_mover_counts は誌面内の相互参照表記（「→ 値下がり N 位を参照」等・
+        # _common_rules.md §40）も lib/crossref_check.py で検出しログへ出す。これは警告のみで
+        # exit code を変えないため配信は止まらない（絶対配信原則）。次回生成で Claude が是正する。
         # exit 1（ファイル読込不可等のインフラ失敗）のみ step 失敗（❌）。
         id: gate
         working-directory: ./private-repo
