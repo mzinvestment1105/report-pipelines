@@ -70,7 +70,9 @@ COOLDOWN_MIN = fb.COOLDOWN_MIN
 POOL_DAYS = 60            # 対象日からこの日数以内の候補プールだけを使う
 DEFAULT_MAX_FOLLOWERS = 600   # PM 指示 2026-09-04: フォロワー 600 以上はフォローしない
 MAX_FRIENDS_OUTREACH = 300    # PM 指示 2026-09-04: フォロー数 300 以上はフォローしない
-MAX_INACTIVE_DAYS = 14        # PM 指示 2026-09-04: 直近 2 週間に RT か投稿の実績が無い相手（動いていない）はフォローしない
+DEFAULT_MAX_CANDIDATES = 30   # PM 指示 2026-09-04: 1 日の先行フォローは 30 件まで
+                              # （実測で 39 件目まで成功し 40 件目に code=88 のレート制限へ到達したため）
+MAX_INACTIVE_DAYS = 14       # PM 指示 2026-09-04: 直近 2 週間に RT か投稿の実績が無い相手（動いていない）はフォローしない
 MIN_FF_RATIO = 0.5            # PM 指示 2026-09-04: フォロワーがフォロー数の 2 倍以上（FF比 0.5 以下）はフォローしない
 JP_RE = re.compile(r"[぀-ヿ一-鿿]")  # ひらがな・カタカナ・漢字
 
@@ -465,6 +467,61 @@ def patched_js_body() -> str:
         "    );\n",
         "終了時クールダウン案内",
     )
+    # --- レート制限（code=88 / HTTP 429）で即時全停止（PM 指示 2026-09-04）-----
+    # 実測: 39 件目まで成功し 40 件目で code=88 が出た（2026-09-04）。
+    # 連続失敗 3 件を待たずに 1 件目の制限で止め、成功件数を明示する。
+    body = _replace_once(
+        body,
+        "    if (json && Array.isArray(json.errors) && json.errors.length > 0) {\n"
+        "      const e0 = json.errors[0];\n"
+        "      return {\n"
+        "        ok: false,\n"
+        '        reason: "API エラー code=" + e0.code + " " + e0.message,\n'
+        "        status: res.status,\n"
+        "      };\n"
+        "    }\n"
+        "    if (!res.ok) {\n"
+        '      return { ok: false, reason: "HTTP " + res.status, status: res.status };\n'
+        "    }\n",
+        "    if (json && Array.isArray(json.errors) && json.errors.length > 0) {\n"
+        "      const e0 = json.errors[0];\n"
+        "      // code=88 (Rate limit exceeded) / HTTP 429 は X 側の回数制限。\n"
+        "      // 続けても全て失敗し検知を強めるだけなので、その場で全停止する。\n"
+        "      const limited =\n"
+        "        e0.code === 88 || res.status === 429 || /rate limit/i.test(String(e0.message || \"\"));\n"
+        "      return {\n"
+        "        ok: false,\n"
+        "        rateLimited: limited,\n"
+        '        reason: "API エラー code=" + e0.code + " " + e0.message,\n'
+        "        status: res.status,\n"
+        "      };\n"
+        "    }\n"
+        "    if (!res.ok) {\n"
+        "      return {\n"
+        "        ok: false,\n"
+        "        rateLimited: res.status === 429,\n"
+        '        reason: "HTTP " + res.status,\n'
+        "        status: res.status,\n"
+        "      };\n"
+        "    }\n",
+        "レート制限の検知",
+    )
+    body = _replace_once(
+        body,
+        "    if (consecutiveFail >= MAX_CONSECUTIVE_FAIL) {\n",
+        "    // レート制限に当たったら連続失敗の判定を待たずに即停止する\n"
+        "    if (r.rateLimited === true) {\n"
+        "      console.warn(\n"
+        '        "[全停止] X のフォロー回数制限に達しました（' + "code=88 / HTTP 429" + '）。" +\n'
+        '          "この実行では " + okCount + " 件フォローできました。時間を空けてから貼り直してください。"\n'
+        "      );\n"
+        '      stoppedReason = "レート制限（この実行での成功 " + okCount + " 件）";\n'
+        "      break;\n"
+        "    }\n"
+        "\n"
+        "    if (consecutiveFail >= MAX_CONSECUTIVE_FAIL) {\n",
+        "レート制限での即時停止",
+    )
     for old, new in (
         ('"fb_done_$key"', '"ob_done_$key"'),
         ('"fb_lastrun_$key"', '"ob_lastrun_$key"'),
@@ -732,7 +789,8 @@ def main() -> int:
     p.add_argument("--account", default="noctra__ai", help="対象アカウントの screen_name（既定 noctra__ai）")
     p.add_argument("--dry-run", action="store_true", help="ファイルを出力せず件数だけ表示する")
     p.add_argument("--no-like", action="store_true", help="生成する JS でいいねを行わない")
-    p.add_argument("--max-candidates", type=int, default=100, help="CSV / JS に載せる対象の上限（既定 100）")
+    p.add_argument("--max-candidates", type=int, default=DEFAULT_MAX_CANDIDATES,
+                   help="1 日の先行フォロー上限（既定 %d・PM 指示 2026-09-04）" % DEFAULT_MAX_CANDIDATES)
     p.add_argument("--max-followers", type=int, default=DEFAULT_MAX_FOLLOWERS,
                    help="この値以上のフォロワー数は除外（既定 %d）" % DEFAULT_MAX_FOLLOWERS)
     args = p.parse_args()
