@@ -68,8 +68,8 @@ MAX_PER_RUN = fb.MAX_PER_RUN
 COOLDOWN_MIN = fb.COOLDOWN_MIN
 
 POOL_DAYS = 60            # 対象日からこの日数以内の候補プールだけを使う
-DEFAULT_MAX_FOLLOWERS = 600   # PM 指示 2026-09-04: フォロワー 600 以上はフォローしない
-MAX_FRIENDS_OUTREACH = 300    # PM 指示 2026-09-04: フォロー数 300 以上はフォローしない
+DEFAULT_MAX_FOLLOWERS = 1000  # PM 指示 2026-09-04: フォロワー 1000 以上はフォローしない（当初 600 → 候補確保のため緩和）
+MAX_FRIENDS_OUTREACH = 800    # PM 指示 2026-09-04: フォロー数 800 以上はフォローしない（当初 300 → 候補確保のため緩和）
 DEFAULT_MAX_CANDIDATES = 30   # PM 指示 2026-09-04: 1 日の先行フォローは 30 件まで
                               # （実測で 39 件目まで成功し 40 件目に code=88 のレート制限へ到達したため）
 MAX_INACTIVE_DAYS = 14       # PM 指示 2026-09-04: 直近 2 週間に RT か投稿の実績が無い相手（動いていない）はフォローしない
@@ -271,6 +271,12 @@ def judge_outreach(rec: dict, sn: str, followers_users: dict, following_users: d
     if sn in unfollowed_history:
         return "過去にリム済み", ""
     reason = fb.judge(u, sn, exclusions, unfollowed_history)
+    # フォロバ側から継承した「FF比 2.0 以上」は、自分から多くフォローする相手を弾く基準であり、
+    # 先行フォローの方針（フォロー数の多い相手を優先する）と正面から矛盾する。
+    # 先行フォローでは E2 の下限（MIN_FF_RATIO）だけで判定するため、この理由は採用しない。
+    # PM 指示 2026-09-04。
+    if reason == "FF比2.0以上":
+        reason = None
     if reason:
         return reason, ""
     followers = fb.to_int(u.get("followers_count"))
