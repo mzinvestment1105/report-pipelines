@@ -16,9 +16,16 @@
 #     workflow_file : 例 pts_mover_report.yml
 #     send_job      : 配信/更新を実際に行うジョブ名（例 build-and-send / merge-and-send / generate / update）
 #     self_run_id   : 集計から除外する自分の run id（省略/0 で除外なし）
-#     since_iso8601 : 集計開始時刻（省略時は当日 00:00 JST）
+#     since_iso8601 : 集計開始時刻（省略時は TARGET_DATE_JST の 00:00 JST）
 #
 # 必要な環境変数: GH_TOKEN（actions:read 権限）・GITHUB_REPOSITORY
+#
+# 任意の環境変数（2026-09-04 追加・完全な後方互換）:
+#   TARGET_DATE_JST : 集計対象の JST 日付（YYYY-MM-DD）。未指定なら従来どおり「実行時点の JST 日付」。
+#       深夜に遅延着火した cron が「前日分」を判定したい場合に、呼び出し側が対象日を明示するための口。
+#       第 4 引数 since が明示された場合は従来どおり since が優先される（既存 14 箇所の呼び出しは不変）。
+#   UNTIL_JST_END   : "true" のとき集計の上端を TARGET_DATE_JST の 23:59:59 JST に閉じる。
+#       既定は従来どおり上端なし（未来方向は開区間）。対象日を過去日に固定して数える時のみ使う。
 #
 # 標準出力: 1 行の JSON
 #   {"today":"YYYY-MM-DD","since":"...","total":N,"delivered":N,"sending":N,
@@ -38,13 +45,28 @@ SELF_RUN_ID="${3:-0}"
 SINCE="${4:-}"
 REPO="${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required}"
 
-TODAY_JST=$(TZ=Asia/Tokyo date +%Y-%m-%d)
+# 集計対象の JST 日付。TARGET_DATE_JST が与えられていればそれを、無ければ実行時点の JST 日付を使う。
+# （遅延着火した深夜 cron が「前日分」を数えられるようにするための唯一の変更点。既定動作は不変。）
+TODAY_JST="${TARGET_DATE_JST:-$(TZ=Asia/Tokyo date +%Y-%m-%d)}"
 if [ -z "$SINCE" ]; then
   SINCE="${TODAY_JST}T00:00:00+09:00"
 fi
 
+# GitHub の created フィルタは下端のみ。対象日を過去日に固定して数える場合、
+# 「対象日の翌日以降に作られた run」まで巻き込むため、必要なときだけ上端で切る。
+UNTIL=""
+if [ "${UNTIL_JST_END:-false}" = "true" ]; then
+  UNTIL="${TODAY_JST}T23:59:59+09:00"
+fi
+
+if [ -n "$UNTIL" ]; then
+  CREATED_FILTER="${SINCE}..${UNTIL}"
+else
+  CREATED_FILTER=">=${SINCE}"
+fi
+
 RUNS=$(gh api -X GET "repos/${REPO}/actions/workflows/${WF}/runs" \
-  -f "created=>=${SINCE}" \
+  -f "created=${CREATED_FILTER}" \
   -f per_page=50 \
   --jq "[.workflow_runs[] | select(.id != ${SELF_RUN_ID}) | {id: .id, event: .event, status: .status, conclusion: (.conclusion // \"none\")}]")
 

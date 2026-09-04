@@ -15,12 +15,28 @@ name: マクロ市況ツイート日次
   #   本 workflow の待ち対象を本来の依存先である夕刊マクロへ戻す。
   #   （ツイートの第一ソースは夕刊本文であり、price_history はセクター欄の補助入力にすぎない。）
   #
+  # PM 2026-09-04 修正（「トークンを無駄にしない」と「失敗しない」の両立）:
+  #   2026-09-03 の実測 2 件から、未発行の原因は 2 つとも「生成品質」ではなく運用設計だった。
+  #     Run1 (workflow_run / 22:46 JST): Claude が 2 回とも API Error: 529 overloaded_error。
+  #       529 はリクエスト自体が拒否されるため実測 input_tokens=0 / output_tokens=0 /
+  #       total_cost_usd=0（run ログの result JSON で確認済み）。つまり一時障害であり、
+  #       粘って再試行するのが正しい。当時は待機 60 秒・計 2 回で力尽きていた。
+  #     Run2 (schedule / cron 0 12): GitHub cron の遅延で 15:15Z = 翌 9/4 00:15 JST に着火。
+  #       時間帯ゲート（JST 17 時未満は skip）に弾かれ、かつ TODAY_JST が 9/4 になるため
+  #       対象日もズレていた。救援枠が救援にならない状態だった。
+  #
   # トリガー設計:
   #   (1) workflow_run（主経路）= 夕刊マクロの完走を受けて起動する。夕刊本文がツイートの
   #       素材なので、夕刊が出た直後が最短・最確実な発行タイミング。success の時のみ先へ進む。
   #   (2) workflow_dispatch = 手動リカバリ用。
-  #   (3) schedule（フェイルセーフ）= UTC 12:00（JST 21:00 起票）。夕刊が失敗した日でも
-  #       夕刊本文が揃っていれば拾える。guard で当日成功済みなら無害に skip される。
+  #   (3) schedule（フェイルセーフ）= 2 枠に増設。GitHub cron の実測遅延は +1h45m〜+3h15m。
+  #         30 10 * * 1-5 = JST 19:30 起票（最悪 +3h15m でも 22:45 JST＝当日中に着地）
+  #         0  12 * * 1-5 = JST 21:00 起票（従来枠。19:30 枠も落ちた日の最後の砦）
+  #
+  #   ★枠を 2 つにしてもトークンは増えない★
+  #     guard は Claude を一切呼ばない（GitHub API を読むだけ）。主経路が成功した日は
+  #     delivered>0 となり両枠とも guard だけで skip して終わる ＝ 追加トークン消費ゼロ。
+  #     生成が走るのは「当日まだ成功していない日」に限られる。
   workflow_run:
     workflows: ["マクロレポート夕刊"]
     types:
@@ -36,6 +52,7 @@ name: マクロ市況ツイート日次
         required: false
         default: 'false'
   schedule:
+    - cron: '30 10 * * 1-5'
     - cron: '0 12 * * 1-5'
 
 # 二重発火を GHA 内部ロックで防ぐ（macro_report_evening.yml と同じ固定 group 方式）。
@@ -45,17 +62,21 @@ concurrency:
 
 jobs:
   guard:
-    # 判定: (1) workflow_run 起点で夕刊マクロが success でない → skip
-    #       (2) cron 起動かつ JST 17 時未満 → skip（深夜着火が翌 JST 日の枠を消費する事故の防止）
-    #       (3) DONE_OK >= 1 → skip（当日すでに生成済み）
-    #       (4) ACTIVE >= 1 → skip（走行中の run あり）
-    #       (5) cron 起動かつ DONE_FAIL >= 2 → skip（連続失敗の課金暴走防止）
-    #       (6) それ以外 → proceed
+    # 判定順:
+    #   (0) 対象日 TARGET_DATE を決める。schedule 起動が JST 00:00〜04:59 の場合は
+    #       「前日分の遅延着火」とみなして前日へ補正する（従来はここで無条件 skip し、
+    #        救援枠を自ら捨てていた）。05:00〜16:59 の schedule は従来どおり skip。
+    #   (1) workflow_run 起点で夕刊マクロが success でない → skip
+    #   (2) DONE_OK >= 1 → skip（対象日すでに生成済み＝ここで Claude を呼ばずに終わる）
+    #   (3) ACTIVE >= 1 → skip（走行中の run あり）
+    #   (4) DONE_FAIL >= 3 → skip（暴走防止の上限。529 が長時間続く日の打ち切り）
+    #   (5) それ以外 → proceed（DONE_FAIL>=1 かつ DONE_OK==0 なら recovery）
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
       proceed: ${{ steps.check.outputs.proceed }}
       reason: ${{ steps.check.outputs.reason }}
+      target_date: ${{ steps.check.outputs.target_date }}
     steps:
       # 通知 composite action（.github/actions/notify-discord）を使うため checkout が必要
       - name: Checkout report-pipelines (通知 action 用)
@@ -65,65 +86,16 @@ jobs:
         id: check
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MY_RUN_ID: ${{ github.run_id }}
+          EVENT: ${{ github.event_name }}
+          UPSTREAM_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          FORCE_RERUN: ${{ github.event.inputs.force_rerun }}
+          INPUT_DATE: ${{ github.event.inputs.target_date }}
         run: |
-          TODAY_JST=$(TZ=Asia/Tokyo date +%Y-%m-%d)
-          MY_RUN_ID=${{ github.run_id }}
-          EVENT="${{ github.event_name }}"
-          UPSTREAM_CONCLUSION="${{ github.event.workflow_run.conclusion }}"
-
-          # force_rerun は「手動 workflow_dispatch かつ明示 true」の時のみ有効（誤再発火防止）。
-          if [ "$EVENT" = "workflow_dispatch" ] && [ "${{ github.event.inputs.force_rerun }}" = "true" ]; then
-            echo "proceed=true" >> $GITHUB_OUTPUT
-            echo "reason=force_rerun (manual guard bypass)" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
-          # workflow_run 起点は、上流（夕刊マクロ）が success した時のみ先へ進む。
-          # 失敗した日はツイートの第一ソースである夕刊本文が存在せず、
-          # 後段の precheck でどうせ skip されるため（無駄な Claude 起動を避ける）。
-          if [ "$EVENT" = "workflow_run" ] && [ "$UPSTREAM_CONCLUSION" != "success" ]; then
-            echo "proceed=false" >> $GITHUB_OUTPUT
-            echo "reason=skip (upstream macro_report_evening conclusion=${UPSTREAM_CONCLUSION})" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
-          # 実際に生成/送信を行うジョブ（generate）の結果だけで当日実績を判定する
-          # （guard が本体を skip した run まで success と数える誤認を避ける）。
-          STATS=$(bash .github/scripts/check_delivery.sh macro_tweet_daily.yml generate "${MY_RUN_ID}")
-          DONE_OK=$(echo "$STATS" | jq -r '.delivered')
-          DONE_FAIL=$(echo "$STATS" | jq -r '.failed')
-          ACTIVE=$(( $(echo "$STATS" | jq -r '.sending') + $(echo "$STATS" | jq -r '.dispatch_pending') + $(echo "$STATS" | jq -r '.schedule_pending') ))
-
-          echo "Today (${TODAY_JST}): active=${ACTIVE} done_ok=${DONE_OK} done_fail=${DONE_FAIL} event=${EVENT} upstream=${UPSTREAM_CONCLUSION} (excluding self ${MY_RUN_ID})"
-
-          echo "active=${ACTIVE}" >> $GITHUB_OUTPUT
-          echo "done_ok=${DONE_OK}" >> $GITHUB_OUTPUT
-          echo "done_fail=${DONE_FAIL}" >> $GITHUB_OUTPUT
-
-          # GitHub cron は数時間遅延し、深夜着火すると翌 JST 日の枠を誤って消費する。
-          # schedule(cron) 起動のみ時間帯ゲートで無害化する（ツイートの妥当な発行帯 = JST 17〜23 時）。
-          HOUR_JST=$((10#$(TZ=Asia/Tokyo date +%H)))
-
-          if [ "$EVENT" = "schedule" ] && [ "$HOUR_JST" -lt 17 ]; then
-            echo "proceed=false" >> $GITHUB_OUTPUT
-            echo "reason=skip (cron outside evening window: ${HOUR_JST}h JST)" >> $GITHUB_OUTPUT
-          elif [ "$DONE_OK" -gt 0 ]; then
-            echo "proceed=false" >> $GITHUB_OUTPUT
-            echo "reason=skip (already succeeded today: done_ok=${DONE_OK})" >> $GITHUB_OUTPUT
-          elif [ "$ACTIVE" -gt 0 ]; then
-            echo "proceed=false" >> $GITHUB_OUTPUT
-            echo "reason=skip (active run exists: active=${ACTIVE})" >> $GITHUB_OUTPUT
-          elif [ "$EVENT" = "schedule" ] && [ "$DONE_FAIL" -ge 2 ]; then
-            echo "proceed=false" >> $GITHUB_OUTPUT
-            echo "reason=retry_cap (cron stopped: done_fail=${DONE_FAIL} >= 2)" >> $GITHUB_OUTPUT
-          else
-            echo "proceed=true" >> $GITHUB_OUTPUT
-            if [ "$DONE_FAIL" -gt 0 ]; then
-              echo "reason=recovery (done_fail=${DONE_FAIL})" >> $GITHUB_OUTPUT
-            else
-              echo "reason=initial" >> $GITHUB_OUTPUT
-            fi
-          fi
+          # 判定ロジック本体は .github/scripts/macro_tweet_guard.sh に切り出してある
+          # （ローカルで NOW_OVERRIDE を注入して単体検証できるようにするため）。
+          bash .github/scripts/macro_tweet_guard.sh
+        # 上記スクリプトが参照する入力は下の env で全て渡す（yml 内に判定式を書かない）。
 
       - name: Discord 通知（⏱ 予備タイマー起動）
         if: github.event_name == 'schedule' && steps.check.outputs.proceed == 'true'
@@ -142,7 +114,7 @@ jobs:
           webhook: ${{ secrets.DISCORD_WEBHOOK_SNS || secrets.DISCORD_WEBHOOK_URL }}
           state: alert
           label: マクロ市況ツイート 自動リトライ停止
-          meaning: 当日 2 回以上失敗したため cron の自動再実行を停止しました。本日ツイート案は未生成です。
+          meaning: 対象日に 3 回以上失敗したため自動再実行を停止しました（暴走防止の上限）。ツイート案は未生成です。
           action_required: run ログ確認 → 原因解消後に手動 dispatch（force_rerun=true）で再実行
 
       - name: Discord 通知（guard 失敗）
@@ -159,15 +131,29 @@ jobs:
     needs: guard
     if: needs.guard.outputs.proceed == 'true'
     runs-on: ubuntu-latest
-    # 最悪ケース = 前段（clone/setup）5 分 + 1 回目 20 分 + 待機 1 分 + 2 回目 20 分 + 送信/commit 4 分 = 50 分。
-    timeout-minutes: 60
+    # 最悪ケース = 前段（clone/setup）5 分 + 20 分 + 待機 1 分 + 20 分 + 待機 3 分 + 20 分
+    #              + 送信/commit 4 分 = 73 分。余裕を見て 85 分。
+    timeout-minutes: 85
+    #
+    # ★想定トークンコスト★
+    #   成功日（大半）: 生成 1 回のみ。後続の cron 2 枠は guard の delivered>0 で skip し
+    #                   Claude を呼ばないため追加ゼロ。
+    #   一時障害の日  : 拒否されたリクエストは実測 0 トークン（529 は input/output とも 0）。
+    #                   同一 run 内で最大 3 試行しても、燃えるのは実際に走った分だけ。
+    #                   回復 run（cron 2 枠）でも同じ規律が効くため、生成の実消費は
+    #                   最悪でも「成功するまでの数回」に収まる。
+    #   確定失敗の日  : 1 回で打ち切る（同一入力の再投入をしない）。約 36k 入力トークン × 1。
 
     steps:
       - name: Determine target date
         id: date
+        # 対象日は guard が決めた値をそのまま使う（深夜遅延着火の前日補正を含む）。
+        # ここで再計算すると guard の補正が無効になり、9/3 の Run2 と同じ日付ズレが再発する。
+        env:
+          GUARD_DATE: ${{ needs.guard.outputs.target_date }}
         run: |
-          if [ -n "${{ github.event.inputs.target_date }}" ]; then
-            echo "value=${{ github.event.inputs.target_date }}" >> $GITHUB_OUTPUT
+          if [ -n "$GUARD_DATE" ]; then
+            echo "value=${GUARD_DATE}" >> $GITHUB_OUTPUT
           else
             echo "value=$(TZ=Asia/Tokyo date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
           fi
@@ -229,7 +215,25 @@ jobs:
           echo "夕刊マクロを確認: $F ($(wc -l < "$F") lines)"
           echo "ready=true" >> $GITHUB_OUTPUT
 
-      - name: Generate macro tweet via Claude Code (Opus 5 + effort high)
+      # ============================================================================
+      # 生成: 最大 3 試行（初回 + 再試行 2 回）。ただし「一時障害」の時だけ粘る。
+      #
+      # 失敗の 2 分類（classify_failure.sh が判定・実測ログで検証済み）:
+      #   transient = リクエストが拒否された一時障害（529 / overloaded / rate_limit /
+      #               ECONNRESET / timeout / 5xx）。2026-09-03 の実測では
+      #               input_tokens=0 / output_tokens=0 / total_cost_usd=0 だった。
+      #               ＝再試行してもトークンを食わないので粘る価値がある。
+      #   permanent = Claude が実際に動いたうえで成果物を作らなかったケース
+      #               （プロンプト側の ABORT、意図的な exit 1 など）。
+      #               同じ入力で再実行しても同じ結論になり、約 36k の入力トークンを
+      #               ただ燃やすだけなので同一 run 内では再試行しない。
+      #
+      # 判定材料は action の execution_file（失敗時も書き出される JSON）を第一に使う。
+      # 実測で確認済み: run-claude.ts は exitCode != 0 の分岐でも execution_file を
+      # setOutput しており、result / is_error / usage を含む完全な JSON が読める。
+      # ============================================================================
+
+      - name: Generate macro tweet via Claude Code (attempt 1)
         id: gen1
         if: success() && steps.precheck.outputs.ready == 'true'
         continue-on-error: true
@@ -250,23 +254,24 @@ jobs:
           # price_history の parquet に対象日が無い日でも 17 業種騰落率を取得できるようにする。
           JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
 
-      - name: Wait before retry 2 (Claude overloaded 等の一時エラー)
+      - name: Classify attempt 1 failure
+        id: cls1
         if: success() && steps.precheck.outputs.ready == 'true' && steps.gen1.outcome == 'failure'
         env:
           TARGET_DATE: ${{ steps.date.outputs.value }}
+          EXECUTION_FILE: ${{ steps.gen1.outputs.execution_file }}
+          ATTEMPT: '1'
+        run: bash report-pipelines/.github/scripts/classify_failure.sh
+
+      - name: Wait before attempt 2 (60s)
+        if: success() && steps.precheck.outputs.ready == 'true' && steps.cls1.outputs.kind == 'transient'
         run: |
-          F="private-repo/research/sns/${TARGET_DATE}_macro_tweet.md"
-          # 途中まで書かれた不完全ファイルは退避（削除しない）。再試行が白紙から書き直せるようにする。
-          if [ -f "$F" ]; then
-            mv "$F" "/tmp/${TARGET_DATE}_macro_tweet.attempt1.partial.md"
-            echo "1 回目の不完全な出力を /tmp へ退避しました（再試行が白紙から書き直せるようにするため）"
-          fi
-          echo "1 回目が失敗しました。60 秒待機して再試行します（529 は即時再試行が無意味なため）"
+          echo "一時障害と判定しました。60 秒待機して再試行します（529 は即時再試行が無意味なため）"
           sleep 60
 
-      - name: Generate macro tweet via Claude Code (retry 2)
+      - name: Generate macro tweet via Claude Code (attempt 2)
         id: gen2
-        if: success() && steps.precheck.outputs.ready == 'true' && steps.gen1.outcome == 'failure'
+        if: success() && steps.precheck.outputs.ready == 'true' && steps.cls1.outputs.kind == 'transient'
         continue-on-error: true
         uses: anthropics/claude-code-base-action@beta
         with:
@@ -281,21 +286,53 @@ jobs:
         env:
           TARGET_DATE: ${{ steps.date.outputs.value }}
           PRIVATE_REPO_ROOT: private-repo
-          # make_sector_daily.py の JQuants ライブ取得フォールバック用（プロンプト内から Bash で呼ぶ）。
-          # price_history の parquet に対象日が無い日でも 17 業種騰落率を取得できるようにする。
+          JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
+
+      - name: Classify attempt 2 failure
+        id: cls2
+        if: success() && steps.precheck.outputs.ready == 'true' && steps.gen2.outcome == 'failure'
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+          EXECUTION_FILE: ${{ steps.gen2.outputs.execution_file }}
+          ATTEMPT: '2'
+        run: bash report-pipelines/.github/scripts/classify_failure.sh
+
+      - name: Wait before attempt 3 (180s)
+        if: success() && steps.precheck.outputs.ready == 'true' && steps.cls2.outputs.kind == 'transient'
+        run: |
+          echo "2 回目も一時障害でした。180 秒待機して最終試行します（障害の収束に時間を与える）"
+          sleep 180
+
+      - name: Generate macro tweet via Claude Code (attempt 3 / final)
+        id: gen3
+        if: success() && steps.precheck.outputs.ready == 'true' && steps.cls2.outputs.kind == 'transient'
+        continue-on-error: true
+        uses: anthropics/claude-code-base-action@beta
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          model: claude-opus-5
+          prompt_file: report-pipelines/prompts/macro-tweet.md
+          allowed_tools: "Read,Write,Edit,Bash,Grep,Glob"
+          timeout_minutes: "20"
+          claude_env: |
+            CLAUDE_CODE_EFFORT_LEVEL: high
+            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+          PRIVATE_REPO_ROOT: private-repo
           JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
 
       - name: Verify generated macro tweet (成否の一元判定)
-        # 上の 2 ステップは continue-on-error のため、ジョブの成否はここだけで決まる。
-        # 「どの試行で成功したか」に依存せず成果物の実在で判定する。
+        # 上の生成ステップは全て continue-on-error のため、ジョブの成否はここだけで決まる。
+        # 「どの試行で成功したか」に依存せず成果物の実在で判定する（従来どおり）。
         if: success() && steps.precheck.outputs.ready == 'true'
         env:
           TARGET_DATE: ${{ steps.date.outputs.value }}
         run: |
           F="private-repo/research/sns/${TARGET_DATE}_macro_tweet.md"
-          echo "attempt outcomes: gen1=${{ steps.gen1.outcome }} gen2=${{ steps.gen2.outcome }}"
+          echo "attempt outcomes: gen1=${{ steps.gen1.outcome }} (kind=${{ steps.cls1.outputs.kind }}) gen2=${{ steps.gen2.outcome }} (kind=${{ steps.cls2.outputs.kind }}) gen3=${{ steps.gen3.outcome }}"
           if [ ! -s "$F" ]; then
-            echo "::error::マクロ市況ツイート案が 2 回の試行で生成されませんでした: $F"
+            echo "::error::マクロ市況ツイート案が生成されませんでした: $F"
             exit 1
           fi
           echo "生成成功: $F ($(wc -l < "$F") lines)"

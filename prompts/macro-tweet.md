@@ -110,11 +110,11 @@ ls -la "${PRIVATE_REPO_ROOT}/bi/data/processed/sector_daily_${TARGET_DATE}."*
 
 - `make_sector_daily.py` は price_history の `Return_1d` と screening_master の `Sector17CodeName` から 17 区分全件を集計する。CSV 列は `Sector17CodeName` / `mean_pct` / `count` / `up_count` / `down_count` / `rank`、JSON は `as_of` / `universe_count` / `sectors` / `top3` / `bottom3` を持つ。
 - **上位3・下位3は JSON の `top3` / `bottom3` をそのまま採用する**（`count >= 3` の下限適用済み）。
-- 生成にも失敗して両ファイルが無い場合は、**【セクター】ブロックを推測で埋めず、ジョブを異常終了させる**（`exit 1`）。動意・テーマレポートの33業種記述で代替してはならない。
+- 生成にも失敗して両ファイルが無い場合は、**【セクター】ブロックを推測で埋めず、ジョブを異常終了させる**（`echo "ABORT: sector_daily を生成できず【セクター】を確定できない"` を出力してから `exit 1`）。動意・テーマレポートの33業種記述で代替してはならない。
 
 ### 3-b. マクロ夕刊が無い場合
 
-`${PRIVATE_REPO_ROOT}/market/daily/macro/${TARGET_DATE}_evening.md` が存在しない、または空の場合は、**前日レポート・別ソースでの代用を禁止**し、ツイートを生成せずジョブを異常終了させる（`exit 1`）。
+`${PRIVATE_REPO_ROOT}/market/daily/macro/${TARGET_DATE}_evening.md` が存在しない、または空の場合は、**前日レポート・別ソースでの代用を禁止**し、ツイートを生成せずジョブを異常終了させる（`echo "ABORT: 夕刊マクロが存在しないため生成不可"` を出力してから `exit 1`）。
 
 ---
 
@@ -465,3 +465,7 @@ PY
 - WebSearch / WebFetch / MCP を使っていない。ファイル削除を行っていない。
 
 完了したら処理を終了してください。**PM への確認・承認待ちを出力しないこと。**
+
+## 中止時の出力規定
+
+意図的に生成を中止する場合は必ず stdout の最終行に `ABORT: <理由>` を出力してから `exit 1` する（GHA の失敗分類器が「確定失敗＝再試行しない」と判定するための固定文言。API エラー等の一時障害と区別する）。
