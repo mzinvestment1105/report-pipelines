@@ -543,6 +543,67 @@ def patched_js_body() -> str:
 def patched_like_engine() -> str:
     """いいね対象を「固定ツイートを除いた最新」→「最上段（固定があれば固定・無ければ最新）」へ。"""
     eng = fb.JS_LIKE_ENGINE
+    # GraphQL のクエリ ID は X 側のデプロイで変わり、固定値は早期に陳腐化する。
+    # ページが実際に読み込んでいる JS バンドルから現行 ID を実行時に抽出し、
+    # 既知の固定値より前に試す（PM 指摘 2026-09-04: いいねが実行されない事象への対処）。
+    eng = _replace_once(
+        eng,
+        "  // 直近で成功したクエリ ID を先頭に固定し、2人目以降の無駄な 404 を避ける\n"
+        "  let userTweetsQid = null;\n"
+        "  let favoriteQid = null;\n",
+        "  // 直近で成功したクエリ ID を先頭に固定し、2人目以降の無駄な 404 を避ける\n"
+        "  let userTweetsQid = null;\n"
+        "  let favoriteQid = null;\n"
+        "\n"
+        "  // ページが読み込んでいる JS バンドルから現行のクエリ ID を実行時に抽出する。\n"
+        "  // 固定値は X 側のデプロイで陳腐化するため、まずこちらを試す。\n"
+        "  async function discoverQueryIds() {\n"
+        "    const found = { UserTweets: [], FavoriteTweet: [] };\n"
+        "    const urls = [];\n"
+        "    for (const el of document.querySelectorAll('script[src]')) {\n"
+        "      const src = el.getAttribute('src') || '';\n"
+        "      // API 定義を含むのは main / api バンドルなので絞る\n"
+        "      if (/\\/(main|api|shared)[.~][^/]*\\.js$/.test(src)) urls.push(src);\n"
+        "    }\n"
+        "    for (const u of urls.slice(0, 12)) {\n"
+        "      let text = '';\n"
+        "      try {\n"
+        "        const r = await fetch(u, { credentials: 'omit' });\n"
+        "        if (!r.ok) continue;\n"
+        "        text = await r.text();\n"
+        "      } catch (e) {\n"
+        "        continue;\n"
+        "      }\n"
+        "      for (const name of ['UserTweets', 'FavoriteTweet']) {\n"
+        "        const re = new RegExp('queryId:\"([A-Za-z0-9_-]{10,})\",operationName:\"' + name + '\"', 'g');\n"
+        "        const re2 = new RegExp('operationName:\"' + name + '\",queryId:\"([A-Za-z0-9_-]{10,})\"', 'g');\n"
+        "        let m;\n"
+        "        while ((m = re.exec(text))) found[name].push(m[1]);\n"
+        "        while ((m = re2.exec(text))) found[name].push(m[1]);\n"
+        "      }\n"
+        "      if (found.UserTweets.length && found.FavoriteTweet.length) break;\n"
+        "    }\n"
+        "    return found;\n"
+        "  }\n"
+        "\n"
+        "  // 抽出できた ID を既知リストの先頭へ差し込む（失敗しても固定値で続行する）\n"
+        "  try {\n"
+        "    const disc = await discoverQueryIds();\n"
+        "    for (const q of disc.UserTweets.reverse()) {\n"
+        "      if (USER_TWEETS_QUERY_IDS.indexOf(q) === -1) USER_TWEETS_QUERY_IDS.unshift(q);\n"
+        "    }\n"
+        "    for (const q of disc.FavoriteTweet.reverse()) {\n"
+        "      if (FAVORITE_TWEET_QUERY_IDS.indexOf(q) === -1) FAVORITE_TWEET_QUERY_IDS.unshift(q);\n"
+        "    }\n"
+        "    console.log(\n"
+        "      '[いいね] 現行クエリID 抽出: UserTweets ' + disc.UserTweets.length +\n"
+        "        ' 件・FavoriteTweet ' + disc.FavoriteTweet.length + ' 件'\n"
+        "    );\n"
+        "  } catch (e) {\n"
+        "    console.warn('[いいね] クエリID の抽出に失敗しました。既知の固定値で試します: ' + e.message);\n"
+        "  }\n",
+        "クエリID の実行時抽出",
+    )
     eng = _replace_once(
         eng,
         "  // GraphQL UserTweets から「固定・RT・リプライを除いた最新の本人ツイート」を選ぶ\n",
