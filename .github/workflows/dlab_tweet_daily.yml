@@ -1,0 +1,457 @@
+name: D ラボレーンツイート日次
+
+# PM 2026-09-04 承認: ノクトラ X の D ラボレーン（雑学・心理学）を毎日無人で生成し、
+# SNS アナリストの Discord チャンネルへ配信する。
+#
+# 素材:
+#   Private リポの knowledge/dlab/dlab.db（2,360 本のチャプター原文から抽出した 16,889 論点）。
+#   bi/pipelines/pick_dlab_topics.py が型フラグで候補を機械選別し、原文チャプターの
+#   該当箇所 14 行を source_excerpt として同梱した JSON を出す。
+#   Claude は「その JSON だけ」を読んで短文化する（DB へ SQL を投げ直さない）。
+#
+# 重複配信の防止:
+#   dlab.db の usage_log に配信済み topic_id を記録する。同一主張（claim_id）も除外する。
+#   ★記録は「配信が成功したあと」に行う★（生成失敗で素材を無駄に消費しないため）。
+#   素材の残量は約 13,475 件 = 1 日 2 本ペースで約 18 年分あり、枯渇の懸念はない。
+#
+# 投稿の型:
+#   knowledge/dlab/instructions/05_write_short.md（字数枠・文体・締め）
+#   + PM フィードバックルール #10・#11・#14・#15・#17・#18・#19・#20。
+#   1 行目は【】フレーム + 断定文を 1 行に収め、4〜5 段落に刻み、問いで締める。
+#
+# トリガー設計:
+#   (1) schedule（主経路）= JST 07:00 起票。素材は DB にあるため外部依存が無く、
+#       朝一番に PM の手元へ届く。GitHub cron の実測遅延は +1h45m〜+3h15m。
+#   (2) schedule（フェイルセーフ）= JST 13:00 起票。朝枠が落ちた日の救援。
+#   (3) workflow_dispatch = 手動リカバリ用。
+#
+#   ★枠を 2 つにしてもトークンは増えない★
+#     guard は Claude を一切呼ばない。主経路が成功した日は delivered>0 で skip する。
+"on":
+  workflow_dispatch:
+    inputs:
+      target_date:
+        description: '対象日付 (YYYY-MM-DD・空欄で当日)'
+        required: false
+        default: ''
+      force_rerun:
+        description: 'true で当日重複ガードを無視して強制実行'
+        required: false
+        default: 'false'
+      theme:
+        description: 'テーマを固定する（空欄で自動選定）'
+        required: false
+        default: ''
+  # ★ schedule は D ラボ DB の復旧まで無効にしてある ★
+  #   2026-09-04 に Private リポの作業ツリーで knowledge/dlab/dlab.db（git 未追跡・42MB・
+  #   16,889 論点）と taxonomy.json / instructions / topics_daigo / scripts が失われた。
+  #   原文チャプター 2,360 本と vectors_*.npz は残存しているため再構築は可能だが、
+  #   抽出スクリプトと指示書も同時に失われており復旧は別作業になる。
+  #   DB が無い状態で cron を回すと pick ステップが毎日 warning skip で空振りするだけなので、
+  #   復旧が済むまで自動起動を止め、手動 dispatch でのみ動かす。
+  #   復旧後に下の 2 行のコメントを外せば日次自動配信が始まる。
+  # schedule:
+  #   - cron: '0 22 * * *'   # JST 07:00 起票（主経路）
+  #   - cron: '0 4 * * *'    # JST 13:00 起票（フェイルセーフ）
+
+concurrency:
+  group: dlab_tweet_daily
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      proceed: ${{ steps.check.outputs.proceed }}
+      reason: ${{ steps.check.outputs.reason }}
+      target_date: ${{ steps.check.outputs.target_date }}
+    steps:
+      - name: Checkout report-pipelines (通知 action 用)
+        uses: actions/checkout@v4
+
+      - name: Check today's runs
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MY_RUN_ID: ${{ github.run_id }}
+          EVENT: ${{ github.event_name }}
+          FORCE_RERUN: ${{ github.event.inputs.force_rerun }}
+          INPUT_DATE: ${{ github.event.inputs.target_date }}
+          WORKFLOW_FILE: dlab_tweet_daily.yml
+          SEND_JOB: generate
+          REQUIRE_UPSTREAM: 'false'
+          # 素材は DB にあり時刻に依存しないため時間帯ゲートは掛けない。
+          WINDOW_START_HOUR: '0'
+        run: bash .github/scripts/sns_lane_guard.sh
+
+      - name: Discord 通知（🚨 自動リトライ停止）
+        if: contains(steps.check.outputs.reason, 'retry_cap')
+        uses: ./.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_SNS || secrets.DISCORD_WEBHOOK_URL }}
+          state: alert
+          label: D ラボレーンツイート 自動リトライ停止
+          meaning: 対象日に 3 回以上失敗したため自動再実行を停止しました。ツイート案は未生成です。
+          action_required: run ログ確認 → 原因解消後に手動 dispatch（force_rerun=true）で再実行
+
+      - name: Discord 通知（guard 失敗）
+        if: failure() || cancelled()
+        uses: ./.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_SNS || secrets.DISCORD_WEBHOOK_URL }}
+          state: failed
+          label: D ラボレーンツイート guard 失敗
+          meaning: 実行前チェック自体がエラーになり、生成ジョブが起動していません。
+          action_required: run ログ確認 → 手動 dispatch で再実行
+
+  generate:
+    needs: guard
+    if: needs.guard.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+
+    steps:
+      - name: Determine target date
+        id: date
+        env:
+          GUARD_DATE: ${{ needs.guard.outputs.target_date }}
+        run: |
+          if [ -n "$GUARD_DATE" ]; then
+            echo "value=${GUARD_DATE}" >> $GITHUB_OUTPUT
+          else
+            echo "value=$(TZ=Asia/Tokyo date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout report-pipelines
+        uses: actions/checkout@v4
+        with:
+          path: report-pipelines
+
+      - name: Setup SSH for private repo
+        env:
+          PRIVATE_REPO_DEPLOY_KEY: ${{ secrets.PRIVATE_REPO_DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$PRIVATE_REPO_DEPLOY_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+      - name: Clone private repo (mizuki-fund)
+        run: |
+          git clone git@github.com:mzinvestment1105/mizuki-fund.git private-repo
+
+      - name: Copy pipelines from Public into private working tree
+        run: |
+          cp -f report-pipelines/bi/pipelines/pick_dlab_topics.py private-repo/bi/pipelines/ 2>/dev/null || true
+          cp -f report-pipelines/bi/pipelines/check_x_post_style.py private-repo/bi/pipelines/ 2>/dev/null || true
+          cp -f report-pipelines/bi/pipelines/send_sns_drafts_discord.py private-repo/bi/pipelines/ 2>/dev/null || true
+          cp -f report-pipelines/bi/pipelines/requirements.txt private-repo/bi/pipelines/
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: report-pipelines/bi/pipelines/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r report-pipelines/bi/pipelines/requirements.txt
+
+      - name: Pick D-Lab topics (素材出し・DB は読むだけ)
+        id: pick
+        # --record を付けない。usage_log への記録は配信成功後に行う
+        # （生成が失敗した日に素材だけ消費してしまうのを防ぐため）。
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+          THEME: ${{ github.event.inputs.theme }}
+          PYTHONIOENCODING: utf-8
+        working-directory: ./private-repo
+        run: |
+          if [ ! -s "knowledge/dlab/dlab.db" ]; then
+            echo "::warning::D ラボ DB（knowledge/dlab/dlab.db）が存在しないため生成をスキップします。"
+            echo "::warning::原文チャプターは knowledge/dlab/chapters/videos に残っているため再構築は可能です。"
+            echo "ready=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          ARGS="--date ${TARGET_DATE} --n 2"
+          if [ -n "$THEME" ]; then ARGS="$ARGS --theme $THEME"; fi
+          python bi/pipelines/pick_dlab_topics.py $ARGS
+          P="bi/outputs/dlab_picks/dlab_picks_${TARGET_DATE}.json"
+          if [ ! -s "$P" ]; then
+            echo "::warning::素材 JSON が生成されませんでした"
+            echo "ready=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          N=$(python -c "import json,sys;print(json.load(open(sys.argv[1],encoding='utf-8'))['meta']['returned'])" "$P")
+          echo "picked=${N}"
+          if [ "${N}" -lt 1 ]; then
+            echo "::warning::選定できた論点が 0 件のため生成をスキップします"
+            echo "ready=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          echo "ready=true" >> $GITHUB_OUTPUT
+
+      # ============================================================================
+      # 生成: 最大 3 試行。一時障害（529 等・実測 0 トークン）の時だけ粘る。
+      # ============================================================================
+
+      - name: Generate D-Lab tweet via Claude Code (attempt 1)
+        id: gen1
+        if: success() && steps.pick.outputs.ready == 'true'
+        continue-on-error: true
+        uses: anthropics/claude-code-base-action@beta
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          model: claude-opus-5
+          prompt_file: report-pipelines/prompts/dlab-tweet.md
+          allowed_tools: "Read,Write,Edit,Bash,Grep,Glob"
+          timeout_minutes: "15"
+          claude_env: |
+            CLAUDE_CODE_EFFORT_LEVEL: high
+            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+          PRIVATE_REPO_ROOT: private-repo
+
+      - name: Classify attempt 1 failure
+        id: cls1
+        if: success() && steps.pick.outputs.ready == 'true' && steps.gen1.outcome == 'failure'
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+          EXECUTION_FILE: ${{ steps.gen1.outputs.execution_file }}
+          ATTEMPT: '1'
+        run: bash report-pipelines/.github/scripts/classify_failure.sh
+
+      - name: Wait before attempt 2 (60s)
+        if: success() && steps.pick.outputs.ready == 'true' && steps.cls1.outputs.kind == 'transient'
+        run: |
+          echo "一時障害と判定しました。60 秒待機して再試行します"
+          sleep 60
+
+      - name: Generate D-Lab tweet via Claude Code (attempt 2)
+        id: gen2
+        if: success() && steps.pick.outputs.ready == 'true' && steps.cls1.outputs.kind == 'transient'
+        continue-on-error: true
+        uses: anthropics/claude-code-base-action@beta
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          model: claude-opus-5
+          prompt_file: report-pipelines/prompts/dlab-tweet.md
+          allowed_tools: "Read,Write,Edit,Bash,Grep,Glob"
+          timeout_minutes: "15"
+          claude_env: |
+            CLAUDE_CODE_EFFORT_LEVEL: high
+            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+          PRIVATE_REPO_ROOT: private-repo
+
+      - name: Classify attempt 2 failure
+        id: cls2
+        if: success() && steps.pick.outputs.ready == 'true' && steps.gen2.outcome == 'failure'
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+          EXECUTION_FILE: ${{ steps.gen2.outputs.execution_file }}
+          ATTEMPT: '2'
+        run: bash report-pipelines/.github/scripts/classify_failure.sh
+
+      - name: Wait before attempt 3 (180s)
+        if: success() && steps.pick.outputs.ready == 'true' && steps.cls2.outputs.kind == 'transient'
+        run: |
+          echo "2 回目も一時障害でした。180 秒待機して最終試行します"
+          sleep 180
+
+      - name: Generate D-Lab tweet via Claude Code (attempt 3 / final)
+        id: gen3
+        if: success() && steps.pick.outputs.ready == 'true' && steps.cls2.outputs.kind == 'transient'
+        continue-on-error: true
+        uses: anthropics/claude-code-base-action@beta
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          model: claude-opus-5
+          prompt_file: report-pipelines/prompts/dlab-tweet.md
+          allowed_tools: "Read,Write,Edit,Bash,Grep,Glob"
+          timeout_minutes: "15"
+          claude_env: |
+            CLAUDE_CODE_EFFORT_LEVEL: high
+            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+          PRIVATE_REPO_ROOT: private-repo
+
+      - name: Verify generated D-Lab tweet (成否の一元判定)
+        if: success() && steps.pick.outputs.ready == 'true'
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+          PYTHONIOENCODING: utf-8
+        run: |
+          F="private-repo/research/sns/${TARGET_DATE}_dlab_tweet.md"
+          echo "attempt outcomes: gen1=${{ steps.gen1.outcome }} (kind=${{ steps.cls1.outputs.kind }}) gen2=${{ steps.gen2.outcome }} (kind=${{ steps.cls2.outputs.kind }}) gen3=${{ steps.gen3.outcome }}"
+          if [ ! -s "$F" ]; then
+            echo "::error::D ラボレーンツイート案が生成されませんでした: $F"
+            exit 1
+          fi
+          # 形式の最終ゲート: 1 行目が【】+ 断定文の 1 行・40 字以内、段落 4〜5、topic_id の記録あり。
+          python - "$F" <<'PY'
+          import re, sys, pathlib
+          t = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+          blocks = re.findall(r"```\n(.*?)```", t, re.S)
+          if not blocks:
+              print("::error::コードブロックが 1 つも無い")
+              raise SystemExit(1)
+          if not re.search(r"topic_id:\s*\d+", t):
+              print("::error::topic_id の出典行が無い（翌日以降の重複判定ができない）")
+              raise SystemExit(1)
+          bad = 0
+          for i, b in enumerate(blocks, 1):
+              body = b.strip()
+              first = body.split("\n")[0]
+              paras = [p for p in re.split(r"\n\s*\n", body) if p.strip()]
+              n = len(body.replace("\n", ""))
+              if not re.match(r"^【[^】]{1,20}】.+", first):
+                  print(f"::error::候補{i}: 1 行目が【】+断定文になっていない")
+                  bad += 1
+              if len(first) > 40:
+                  print(f"::error::候補{i}: 1 行目が 40 字超（{len(first)}）")
+                  bad += 1
+              if not (4 <= len(paras) <= 5):
+                  print(f"::error::候補{i}: 段落が 4〜5 でない（{len(paras)}）")
+                  bad += 1
+              # 枠は短め 150〜270 と長め 280〜560 の 2 本立て。271〜279 は
+              # check_x_post_style.py の LEN_TOTAL が短文枠でも長文枠でも FAIL にする
+              # 谷間であり、プロンプト側でこの帯を避けさせている。ここは
+              # チェッカーと同一の基準で判定する（ゲートだけ緩めると検査と食い違うため）。
+              if not (150 <= n <= 270 or 280 <= n <= 560):
+                  print(f"::error::候補{i}: 字数が枠外（{n}・150〜270 または 280〜560）")
+                  bad += 1
+              if re.search(r"[（）()＝=]", body):
+                  print(f"::error::候補{i}: 丸括弧または注釈記号がある")
+                  bad += 1
+              if not re.search(r"[0-9０-９]", body):
+                  print(f"::error::候補{i}: 数値が 1 つも無い")
+                  bad += 1
+              # 文の途中で改行すると check_x_post_style.py が体言止めと誤判定するため、
+              # 1 行 60 字以下と「文を折り返さない」を同時に満たす必要がある（実測確認済み）。
+              over = [l for l in body.split("\n") if len(l) > 60]
+              if over:
+                  print(f"::error::候補{i}: 60 字を超える行が {len(over)} 本ある")
+                  bad += 1
+              # 研究紹介の定型は NG_EVIDENCE_INTRO と衝突するため機械的に弾く。
+              if re.search(r"という(研究|実験|調査|論文)|(研究|実験|調査|データ)が(あり|ある)|によると|によれば|報告されて|示唆されて", body):
+                  print(f"::error::候補{i}: 研究紹介の定型表現がある")
+                  bad += 1
+              if "要確認" in body:
+                  print(f"::error::候補{i}: 索引の要確認タグを転記している")
+                  bad += 1
+          print(f"blocks={len(blocks)} bad={bad}")
+          for i, b in enumerate(blocks, 1):
+              pathlib.Path(f"/tmp/dlab_gate{i}.txt").write_text(b.strip() + "\n", encoding="utf-8")
+          raise SystemExit(1 if bad else 0)
+          PY
+          # スタイル検査本体も配信前に通す（プロンプト内で回っているが、
+          # 検査を飛ばした本文が配信されることを構造的に防ぐための最終ゲート）。
+          FAILED=0
+          for f in /tmp/dlab_gate*.txt; do
+            [ -s "$f" ] || continue
+            N=$(python -c "import sys,pathlib;print(len(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8').strip().replace(chr(10),'')))" "$f")
+            if [ "$N" -le 270 ]; then FRAME=short; else FRAME=long; fi
+            echo "--- $(basename "$f") (${N}字 / --frame ${FRAME}) ---"
+            if ! python private-repo/bi/pipelines/check_x_post_style.py "$f" --type A --frame "$FRAME"; then
+              FAILED=1
+            fi
+          done
+          if [ "$FAILED" != "0" ]; then
+            echo "::error::スタイル検査に FAIL が残っています"
+            exit 1
+          fi
+          echo "生成成功: $F ($(wc -l < "$F") lines)"
+
+      - name: Send D-Lab tweet drafts to Discord (SNS)
+        id: send
+        if: success() && steps.pick.outputs.ready == 'true'
+        env:
+          DISCORD_WEBHOOK_SNS: ${{ secrets.DISCORD_WEBHOOK_SNS }}
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+          PYTHONIOENCODING: utf-8
+        run: |
+          F="private-repo/research/sns/${TARGET_DATE}_dlab_tweet.md"
+          if [ ! -s "$F" ]; then
+            echo "::warning::D ラボレーンツイート案が無いため送信をスキップします: $F"
+            exit 0
+          fi
+          MD=$(TZ=Asia/Tokyo date -d "${TARGET_DATE}" '+%-m月%-d日')
+          cd private-repo/bi/pipelines
+          python send_sns_drafts_discord.py \
+            --file "../../research/sns/${TARGET_DATE}_dlab_tweet.md" \
+            --header "**D ラボレーンツイート / ${MD}**" \
+            --hide-source
+
+      - name: Record used topics (配信成功後にのみ素材を消費する)
+        id: record
+        # ここが「生成失敗で素材を無駄にしない」の要。send が成功した時だけ usage_log へ記録する。
+        if: success() && steps.pick.outputs.ready == 'true' && steps.send.outcome == 'success'
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+          PYTHONIOENCODING: utf-8
+        working-directory: ./private-repo
+        run: |
+          # 実際に配信された本文に含まれる topic_id だけを記録する
+          # （素材 JSON に 2 件あっても 1 本しか採用しなかった日に、未使用分まで消費しないため）。
+          python - "research/sns/${TARGET_DATE}_dlab_tweet.md" <<'PY' > /tmp/used_ids.txt
+          import re, sys, pathlib
+          t = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+          ids = sorted(set(re.findall(r"topic_id:\s*(\d+)", t)))
+          print(" ".join(ids))
+          PY
+          IDS=$(cat /tmp/used_ids.txt)
+          echo "used_topic_ids=${IDS}"
+          if [ -z "$IDS" ]; then
+            echo "::warning::本文から topic_id を抽出できなかったため usage_log への記録をスキップします"
+            exit 0
+          fi
+          python - "$IDS" "${TARGET_DATE}" <<'PY'
+          import sys, sqlite3
+          from datetime import datetime, timedelta, timezone
+          ids = [int(x) for x in sys.argv[1].split()]
+          jst = timezone(timedelta(hours=9))
+          now = datetime.now(jst).strftime("%Y-%m-%d %H:%M:%S")
+          con = sqlite3.connect("knowledge/dlab/dlab.db")
+          con.execute("CREATE TABLE IF NOT EXISTS usage_log(topic_id INTEGER, used_at TEXT, output TEXT)")
+          con.executemany("INSERT INTO usage_log(topic_id, used_at, output) VALUES (?,?,?)",
+                          [(i, now, f"sns_dlab {sys.argv[2]}") for i in ids])
+          con.commit()
+          n = con.execute("SELECT COUNT(DISTINCT topic_id) FROM usage_log").fetchone()[0]
+          print(f"recorded={len(ids)} total_used={n}")
+          con.close()
+          PY
+
+      - name: Commit and push to private repo
+        if: success() && steps.pick.outputs.ready == 'true'
+        working-directory: ./private-repo
+        run: |
+          bash ../report-pipelines/bi/pipelines/ops/ci_commit_push.sh \
+            -m "data: dlab tweet ${{ steps.date.outputs.value }}" \
+            research/sns bi/outputs/dlab_picks knowledge/dlab/dlab.db
+
+      - name: Discord 通知（⚠️ 配信済み・後処理のみ失敗）
+        if: (failure() || cancelled()) && steps.send.outcome == 'success'
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_SNS || secrets.DISCORD_WEBHOOK_URL }}
+          state: partial
+          label: D ラボレーンツイート 後処理のみ失敗
+          date: ${{ steps.date.outputs.value }}
+          meaning: ツイート案は Discord へ配信済みです。配信後の記録または commit だけが失敗しました。
+          action_required: 不要（差分は次回 run が回収。ただし同じ論点が翌日再選定される可能性あり）
+
+      - name: Discord 通知（❌ 失敗）
+        if: (failure() || cancelled()) && steps.send.outcome != 'success'
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_SNS || secrets.DISCORD_WEBHOOK_URL }}
+          state: failed
+          label: D ラボレーンツイート 失敗
+          date: ${{ steps.date.outputs.value }}
+          meaning: 生成または送信が完了せず、本日の D ラボレーンツイート案は未配信です。
+          action_required: run ログ確認 → 手動 dispatch（force_rerun=true）で再実行

@@ -1,0 +1,409 @@
+name: AI レーンツイート日次
+
+# PM 2026-09-04 承認: ノクトラ X の AI レーン（記事引用型）を毎日無人で生成し、
+# SNS アナリストの Discord チャンネルへ配信する。
+#
+# 素材:
+#   「SNS デイリーデータ同期」（daily_data_sync.yml・毎朝 06:00 JST）が収集する
+#   bi/outputs/x_posts/gha/buzz_{date}.json の記事引用レーン（top_articles_ja / top_articles_en）。
+#   fetch_x_buzz.py が記事本文（article_text）まで取得済みのため、本 workflow は
+#   Playwright も X cookie も必要としない（素材は Private リポに commit 済みのものを読むだけ）。
+#
+# 投稿の型（PM 2026-09-04 ルール #21・#22）:
+#   ノクトラ本文 → 空行 → 記事 URL。引用RTにしない。記事本文を読んでから書く。
+#   本文は「なぜ保存に値するか」の断定 1 つ。要約・中立論評は不可。
+#
+# トリガー設計（macro_tweet_daily.yml と同じ三段構え）:
+#   (1) workflow_run（主経路）= バズ収集の完走を受けて起動する。素材が出た直後が最短。
+#   (2) workflow_dispatch = 手動リカバリ用。
+#   (3) schedule（フェイルセーフ）= 2 枠。GitHub cron の実測遅延は +1h45m〜+3h15m。
+#         0 1  * * * = JST 10:00 起票
+#         0 5  * * * = JST 14:00 起票（10:00 枠も落ちた日の最後の砦）
+#
+#   ★枠を 2 つにしてもトークンは増えない★
+#     guard は Claude を一切呼ばない（GitHub API を読むだけ）。主経路が成功した日は
+#     delivered>0 となり両枠とも guard だけで skip して終わる ＝ 追加トークン消費ゼロ。
+"on":
+  workflow_run:
+    workflows: ["SNS デイリーデータ同期"]
+    types:
+      - completed
+  workflow_dispatch:
+    inputs:
+      target_date:
+        description: '対象日付 (YYYY-MM-DD・空欄で当日)'
+        required: false
+        default: ''
+      force_rerun:
+        description: 'true で当日重複ガードを無視して強制実行'
+        required: false
+        default: 'false'
+  schedule:
+    - cron: '0 1 * * *'
+    - cron: '0 5 * * *'
+
+concurrency:
+  group: ai_tweet_daily
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      proceed: ${{ steps.check.outputs.proceed }}
+      reason: ${{ steps.check.outputs.reason }}
+      target_date: ${{ steps.check.outputs.target_date }}
+    steps:
+      - name: Checkout report-pipelines (通知 action 用)
+        uses: actions/checkout@v4
+
+      - name: Check today's runs
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MY_RUN_ID: ${{ github.run_id }}
+          EVENT: ${{ github.event_name }}
+          UPSTREAM_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          FORCE_RERUN: ${{ github.event.inputs.force_rerun }}
+          INPUT_DATE: ${{ github.event.inputs.target_date }}
+          WORKFLOW_FILE: ai_tweet_daily.yml
+          SEND_JOB: generate
+          # バズ収集は continue-on-error だらけで run 全体が success になりやすいが、
+          # 素材が無ければ後段 precheck が skip して空振りするだけなので上流成否は問わない。
+          REQUIRE_UPSTREAM: 'false'
+          # 素材は朝 06:00 に揃うため時間帯ゲートは掛けない。
+          WINDOW_START_HOUR: '0'
+        run: bash .github/scripts/sns_lane_guard.sh
+
+      - name: Discord 通知（🚨 自動リトライ停止）
+        if: contains(steps.check.outputs.reason, 'retry_cap')
+        uses: ./.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_SNS || secrets.DISCORD_WEBHOOK_URL }}
+          state: alert
+          label: AI レーンツイート 自動リトライ停止
+          meaning: 対象日に 3 回以上失敗したため自動再実行を停止しました。ツイート案は未生成です。
+          action_required: run ログ確認 → 原因解消後に手動 dispatch（force_rerun=true）で再実行
+
+      - name: Discord 通知（guard 失敗）
+        if: failure() || cancelled()
+        uses: ./.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_SNS || secrets.DISCORD_WEBHOOK_URL }}
+          state: failed
+          label: AI レーンツイート guard 失敗
+          meaning: 実行前チェック自体がエラーになり、生成ジョブが起動していません。
+          action_required: run ログ確認 → 手動 dispatch で再実行
+
+  generate:
+    needs: guard
+    if: needs.guard.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    # 前段（clone/setup）5 分 + 生成 15 分 × 3 + 待機 4 分 + 送信/commit 4 分 = 58 分。余裕を見て 70 分。
+    timeout-minutes: 70
+
+    steps:
+      - name: Determine target date
+        id: date
+        env:
+          GUARD_DATE: ${{ needs.guard.outputs.target_date }}
+        run: |
+          if [ -n "$GUARD_DATE" ]; then
+            echo "value=${GUARD_DATE}" >> $GITHUB_OUTPUT
+          else
+            echo "value=$(TZ=Asia/Tokyo date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout report-pipelines
+        uses: actions/checkout@v4
+        with:
+          path: report-pipelines
+
+      - name: Setup SSH for private repo
+        env:
+          PRIVATE_REPO_DEPLOY_KEY: ${{ secrets.PRIVATE_REPO_DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$PRIVATE_REPO_DEPLOY_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+      - name: Clone private repo (mizuki-fund)
+        run: |
+          git clone git@github.com:mzinvestment1105/mizuki-fund.git private-repo
+
+      - name: Copy pipelines from Public into private working tree
+        # PM が Private 側への push を忘れた場合でも Public 側の最新で上書きし自動化の品質を保つ。
+        # X 系スクリプト（fetch_x_*.py）は Private にしか無いため上書き対象にしない。
+        run: |
+          cp -f report-pipelines/bi/pipelines/check_x_post_style.py private-repo/bi/pipelines/ 2>/dev/null || true
+          cp -f report-pipelines/bi/pipelines/send_sns_drafts_discord.py private-repo/bi/pipelines/ 2>/dev/null || true
+          cp -f report-pipelines/bi/pipelines/requirements.txt private-repo/bi/pipelines/
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: report-pipelines/bi/pipelines/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r report-pipelines/bi/pipelines/requirements.txt
+
+      - name: Check prerequisite (バズ収集素材の存在と記事レーンの中身)
+        id: precheck
+        # 素材が無い日・記事レーンが空の日は生成しない。夕刊マクロと同じく warning で skip し
+        # ジョブは成功扱いで終える（素材欠落は daily_data_sync 側の問題であり二重通知しない）。
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+          PYTHONIOENCODING: utf-8
+        run: |
+          B1="private-repo/bi/outputs/x_posts/gha/buzz_${TARGET_DATE}.json"
+          B2="private-repo/bi/outputs/x_posts/buzz_${TARGET_DATE}.json"
+          if   [ -s "$B1" ]; then BUZZ="$B1"
+          elif [ -s "$B2" ]; then BUZZ="$B2"
+          else
+            echo "::warning::当日のバズ収集 JSON が無いため AI レーンツイート生成をスキップします: ${TARGET_DATE}"
+            echo "ready=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          # 記事本文が 120 字以上ある候補が 1 件以上あるか（無ければ書けない・ルール #22）
+          N=$(python - "$BUZZ" <<'PY'
+          import json, sys
+          d = json.load(open(sys.argv[1], encoding="utf-8"))
+          n = 0
+          for lane in ("top_articles_ja", "top_articles_en"):
+              for p in d.get(lane, []):
+                  if len(p.get("article_text") or "") >= 120 and p.get("article_url"):
+                      n += 1
+          print(n)
+          PY
+          )
+          echo "article_candidates=${N}"
+          if [ "${N}" -lt 1 ]; then
+            echo "::warning::本文取得済みの記事候補が 0 件のため AI レーンツイート生成をスキップします: ${TARGET_DATE}"
+            echo "ready=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          echo "ready=true" >> $GITHUB_OUTPUT
+
+      # ============================================================================
+      # 生成: 最大 3 試行。一時障害（529 等・実測 0 トークン）の時だけ粘る。
+      # 確定失敗（ABORT・プロンプト側の意図的中止）は同一 run 内で再試行しない。
+      # 分類は classify_failure.sh が execution_file の JSON から判定する。
+      # ============================================================================
+
+      - name: Generate AI tweet via Claude Code (attempt 1)
+        id: gen1
+        if: success() && steps.precheck.outputs.ready == 'true'
+        continue-on-error: true
+        uses: anthropics/claude-code-base-action@beta
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          model: claude-opus-5
+          prompt_file: report-pipelines/prompts/ai-tweet.md
+          allowed_tools: "Read,Write,Edit,Bash,Grep,Glob"
+          timeout_minutes: "15"
+          claude_env: |
+            CLAUDE_CODE_EFFORT_LEVEL: high
+            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+          PRIVATE_REPO_ROOT: private-repo
+
+      - name: Classify attempt 1 failure
+        id: cls1
+        if: success() && steps.precheck.outputs.ready == 'true' && steps.gen1.outcome == 'failure'
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+          EXECUTION_FILE: ${{ steps.gen1.outputs.execution_file }}
+          ATTEMPT: '1'
+        run: bash report-pipelines/.github/scripts/classify_failure.sh
+
+      - name: Wait before attempt 2 (60s)
+        if: success() && steps.precheck.outputs.ready == 'true' && steps.cls1.outputs.kind == 'transient'
+        run: |
+          echo "一時障害と判定しました。60 秒待機して再試行します"
+          sleep 60
+
+      - name: Generate AI tweet via Claude Code (attempt 2)
+        id: gen2
+        if: success() && steps.precheck.outputs.ready == 'true' && steps.cls1.outputs.kind == 'transient'
+        continue-on-error: true
+        uses: anthropics/claude-code-base-action@beta
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          model: claude-opus-5
+          prompt_file: report-pipelines/prompts/ai-tweet.md
+          allowed_tools: "Read,Write,Edit,Bash,Grep,Glob"
+          timeout_minutes: "15"
+          claude_env: |
+            CLAUDE_CODE_EFFORT_LEVEL: high
+            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+          PRIVATE_REPO_ROOT: private-repo
+
+      - name: Classify attempt 2 failure
+        id: cls2
+        if: success() && steps.precheck.outputs.ready == 'true' && steps.gen2.outcome == 'failure'
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+          EXECUTION_FILE: ${{ steps.gen2.outputs.execution_file }}
+          ATTEMPT: '2'
+        run: bash report-pipelines/.github/scripts/classify_failure.sh
+
+      - name: Wait before attempt 3 (180s)
+        if: success() && steps.precheck.outputs.ready == 'true' && steps.cls2.outputs.kind == 'transient'
+        run: |
+          echo "2 回目も一時障害でした。180 秒待機して最終試行します"
+          sleep 180
+
+      - name: Generate AI tweet via Claude Code (attempt 3 / final)
+        id: gen3
+        if: success() && steps.precheck.outputs.ready == 'true' && steps.cls2.outputs.kind == 'transient'
+        continue-on-error: true
+        uses: anthropics/claude-code-base-action@beta
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          model: claude-opus-5
+          prompt_file: report-pipelines/prompts/ai-tweet.md
+          allowed_tools: "Read,Write,Edit,Bash,Grep,Glob"
+          timeout_minutes: "15"
+          claude_env: |
+            CLAUDE_CODE_EFFORT_LEVEL: high
+            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+          PRIVATE_REPO_ROOT: private-repo
+
+      - name: Verify generated AI tweet (成否の一元判定)
+        # 生成ステップは全て continue-on-error のため、ジョブの成否はここだけで決まる。
+        if: success() && steps.precheck.outputs.ready == 'true'
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+          PYTHONIOENCODING: utf-8
+        run: |
+          F="private-repo/research/sns/${TARGET_DATE}_ai_tweet.md"
+          echo "attempt outcomes: gen1=${{ steps.gen1.outcome }} (kind=${{ steps.cls1.outputs.kind }}) gen2=${{ steps.gen2.outcome }} (kind=${{ steps.cls2.outputs.kind }}) gen3=${{ steps.gen3.outcome }}"
+          if [ ! -s "$F" ]; then
+            echo "::error::AI レーンツイート案が生成されませんでした: $F"
+            exit 1
+          fi
+          # 形式の最終ゲート: 各コードブロックが「本文 → 空行 → URL」であること（ルール #22）。
+          python - "$F" <<'PY'
+          import re, sys, pathlib
+          t = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+          blocks = re.findall(r"```\n(.*?)```", t, re.S)
+          if not blocks:
+              print("::error::コードブロックが 1 つも無い")
+              raise SystemExit(1)
+          bad = 0
+          for i, b in enumerate(blocks, 1):
+              lines = b.strip().split("\n")
+              if not lines[-1].startswith("http"):
+                  print(f"::error::候補{i}: 最終行が記事 URL でない")
+                  bad += 1
+              elif len(lines) < 3 or lines[-2].strip() != "":
+                  print(f"::error::候補{i}: URL の直前に空行が無い")
+                  bad += 1
+              elif sum(1 for l in lines if l.startswith("http")) != 1:
+                  print(f"::error::候補{i}: URL が 1 本でない")
+                  bad += 1
+              else:
+                  # 本文は 2 文・各文 60 字以内・全体 80〜130 字（prompts/ai-tweet.md §4-b）。
+                  # 3 文にすると CNT_LAST_LINE_SENT が、1 文 60 字超だと文が冗長になる。
+                  body = "\n".join(l for l in lines if not l.startswith("http")).strip()
+                  n = len(body.replace("\n", ""))
+                  sents = [s for s in re.split(r"(?<=。)", body) if s.strip()]
+                  if not (80 <= n <= 130):
+                      print(f"::error::候補{i}: 本文が 80〜130 字の外（{n}）")
+                      bad += 1
+                  if len(sents) != 2:
+                      print(f"::error::候補{i}: 本文が 2 文でない（{len(sents)}）")
+                      bad += 1
+                  if any(len(s) > 60 for s in sents):
+                      print(f"::error::候補{i}: 60 字を超える文がある")
+                      bad += 1
+                  if re.search(r"[（）()＝=]", body):
+                      print(f"::error::候補{i}: 丸括弧または注釈記号がある")
+                      bad += 1
+          print(f"blocks={len(blocks)} bad={bad}")
+          for i, b in enumerate(blocks, 1):
+              body = "\n".join(l for l in b.strip().split("\n") if not l.startswith("http")).strip()
+              pathlib.Path(f"/tmp/ai_gate{i}.txt").write_text(body + "\n", encoding="utf-8")
+          raise SystemExit(1 if bad else 0)
+          PY
+          # スタイル検査本体も配信前に通す（最終ゲート）。
+          # 構造系 11 ID は記事引用型では構造的に FAIL になる基準のため許容する
+          # （PM 承認済みの完成例と本レーンの字数規定から必ず発生することを実測確認済み。
+          #  詳細は prompts/ai-tweet.md §7-a-1）。禁止語系の FAIL は 1 件も許容しない。
+          ALLOW="LEN_TOTAL|LEN_FIRST_LINE|CNT_FIRST_LINE_SENT|RATIO_CHARS_PER_LINE|CNT_LINES|CNT_PARA|CNT_BLANK|LEN_LAST_LINE|CNT_DIGIT|LEN_SENT_AVG|CNT_LAST_LINE_SENT"
+          FAILED=0
+          for f in /tmp/ai_gate*.txt; do
+            [ -s "$f" ] || continue
+            echo "--- $(basename "$f") ---"
+            python private-repo/bi/pipelines/check_x_post_style.py "$f" --type A --frame short 2>&1 \
+              | grep -E '^\s+FAIL' | grep -vE "FAIL\s+(${ALLOW})\b" > /tmp/ai_gate_fail.txt || true
+            if [ -s /tmp/ai_gate_fail.txt ]; then
+              cat /tmp/ai_gate_fail.txt
+              FAILED=1
+            else
+              echo "許容外 FAIL なし"
+            fi
+          done
+          if [ "$FAILED" != "0" ]; then
+            echo "::error::スタイル検査に許容外の FAIL が残っています"
+            exit 1
+          fi
+          echo "生成成功: $F ($(wc -l < "$F") lines)"
+
+      - name: Send AI tweet drafts to Discord (SNS)
+        id: send
+        if: success() && steps.precheck.outputs.ready == 'true'
+        env:
+          DISCORD_WEBHOOK_SNS: ${{ secrets.DISCORD_WEBHOOK_SNS }}
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+          PYTHONIOENCODING: utf-8
+        run: |
+          F="private-repo/research/sns/${TARGET_DATE}_ai_tweet.md"
+          if [ ! -s "$F" ]; then
+            echo "::warning::AI レーンツイート案が無いため送信をスキップします: $F"
+            exit 0
+          fi
+          MD=$(TZ=Asia/Tokyo date -d "${TARGET_DATE}" '+%-m月%-d日')
+          cd private-repo/bi/pipelines
+          python send_sns_drafts_discord.py \
+            --file "../../research/sns/${TARGET_DATE}_ai_tweet.md" \
+            --header "**AI レーンツイート / ${MD}**" \
+            --hide-source
+
+      - name: Commit and push to private repo
+        if: success() && steps.precheck.outputs.ready == 'true'
+        working-directory: ./private-repo
+        run: |
+          bash ../report-pipelines/bi/pipelines/ops/ci_commit_push.sh \
+            -m "data: ai tweet ${{ steps.date.outputs.value }}" research/sns
+
+      - name: Discord 通知（⚠️ 配信済み・後処理のみ失敗）
+        if: (failure() || cancelled()) && steps.send.outcome == 'success'
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_SNS || secrets.DISCORD_WEBHOOK_URL }}
+          state: partial
+          label: AI レーンツイート 後処理のみ失敗
+          date: ${{ steps.date.outputs.value }}
+          meaning: ツイート案は Discord へ配信済みです。配信後の commit だけが失敗しました。
+          action_required: 不要（差分は次回 run が回収）
+
+      - name: Discord 通知（❌ 失敗）
+        if: (failure() || cancelled()) && steps.send.outcome != 'success'
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_SNS || secrets.DISCORD_WEBHOOK_URL }}
+          state: failed
+          label: AI レーンツイート 失敗
+          date: ${{ steps.date.outputs.value }}
+          meaning: 生成または送信が完了せず、本日の AI レーンツイート案は未配信です。
+          action_required: run ログ確認 → 手動 dispatch（force_rerun=true）で再実行
