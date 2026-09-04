@@ -1,7 +1,7 @@
-name: X リムーブ候補 週次
+name: X リムーブ候補 日次
 
-# PM 2026-09-02: 運用 X アカウント（ノクトラ）の「片思いフォロー」を毎週棚卸しし、
-# リムーブ候補レポートを無人で発行する。素材は daily_data_sync.yml（毎日 06:00 JST）が
+# PM 2026-09-02: 運用 X アカウント（ノクトラ）の「片思いフォロー」を毎日棚卸しし、
+# リムーブ候補レポートを無人で発行する（PM 指示 2026-09-04 で週次から日次へ変更）。素材は daily_data_sync.yml（毎日 06:00 JST）が
 # Private へ commit back している profile_daily_{date}.json の following / followers。
 #
 # 生成物（すべて Private リポへ commit back）:
@@ -18,14 +18,9 @@ name: X リムーブ候補 週次
 #     ローカル JSON だけを読む純粋な集計処理であり、cookie 系 Secrets も使わない。
 "on":
   schedule:
-    # UTC 11:20 = JST 20:20 起票。GitHub cron の実測遅延（+1h45m〜+3h15m）を見込むと
-    # 実際の着火は JST 22:05〜23:35 に落ちる。金曜夜の既存レポート
-    # （セクター週次フル 21:00 JST・動意週次 22:43 JST）と同じ帯に並ぶ設計。
-    # 起票を早めに置くのは、遅延しても日付が翌 JST 土曜へ回らないようにするため。
-    # 毎時 :00 は GitHub 全体で cron が最も集中し遅延が伸びる帯であり、加えて
-    # price_history.yml が金曜 UTC 11:00 を既に使っている。同一スロットの取り合いを
-    # 避けるため :20 へずらす（本 workflow は price_history に依存しないため前後関係は不問）。
-    - cron: '20 11 * * 5'
+    # UTC 08:00 = JST 17:00 起票（PM 指示 2026-09-04: 毎日 17 時）。
+    # GitHub cron は数十分〜数時間遅延し得るため、guard の時間帯ゲートは JST 15〜23 時を許容する。
+    - cron: '0 8 * * *'
   workflow_dispatch:
     inputs:
       target_date:
@@ -39,13 +34,13 @@ name: X リムーブ候補 週次
 
 # 二重発火を GHA 内部ロックで防ぐ（macro_tweet_daily.yml と同じ固定 group 方式）。
 concurrency:
-  group: x_unfollow_weekly
+  group: x_unfollow_daily
   cancel-in-progress: false
 
 jobs:
   guard:
     # 判定: (1) workflow_dispatch かつ force_rerun=true → 無条件 proceed
-    #       (2) cron 起動かつ JST 17 時未満 → skip（深夜着火が翌 JST 日の枠を消費する事故の防止）
+    #       (2) cron 起動かつ JST 15 時未満 → skip（深夜着火が翌 JST 日の枠を消費する事故の防止）
     #       (3) DONE_OK >= 1 → skip（当日すでに生成済み）
     #       (4) ACTIVE >= 1 → skip（走行中の run あり）
     #       (5) cron 起動かつ DONE_FAIL >= 2 → skip（連続失敗の課金暴走防止）
@@ -78,7 +73,7 @@ jobs:
 
           # 実際に生成/送信を行うジョブ（generate）の結果だけで当日実績を判定する
           # （guard が本体を skip した run まで success と数える誤認を避ける）。
-          STATS=$(bash .github/scripts/check_delivery.sh x_unfollow_weekly.yml generate "${MY_RUN_ID}")
+          STATS=$(bash .github/scripts/check_delivery.sh x_unfollow_daily.yml generate "${MY_RUN_ID}")
           DONE_OK=$(echo "$STATS" | jq -r '.delivered')
           DONE_FAIL=$(echo "$STATS" | jq -r '.failed')
           ACTIVE=$(( $(echo "$STATS" | jq -r '.sending') + $(echo "$STATS" | jq -r '.dispatch_pending') + $(echo "$STATS" | jq -r '.schedule_pending') ))
@@ -90,12 +85,12 @@ jobs:
           echo "done_fail=${DONE_FAIL}" >> $GITHUB_OUTPUT
 
           # GitHub cron は数時間遅延し、深夜着火すると翌 JST 日の枠を誤って消費する。
-          # schedule(cron) 起動のみ時間帯ゲートで無害化する（本レポートの妥当な発行帯 = JST 17〜23 時）。
+          # schedule(cron) 起動のみ時間帯ゲートで無害化する（本レポートの妥当な発行帯 = JST 15〜23 時）。
           HOUR_JST=$((10#$(TZ=Asia/Tokyo date +%H)))
 
-          if [ "$EVENT" = "schedule" ] && [ "$HOUR_JST" -lt 17 ]; then
+          if [ "$EVENT" = "schedule" ] && [ "$HOUR_JST" -lt 15 ]; then
             echo "proceed=false" >> $GITHUB_OUTPUT
-            echo "reason=skip (cron outside evening window: ${HOUR_JST}h JST)" >> $GITHUB_OUTPUT
+            echo "reason=skip (cron outside window: ${HOUR_JST}h JST)" >> $GITHUB_OUTPUT
           elif [ "$DONE_OK" -gt 0 ]; then
             echo "proceed=false" >> $GITHUB_OUTPUT
             echo "reason=skip (already succeeded today: done_ok=${DONE_OK})" >> $GITHUB_OUTPUT
@@ -120,7 +115,7 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_SNS || secrets.DISCORD_WEBHOOK_URL }}
           state: alert
-          label: X リムーブ候補 週次 自動リトライ停止
+          label: X リムーブ候補 日次 自動リトライ停止
           meaning: 当日 2 回以上失敗したため cron の自動再実行を停止しました。本日のリムーブ候補レポートは未発行です。
           action_required: run ログ確認 → 原因解消後に手動 dispatch（force_rerun=true）で再実行
 
@@ -130,7 +125,7 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_SNS || secrets.DISCORD_WEBHOOK_URL }}
           state: failed
-          label: X リムーブ候補 週次 guard 失敗
+          label: X リムーブ候補 日次 guard 失敗
           meaning: 実行前チェック（当日重複判定）自体がエラーになり、生成ジョブが起動していません。
           action_required: run ログ確認 → 手動 dispatch で再実行
 
@@ -365,7 +360,7 @@ jobs:
           render_markdown_to_pdf(md_text, pdf_path, kind="review", target_date=date)
           print(f"rendered: {pdf_path.name} size={pdf_path.stat().st_size:,} bytes")
 
-          note = "**X リムーブ候補（週次）** " + date
+          note = "**X リムーブ候補（日次）** " + date
           files_payload = {}
           attachments = []
           opened = []
@@ -416,7 +411,7 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_SNS || secrets.DISCORD_WEBHOOK_URL }}
           state: partial
-          label: X リムーブ候補 週次 後処理のみ失敗
+          label: X リムーブ候補 日次 後処理のみ失敗
           date: ${{ steps.date.outputs.value }}
           meaning: リムーブ候補レポートは Discord へ配信済みです。配信後の commit だけが失敗しました。
           action_required: 不要（差分は次回 run が回収）
@@ -427,7 +422,7 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_SNS || secrets.DISCORD_WEBHOOK_URL }}
           state: failed
-          label: X リムーブ候補 週次 失敗
+          label: X リムーブ候補 日次 失敗
           date: ${{ steps.date.outputs.value }}
           meaning: 生成または送信が完了せず、本日のリムーブ候補レポートは未配信です。
           action_required: run ログ確認 → 手動 dispatch（force_rerun=true）で再実行

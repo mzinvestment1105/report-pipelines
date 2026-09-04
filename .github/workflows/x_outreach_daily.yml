@@ -1,0 +1,424 @@
+name: X 先行フォロー候補 日次
+
+# PM 2026-09-04: 運用 X アカウント（ノクトラ）を「まだフォローしていない」金融・AI 系の
+# 小規模アカウントを毎日発掘し、先行フォロー＋最上段投稿へのいいねを行う Console スクリプトを
+# 無人で発行する。リムーブ側（x_unfollow_daily.yml）と対になる「攻め」のレーン。
+#
+# 処理の流れ:
+#   1. fetch_x_retweeters.py  … 金融・AI キーワードの投稿を RT した人を収集（X へアクセスする）
+#   2. make_outreach_candidates.py … 候補プールを機械基準でふるい、CSV / Console JS / md を生成
+#   3. PDF 化して Discord（SNS）へ送信し、Private リポへ commit back
+#
+# 生成物（すべて Private リポへ commit back）:
+#   bi/outputs/x_posts/retweeters_outreach_{date}.json  … 候補プール（RT 者一覧）
+#   bi/outputs/x_posts/outreach_candidates_{date}.csv   … 判定結果の全件
+#   bi/outputs/x_posts/outreach_console_{date}.js       … 実行用 Console スクリプト（0 件なら生成されない）
+#   research/sns/{date}_outreach.md                     … PM 向けレポート本文（PDF 化して送信）
+#
+# 設計上の注意（このリポジトリは Public のため）:
+#   - 対象アカウント名・ハンドル・候補の中身を公開ログへ一切 echo しない。
+#     各スクリプトの stdout はハンドルを含むため *.log へ隔離し、公開ログへ出すのは
+#     exit code・ファイルの有無（bool）・件数のみとする。
+#   - artifact のアップロードはしない（Public リポの artifact は第三者が取得可能）。
+#   - X_BURNER_* Secrets（バーナー垢の cookie）を使う。値をログへ出す処理を一切書かない。
+#     PM 承認 2026-09-04: バーナー垢は凍結を許容する前提で、クラウドからの収集を行う。
+"on":
+  schedule:
+    # UTC 08:00 = JST 17:00 起票（PM 指示 2026-09-04: 毎日 17 時）。
+    # GitHub cron は数十分〜数時間遅延し得るため、guard の時間帯ゲートは JST 15〜23 時を許容する。
+    - cron: '0 8 * * *'
+  workflow_dispatch:
+    inputs:
+      target_date:
+        description: '対象日付 (YYYY-MM-DD・空欄で当日)'
+        required: false
+        default: ''
+      force_rerun:
+        description: 'true で当日重複ガードを無視して強制実行（修正後の再テスト用）'
+        required: false
+        default: 'false'
+      skip_fetch:
+        description: 'true で RT 者収集をスキップし既存プールだけで判定（X へアクセスしない）'
+        required: false
+        default: 'false'
+
+# 二重発火を GHA 内部ロックで防ぐ（x_unfollow_daily.yml と同じ固定 group 方式）。
+concurrency:
+  group: x_outreach_daily
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    # 判定: (1) workflow_dispatch かつ force_rerun=true → 無条件 proceed
+    #       (2) cron 起動かつ JST 15 時未満 → skip（深夜着火が翌 JST 日の枠を消費する事故の防止）
+    #       (3) DONE_OK >= 1 → skip（当日すでに生成済み）
+    #       (4) ACTIVE >= 1 → skip（走行中の run あり）
+    #       (5) cron 起動かつ DONE_FAIL >= 2 → skip（連続失敗の暴走防止）
+    #       (6) それ以外 → proceed
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      proceed: ${{ steps.check.outputs.proceed }}
+      reason: ${{ steps.check.outputs.reason }}
+    steps:
+      - name: Checkout report-pipelines (通知 action 用)
+        uses: actions/checkout@v4
+
+      - name: Check today's runs
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TODAY_JST=$(TZ=Asia/Tokyo date +%Y-%m-%d)
+          MY_RUN_ID=${{ github.run_id }}
+          EVENT="${{ github.event_name }}"
+
+          if [ "$EVENT" = "workflow_dispatch" ] && [ "${{ github.event.inputs.force_rerun }}" = "true" ]; then
+            echo "proceed=true" >> $GITHUB_OUTPUT
+            echo "reason=force_rerun (manual guard bypass)" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          STATS=$(bash .github/scripts/check_delivery.sh x_outreach_daily.yml generate "${MY_RUN_ID}")
+          DONE_OK=$(echo "$STATS" | jq -r '.delivered')
+          DONE_FAIL=$(echo "$STATS" | jq -r '.failed')
+          ACTIVE=$(( $(echo "$STATS" | jq -r '.sending') + $(echo "$STATS" | jq -r '.dispatch_pending') + $(echo "$STATS" | jq -r '.schedule_pending') ))
+
+          echo "Today (${TODAY_JST}): active=${ACTIVE} done_ok=${DONE_OK} done_fail=${DONE_FAIL} event=${EVENT} (excluding self ${MY_RUN_ID})"
+
+          echo "active=${ACTIVE}" >> $GITHUB_OUTPUT
+          echo "done_ok=${DONE_OK}" >> $GITHUB_OUTPUT
+          echo "done_fail=${DONE_FAIL}" >> $GITHUB_OUTPUT
+
+          HOUR_JST=$((10#$(TZ=Asia/Tokyo date +%H)))
+
+          if [ "$EVENT" = "schedule" ] && [ "$HOUR_JST" -lt 15 ]; then
+            echo "proceed=false" >> $GITHUB_OUTPUT
+            echo "reason=skip (cron outside window: ${HOUR_JST}h JST)" >> $GITHUB_OUTPUT
+          elif [ "$DONE_OK" -gt 0 ]; then
+            echo "proceed=false" >> $GITHUB_OUTPUT
+            echo "reason=skip (already succeeded today: done_ok=${DONE_OK})" >> $GITHUB_OUTPUT
+          elif [ "$ACTIVE" -gt 0 ]; then
+            echo "proceed=false" >> $GITHUB_OUTPUT
+            echo "reason=skip (active run exists: active=${ACTIVE})" >> $GITHUB_OUTPUT
+          elif [ "$EVENT" = "schedule" ] && [ "$DONE_FAIL" -ge 2 ]; then
+            echo "proceed=false" >> $GITHUB_OUTPUT
+            echo "reason=retry_cap (cron stopped: done_fail=${DONE_FAIL} >= 2)" >> $GITHUB_OUTPUT
+          else
+            echo "proceed=true" >> $GITHUB_OUTPUT
+            if [ "$DONE_FAIL" -gt 0 ]; then
+              echo "reason=recovery (done_fail=${DONE_FAIL})" >> $GITHUB_OUTPUT
+            else
+              echo "reason=initial" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: Discord 通知（🚨 自動リトライ停止）
+        if: contains(steps.check.outputs.reason, 'retry_cap')
+        uses: ./.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_SNS || secrets.DISCORD_WEBHOOK_URL }}
+          state: alert
+          label: X 先行フォロー候補 日次 自動リトライ停止
+          meaning: 当日 2 回以上失敗したため cron の自動再実行を停止しました。本日の先行フォロー候補は未発行です。
+          action_required: run ログ確認 → 原因解消後に手動 dispatch（force_rerun=true）で再実行
+
+      - name: Discord 通知（guard 失敗）
+        if: failure() || cancelled()
+        uses: ./.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_SNS || secrets.DISCORD_WEBHOOK_URL }}
+          state: failed
+          label: X 先行フォロー候補 日次 guard 失敗
+          meaning: 実行前チェック（当日重複判定）自体がエラーになり、生成ジョブが起動していません。
+          action_required: run ログ確認 → 手動 dispatch で再実行
+
+  generate:
+    needs: guard
+    if: needs.guard.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    # RT 者収集（Playwright でのページ遷移）が支配的。ローカル実測で約 35 分のため余裕を持たせる。
+    timeout-minutes: 75
+
+    steps:
+      - name: Determine target date
+        id: date
+        run: |
+          if [ -n "${{ github.event.inputs.target_date }}" ]; then
+            echo "value=${{ github.event.inputs.target_date }}" >> $GITHUB_OUTPUT
+          else
+            echo "value=$(TZ=Asia/Tokyo date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout report-pipelines
+        uses: actions/checkout@v4
+        with:
+          path: report-pipelines
+
+      - name: Setup SSH for private repo
+        env:
+          PRIVATE_REPO_DEPLOY_KEY: ${{ secrets.PRIVATE_REPO_DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$PRIVATE_REPO_DEPLOY_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+      - name: Clone private repo (mizuki-fund)
+        run: |
+          git clone git@github.com:mzinvestment1105/mizuki-fund.git private-repo
+
+      - name: Copy pipelines and static files from Public into private working tree
+        # PM が Private 側への push を忘れた場合でも Public 側の最新ファイルで上書きし、自動化の品質を保つ。
+        # 除外リスト bi/data/x_influencers.yaml は Private のみに存在し、clone した実物が使われる。
+        run: |
+          cp -f report-pipelines/bi/pipelines/*.py private-repo/bi/pipelines/
+          cp -f report-pipelines/bi/pipelines/requirements.txt private-repo/bi/pipelines/
+          mkdir -p private-repo/bi/pipelines/lib
+          cp -rf report-pipelines/bi/pipelines/lib/*.py private-repo/bi/pipelines/lib/ 2>/dev/null || true
+          mkdir -p private-repo/bi/pipelines/assets/fonts
+          cp -rf report-pipelines/bi/pipelines/assets/fonts/* private-repo/bi/pipelines/assets/fonts/ 2>/dev/null || true
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: report-pipelines/bi/pipelines/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r report-pipelines/bi/pipelines/requirements.txt
+
+      - name: Install Japanese fonts (Noto Sans CJK JP)
+        # x_unfollow_daily.yml と同一の耐ハング実装。失敗してもジョブを落とさない
+        # （PDF は lib/md_to_pdf.py が assets/fonts の woff2 を base64 埋め込みするため豆腐にならない）。
+        timeout-minutes: 8
+        continue-on-error: true
+        run: |
+          set -u
+          DEADLINE=$(( $(date +%s) + 280 ))
+          for i in 1 2 3; do
+            if [ "$i" -gt 1 ] && [ "$(date +%s)" -ge "$DEADLINE" ]; then
+              echo "時間予算を超過したため再試行を打ち切ります"
+              break
+            fi
+            if timeout 75 sudo apt-get update -qq \
+               && timeout 120 sudo apt-get install -y -qq fonts-noto-cjk fonts-noto-cjk-extra; then
+              echo "日本語フォント導入に成功しました（${i} 回目）"
+              exit 0
+            fi
+            echo "日本語フォント導入に失敗またはハングしました（${i}/3 回目）"
+            if [ "$i" -lt 3 ]; then
+              sleep $((i * 15))
+            fi
+          done
+          echo "::warning::日本語フォントの apt 導入をスキップしました。PDF は埋め込みフォントで描画するため誌面に影響はありません"
+          exit 0
+
+      - name: Install Playwright Chromium
+        # RT 者収集（fetch_x_retweeters.py）と PDF 出力（lib/md_to_pdf.py）の双方で必須。
+        run: |
+          playwright install chromium --with-deps
+
+      - name: Fetch retweeters (候補プールの収集)
+        id: fetch
+        # X へアクセスする唯一のステップ。バーナー垢の cookie を使う。
+        # PM 承認 2026-09-04: バーナー垢は凍結を許容する前提でクラウドから収集する。
+        # cookie は .env 経由で渡す（環境変数の値はログへ出さない）。
+        # skip_fetch=true の手動実行時は収集せず既存プールだけで判定する。
+        # 収集に失敗しても直近 60 日のプールで判定を続行できるため、ここでジョブは落とさない。
+        if: github.event.inputs.skip_fetch != 'true'
+        continue-on-error: true
+        timeout-minutes: 50
+        working-directory: ./private-repo/bi/pipelines
+        env:
+          X_BURNER_AUTH_TOKEN: ${{ secrets.X_BURNER_AUTH_TOKEN }}
+          X_BURNER_CT0: ${{ secrets.X_BURNER_CT0 }}
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+          PYTHONIOENCODING: utf-8
+        run: |
+          if [ -z "${X_BURNER_AUTH_TOKEN}" ] || [ -z "${X_BURNER_CT0}" ]; then
+            echo "::warning::X_BURNER_* Secrets が未設定のため RT 者収集をスキップします（既存プールで判定します）"
+            echo "fetched=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          # fetch_x_posts.py が load_dotenv でこのファイルを読む。値は echo しない。
+          umask 077
+          {
+            printf 'X_BURNER_AUTH_TOKEN=%s\n' "${X_BURNER_AUTH_TOKEN}"
+            printf 'X_BURNER_CT0=%s\n' "${X_BURNER_CT0}"
+          } > .env
+
+          # stdout にはハンドル・投稿本文が含まれるため公開ログへは出さず *.log へ隔離する。
+          set +e
+          python fetch_x_retweeters.py \
+            --queries "日本株,株式投資,新NISA,決算,高配当,生成AI,ChatGPT,Claude" \
+            --min-retweets 1 \
+            --posts-per-query 8 \
+            --max-retweeters-per-post 40 \
+            --since-days 3 \
+            --slug outreach > retweeters.log 2>&1
+          ec=$?
+          set -e
+          rm -f .env
+
+          POOL="../outputs/x_posts/retweeters_outreach_${TARGET_DATE}.json"
+          if [ -s "$POOL" ]; then
+            N=$(python -c "import json,sys;print(len(json.load(open(sys.argv[1],encoding='utf-8')).get('accounts') or []))" "$POOL")
+            echo "fetched=true" >> $GITHUB_OUTPUT
+            echo "収集成功: ${N} 件（exit ${ec}）"
+          else
+            echo "fetched=false" >> $GITHUB_OUTPUT
+            echo "::warning::RT 者収集に失敗しました（exit ${ec}）。cookie 失効の可能性があります。既存プールで判定を続行します"
+          fi
+
+      - name: Generate outreach candidates
+        id: gen
+        working-directory: ./private-repo/bi/pipelines
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+          PYTHONIOENCODING: utf-8
+        run: |
+          # stdout にはハンドルが含まれるため公開ログへは出さず *.log へ隔離する。
+          # exit 1 は 2 系統: (a) 当日分の既存ファイルあり（上書き防止） (b) データ不足。
+          set +e
+          python make_outreach_candidates.py --date "${TARGET_DATE}" > outreach.log 2>&1
+          ec=$?
+          set -e
+          echo "exit_code=${ec}"
+
+          MD="../../research/sns/${TARGET_DATE}_outreach.md"
+          CSV="../outputs/x_posts/outreach_candidates_${TARGET_DATE}.csv"
+          JS="../outputs/x_posts/outreach_console_${TARGET_DATE}.js"
+          [ -s "$MD" ]  && echo "md_exists=true"  || echo "md_exists=false"
+          [ -s "$CSV" ] && echo "csv_exists=true" || echo "csv_exists=false"
+          # JS は対象 0 件だと生成されない（＝存在しなくても正常）
+          if [ -s "$JS" ]; then echo "js_exists=true"; echo "js_exists=true" >> $GITHUB_OUTPUT
+          else echo "js_exists=false"; echo "js_exists=false" >> $GITHUB_OUTPUT; fi
+
+          if [ "$ec" -ne 0 ]; then
+            if [ -s "$MD" ]; then
+              echo "::warning::当日分のレポートが既に存在するため、スクリプトが上書きせず中止しました（exit ${ec}）。既存ファイルをそのまま配信します"
+            else
+              echo "::error::先行フォロー候補の生成に失敗しました（exit ${ec}・当日分の成果物なし）。候補プール不足の可能性があります"
+              exit 1
+            fi
+          fi
+
+          if [ ! -s "$MD" ]; then
+            echo "::error::スクリプトは正常終了しましたがレポートが生成されていません: ${MD}"
+            exit 1
+          fi
+          echo "生成成功: research/sns/${TARGET_DATE}_outreach.md ($(wc -l < "$MD") lines)"
+
+      - name: Send report to Discord (SNS) as PDF
+        id: send
+        # 送信手段は x_unfollow_daily.yml と同一（_cr §33: 全レポート PDF 統一・JPEG 禁止）。
+        # 実行用 JS は同一メッセージに添付し、PM が貼るまでの手数を最小化する。
+        env:
+          DISCORD_WEBHOOK_SNS: ${{ secrets.DISCORD_WEBHOOK_SNS }}
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+          PYTHONIOENCODING: utf-8
+        working-directory: ./private-repo/bi/pipelines
+        run: |
+          python - <<'PY'
+          import json, os, sys
+          from pathlib import Path
+
+          sys.path.insert(0, str(Path(__file__).resolve().parent))
+          sys.path.insert(0, os.getcwd())
+          import requests
+          from lib.md_to_pdf import render_markdown_to_pdf
+
+          date = os.environ["TARGET_DATE"]
+          webhook = os.environ.get("DISCORD_WEBHOOK_SNS", "")
+          if not webhook:
+              print("ERROR: DISCORD_WEBHOOK_SNS not set", file=sys.stderr)
+              raise SystemExit(1)
+
+          repo = Path(os.getcwd()).parents[1]          # private-repo のルート
+          md_path = repo / "research" / "sns" / f"{date}_outreach.md"
+          js_path = repo / "bi" / "outputs" / "x_posts" / f"outreach_console_{date}.js"
+          out_dir = repo / "bi" / "outputs" / "report_pdfs"
+          out_dir.mkdir(parents=True, exist_ok=True)
+          pdf_path = out_dir / f"x_outreach_{date}.pdf"
+
+          md_text = md_path.read_text(encoding="utf-8")
+          render_markdown_to_pdf(md_text, pdf_path, kind="review", target_date=date)
+          print(f"rendered: {pdf_path.name} size={pdf_path.stat().st_size:,} bytes")
+
+          note = "**X 先行フォロー候補（日次）** " + date
+          files_payload = {}
+          attachments = []
+          opened = []
+          try:
+              f_pdf = pdf_path.open("rb")
+              opened.append(f_pdf)
+              attachments.append({"id": 0, "filename": pdf_path.name})
+              files_payload["files[0]"] = (pdf_path.name, f_pdf, "application/pdf")
+
+              if js_path.exists() and js_path.stat().st_size > 0:
+                  f_js = js_path.open("rb")
+                  opened.append(f_js)
+                  attachments.append({"id": 1, "filename": js_path.name})
+                  files_payload["files[1]"] = (js_path.name, f_js, "text/javascript")
+                  note += (
+                      "\n実行用 Console スクリプトを添付しました（`" + js_path.name + "`）。"
+                      "x.com/home の Console に貼り付けると 10 件ずつ実行します（待機なし・貼り直しで続行）。"
+                  )
+              else:
+                  note += "\n本日の対象は 0 件のため、Console スクリプトはありません。"
+
+              payload = {"content": note, "attachments": attachments}
+              files_payload["payload_json"] = (
+                  None, json.dumps(payload, ensure_ascii=False), "application/json",
+              )
+              r = requests.post(webhook, files=files_payload, timeout=60)
+          finally:
+              for f in opened:
+                  f.close()
+
+          print(f"status {r.status_code} attachments={len(attachments)}")
+          if r.status_code >= 400:
+              print(f"body: {r.text[:400]}", file=sys.stderr)
+              raise SystemExit(1)
+          PY
+
+      - name: Commit and push to private repo
+        if: success()
+        working-directory: ./private-repo
+        run: |
+          bash ../report-pipelines/bi/pipelines/ops/ci_commit_push.sh \
+            -m "data: x outreach candidates ${{ steps.date.outputs.value }}" \
+            bi/outputs/x_posts research/sns
+
+      - name: Discord 通知（⚠️ 配信済み・後処理のみ失敗）
+        if: (failure() || cancelled()) && steps.send.outcome == 'success'
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_SNS || secrets.DISCORD_WEBHOOK_URL }}
+          state: partial
+          label: X 先行フォロー候補 日次 後処理のみ失敗
+          date: ${{ steps.date.outputs.value }}
+          meaning: 先行フォロー候補は Discord へ配信済みです。配信後の commit だけが失敗しました。
+          action_required: 不要（差分は次回 run が回収）
+
+      - name: Discord 通知（❌ 失敗）
+        if: (failure() || cancelled()) && steps.send.outcome != 'success'
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_SNS || secrets.DISCORD_WEBHOOK_URL }}
+          state: failed
+          label: X 先行フォロー候補 日次 失敗
+          date: ${{ steps.date.outputs.value }}
+          meaning: 生成または送信が完了せず、本日の先行フォロー候補は未配信です。
+          action_required: run ログ確認 → 手動 dispatch（force_rerun=true）で再実行
+
+      - name: 成否サマリ（bool のみ）
+        if: always()
+        run: |
+          echo "date=${{ steps.date.outputs.value }}"
+          echo "fetched=${{ steps.fetch.outputs.fetched }}"
+          echo "gen_ok=${{ steps.gen.outcome == 'success' }}"
+          echo "js_exists=${{ steps.gen.outputs.js_exists }}"
+          echo "send_ok=${{ steps.send.outcome == 'success' }}"
