@@ -176,10 +176,9 @@ GHA 自動化では環境変数 `TARGET_MARKET`（`prime` / `standard` / `growth
 
 ---
 
-## 専門用語の注釈（全セクション共通・必須・PM 2026-05-20 明示指示）
+## 専門用語の注釈
 
-- ※誌面共通ルールは [prompts/_common_rules.md](../prompts/_common_rules.md) §5 を適用
-- 「何の会社」欄で特に厳格に適用（例：量子ドットレーザー・SAR 衛星・系統用蓄電・SAP on AWS・光電融合等は必ず注釈）。
+- ※[prompts/_common_rules.md](../prompts/_common_rules.md) §5 を適用（正本）。
 
 ---
 

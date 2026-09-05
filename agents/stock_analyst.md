@@ -10,12 +10,9 @@ PMから指定された銘柄を深掘りし、エントリー・見送りの判
 
 ---
 
-## 専門用語ルール（全セクション共通）
+## 専門用語ルール
 
-※誌面共通ルールは [prompts/_common_rules.md](../prompts/_common_rules.md) §5 を適用
-
-- 保存前の注釈自己検証は [/stock-report](../.claude/commands/stock-report.md) Step 4.5 で必ず実行する（スキップ即重大インシデント）。
-- 詳細 memory: [feedback_jargon_annotation.md](../claude_memory/feedback_jargon_annotation.md)
+※[prompts/_common_rules.md](../prompts/_common_rules.md) §5 を適用（正本）。保存前の注釈自己検証は [/stock-report](../.claude/commands/stock-report.md) Step 4.5 で実行する。
 
 ---
 
