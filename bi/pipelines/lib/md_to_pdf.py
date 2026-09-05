@@ -469,10 +469,25 @@ def _wrap_theme_blocks(html: str) -> str:
     # だけがページ末に残る分断が v10 まで残っていた（8/28 実測で「仮想通貨」が分断）。
     # `**1位 テーマ名**（10日中7日点灯）` のように太字の後ろに素の文字が続く形も見出しと
     # みなす（v11 の点灯日数表記）。`</strong></p>` で閉じる形だけを見ていると掛からない。
+    # 早期リターン。テーマ2部を持たない誌面（個別銘柄レポート等）では theme-lead 表が
+    # 1つも無く、本ラッパは何も包まない。にもかかわらず正規表現は全文を走査するため、
+    # 掛からないことの確認に指数時間を費やしていた（下記参照）。先に安価な部分文字列
+    # 検査で抜ける（2026-09-05）。
+    if '<table class="theme-lead">' not in html:
+        return html
+
     _HEAD = r"(?:<h5[^>]*>.*?</h5>|<p><strong>(?:(?!</p>).)*?</strong>(?:(?!</p>).)*?</p>)"
+    # 中間の理由段落群は `.*?`（DOTALL）ではなく `(?:(?!</p>).)*?` で書く。
+    # `.*?` は DOTALL 下で `</p>` を跨げるため、N 個連続する段落を「1段落あたり
+    # 区切るか跨ぐか」で分割する組み合わせが 2^N 通り生まれ、末尾の theme-lead 表が
+    # 見つからない位置ではその全パターンを試し尽くしてから失敗する（catastrophic
+    # backtracking）。実測で 150行=2.4秒 / 170行=19秒 / 180行=38秒 と約10行ごとに
+    # 倍増し、12ページ級で事実上ハングしていた（2026-09-05 実測）。段落境界を跨げなく
+    # すると分割は一意に定まり線形時間になる。誌面上の意味（見出しと表の間に挟まる
+    # 理由段落の 0 個以上の連なり）は変わらない。
     pattern = re.compile(
         r"(" + _HEAD + r")\s*"
-        r"((?:<p>(?!<strong>).*?</p>\s*)*?)"
+        r"((?:<p>(?!<strong>)(?:(?!</p>).)*?</p>\s*)*?)"
         r"(<table class=\"theme-lead\">.*?</table>)",
         flags=re.DOTALL,
     )
@@ -632,7 +647,11 @@ def render_markdown_to_pdf(
     with sync_playwright() as p:
         browser = p.chromium.launch()
         page = browser.new_page()
-        page.set_content(full_html, wait_until="load")
+        # 明示タイムアウト（120秒）。無言のまま CPU を回し続ける事故を防ぎ、上限を
+        # 超えたら例外で落とす（2026-09-05）。`page.pdf()` は本バージョンの Playwright
+        # では timeout 引数を受け取らないため、ページ既定のタイムアウトで掛ける。
+        page.set_default_timeout(120_000)
+        page.set_content(full_html, wait_until="load", timeout=120_000)
         page.pdf(
             path=str(out_path),
             format="A4",
