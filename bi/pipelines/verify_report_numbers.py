@@ -22,6 +22,17 @@ import re
 import sys
 from pathlib import Path
 
+# Windows 既定の cp932 だと日本語メッセージを print した瞬間に UnicodeEncodeError で
+# 落ち、判定行（NUMBER VERIFY: OK / FAILED）が出力されない。標準出力・標準エラーを
+# UTF-8（変換不能文字は置換）へ張り替える。失敗しても検査は続行する（フェイルオープン）。
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:  # noqa: BLE001
+    pass
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # 許容誤差（レポートは四捨五入した値を載せるため、丸め分は通す）

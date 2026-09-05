@@ -29,9 +29,19 @@ PMから指定された銘柄を深掘りし、エントリー・見送りの判
 - [market/daily/movers/](../market/daily/movers/) 配下の `YYYY-MM-DD.md` を**直近2件**
 - [market/daily/sector/](../market/daily/sector/) 配下の `YYYY-MM-DD.md` を**直近1件**
 - [market/daily/ideas/](../market/daily/ideas/) 配下の `YYYY-MM-DD.md` を**直近1件**
+- 上記の既定件数の Read は維持したうえで、当銘柄のテーマ・セクターに関する**過去の言及**を検索で補う。
+  `python bi/pipelines/rag/search.py --collection market_daily --query "<テーマ・セクター名>" --since <90日前の YYYY-MM-DD> --top 5`
+  で上位 5 件の断片だけを読み、必要なら断片に出た path の該当行範囲のみ Read する。
 
-### Step 3: 当銘柄の過去レポート（全件）
-- [research/stocks/](../research/stocks/){コード}/ 配下のファイルを全て読む（日付順）。初回分析の場合はスキップ。
+### Step 3: 当銘柄の過去レポート（全文 Read は 3 種のみ・残りは検索）
+- **全文 Read するのは次の 3 種だけ**: `thesis_master.md`・`core_satellite_plan.md`（保有中のみ）・最新レポート 1 本。
+- **それ以外の過去分は全件 Read せず**、
+  `python bi/pipelines/rag/search.py --collection stocks --code {コード} --query "<今回の論点>" --top 5`
+  で返る断片のみを読む。断片に出た path は、その断片だけでは判断できない時に限り該当行範囲を Read する。
+  （`research/stocks/{コード}/` は 1 銘柄で 200 万バイトを超えることがあり、全件 Read は論点に無関係な過去分で
+  文脈を埋めてしまうため。検索は同一本文の複製を既定で 1 件に畳む。）
+- 初回分析の場合はスキップ。
+- **索引が無い・古い場合**は先に `python bi/pipelines/rag/build_index.py --collection stocks` を実行する。
 
 ### Step 4: 銘柄データ（必須）
 - EDINETまたはTDNetの直近決算短信・決算説明資料
