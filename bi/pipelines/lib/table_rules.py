@@ -34,6 +34,13 @@ _NUMERIC_CELL = re.compile(
 # 表の区切り行 `|---|---|`
 _SEPARATOR = re.compile(r"^\|[\s:\-|]+\|$")
 
+# テキスト列とみなすヘッダ語。この列を持つ表は「本文セルが数値のみ」の除外に
+# 該当させない（本文が空欄・記号でも、埋めれば長文になる列であるため）。
+_TEXT_COL = re.compile(
+    r"割当先|備考|関係|理由|内容|条件|コメント|概要|説明|状態|状況|区分|目的"
+    r"|評価|判定|所感|読み|材料|事象|イベント|注記|条項|ロックアップ|株主名"
+)
+
 # 字数カウントから除外するマークダウン装飾・HTML
 _DECOR = re.compile(r"\*\*|__|`|<br\s*/?>|</?[a-zA-Z][^>]*>")
 
@@ -123,8 +130,13 @@ def check_tables(md_text: str) -> list[dict]:
 
         # 除外: 本文セルが全て数値・記号のみの表（業績推移表・比較表など）。
         # ラベル列（1 列目）は文字列でも許すため、2 列目以降で判定する。
+        # PM 2026-09-05 改定: 本文セルが空欄・記号ばかりでも、テキスト列
+        # （「割当先」「備考」「関係」等）を持つ表は数値表ではないため除外しない。
+        # 旧実装は本文セルだけを見ていたため、埋まっていないテキスト列を含む表が
+        # 「数値のみ」と誤判定されて列数・字数の検査を素通りしていた。
         non_label = [c for r in rows for c in r[1:]] if ncols >= 2 else []
-        if non_label and all(_is_numeric_cell(c) for c in non_label):
+        text_cols = [h for h in (header[1:] if ncols >= 2 else []) if _TEXT_COL.search(h)]
+        if non_label and all(_is_numeric_cell(c) for c in non_label) and not text_cols:
             continue
 
         # (a) 列数 5 以上

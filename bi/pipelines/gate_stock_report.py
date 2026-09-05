@@ -326,6 +326,227 @@ def _check_reaction_format(md: str) -> list[str]:
     return errs
 
 
+# --- 希薄化・資本異動セクションの記載形式検査（PM 2026-09-05）-------------------
+# 回数は希薄化の大きさを表さないため、回数列を禁止し希薄化率（%）を必須とする。
+# 生株数（分割前・分割後）を主表示にすることも禁止する。
+_DILUTION_HEADING = re.compile(r"^#{2,6}\s.*(希薄化|資本異動)", re.M)
+# 回数だけの列（「実施回数」「発行回数」「回数」）
+_COUNT_COL = re.compile(r"回数")
+# 生株数の分割前後を列に出すことの禁止
+_SPLIT_COL = re.compile(r"分割前|分割後")
+# 希薄化率の記載（「希薄化」または「潜在」と % が同一行に共起する）
+_DILUTION_PCT = re.compile(r"(希薄化|潜在)[^\n]*[0-9０-９][^\n]*[%％]|[0-9０-９][^\n]*[%％][^\n]*(希薄化|潜在)")
+
+DILUTION_PCT_REMEDY = (
+    "各資本異動について (1) 当時の発行済株式数に対する希薄化率（%）"
+    " (2) 現在の発行済株式数に対する比率（%）を書く"
+    "（分母の出典と基準日を併記する）"
+)
+DILUTION_COUNT_REMEDY = (
+    "回数の列・行を削除し、発行株数と希薄化率（%）の列へ置き換える"
+    "（回数は本文の一文としてのみ補足する）"
+)
+DILUTION_SPLIT_REMEDY = (
+    "分割前・分割後の生株数の列を削除し、"
+    "「現在の発行済株式数に対する潜在希薄化率（%）」を主表示にする"
+    "（換算の前提は表の直下の文章で書く）"
+)
+
+
+def _dilution_ranges(md: str) -> list[tuple[int, int]]:
+    """希薄化・資本異動セクションの (開始行, 終了行) を 0 始まりで返す。
+
+    見出しの次の行から、同じかそれより浅いレベルの見出しの直前までを範囲とする。
+    """
+    lines = md.replace("\r\n", "\n").split("\n")
+    ranges: list[tuple[int, int]] = []
+    for i, raw in enumerate(lines):
+        s = raw.strip()
+        m = re.match(r"^(#{2,6})\s.*(希薄化|資本異動)", s)
+        if not m:
+            continue
+        level = len(m.group(1))
+        end = len(lines)
+        for j in range(i + 1, len(lines)):
+            m2 = re.match(r"^(#{2,6})\s", lines[j].strip())
+            if m2 and len(m2.group(1)) <= level:
+                end = j
+                break
+        ranges.append((i, end))
+
+    # 見出しではなく本文の導入文（「増資・希薄化の履歴は以下のとおり」等）で
+    # 始まる表も対象にする。導入文からの 12 行を範囲に加える。
+    for i, raw in enumerate(lines):
+        s = raw.strip()
+        if s.startswith("#") or s.startswith("|"):
+            continue
+        if not re.search(r"(増資|希薄化|資本異動)[^\n]{0,20}(履歴|一覧|推移|内訳)", s):
+            continue
+        if any(lo <= i < hi for lo, hi in ranges):
+            continue
+        ranges.append((i, min(len(lines), i + 12)))
+
+    return ranges
+
+
+def _check_dilution(md: str) -> list[str]:
+    """希薄化・資本異動セクションの回数列禁止・希薄化率必須・生株数列禁止を検査する。
+
+    該当セクションが無い誌面では検査をスキップして空リストを返す。
+    """
+    ranges = _dilution_ranges(md)
+    if not ranges:
+        return []
+
+    errs: list[str] = []
+    lines = md.replace("\r\n", "\n").split("\n")
+
+    # (i) 表ヘッダの禁止列（回数 / 分割前 / 分割後）
+    for hline, header, _rows in _tables_with_lines(md):
+        if not any(lo < hline - 1 <= hi for lo, hi in ranges):
+            continue
+        bad_count = [c for c in header if _COUNT_COL.search(c)]
+        if bad_count:
+            errs.append(
+                f"[回数列の禁止] L{hline} の表ヘッダに回数の列がある: "
+                f"{' / '.join(bad_count)}"
+                f" → 対処: {DILUTION_COUNT_REMEDY}"
+            )
+        bad_split = [c for c in header if _SPLIT_COL.search(c)]
+        if bad_split:
+            errs.append(
+                f"[生株数の列の禁止] L{hline} の表ヘッダに分割前後の株数の列がある: "
+                f"{' / '.join(bad_split)}"
+                f" → 対処: {DILUTION_SPLIT_REMEDY}"
+            )
+
+    # (ii) セクション内に希薄化率（%）の記載が 1 件も無い
+    for lo, hi in ranges:
+        body = "\n".join(lines[lo:hi])
+        if not _DILUTION_PCT.search(body):
+            title = lines[lo].strip().lstrip("# ").strip()
+            errs.append(
+                f"[希薄化率（%）の欠落] L{lo + 1}「{title}」に "
+                "希薄化率・潜在希薄化率の % 表記が 1 件も無い。"
+                f" → 対処: {DILUTION_PCT_REMEDY}"
+            )
+
+    return errs
+
+
+# --- IPO ロックアップ節の必須化検査（PM 2026-09-05）---------------------------
+# 上場から 2 年以内の銘柄は §7-B「IPO ロックアップ」を必須とする。
+_LOCKUP_HEADING = re.compile(r"^#{2,6}\s.*(ロックアップ|IPO)", re.M)
+_LOCKUP_PCT = re.compile(r"ロックアップ[^\n]*[0-9０-９][^\n]*[%％]|[0-9０-９][^\n]*[%％][^\n]*ロックアップ")
+# 本文中の「YYYY年M月D日付で…上場いたしました」「YYYY年M月の上場」等から上場年月を拾う。
+# 「上場」が先に来る形（「上場…YYYY年M月」）は、上場と無関係の後段の日付を拾う事故が
+# あるため採らない。日付が先行し、その直後に上場が来る形のみを採用する。
+_LISTING_DATE = re.compile(
+    r"(20[0-9]{2})\s*年\s*([0-9]{1,2})\s*月(?:\s*([0-9]{1,2})\s*日)?"
+    r"\s*(?:付|付け)?\s*(?:で|に|の)?\s*"
+    r"(?:東京証券取引所[^\n]{0,12}?)?(?:に)?(?:株式を)?(?:新規)?上場"
+)
+
+LOCKUP_REMEDY = (
+    "上場 2 年以内の銘柄は §7-B「IPO ロックアップ・新規上場株主分析」を必須とし、"
+    "(1) 株主ごとのロックアップ条件と対象株数の発行済比% "
+    "(2) 各大株主の現在の保有比率と上場時からの増減（基準日併記） "
+    "(3) 各株主の会社との関係 "
+    "(4) 解除済・解除予定株数の発行済比%と 5 日平均出来高に対する日数換算 を書く"
+)
+
+
+def _earliest_listing_ym(text: str) -> str | None:
+    """本文から「YYYY年M月[D日]付で…上場」を全件拾い、最も古い年月を返す。
+
+    生データは複数の開示を連結したものであり、後段に上場と無関係の日付が並ぶ。
+    上場日は各開示に繰り返し現れるため、最古を採るのが最も安定する。
+    """
+    yms = []
+    for m in _LISTING_DATE.finditer(text):
+        try:
+            yms.append(f"{m.group(1)}-{int(m.group(2)):02d}")
+        except (TypeError, ValueError):
+            continue
+    return min(yms) if yms else None
+
+
+def _listing_date(md: str, code: str) -> tuple[str | None, str]:
+    """(上場日 YYYY-MM-DD 相当, 取得元) を返す。判定できなければ (None, 理由)。
+
+    優先順位: (1) 生データ research/stocks/{code}_*_data.md
+              (2) screening_master の上場日列
+              (3) レポート本文の「上場」+ 年月の記載
+    """
+    # (1) 生データ
+    for p in sorted((REPO_ROOT / "research" / "stocks").glob(f"{code}_*_data.md")) + sorted(
+        (REPO_ROOT / "research" / "stocks" / str(code)).glob(f"{code}_*_data.md")
+    ):
+        try:
+            txt = p.read_text(encoding="utf-8")
+        except Exception:  # noqa: BLE001
+            continue
+        ym = _earliest_listing_ym(txt)
+        if ym:
+            return ym, f"生データ {p.name}"
+
+    # (2) screening_master の上場日列
+    pq = REPO_ROOT / "bi" / "outputs" / "screening_master.parquet"
+    if pq.exists():
+        try:
+            import pandas as pd
+
+            head = pd.read_parquet(pq).head(0)
+            col = next(
+                (c for c in head.columns if ("上場" in c and "日" in c) or c in ("ListingDate", "IPODate")),
+                None,
+            )
+            if col:
+                df = pd.read_parquet(pq, columns=["Code", col])
+                row = df[df["Code"].astype(str).str.upper() == str(code).upper()]
+                if not row.empty and str(row.iloc[0][col]) not in ("nan", "NaT", ""):
+                    return str(row.iloc[0][col])[:7], f"screening_master 列「{col}」"
+        except Exception:  # noqa: BLE001
+            pass
+
+    # (3) レポート本文
+    ym = _earliest_listing_ym(md)
+    if ym:
+        return ym, "レポート本文の「上場」記載"
+
+    return None, "上場日を特定できず（検査スキップ）"
+
+
+def _check_ipo_lockup(md: str, code: str) -> tuple[list[str], str]:
+    """(errors, 判定に使った上場日の取得元メモ) を返す。"""
+    ym, src = _listing_date(md, code)
+    if not ym:
+        return [], f"[IPO ロックアップ] {src}"
+
+    from datetime import date
+
+    y, mo = int(ym[:4]), int(ym[5:7])
+    today = date.today()
+    months = (today.year - y) * 12 + (today.month - mo)
+    if months > 24:
+        return [], f"[IPO ロックアップ] 上場 {ym}（{src}）→ 2 年超のため任意"
+
+    note = f"[IPO ロックアップ] 上場 {ym}（{src}）→ 2 年以内のため必須"
+    if not _LOCKUP_HEADING.search(md):
+        return [
+            f"[IPO ロックアップ節の欠落] 上場 {ym}（{src}）で 2 年以内だが "
+            "§7-B「IPO ロックアップ」の見出しが無い。"
+            f" → 対処: {LOCKUP_REMEDY}"
+        ], note
+    if not _LOCKUP_PCT.search(md):
+        return [
+            f"[IPO ロックアップの発行済比%欠落] 上場 {ym}（{src}）で 2 年以内。"
+            "「ロックアップ」と % の共起が 1 件も無い。"
+            f" → 対処: {LOCKUP_REMEDY}"
+        ], note
+    return [], note
+
+
 def run_gate(md: str, code: str) -> tuple[list[str], list[str], list[str]]:
     """(errors, warnings, info) を返す。errors が空なら送信可。"""
     errors: list[str] = []
@@ -431,6 +652,23 @@ def run_gate(md: str, code: str) -> tuple[list[str], list[str], list[str]]:
             )
         else:
             info.append("[希薄化の記載] 行使価・期間・現在値との位置関係すべて在籍")
+
+    # 7b. 希薄化・資本異動セクションの記載形式（errors・PM 2026-09-05）
+    #     回数列・分割前後の生株数列を禁止し、希薄化率（%）の記載を必須とする。
+    dil_errs = _check_dilution(md)
+    if dil_errs:
+        errors.extend(dil_errs)
+    else:
+        if _DILUTION_HEADING.search(md):
+            info.append("[希薄化の記載形式] 回数列なし・希薄化率（%）在籍")
+        else:
+            info.append("[希薄化の記載形式] 該当セクションなし → 検査スキップ")
+
+    # 7c. IPO ロックアップ節の必須化（errors・PM 2026-09-05）
+    lock_errs, lock_note = _check_ipo_lockup(md, code)
+    if lock_errs:
+        errors.extend(lock_errs)
+    info.append(lock_note)
 
     # 8. 同業比較表の銘柄コードが screening_master に在籍するか（errors）
     peer_err = _check_peer_codes(md, code)
