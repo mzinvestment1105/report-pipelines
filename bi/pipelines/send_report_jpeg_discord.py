@@ -402,8 +402,10 @@ def split_movers_by_market(md_text: str) -> list[tuple[str, str]]:
     """
     import re
 
+    # 2026-09-04 PM 指示で市場 h1 は `# グロース市場` 形式。旧形式も受ける。
+    _mk = r"(?:^#\s*(?:プライム|スタンダード|グロース)市場\s*$|^#\s*動意銘柄レポート)"
     block_pattern = re.compile(
-        r"(^#\s*動意銘柄レポート.*?)(?=^#\s*動意銘柄レポート|\Z)",
+        rf"({_mk}.*?)(?={_mk}|\Z)",
         flags=re.DOTALL | re.MULTILINE,
     )
     blocks = [m.group(1).rstrip() for m in block_pattern.finditer(md_text)]

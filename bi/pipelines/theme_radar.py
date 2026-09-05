@@ -80,6 +80,167 @@ HEAT_WINDOW_DAYS = 10
 MERGE_JACCARD = 0.5
 # 統合には最低この銘柄数の重複を要求する（1銘柄だけの重なりでは統合しない）
 MERGE_MIN_OVERLAP = 2
+# 誌面表示ベースの二次統合の閾値（2026-09-04 PM 指示）。
+# merge_overlapping_themes は「点灯銘柄集合」で統合するが、誌面に実際に出る銘柄は
+# 欄ごとに絞られる（初動候補は +3%以上の銘柄のみ、2週間欄は当日点灯銘柄のみ）ため、
+# 統合後でも「誌面上は同じ銘柄群の別名テーマ」が複数枠を占めた（9/3 の
+# 自動運転車 / フィジカルAI / MaaS）。表示対象集合で見て**小さい方の集合の
+# DISPLAY_MERGE_RATIO 以上が重なる**場合も1行へ統合する。
+DISPLAY_MERGE_RATIO = 0.5
+# 表示ベース統合でも最低この銘柄数の重複を要求する（1銘柄の重なりでは統合しない）
+DISPLAY_MERGE_MIN_OVERLAP = 2
+# 候補行のうちこの割合以上に登場する銘柄は「多テーマ所属の大型株」とみなし、
+# 表示ベース統合の判定根拠から除外する（総合商社・電力の共有だけで無関係なテーマが
+# 芋づるに潰れるのを防ぐ）。
+DISPLAY_PROMISCUOUS_RATIO = 0.34
+# 大きい方の集合の側にも要求する重複率。小さい方の過半だけで統合すると、構成2〜3銘柄の
+# 小テーマが大テーマへ次々と吸収されて1行が肥大する。
+DISPLAY_MERGE_OUTER_RATIO = 0.34
+# 片側だけの重なりで統合を認める「包含」の閾値。小さい方の集合のこの割合以上が
+# 大きい方に含まれる場合、その行は大テーマの部分集合として別枠を占めているだけと見なす。
+DISPLAY_MERGE_CONTAIN_RATIO = 0.6
+# 新規性フィルタ（2026-09-04 PM 指示）: 誌面の各欄で、その行の表示銘柄のうち
+# 「上位行に未掲載の銘柄」がこの数に満たない行は、新しい情報が無いので落として次点を
+# 繰り上げる。9/3 実測で初動候補 4位 ナノテクノロジーが 三菱商事（1位既出）＋
+# テクセンドフォトマスク（2位既出）の2銘柄だけになり、枠を消費して何も伝えなかった。
+MIN_NEW_CODES = 2
+# 「統合 → 銘柄の絞り込み → 新規性判定」を繰り返す最大回数（2026-09-04 PM 指示）。
+# 絞り込みで表示銘柄が減ると新たな重複が生まれるため、変化がなくなるまで回す。
+# 上限を置くのは、無制限だと全テーマが1行へ収束し得るため（実測）。
+MERGE_REFINE_PASSES = 4
+
+
+def _pct_at_least(rec: dict, pct: float) -> bool:
+    """レコードの騰落率が pct 以上か（取れない場合は False）。"""
+    try:
+        return float(rec.get("return_pct") or 0) >= float(pct)
+    except (TypeError, ValueError):
+        return False
+
+# 汎用銘柄の判定（2026-09-04 PM 指示）。上位プールのうちこの数以上のテーマに現れる銘柄は
+# 商社・電力・大型汎用株であり、そのテーマを説明しないので表示・n3・新規性判定から外す。
+# 9/3 実測で 三菱商事(8058・辞書上46テーマ所属)・住友商事(8053・48テーマ) が
+# 自動運転車／EUV／再生可能エネルギーの3行すべてに並んだ。
+GENERIC_CODE_MIN_THEMES = 3
+
+
+def _self_codes(entry: dict, code_to_themes: dict | None) -> set:
+    """その行の**代表テーマ自身**の辞書構成銘柄だけを返す（2026-09-04 PM 指示）。
+
+    merge_by_display_overlap / merge_overlapping_themes は統合行の codes を和集合にする。
+    和集合をそのまま誌面へ出すと、吸収した別名テーマにしか属さない銘柄が代表テーマの
+    行に並ぶ（9/3 実測で 自動運転車 の行に レーザーテック(6920) が出た。6920 は辞書上
+    自動運転車に属さず、吸収した EUV 系テーマ由来だった）。別名テーマは
+    「（…を含む）」の名前表記だけで示し、銘柄は代表テーマ自身のものに限定する。
+
+    code_to_themes が無い場合は判定できないので全件を返す（従来動作）。
+    """
+    theme = entry.get("theme")
+    if not code_to_themes or not theme:
+        return {str(c.get("code")) for c in (entry.get("codes") or [])}
+    return {
+        str(c.get("code"))
+        for c in (entry.get("codes") or [])
+        if theme in (code_to_themes.get(str(c.get("code"))) or [])
+    }
+
+
+def generic_codes(
+    entries: list[dict],
+    code_to_themes: dict | None = None,
+    min_themes: int = GENERIC_CODE_MIN_THEMES,
+) -> set:
+    """上位プールの min_themes 以上のテーマに現れる「汎用銘柄」の集合を返す。
+
+    数えるのは「誌面の何行に出得るか」であり、各行の代表テーマ自身の構成銘柄
+    （_self_codes）を跨いで数える。統合後の codes（和集合）を数えると吸収した別名
+    テーマ由来の銘柄まで数に入り、辞書テーマ数で数えるとプールの別名テーマが母数に
+    入って本来の主役まで汎用扱いになる（9/3 実測でいずれも誤判定）。
+
+    誌面の表示・n3・新規性判定から外すためのもので、ゲート判定の n_up（単一テーマとして
+    何社同時に動いたか）からは外さない（PM 指示）。
+    """
+    from collections import Counter
+
+    # 数えるのは「その銘柄が誌面の**何行**に出得るか」。行の掲載可否は代表テーマ自身の
+    # 構成銘柄かどうかで決まる（_self_codes）ため、その集合で行を跨いだ出現数を数える。
+    # 統合前の辞書テーマ数で数えると、プールの別名テーマまで母数に入って 593A のような
+    # 本来の主役まで汎用扱いになる（9/3 実測でプール104テーマ・593A が 6 テーマ該当）。
+    cnt: Counter = Counter()
+    for e in entries:
+        cnt.update(_self_codes(e, code_to_themes))
+    return {c for c, n in cnt.items() if n >= int(min_themes) and c}
+
+
+
+
+def filter_new_codes(
+    rows: list[dict],
+    display_codes,
+    max_rows: int | None = None,
+    min_new: int = MIN_NEW_CODES,
+) -> list[dict]:
+    """上位行に未掲載の銘柄が min_new 件未満の行を落とす（2026-09-04 PM 指示）。
+
+    上から順に見て、その行の表示銘柄のうち「ここまでに採用した行で既に出た銘柄」を
+    除いた残りが min_new 件未満なら、その行を採用しない（既出銘柄の寄せ集めであり
+    誌面に新しい情報を足さないため）。落とした分は後続の候補が自動的に繰り上がる。
+    枠（max_rows）を満たせない場合は少ない行数のまま返す（水増し禁止・§25）。
+
+    Args:
+        rows: 優先順（上位が先頭）に並んだ候補行。
+        display_codes: row -> 誌面に出る銘柄コードの集合（または iterable）。
+        max_rows: 採用する最大行数。None なら全件を判定する。
+    """
+    out: list[dict] = []
+    seen: set[str] = set()
+    for r in rows:
+        try:
+            disp = {str(c) for c in (display_codes(r) or []) if str(c).strip()}
+        except Exception:
+            disp = set()
+        if not disp:
+            continue
+        if len(disp - seen) < int(min_new):
+            continue
+        out.append(r)
+        seen |= disp
+        if max_rows is not None and len(out) >= max(int(max_rows), 0):
+            break
+    return out
+
+
+def refine_rows_by_display(
+    rows: list[dict],
+    display_codes,
+    max_rows: int | None = None,
+    score_key: str = "score",
+    min_new: int = MIN_NEW_CODES,
+    passes: int = MERGE_REFINE_PASSES,
+) -> list[dict]:
+    """「表示ベース統合 → 新規性判定」を行数が変化しなくなるまで繰り返す。
+
+    2026-09-04 PM 指示。銘柄の絞り込み（代表テーマ限定・汎用銘柄除外）で表示銘柄が
+    減った結果として新たに生じた重複は、絞り込み前に1度統合しただけでは畳めない
+    （9/3 実測で初動候補の 2位・3位 がともに九州電力(9508)を表示した）。
+    初動候補・2週間欄・本日のテーマで共通に使う。
+    """
+    out = filter_new_codes(rows, display_codes, max_rows=max_rows, min_new=min_new)
+    for _ in range(max(int(passes), 0)):
+        before = len(out)
+        out = merge_by_display_overlap(out, display_codes, score_key=score_key)
+        out.sort(
+            key=lambda r: (
+                -float(r.get(score_key, 0.0) or 0.0),
+                str(r.get("theme") or ""),
+            )
+        )
+        out = filter_new_codes(out, display_codes, max_rows=max_rows, min_new=min_new)
+        if len(out) == before:
+            break
+    return out
+
+
 # 各部の最大表示行数
 # 「本日のテーマ」は機械が確定させない。機械は候補を TODAY_CANDIDATES 件まで出し、
 # レポート作成 Claude が「主導銘柄2社以上に共通する材料があるテーマ」だけを残して
@@ -837,6 +998,167 @@ def merge_overlapping_themes(entries: list[dict], theme_size: dict) -> list[dict
     return merged
 
 
+def merge_by_display_overlap(
+    rows: list[dict],
+    display_codes,
+    theme_size: dict | None = None,
+    score_key: str = "score",
+    ratio: float = DISPLAY_MERGE_RATIO,
+    min_overlap: int = DISPLAY_MERGE_MIN_OVERLAP,
+) -> list[dict]:
+    """**誌面に実際に出る銘柄集合**が重なるテーマ行を1行へ統合する（2026-09-04 PM 指示）。
+
+    merge_overlapping_themes は「点灯銘柄集合」で統合するため、点灯集合では別物でも
+    誌面に載る銘柄（初動候補欄=+3%以上の点灯銘柄／2週間欄・本日=表示する点灯銘柄）が
+    ほぼ同じテーマが複数枠を占めることがあった（9/3 の 自動運転車 / フィジカルAI /
+    MaaS がいずれも 593A・336A・4667 の重複）。本関数は表示対象集合で見て
+    **小さい方の集合の ratio 以上（既定 50%）が重なる**場合も統合する。
+
+    統合の仕様（PM 指示）:
+        名前   … 上位テーマ名＋「（吸収したテーマ名を含む）」（format_theme_label が付与）
+        銘柄   … 和集合
+        指標   … スコア・n_up・turn3 等は**上位側（残る行）の値**をそのまま引き継ぐ。
+                 ただし銘柄を数え直す指標（turn3_oku 等）は呼び出し側が和集合から再集計する。
+
+    Args:
+        rows: 統合対象の行（"theme" / "merged_names" / score_key / "codes" を持つ dict）。
+            入力順が優先順（先頭ほど上位）である必要はなく、score_key 降順で上位を決める。
+        display_codes: row -> 誌面に出る銘柄コードの集合（または iterable）を返す callable。
+        theme_size: theme -> 構成銘柄数（併記名の並び順にだけ使う）。
+    Returns:
+        統合済みの行リスト（入力の dict をコピーし "merged_names" と "codes" を更新）。
+        並びは score_key 降順（入力の相対順は保たない）。
+    """
+    if not rows:
+        return []
+    theme_size = theme_size or {}
+
+    def _score(r: dict) -> float:
+        try:
+            return float(r.get(score_key) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    items = []
+    for r in rows:
+        try:
+            disp = {str(c) for c in (display_codes(r) or []) if str(c).strip()}
+        except Exception:
+            disp = set()
+        items.append({"row": r, "_disp": disp, "_key": set(disp)})
+
+    # 多テーマに顔を出す銘柄（総合商社・電力・大手半導体など、辞書上ほぼ全テーマへ
+    # ぶら下がる大型株）を除いた「そのテーマを特徴づける銘柄」の集合 `_key` を作る。
+    # 重なりの割合判定は誌面に出る生の集合 `_disp` で行い（PM が誌面で見る重複は
+    # 大型株の並びそのものなので、ここから大型株を抜くと重複が検知できない）、
+    # `_key` は「特徴銘柄を1つも共有しない＝別テーマ」を弾く**拒否条件**にだけ使う。
+    # これを入れないと 8058・9503 等を共有するだけで無関係なテーマが1行へ潰れる。
+    if len(items) >= 3:
+        from collections import Counter
+
+        cnt: Counter = Counter()
+        for it in items:
+            cnt.update(it["_disp"])
+        limit = max(2, int(len(items) * DISPLAY_PROMISCUOUS_RATIO))
+        promiscuous = {c for c, n in cnt.items() if n >= limit}
+        if promiscuous:
+            for it in items:
+                it["_key"] = it["_disp"] - promiscuous
+
+    # 統合はスコア上位を代表とする**貪欲法**で行い、Union-Find（連結成分）は採らない。
+    # 連結成分だと A⊂B・B⊂C の連鎖で無関係なテーマ（自動運転車とショッピングセンター）
+    # まで1行へ潰れる（9/3 実測で全候補が1行に収束した）。代表と**直接**過半が重なる
+    # 行だけを吸収し、吸収のたび代表の判定集合を和集合へ広げる（同じクラスタを2行が
+    # 別々に吸収して結果的に重複するのを防ぐ）。
+    order = sorted(
+        range(len(items)),
+        key=lambda i: (-_score(items[i]["row"]), str(items[i]["row"].get("theme") or "")),
+    )
+
+    def _hit(a: set, b: set) -> bool:
+        """表示対象集合が「実質同じ銘柄群」か。
+
+        小さい方の過半（ratio）が重なることに加え、**大きい方の側も
+        DISPLAY_MERGE_OUTER_RATIO 以上**が重なることを要求する。小さい方だけを見ると、
+        構成2〜3銘柄の小テーマが大テーマの部分集合になっているだけで統合され、
+        代表テーマが無関係な銘柄まで飲み込む（9/3 実測で自動運転車が
+        ショッピングセンター・銀行まで吸収した）。
+        """
+        if not a or not b:
+            return False
+        inter = len(a & b)
+        if inter < int(min_overlap):
+            return False
+        smaller, larger = min(len(a), len(b)), max(len(a), len(b))
+        if not smaller or not larger:
+            return False
+        if (inter / smaller) < float(ratio):
+            return False
+        # (i) 双方向の重なり: 両側とも一定割合が重なる＝実質同じ銘柄群。
+        if (inter / larger) >= DISPLAY_MERGE_OUTER_RATIO:
+            return True
+        # (ii) 包含: 小さい方が大きい方へほぼ収まっている（大テーマの部分集合として
+        #      別枠を占めているだけの行）。9/3 の 地図情報システム（593A・336A・4425 が
+        #      いずれも自動運転車の主導銘柄）がこれに当たる。片側の割合だけで通すと
+        #      構成2〜3銘柄の小テーマが無差別に吸収されるため、包含率を
+        #      DISPLAY_MERGE_CONTAIN_RATIO まで引き上げて要求する。
+        return (inter / smaller) >= DISPLAY_MERGE_CONTAIN_RATIO
+
+    used: set[int] = set()
+    out: list[dict] = []
+    for i in order:
+        if i in used:
+            continue
+        used.add(i)
+        rep = items[i]
+        absorbed: list[int] = []
+        # 代表の判定集合は**固定**する（吸収して広げると芋づるに全テーマを飲み込む）。
+        for j in order:
+            if j in used:
+                continue
+            if _hit(rep["_disp"], items[j]["_disp"]) and (
+                rep["_key"] & items[j]["_key"]
+            ):
+                absorbed.append(j)
+                used.add(j)
+        new = dict(rep["row"])
+        if absorbed:
+            names = list(new.get("merged_names") or [])
+            seen_codes: dict[str, dict] = {
+                str(c.get("code")): c for c in (new.get("codes") or [])
+            }
+            for j in absorbed:
+                other = items[j]["row"]
+                names.append(str(other.get("theme") or ""))
+                names += [str(n) for n in (other.get("merged_names") or [])]
+                for c in (other.get("codes") or []):
+                    seen_codes.setdefault(str(c.get("code")), c)
+            names = [n for n in names if n and n != new.get("theme")]
+            new["merged_names"] = sorted(
+                set(names), key=lambda t: (theme_size.get(t, 10**6), t)
+            )
+            new["codes"] = list(seen_codes.values())
+            # member_counts は「単一テーマとして何社同時に動いたか」の最大値であり、
+            # 吸収した側の内訳も候補に含める（和集合件数へは膨らませない）。
+            mc = list(new.get("member_counts") or [])
+            for j in absorbed:
+                mc += list(items[j]["row"].get("member_counts") or [])
+            if mc:
+                new["member_counts"] = mc
+            # 熱量行が持つ「当日点灯銘柄」も和集合にする（欄の見出し・局面判定の材料）。
+            if "today_codes" in new:
+                seen_today: dict[str, dict] = {
+                    str(c.get("code")): c for c in (new.get("today_codes") or [])
+                }
+                for j in absorbed:
+                    for c in (items[j]["row"].get("today_codes") or []):
+                        seen_today.setdefault(str(c.get("code")), c)
+                new["today_codes"] = list(seen_today.values())
+        out.append(new)
+    out.sort(key=lambda r: (-_score(r), str(r.get("theme") or "")))
+    return out
+
+
 def format_theme_label(entry: dict) -> str:
     """代表名（統合した他テーマ名を括弧内へ併記）。"""
     names = entry.get("merged_names") or []
@@ -883,10 +1205,28 @@ def detect_today(
         if len({str(c.get("code")) for c in v["codes"]}) >= min_codes
     ]
     rows = merge_overlapping_themes(entries, theme_size)
+    # 表示ベースの二次統合（2026-09-04 PM 指示）。本日のテーマ欄が誌面へ出す銘柄は
+    # 点灯銘柄そのものなので、点灯集合の過半が重なる別名テーマを1行へ畳む。
+    rows = merge_by_display_overlap(
+        rows,
+        lambda r: {str(c.get("code")) for c in (r.get("codes") or [])},
+        theme_size=theme_size,
+    )
+    # 2026-09-04 PM 指示: 誌面へ出す銘柄を代表テーマ自身の構成銘柄に限定し、
+    # 上位プールの汎用銘柄（商社・電力等）を外す。
+    _generic_today = generic_codes(rows, code_to_themes)
+    for r in rows:
+        _keep = _self_codes(r, code_to_themes) - _generic_today
+        _filtered = [c for c in (r.get("codes") or []) if str(c.get("code")) in _keep]
+        if _filtered:
+            r["codes"] = _filtered
     for r in rows:
         r["codes"] = sorted(
             r["codes"], key=lambda c: -float(c.get("turnover") or 0)
         )
+    # 点灯条件（MIN_CODES_FOR_ALERT）は絞り込み後の銘柄数で判定し直す
+    # （汎用銘柄だけで成立していた行を誌面へ出さない）。
+    rows = [r for r in rows if len({str(c.get("code")) for c in r["codes"]}) >= min_codes]
     rows.sort(key=lambda r: (-r["score"], r["theme"]))
     return {"rows": rows, "stale_note": stale_note, "excluded_count": excluded}
 
@@ -1113,6 +1453,52 @@ def compute_theme_heat(
 
     # 減衰は誌面に出さない
     rows = [r for r in rows if r["phase"] != "減衰"]
+    # 表示ベースの二次統合（2026-09-04 PM 指示）。この欄が誌面へ出すのは主導銘柄表の
+    # 上位 LEAD_CANDIDATES 件なので、その表示対象で過半が重なる別名テーマを1行へ畳む。
+    # 統合はプール切り詰め（HEAT_CANDIDATE_POOL）の**前**に行い、空いた枠へ次点の
+    # 非重複テーマが繰り上がるようにする。
+    # 判定に使う集合は**誌面と同じ並び・同じ件数**でなければならない。lead_pool は
+    # 「当日点灯銘柄→窓内の累計代金順」の合成順であり、誌面表と並びが違うため、
+    # 統合の前に誌面と同じ累計売買代金降順へ揃えてから上位 LEAD_CANDIDATES 件を採る。
+    for r in rows:
+        r["codes"] = sorted(
+            r["codes"], key=lambda c: -float(c.get("turnover") or 0)
+        )
+    # 判定集合は「当日点灯銘柄 ∪ 主導銘柄表の上位 LEAD_CANDIDATES 件」。当日点灯銘柄を
+    # 必ず含めるのは、主導銘柄の並びが窓内の累計売買代金順であり、当日いちばん派手に
+    # 動いた小型株（9/3 の 336A・4425）が大型株に押し出されて上位12件へ入らないため。
+    # PM が誌面で見る重複はまさにその当日の主役銘柄の重なりであり、そこを判定へ入れないと
+    # 「同じ銘柄群の別名テーマ」（自動運転車と地図情報システム）を検知できない。
+    rows = merge_by_display_overlap(
+        rows,
+        lambda r: {
+            str(c.get("code")) for c in (r.get("today_codes") or [])
+        }
+        | {str(c.get("code")) for c in (r.get("codes") or [])[:LEAD_CANDIDATES]},
+        theme_size=theme_size,
+        score_key="heat",
+    )
+    # 2026-09-04 PM 指示: 誌面へ出す銘柄を「代表テーマ自身の辞書構成銘柄」に限定し、
+    # 上位プールで GENERIC_CODE_MIN_THEMES 以上のテーマに現れる汎用銘柄を外す。
+    # 統合の和集合をそのまま出すと、吸収した別名テーマにしか属さない銘柄が代表テーマの
+    # 行に並ぶ（9/3 の 自動運転車 に レーザーテック(6920)）。
+    _generic_heat = generic_codes(rows, code_to_themes)
+    for r in rows:
+        _keep = _self_codes(r, code_to_themes) - _generic_heat
+        _filtered = [c for c in (r.get("codes") or []) if str(c.get("code")) in _keep]
+        # 全滅する行（辞書が引けない等）は従来どおり和集合を残す（配信絶対の原則）。
+        if _filtered:
+            r["codes"] = _filtered
+        r["today_codes"] = [
+            c for c in (r.get("today_codes") or []) if str(c.get("code")) in _keep
+        ] or r.get("today_codes") or []
+    # 統合で codes が和集合になったため、表示順と当日点灯銘柄を数え直す。
+    for r in rows:
+        r["codes"] = sorted(
+            r["codes"], key=lambda c: -float(c.get("turnover") or 0)
+        )
+        _today_set = {str(c.get("code")) for c in (r.get("today_codes") or [])}
+        r["today_count"] = len(_today_set)
     # 並び順は熱量降順を基本とする（2026-08-31 PM 確定）。
     # 旧実装は上位 HEAT_CANDIDATE_POOL 件を局面順（新規 -> 加速 -> 継続）へ並べ替えていたが、
     # そのため熱量上位でも「継続」局面のテーマが加速テーマに押し出されて誌面から落ちた
@@ -1268,6 +1654,8 @@ def evaluate_early_pool(
     if not entries_merged:
         return []
     lit_history = lit_history or {}
+    if code_to_themes is None:
+        code_to_themes, _ts, _sn, _ex = load_theme_map()
 
     def _turnover(rec: dict) -> float:
         try:
@@ -1413,10 +1801,12 @@ def select_early_candidates(
     min_nup3: int = EARLY_MIN_NUP3,
     min_turn3_oku: float = EARLY_MIN_TURN3_OKU,
     max_rows: int = EARLY_MAX_ROWS,
+    code_to_themes: dict | None = None,
 ) -> list[dict]:
     """当日の統合テーマ行から「初動候補テーマ」を機械抽出する（案E）。
 
     判定は当日の一次データだけで閉じており、Claude の解釈も辞書の意味づけも入らない。
+        0. 誌面へ出す銘柄集合（+3%以上の点灯銘柄）が重なるテーマ行を統合する
         1. 当日 score 降順で上位 `top_pool` 件を候補プールにする
         2. そのうち n_up >= `min_nup` かつ n3 >= `min_nup3` かつ turn3 >= `min_turn3_oku` 億円
         3. 残りを score 順に最大 `max_rows` 件
@@ -1465,6 +1855,8 @@ def select_early_candidates(
     if not entries_merged:
         return []
     lit_history = lit_history or {}
+    if code_to_themes is None:
+        code_to_themes, _ts0, _sn0, _ex0 = load_theme_map()
 
     def _turnover(rec: dict) -> float:
         try:
@@ -1472,26 +1864,60 @@ def select_early_candidates(
         except (TypeError, ValueError):
             return 0.0
 
-    # 1. 当日 score 降順の候補プール（順位は誌面の「当日順位」列へそのまま出す）
-    ranked = sorted(
-        entries_merged,
-        key=lambda e: (-float(e.get("score") or 0.0), str(e.get("theme") or "")),
-    )
-    pool = ranked[: max(int(top_pool or 0), 0)]
+    def _moved_codes(e: dict) -> set:
+        s_ = set()
+        for c in (e.get("codes") or []):
+            try:
+                if float(c.get("return_pct") or 0) >= EARLY_MOVE_PCT:
+                    s_.add(str(c.get("code") or ""))
+            except (TypeError, ValueError):
+                continue
+        return {c for c in s_ if c}
+
+    # 2026-09-04 PM 指示: 「統合 → 銘柄の絞り込み → 新規性判定」を**変化がなくなるまで
+    # 繰り返す**。1回で済ませると、絞り込みで表示銘柄が減った後に生じた重複を畳めない
+    # （9/3 実測で 初動候補 2位・3位 がともに九州電力(9508)を表示した）。
+    # 各パスの入口で毎回、統合前の素の entries から作り直す（前パスの絞り込み結果を
+    # 入力にすると銘柄が単調減少して痩せ続けるため）。
+    def _build_pool(src: list[dict]) -> list[dict]:
+        """統合 → プール切り出し → 表示銘柄の絞り込み まで進めた行を返す。"""
+        merged = merge_by_display_overlap(src, _moved_codes, theme_size=theme_size)
+        ranked_ = sorted(
+            merged,
+            key=lambda e: (-float(e.get("score") or 0.0), str(e.get("theme") or "")),
+        )
+        pool_ = ranked_[: max(int(top_pool or 0), 0)]
+        # (a) 代表テーマ自身の辞書構成銘柄に限定（吸収した別名テーマの銘柄を混ぜない。
+        #     9/3 の 自動運転車 の行に レーザーテック(6920) が出た原因）。
+        # (b) 上位プールの GENERIC_CODE_MIN_THEMES 行以上に出得る汎用銘柄
+        #     （商社・電力・大型汎用株）を外す。ゲート判定の n_up からは外さない。
+        generic_ = generic_codes(pool_, code_to_themes)
+        for e in pool_:
+            keep = _self_codes(e, code_to_themes) - generic_
+            e["_shown"] = [
+                c for c in (e.get("codes") or []) if str(c.get("code")) in keep
+            ]
+        return pool_
+
+    pool = _build_pool(entries_merged)
 
     out: list[dict] = []
-    for rank, e in enumerate(pool, 1):
+    for e in pool:
         codes = [c for c in (e.get("codes") or []) if str(c.get("code") or "").strip()]
         if not codes:
             continue
+        # 誌面へ出す銘柄（代表テーマ自身の構成銘柄・汎用銘柄を除く）
+        shown = list(e.get("_shown") or [])
         # n_up: 構成テーマ単位の点灯銘柄数の最大値。merge_overlapping_themes は
         # 構成テーマ別の内訳を残さないため、統合前の内訳が渡らない場合は和集合件数へ
         # フォールバックする（呼び出し側が "member_counts" を積んでいればそれを使う）。
         member_counts = e.get("member_counts") or []
         n_up = max([int(x) for x in member_counts], default=len(codes))
         # E5: 判定は「実際に +3%以上動いた銘柄」だけで行う（本数 n3 と実弾 turn3）。
+        # 2026-09-04: 母集団は誌面へ出す銘柄（shown）に揃える。誌面に出ない銘柄で
+        # n3・turn3 を膨らませると、表と見出しの数字が食い違う。
         moved = []
-        for c in codes:
+        for c in shown:
             try:
                 if float(c.get("return_pct") or 0) >= EARLY_MOVE_PCT:
                     moved.append(c)
@@ -1510,7 +1936,10 @@ def select_early_candidates(
                 "theme": e.get("theme"),
                 "merged_names": list(e.get("merged_names") or []),
                 "label": format_theme_label(e),
-                "rank": rank,
+                # 順位＝**表示順**（掲載位置の連番）。プール内順位をそのまま出すと
+                # 誌面が「1位・3位・5位・7位・8位」と歯抜けになるため（2026-09-04 PM 指示）。
+                # 実値は新規性フィルタ適用後に振り直す。
+                "rank": 0,
                 "score": float(e.get("score") or 0.0),
                 "n_up": int(n_up),
                 "n3": int(n3),
@@ -1522,12 +1951,63 @@ def select_early_candidates(
                     or (theme_size or {}).get(e.get("theme"), 0)
                     or 0
                 ),
-                "codes": sorted(codes, key=lambda c: -_turnover(c)),
+                "codes": sorted(shown, key=lambda c: -_turnover(c)),
             }
         )
-        if len(out) >= max(int(max_rows or 0), 0):
+    # 新規性フィルタ（2026-09-04 PM 指示）。上位行に未掲載の +3%銘柄が MIN_NEW_CODES 件
+    # 未満の行を落とし、次点を繰り上げる。ここで初めて max_rows へ切る（先に切ると
+    # 落とした分の繰り上げ候補が残らない）。
+    # 2026-09-04 PM 指示: 絞り込み後の表示銘柄で**統合と新規性判定を再適用**し、
+    # 行数が変化しなくなるまで繰り返す。絞り込みで表示銘柄が減った結果として新たに
+    # 生じた重複（9/3 の 2位・3位 がともに 9508 を表示）を畳むため。
+    for _ in range(MERGE_REFINE_PASSES):
+        before = len(out)
+        # 絞り込み後の表示銘柄（+3%）で統合し直す。codes は既に絞り込み済みなので
+        # merge_by_display_overlap の和集合も絞り込み後の銘柄だけで構成される。
+        out = merge_by_display_overlap(out, _moved_codes, theme_size=theme_size)
+        # 統合で消えた行のぶん turn3 / n3 を数え直す（見出しと表の数字を一致させる）。
+        for r in out:
+            _mv = [
+                c
+                for c in (r.get("codes") or [])
+                if _pct_at_least(c, EARLY_MOVE_PCT)
+            ]
+            r["n3"] = len(_mv)
+            r["turn3_oku"] = sum(_turnover(c) for c in _mv) / 1e8
+            r["label"] = format_theme_label(r)
+        out.sort(key=lambda r: (-float(r.get("score") or 0.0), str(r.get("theme") or "")))
+        out = filter_new_codes(out, _moved_codes, max_rows=max(int(max_rows or 0), 0))
+        if len(out) == before:
             break
+    # 順位＝表示順。フィルタ後の掲載位置で振り直す。
+    for _i, _r in enumerate(out, 1):
+        _r["rank"] = _i
     return out
+
+
+def _early_rows_once(
+    entries_merged,
+    code_to_themes,
+    theme_size,
+    lit_history,
+    top_pool,
+    min_nup,
+    min_nup3,
+    min_turn3_oku,
+    max_rows,
+):
+    """後方互換のための薄いラッパ（現在は select_early_candidates 内で完結）。"""
+    return select_early_candidates(
+        entries_merged,
+        theme_size=theme_size,
+        lit_history=lit_history,
+        top_pool=top_pool,
+        min_nup=min_nup,
+        min_nup3=min_nup3,
+        min_turn3_oku=min_turn3_oku,
+        max_rows=max_rows,
+        code_to_themes=code_to_themes,
+    )
 
 
 _EARLY_FOOTER = (
@@ -1549,7 +2029,7 @@ def render_early_candidates(
     均等7分割では全セルが折り返して縦長になり「読めない」と却下された（PM 2026-09-03）。
 
     新形式はテーマごとのブロック（本日のテーマ・直近2週間と同じ体裁に統一）:
-        **{当日順位}位 {テーマ名} ｜ 上昇{n_up}銘柄 ｜ +3%以上の売買代金 {turn3_oku}億円 ｜ {局面}**
+        **{順位（表示順）}位 {テーマ名} ｜ 上昇{n_up}銘柄 ｜ +3%以上の売買代金 {turn3_oku}億円 ｜ {局面}**
         材料: {Claude が1文で書く。無ければ「材料なし（値動きのみ）」}
 
         | コード | 銘柄名 | 何の会社 | 時価総額 | 騰落率 |
@@ -1675,6 +2155,12 @@ def detect_night(pts_risers, theme_master_path: Path | str | None = None):
         if len({str(c.get("code")) for c in v["codes"]}) >= MIN_CODES_FOR_ALERT
     ]
     rows = merge_overlapping_themes(entries, theme_size)
+    # 表示ベースの二次統合（2026-09-04 PM 指示・当日欄と同じ扱い）。
+    rows = merge_by_display_overlap(
+        rows,
+        lambda r: {str(c.get("code")) for c in (r.get("codes") or [])},
+        theme_size=theme_size,
+    )
     for r in rows:
         r["codes"] = sorted(r["codes"], key=lambda c: -float(c.get("return_pct") or 0))
     rows.sort(key=lambda r: (-r["score"], r["theme"]))
@@ -1717,6 +2203,25 @@ def _pct_str(rec: dict, pct_key: str = "return_pct") -> str:
         return ""
 
 
+# テーマ系の表で時価総額を補完するためのグローバル lookup（code -> 億円）。
+# 2週間欄・初動候補の主導銘柄は history parquet 由来のレコードであり、当日の動意母集団に
+# 入っていない銘柄には mcap_oku が付かない（9/3 実測で2週間欄の12銘柄が `―` になった）。
+# make_mover_report が全上場銘柄の full_df（当日終値×発行済株数）から作った辞書を
+# set_mcap_lookup() で注入し、レコードに値が無い銘柄だけここから補う。
+_MCAP_LOOKUP: dict[str, float] = {}
+
+
+def set_mcap_lookup(mapping: dict | None) -> None:
+    """全上場銘柄の時価総額辞書（code -> 億円）を注入する（2026-09-04 PM 指示）。
+
+    make_mover_report が full_df の MarketCapOku から組んで渡す。当日の動意母集団に
+    入らない銘柄（2週間欄の主導銘柄など）の時価総額を誌面で `―` にしないための補完。
+    推計はせず、full_df に実在する値だけを使う（§0 一次情報）。
+    """
+    global _MCAP_LOOKUP
+    _MCAP_LOOKUP = {str(k).strip(): v for k, v in (mapping or {}).items() if str(k).strip()}
+
+
 def _mcap_str(rec: dict) -> str:
     """時価総額を「1,234億円」「1.9兆円」形式で返す（取れなければ空文字）。
 
@@ -1725,12 +2230,21 @@ def _mcap_str(rec: dict) -> str:
     MarketCapOku 由来・億円単位）。取れない銘柄は空欄にする（推計で埋めない・§0）。
     他レポート（夜間PTS の cap_str 等）と同じ書式（10,000億円以上は兆円表記）に揃える。
     """
+    oku = None
     try:
         oku = float(rec.get("mcap_oku"))
+        if oku != oku:  # NaN
+            oku = None
     except (TypeError, ValueError):
-        return ""
-    if oku != oku:  # NaN
-        return ""
+        oku = None
+    if oku is None:
+        # レコードに値が無い銘柄は全上場銘柄の辞書から補う（2026-09-04 PM 指示）。
+        try:
+            oku = float(_MCAP_LOOKUP.get(str(rec.get("code") or "").strip()))
+            if oku != oku:
+                return ""
+        except (TypeError, ValueError):
+            return ""
     if oku >= 10000:
         return f"{oku / 10000:.1f}兆円"
     return f"{oku:,.0f}億円"
@@ -2241,7 +2755,15 @@ def render_today_candidates(
             build_material_lookup を渡すと当日分→遡り分のフォールバックが効く。
     """
     lines = ["## 本日のテーマ候補", ""]
-    rows = (result.get("rows") or [])[:max_rows]
+    # 2026-09-04 PM 指示: 絞り込み後の表示銘柄で「統合 → 新規性判定」を再適用し、
+    # 変化がなくなるまで繰り返す（初動候補・2週間欄と同じ扱い）。
+    rows = refine_rows_by_display(
+        result.get("rows") or [],
+        lambda r: {
+            str(c.get("code")) for c in (r.get("codes") or [])[:MAX_LEAD_ROWS]
+        },
+        max_rows=max_rows,
+    )
     if not rows:
         lines += ["本日の点灯なし", ""]
         return lines
@@ -2335,7 +2857,13 @@ def render_today_section(
     現行の動意／PTS raw は render_today_candidates を使い、誌面は Claude が組み立てる。
     """
     lines = ["## 本日のテーマ", ""]
-    rows = (result.get("rows") or [])[:max_rows]
+    rows = refine_rows_by_display(
+        result.get("rows") or [],
+        lambda r: {
+            str(c.get("code")) for c in (r.get("codes") or [])[:MAX_LEAD_ROWS]
+        },
+        max_rows=max_rows,
+    )
     if not rows:
         lines += ["本日の点灯なし", ""]
         return lines
@@ -2420,7 +2948,34 @@ def select_heat_rows_v2(
         r["today_shown"] = bool(_theme_group_names(r) & shown)
         r["_rank_key"] = float(r.get("sustain", r.get("heat", 0.0)) or 0.0)
     rows.sort(key=lambda r: (-r["_rank_key"], -float(r.get("heat", 0.0)), r["theme"]))
-    return rows[:max_rows]
+
+    # 誌面に出る銘柄（主導銘柄表の上位 MAX_LEAD_ROWS 件）で判定する。
+    def _disp(r: dict) -> set:
+        return {str(c.get("code")) for c in (r.get("codes") or [])[:MAX_LEAD_ROWS]}
+
+    # 2026-09-04 PM 指示: 銘柄の絞り込み後に「表示ベース統合 → 新規性判定」を再適用し、
+    # 行数が変化しなくなるまで繰り返す（絞り込みで表示銘柄が減って初めて見える重複を畳む）。
+    # 新規性フィルタ: 上位行に未掲載の銘柄が MIN_NEW_CODES 件未満の行は既出銘柄の
+    # 寄せ集めで新しい情報を足さないため落とし、次点を繰り上げる。
+    out = filter_new_codes(rows, _disp, max_rows=max_rows)
+    for _ in range(MERGE_REFINE_PASSES):
+        before = len(out)
+        out = merge_by_display_overlap(out, _disp, score_key="heat")
+        for r in out:
+            r["codes"] = sorted(
+                r.get("codes") or [], key=lambda c: -float(c.get("turnover") or 0)
+            )
+        out.sort(
+            key=lambda r: (
+                -float(r.get("_rank_key", 0.0) or 0.0),
+                -float(r.get("heat", 0.0) or 0.0),
+                str(r.get("theme") or ""),
+            )
+        )
+        out = filter_new_codes(out, _disp, max_rows=max_rows)
+        if len(out) == before:
+            break
+    return out
 
 
 def lit_days_str(row: dict) -> str:

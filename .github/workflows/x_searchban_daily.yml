@@ -1,0 +1,204 @@
+name: X 検索除外・インプレッション 日次測定
+
+# 目的（research/sns/x_algorithm/searchban_action_plan.md 手1・手2）:
+#   ノクトラ（運用 X アカウント）の「検索除外（サーチバン）」状態と自投稿の
+#   インプレッションを毎日自動測定し、除外がいつ解除されたかを解除の当日に検知する。
+#   あわせてフォロー中タイムラインへの出現を測り、
+#   「検索除外だけか、ホーム配信も絞られているか」を切り分けるデータを蓄積する。
+#
+# 処理:
+#   bi/pipelines/check_x_searchban.py 単体を実行する（X へアクセスする唯一のステップ）。
+#
+# 生成物（すべて Private リポへ commit back）:
+#   bi/outputs/x_posts/searchban_log.csv               … 1実行1行の追記（履歴の正本）
+#   bi/outputs/x_posts/x_impressions_{date}.csv        … 投稿別のインプレッション明細
+#   bi/outputs/x_posts/searchban_raw_{date}.json       … 判定の生データ（デバッグ用）
+#
+# ---------------------------------------------------------------------------
+# 【重要】cron は意図的にコメントアウトしてあります（PM 承認待ち）
+#   PM の承認なく日次自動実行を開始しないため、現状は workflow_dispatch（手動実行）のみ
+#   有効です。日次運用を開始する場合は下の schedule ブロックのコメントを外してください。
+#
+# 【重要】GHA 環境で Cookie 認証が機能するかは未検証です
+#   ローカル（PM の PC）では 2026-09-05 に完走を実測済みです。一方 GHA の
+#   データセンター IP からのアクセスは X 側に弾かれる可能性があり、本 workflow が
+#   クラウドで完走するかは未確認です。弾かれた場合は status 列に
+#   cookie_expired / graphql_changed が記録され、verdict は「判定不能」になります
+#   （誤って「正常」と記録されることはありません）。
+#   その場合は本 workflow を使わず、ローカルで
+#       python bi/pipelines/check_x_searchban.py
+#   を実行する運用に切り替えてください。
+#
+# 必要な Secrets（既存の x_outreach_daily.yml と同一の名前を踏襲）:
+#   X_BURNER_AUTH_TOKEN     … バーナー垢の auth_token cookie
+#   X_BURNER_CT0            … バーナー垢の ct0 cookie
+#   PRIVATE_REPO_DEPLOY_KEY … Private リポ（mizuki-fund）への push 用デプロイキー
+#   DISCORD_WEBHOOK_SNS     … 失敗通知の送信先（未設定なら DISCORD_WEBHOOK_URL）
+#
+# 設計上の注意（このリポジトリは Public のため）:
+#   - ハンドル・投稿本文を公開ログへ一切 echo しない。スクリプトの stdout は
+#     *.log へ隔離し、公開ログへ出すのは exit code・ファイルの有無（bool）・件数のみ。
+#   - artifact のアップロードはしない（Public リポの artifact は第三者が取得可能）。
+#   - X_BURNER_* Secrets の値をログへ出す処理を一切書かない。
+# ---------------------------------------------------------------------------
+"on":
+  # schedule:
+  #   # UTC 13:00 = JST 22:00。既存の X 系（x_outreach_daily / x_unfollow_daily は
+  #   # UTC 08:00 = JST 17:00）と重複しない時刻を選んでいる。
+  #   # PM の承認後にこの2行のコメントを外すと日次自動実行が始まる。
+  #   - cron: '0 13 * * *'
+  workflow_dispatch:
+    inputs:
+      phrases:
+        description: '除外判定に使うフレーズ数（既定 5）'
+        required: false
+        default: '5'
+      backfill:
+        description: 'true で欠測期間の遡及取得も行う'
+        required: false
+        default: 'false'
+      backfill_since:
+        description: '遡及取得の開始日 (YYYY-MM-DD)'
+        required: false
+        default: '2026-08-14'
+
+# 二重発火を GHA 内部ロックで防ぐ（他の X 系 workflow と同じ固定 group 方式）。
+concurrency:
+  group: x_searchban_daily
+  cancel-in-progress: false
+
+jobs:
+  measure:
+    runs-on: ubuntu-latest
+    # 検索を1件ずつランダム待機を挟んで回すため、実測で 10〜20 分程度。余裕を持たせる。
+    timeout-minutes: 45
+
+    steps:
+      - name: Determine target date
+        id: date
+        run: echo "value=$(TZ=Asia/Tokyo date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+
+      - name: Checkout report-pipelines
+        uses: actions/checkout@v4
+        with:
+          path: report-pipelines
+
+      - name: Setup SSH for private repo
+        env:
+          PRIVATE_REPO_DEPLOY_KEY: ${{ secrets.PRIVATE_REPO_DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$PRIVATE_REPO_DEPLOY_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+      - name: Clone private repo (mizuki-fund)
+        run: git clone git@github.com:mzinvestment1105/mizuki-fund.git private-repo
+
+      - name: Copy pipelines from Public into private working tree
+        # PM が Private 側への push を忘れた場合でも Public 側の最新ファイルで上書きし、
+        # 自動化の品質を保つ（x_outreach_daily.yml と同じ方式）。
+        run: |
+          cp -f report-pipelines/bi/pipelines/*.py private-repo/bi/pipelines/
+          cp -f report-pipelines/bi/pipelines/requirements.txt private-repo/bi/pipelines/
+          mkdir -p private-repo/bi/pipelines/lib
+          cp -rf report-pipelines/bi/pipelines/lib/*.py private-repo/bi/pipelines/lib/ 2>/dev/null || true
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: report-pipelines/bi/pipelines/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r report-pipelines/bi/pipelines/requirements.txt
+
+      - name: Install Playwright Chromium
+        run: playwright install chromium --with-deps
+
+      - name: Measure search ban and impressions
+        id: measure
+        # X へアクセスする唯一のステップ。バーナー垢の cookie を使う。
+        # cookie は .env 経由で渡す（環境変数の値はログへ出さない）。
+        # 測定に失敗しても searchban_log.csv には status 付きの1行が必ず記録されるため、
+        # ここでジョブを落とさず、記録を commit させてから判定する。
+        continue-on-error: true
+        timeout-minutes: 35
+        working-directory: ./private-repo/bi/pipelines
+        env:
+          X_BURNER_AUTH_TOKEN: ${{ secrets.X_BURNER_AUTH_TOKEN }}
+          X_BURNER_CT0: ${{ secrets.X_BURNER_CT0 }}
+          PYTHONIOENCODING: utf-8
+        run: |
+          if [ -z "${X_BURNER_AUTH_TOKEN}" ] || [ -z "${X_BURNER_CT0}" ]; then
+            echo "::error::X_BURNER_* Secrets が未設定のため測定できません"
+            exit 1
+          fi
+          # check_x_searchban.py が load_dotenv でこのファイルを読む。値は echo しない。
+          umask 077
+          {
+            printf 'X_BURNER_AUTH_TOKEN=%s\n' "${X_BURNER_AUTH_TOKEN}"
+            printf 'X_BURNER_CT0=%s\n' "${X_BURNER_CT0}"
+          } > .env
+
+          ARGS="--phrases ${{ github.event.inputs.phrases || '5' }}"
+          if [ "${{ github.event.inputs.backfill }}" = "true" ]; then
+            ARGS="$ARGS --backfill --backfill-since ${{ github.event.inputs.backfill_since || '2026-08-14' }}"
+          fi
+
+          # stdout には投稿本文の断片が含まれ得るため公開ログへは出さず *.log へ隔離する。
+          set +e
+          python check_x_searchban.py $ARGS > searchban.log 2>&1
+          ec=$?
+          set -e
+          rm -f .env
+          echo "exit_code=${ec}" >> $GITHUB_OUTPUT
+
+          # 公開ログへ出すのは status / verdict（ハンドルや本文を含まない値）のみ。
+          LOG="../outputs/x_posts/searchban_log.csv"
+          if [ -s "$LOG" ]; then
+            python - <<'PY'
+          import csv, os
+          rows = list(csv.DictReader(open("../outputs/x_posts/searchban_log.csv", encoding="utf-8-sig")))
+          if rows:
+              last = rows[-1]
+              for k in ("date", "status", "verdict", "control_verdict",
+                        "timeline_status", "impressions_n", "impressions_median"):
+                  print(f"{k}={last.get(k)}")
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+                  f.write(f"status={last.get('status')}\n")
+                  f.write(f"verdict={last.get('verdict')}\n")
+          PY
+          else
+            echo "::error::searchban_log.csv が生成されていません"
+          fi
+
+      - name: Commit and push to private repo
+        if: always()
+        working-directory: ./private-repo
+        run: |
+          bash ../report-pipelines/bi/pipelines/ops/ci_commit_push.sh \
+            -m "data: x searchban measurement ${{ steps.date.outputs.value }}" \
+            bi/outputs/x_posts
+
+      - name: Discord 通知（❌ 測定失敗）
+        # 測定が成立しなかった場合（cookie 失効・429・GraphQL 仕様変更）は
+        # 判定不能のまま放置すると除外解除の検知が止まるため必ず通知する。
+        if: steps.measure.outputs.status != 'ok'
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_SNS || secrets.DISCORD_WEBHOOK_URL }}
+          state: failed
+          label: X 検索除外 日次測定 失敗
+          date: ${{ steps.date.outputs.value }}
+          meaning: 検索除外の判定が成立しませんでした（cookie 失効・レート制限・GraphQL 仕様変更のいずれか）。本日の除外状態は未測定です。
+          action_required: searchban_log.csv の status 列を確認 → cookie 失効なら Secrets を更新し手動 dispatch で再実行
+
+      - name: 成否サマリ（ハンドル・本文を含まない値のみ）
+        if: always()
+        run: |
+          echo "date=${{ steps.date.outputs.value }}"
+          echo "exit_code=${{ steps.measure.outputs.exit_code }}"
+          echo "status=${{ steps.measure.outputs.status }}"
+          echo "verdict=${{ steps.measure.outputs.verdict }}"

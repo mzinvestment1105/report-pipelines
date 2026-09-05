@@ -70,6 +70,7 @@ from theme_radar import (
     render_today_candidates,
     render_today_roster,
     select_early_candidates,
+    set_mcap_lookup,
 )
 
 # ---------------------------------------------------------------------------
@@ -1914,6 +1915,21 @@ def build_report(
     # 展開し、所属テーマ数で按分した資金量スコアでテーマを順位付けする。
     # 「動いた理由」列は Claude が理由素材から1文で書くため raw では空欄にする。
     # 失敗しても本体レポートは止めない（配信絶対の原則）。
+    # 2026-09-04 PM 指示: テーマ2部・初動候補の全表で時価総額が `―` にならないよう、
+    # 全上場銘柄の時価総額辞書（当日終値×発行済株数）を theme_radar へ注入する。
+    # 2週間欄の主導銘柄は history parquet 由来で当日の動意母集団に入らない銘柄を含み、
+    # レコード側の mcap_oku が付かないため（9/3 実測で12銘柄が `―`）。
+    try:
+        _mcap_map = {
+            normalize_code_4(_r["Code"]): _r.get("MarketCapOku")
+            for _, _r in full_df.iterrows()
+            if pd.notna(_r.get("MarketCapOku"))
+        }
+        set_mcap_lookup(_mcap_map)
+        print(f"  時価総額 lookup: {len(_mcap_map)}銘柄")
+    except Exception as _e:
+        print(f"  [WARN] 時価総額 lookup: {_e}")
+
     _codes_today: list[dict] = []
     try:
         _codes_today = [
