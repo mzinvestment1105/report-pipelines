@@ -20,6 +20,18 @@ import re
 import sys
 from pathlib import Path
 
+# Windows 既定の cp932 だと日本語メッセージや「≈」等の記号を print した瞬間に
+# UnicodeEncodeError で落ち、肝心の最終判定行（GATE: PASS / FAIL）が出力されない。
+# 標準出力・標準エラーを UTF-8（変換不能文字は置換）へ張り替えて出力を守る。
+# 再設定に失敗しても検査そのものは続行する（フェイルオープン）。
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:  # noqa: BLE001
+    pass
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
@@ -455,6 +467,54 @@ LOCKUP_REMEDY = (
     "(4) 解除済・解除予定株数の発行済比%と 5 日平均出来高に対する日数換算 を書く"
 )
 
+# --- §7-B 内の必須要素検査（PM 2026-09-06 指摘・_common_rules §42）------------
+# 上場 2 年以内の銘柄は §7-B 冒頭に IPO 価格情報ブロック（想定価格・仮条件・公募価格・
+# 初値・初値の公募価格比・上場日・主幹事）と、株主×ロックアップ対応表を必ず置く。
+PRICE_BLOCK_REMEDY = (
+    "§7-B の冒頭に IPO 価格情報ブロックを置き、想定価格・仮条件（下限〜上限）・"
+    "公募価格（決定価格）・初値・初値の公募価格比（円と %）・上場日・主幹事を全て書く"
+    "（出典は有価証券届出書および訂正届出書）。公募価格・初値を他セクションへ散らさない"
+)
+SHAREHOLDER_TABLE_REMEDY = (
+    "§7-B に株主×ロックアップ対応表（3 列固定「株主名 / 上場時発行済比% / "
+    "ロックアップ条件」）をパイプ記法の表で置く。上場時の上位 10 名以上を列挙し、"
+    "現在上位から外れた株主も行として残す（同一条件でも行を集約しない）"
+)
+# §7-B 節の開始見出し（「7-B」「IPO ロックアップ」等）
+_LOCKUP_SECTION_START = re.compile(r"^(#{2,6})\s.*(ロックアップ|IPO).*$", re.M)
+# パイプ記法の表とみなす行（行頭が | ）
+_PIPE_ROW = re.compile(r"^\s*\|")
+
+
+def _lockup_section_body(md: str) -> str:
+    """§7-B（IPO ロックアップ節）の本文だけを切り出す。
+
+    見出しが見つからなければ空文字。節の終端は「同じ階層以上の次の見出し」とする。
+    """
+    m = _LOCKUP_SECTION_START.search(md)
+    if not m:
+        return ""
+    level = len(m.group(1))
+    start = m.end()
+    tail = md[start:]
+    for nxt in re.finditer(r"^(#{1,6})\s", tail, re.M):
+        if len(nxt.group(1)) <= level:
+            return tail[: nxt.start()]
+    return tail
+
+
+def _has_pipe_table(text: str) -> bool:
+    """行頭 | の行が 3 行以上連続するブロックが 1 つでもあれば True。"""
+    run = 0
+    for line in text.splitlines():
+        if _PIPE_ROW.match(line):
+            run += 1
+            if run >= 3:
+                return True
+        else:
+            run = 0
+    return False
+
 
 def _earliest_listing_ym(text: str) -> str | None:
     """本文から「YYYY年M月[D日]付で…上場」を全件拾い、最も古い年月を返す。
@@ -544,7 +604,39 @@ def _check_ipo_lockup(md: str, code: str) -> tuple[list[str], str]:
             "「ロックアップ」と % の共起が 1 件も無い。"
             f" → 対処: {LOCKUP_REMEDY}"
         ], note
-    return [], note
+
+    # --- §7-B 内の必須要素検査（PM 2026-09-06 指摘・_common_rules §42）---------
+    errs: list[str] = []
+    body = _lockup_section_body(md)
+    if not body.strip():
+        body = md  # 節の切り出しに失敗した場合は誌面全体を対象にして取りこぼしを防ぐ
+
+    if not re.search(r"公募価格|公開価格", body):
+        errs.append(
+            f"[IPO 価格情報ブロックの欠落・公募価格] 上場 {ym}（{src}）で 2 年以内だが "
+            "§7-B 内に「公募価格」「公開価格」のいずれの語も無い。"
+            f" → 対処: {PRICE_BLOCK_REMEDY}"
+        )
+    if "初値" not in body:
+        errs.append(
+            f"[IPO 価格情報ブロックの欠落・初値] 上場 {ym}（{src}）で 2 年以内だが "
+            "§7-B 内に「初値」の語が無い。公募価格と初値が揃わないと公募割れが読めない。"
+            f" → 対処: {PRICE_BLOCK_REMEDY}"
+        )
+    if "仮条件" not in body:
+        errs.append(
+            f"[IPO 価格情報ブロックの欠落・仮条件] 上場 {ym}（{src}）で 2 年以内だが "
+            "§7-B 内に「仮条件」の語が無い。"
+            f" → 対処: {PRICE_BLOCK_REMEDY}"
+        )
+    if not _has_pipe_table(body):
+        errs.append(
+            f"[株主×ロックアップ対応表の欠落] 上場 {ym}（{src}）で 2 年以内だが "
+            "§7-B 内にパイプ記法の表（行頭 | が 3 行以上連続）が 1 つも無い。"
+            "株主ごとの条件を本文の羅列で済ませることを禁止する。"
+            f" → 対処: {SHAREHOLDER_TABLE_REMEDY}"
+        )
+    return errs, note
 
 
 def run_gate(md: str, code: str) -> tuple[list[str], list[str], list[str]]:
