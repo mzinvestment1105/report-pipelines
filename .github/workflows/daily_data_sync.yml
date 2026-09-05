@@ -37,7 +37,11 @@ concurrency:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # 2026-09-05: バズ収集を 12 → 28 分へ延長したため 30 → 50 分。
+    # 内訳: 前段（setup/playwright）4 + プロフィール 18 + churn 2 + タイムライン 5 + commit 4
+    #       + バズ 28 + commit 4 = 65 分が最悪値だが、各ステップは並行して上限に張り付かない
+    #       （実測: プロフィール 5 分・タイムライン 1 分）ため 50 分で収まる。
+    timeout-minutes: 50
 
     steps:
       - name: Resolve date (JST)
@@ -291,7 +295,13 @@ jobs:
         id: buzz
         if: always()
         continue-on-error: true
-        timeout-minutes: 12
+        # 2026-09-05 修正: 2026-08-13 を最後にバズ収集の成果物が一度も出ていなかった。
+        # 実測ログ（9/4 run）では開始から 12 分ちょうどで step timeout に達し python と
+        # chrome が orphan として強制終了されていた。作り直した収集スクリプトは
+        # 検索 7 クエリ + 記事本文の取得を行うため 12 分に収まらない。
+        # AI レーンツイート（ai_tweet_daily.yml）はこの成果物を素材にするため、
+        # ここが落ちると毎日「素材なし」で skip になる。
+        timeout-minutes: 28
         working-directory: ./private-repo/bi/pipelines
         env:
           X_BURNER_AUTH_TOKEN: ${{ secrets.X_BURNER_AUTH_TOKEN }}
