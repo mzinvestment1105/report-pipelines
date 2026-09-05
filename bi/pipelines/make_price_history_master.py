@@ -358,8 +358,91 @@ API_COL_CANDIDATES: dict[str, list[str]] = {
 }
 
 
+def partition_latest_date(year: int) -> date | None:
+    """`{year}.parquet` に入っている最新の Date を返す（無ければ None）。"""
+    path = OUT_DIR / f"{year}.parquet"
+    if not path.exists():
+        return None
+    df = pd.read_parquet(path, columns=["Date"])
+    if df.empty:
+        return None
+    return pd.to_datetime(df["Date"]).max().date()
+
+
+def missing_trading_days(client, upto: date, *, max_scan_days: int = 30) -> list[date]:
+    """partition の最新日より後・`upto` 以下で、API にデータがある営業日を古い順に返す。
+
+    「1日でも走り損ねるとその日が永久に欠損する」という日次更新の構造的欠陥を塞ぐための
+    探索。partition の最新日を起点に、`upto` までの各日を API へ問い合わせ、実際にデータが
+    返る日（＝営業日）だけを拾う。土日祝はデータが返らないので自然に除外される。
+    値の推定・補完は一切しない（API が返さない日は候補にしない）。
+    """
+    last = partition_latest_date(upto.year)
+    if last is None:
+        prev_last = partition_latest_date(upto.year - 1)
+        if prev_last is None:
+            raise FileNotFoundError(
+                f"{OUT_DIR / f'{upto.year}.parquet'} がありません。initial を先に実行してください。")
+        last = prev_last
+    if last >= upto:
+        return []
+
+    days: list[date] = []
+    d = last + timedelta(days=1)
+    scanned = 0
+    while d <= upto and scanned < max_scan_days:
+        rows = fetch_paginated_v2(
+            client, "/equities/bars/daily",
+            params={"date": d.strftime("%Y-%m-%d")},
+        )
+        if rows:
+            days.append(d)
+        d += timedelta(days=1)
+        scanned += 1
+    return days
+
+
 def cmd_daily(args) -> int:
-    """最新営業日 1 日分を年別 partition へ **追記** する（既存行は一切書き換えない）。
+    """欠損している営業日を古い順に年別 partition へ **追記** する（既存行は書き換えない）。
+
+    既定では partition の最新日の翌日から最新営業日までの欠損営業日をすべて埋める
+    （`--no-backfill` を付けると従来どおり最新営業日 1 日だけを処理する）。GHA の cron
+    着火が遅延・失敗した日があっても、次に走った回が自動的に穴を埋める。
+    """
+    api_key = os.environ.get("JQUANTS_API_KEY", "").strip()
+    if not api_key:
+        raise ValueError("JQUANTS_API_KEY 未設定")
+
+    client = jquantsapi.ClientV2(api_key=api_key)
+    latest = latest_trading_day_date_v2(client)
+
+    if getattr(args, "no_backfill", False):
+        targets = [latest]
+    else:
+        targets = missing_trading_days(client, latest)
+        if not targets:
+            print(f"=== 欠損なし: partition は {latest.isoformat()} まで最新です ===")
+            return 0
+        if len(targets) > 1:
+            print(f"=== バックフィル: 欠損 {len(targets)} 営業日を古い順に追記します "
+                  f"({targets[0].isoformat()} 〜 {targets[-1].isoformat()}) ===")
+
+    failed: list[date] = []
+    for i, day in enumerate(targets, 1):
+        print(f"\n---------- [{i}/{len(targets)}] {day.isoformat()} ----------")
+        rc = append_one_day(client, day)
+        if rc != 0:
+            failed.append(day)
+
+    if failed:
+        print(f"\n=== 失敗 {len(failed)} 日: {[d.isoformat() for d in failed]} ===")
+        return 1
+    print(f"\n=== 完了: {len(targets)} 営業日を追記しました ===")
+    return 0
+
+
+def append_one_day(client, latest: date) -> int:
+    """指定 1 営業日分を年別 partition へ **追記** する（既存行は一切書き換えない）。
 
     【2026-08 に修理した3点】
     旧実装は (1) 4桁数字コードだけを通す (2) partition を素の OHLCV だけから作り直す
@@ -382,12 +465,6 @@ def cmd_daily(args) -> int:
     居る銘柄を日次更新のたびに追い出してしまうため）。英字コードは screening_master との
     積集合に限る（ETF・投資信託など個別株でないものの混入を防ぐ）。
     """
-    api_key = os.environ.get("JQUANTS_API_KEY", "").strip()
-    if not api_key:
-        raise ValueError("JQUANTS_API_KEY 未設定")
-
-    client = jquantsapi.ClientV2(api_key=api_key)
-    latest = latest_trading_day_date_v2(client)
     print(f"=== 日次差分更新: {latest.isoformat()} ===")
 
     rows = fetch_paginated_v2(
@@ -527,7 +604,10 @@ def main() -> int:
     p_init.add_argument("--limit", type=int, default=0,
                         help="先頭 N 銘柄のみ取得（動作確認用・0 で全銘柄）")
 
-    sub.add_parser("daily", help="日次差分更新（最新営業日のみ）")
+    p_daily = sub.add_parser(
+        "daily", help="日次差分更新（既定で欠損営業日をすべてバックフィル）")
+    p_daily.add_argument("--no-backfill", action="store_true",
+                         help="最新営業日 1 日だけを処理する（従来動作）")
 
     p_test = sub.add_parser("test", help="テスト（指定銘柄のみ）")
     p_test.add_argument("--codes", type=str, required=True,
