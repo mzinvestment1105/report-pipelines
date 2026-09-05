@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import base64
 import re
+import sys
 from datetime import date, datetime
 from pathlib import Path
 
@@ -336,6 +337,32 @@ h5 + table.theme-lead, h5 + p + table.theme-lead {{ margin-top:4px; }}
 .theme-block > h5:first-child {{ margin-top:14px; }}
 .theme-block > table.theme-lead:last-child {{ margin-bottom:15px; }}
 
+/* ── 折り返し表のカード変換（PM 2026-09-05 承認・全レポート種別横断）──
+   セルが折り返す表は誌面として読めないため、レンダラが折り返しを実測検知して
+   表を「1行=1カード」形式へ自動変換する（実装は _TABLE_CARDIFY_JS）。
+   配色・フォントは既存テーマ（thead の #1A2A44・罫線 #E3E8EF・縞 #F6F8FB）に合わせる。
+   カードは 1 枚ずつが独立ブロックのため、折り返しても列幅の圧迫が起きず読める。 */
+.md-cards {{ margin:13px 0 17px; }}
+.md-card {{
+  border:0.6pt solid #DBE1E9; border-left:2.4pt solid {accent};
+  background:#FFFFFF; border-radius:3px;
+  padding:8px 12px 7px; margin:0 0 7px;
+  font-size:10.5pt; line-height:1.6; font-variant-numeric:tabular-nums;
+}}
+.md-card:nth-child(even) {{ background:#F6F8FB; }}
+.md-card .md-card-head {{
+  font-weight:700; color:#1A2A44; font-size:11pt; line-height:1.5;
+  margin:0 0 4px; padding:0 0 4px; border-bottom:0.6pt solid #E3E8EF;
+  letter-spacing:.02em;
+}}
+.md-card .md-card-row {{ margin:0; padding:1px 0; line-height:1.6; }}
+.md-card .md-card-key {{
+  color:#6B7686; font-weight:700; font-size:9.5pt; letter-spacing:.02em;
+  white-space:nowrap;
+}}
+.md-card .md-card-key::after {{ content:"："; color:#9AA3B0; font-weight:400; }}
+.md-card .md-card-val {{ color:#222222; }}
+
 code {{
   background:#EEF1F5; padding:1px 5px; border-radius:3px; color:#B5483D;
   font-family:'Consolas','Courier New',monospace; font-size:10pt;
@@ -366,6 +393,10 @@ hr {{ border:0; border-top:0.8pt solid #DBE1E9; margin:20px 0; }}
   h5:has(+ p + table.theme-lead), h5:has(+ table.theme-lead) {{ break-after:avoid; }}
   thead {{ display:table-header-group; }}
   tr, img {{ break-inside:avoid; }}
+  /* カードは 1 枚が小さいため塊送りしても大空白を生まない（_cr §39 の 1/3 基準内）。
+     カード束全体は分割可のまま、1 枚のカードだけ分断させない。 */
+  .md-cards {{ break-inside:auto; }}
+  .md-card {{ break-inside:avoid; }}
   h1, h2, h3, h4, h5 {{ break-after:avoid; break-inside:avoid; }}
   p, li {{ orphans:2; widows:2; }}
   blockquote {{ break-inside:auto; }}
@@ -554,6 +585,151 @@ def _tag_theme_tables(html: str) -> str:
     return re.sub(r"<table>.*?</table>", _repl, html, flags=re.DOTALL)
 
 
+# ── 折り返し表のカード変換（PM 2026-09-05 承認・全レポート種別横断）────────────
+# set_content 後に page.evaluate で実行する。DOM を実測して折り返しを検知するため、
+# markdown 段階では判定できなかった「実際に折れている表」を確実に拾える。
+#
+# 検知条件（いずれか）:
+#   (1) いずれかの td/th の描画高さが computed line-height の 1.6 倍を超える
+#       → そのセルは 2 行以上に折り返している
+#   (2) table の scrollWidth が親コンテナ幅を超える → 横あふれ
+#
+# 変換後の形（1 行 = 1 カード）:
+#   <div class="md-cards"><div class="md-card">
+#     <div class="md-card-head">{先頭セル}</div>
+#     <div class="md-card-row"><span class="md-card-key">{ヘッダ名}</span>
+#       <span class="md-card-val">{値}</span></div> …
+#   </div>…</div>
+#
+# theme-lead / theme-solo / theme-today / theme-heat も対象に含める（PM 指示）。
+_TABLE_CARDIFY_JS = r"""
+() => {
+  const WRAP_FACTOR = 1.6;   // 行高の何倍を超えたら「折り返している」とみなすか
+  const SLACK_PX = 2;        // 横あふれ判定のゆとり
+
+  // 数値・記号のみのセル（業績推移表・比較表）。列数・折り返しの制限を受けない。
+  // table_rules.py の _NUMERIC_CELL と同じ趣旨（両者を揃えて運用する）。
+  const NUMERIC = /^[\s0-9,.+\-±%％〜～~/（）()円株倍日年月期件回名口万億兆千百人時分秒中間予想末初pt―ー—–−]*$/;
+
+  const lineHeightOf = (el) => {
+    const cs = getComputedStyle(el);
+    let lh = parseFloat(cs.lineHeight);
+    if (!isFinite(lh) || lh <= 0) {
+      const fs = parseFloat(cs.fontSize) || 12;
+      lh = fs * 1.2;
+    }
+    return lh;
+  };
+
+  // セルの中身を display:block の span で包み、その span の高さで折り返しを測る。
+  // td は vertical-align:middle かつ行の最大高に揃うため、td 自身の矩形では
+  // 「そのセルが折れているか」を判定できない（実測でどのセルも同じ高さになる）。
+  const wrapRatio = (c) => {
+    const sp = document.createElement('span');
+    sp.style.display = 'block';
+    while (c.firstChild) sp.appendChild(c.firstChild);
+    c.appendChild(sp);
+    const r = sp.getBoundingClientRect().height / lineHeightOf(c);
+    // 包んだ span はそのまま残す（display:block でも見た目は変わらない）。
+    return r;
+  };
+
+  const bodyRowsOf = (table) => {
+    const tb = table.querySelector('tbody');
+    return tb ? Array.from(tb.rows) : Array.from(table.rows).slice(1);
+  };
+
+  // ラベル列（1 列目）を除く本文セルが全て数値・記号のみなら数値表として除外する。
+  const isNumericTable = (table) => {
+    const cells = [];
+    for (const tr of bodyRowsOf(table)) {
+      for (let i = 1; i < tr.cells.length; i++) {
+        cells.push((tr.cells[i].textContent || '').trim());
+      }
+    }
+    if (!cells.length) return false;
+    return cells.every((t) => !t || NUMERIC.test(t));
+  };
+
+  const isWrapped = (table) => {
+    if (isNumericTable(table)) return false;
+    // (2) 横あふれ
+    const parentW = table.parentElement
+      ? table.parentElement.clientWidth
+      : table.clientWidth;
+    if (table.scrollWidth > (parentW || table.clientWidth) + SLACK_PX) return true;
+    // (1) セルの折り返し。ラベル列（1 列目）の折り返しは許容する
+    //     （「営業キャッシュフロー」等の項目名が 2 行になるのは読みやすさを損なわない）。
+    for (const tr of bodyRowsOf(table)) {
+      for (let i = 1; i < tr.cells.length; i++) {
+        const c = tr.cells[i];
+        if (!(c.textContent || '').trim()) continue;
+        if (wrapRatio(c) > WRAP_FACTOR) return true;
+      }
+    }
+    return false;
+  };
+
+  const headerNames = (table) => {
+    const hrow = table.querySelector('thead tr') || table.querySelector('tr');
+    if (!hrow) return [];
+    return Array.from(hrow.children).map((c) => (c.textContent || '').trim());
+  };
+
+  const cardify = (table) => {
+    const heads = headerNames(table);
+    const rows = bodyRowsOf(table);
+    if (!rows.length) return false;
+
+    const wrap = document.createElement('div');
+    wrap.className = 'md-cards';
+
+    for (const tr of rows) {
+      const cells = Array.from(tr.cells);
+      if (!cells.length) continue;
+      const card = document.createElement('div');
+      card.className = 'md-card';
+
+      // 先頭セルを太字見出しにする。
+      const head = document.createElement('div');
+      head.className = 'md-card-head';
+      head.innerHTML = cells[0].innerHTML;
+      card.appendChild(head);
+
+      // 残りのセルを「ヘッダ名: 値」の 1 行ずつで表示する。
+      for (let i = 1; i < cells.length; i++) {
+        const val = (cells[i].textContent || '').trim();
+        if (!val) continue;
+        const row = document.createElement('div');
+        row.className = 'md-card-row';
+        const k = document.createElement('span');
+        k.className = 'md-card-key';
+        k.textContent = heads[i] !== undefined ? heads[i] : '';
+        const v = document.createElement('span');
+        v.className = 'md-card-val';
+        v.innerHTML = cells[i].innerHTML;
+        if (k.textContent) row.appendChild(k);
+        row.appendChild(v);
+        card.appendChild(row);
+      }
+      wrap.appendChild(card);
+    }
+
+    table.parentNode.replaceChild(wrap, table);
+    return true;
+  };
+
+  let converted = 0;
+  // 判定中に DOM を書き換えると後続の実測がずれるため、先に対象を確定させる。
+  const targets = Array.from(document.querySelectorAll('table')).filter(isWrapped);
+  for (const t of targets) {
+    if (cardify(t)) converted++;
+  }
+  return converted;
+}
+"""
+
+
 def render_markdown_to_pdf(
     md_text: str,
     out_path: Path,
@@ -646,12 +822,29 @@ def render_markdown_to_pdf(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with sync_playwright() as p:
         browser = p.chromium.launch()
-        page = browser.new_page()
+        # 折り返しの実測には「印刷時の本文幅」でレイアウトさせる必要がある。既定ビューポート
+        # （1280px）のまま測ると A4 では折れている表が折れていないと判定される（実測: 新株
+        # 予約権の 5 列表・需給の 4 列表が 1280px では 1 行に収まり検知漏れした）。
+        # A4 幅 210mm − 左右マージン 24mm×2 = 162mm ≒ 612px（96dpi）を本文幅として与える。
+        page = browser.new_page(viewport={"width": 612, "height": 900})
         # 明示タイムアウト（120秒）。無言のまま CPU を回し続ける事故を防ぎ、上限を
         # 超えたら例外で落とす（2026-09-05）。`page.pdf()` は本バージョンの Playwright
         # では timeout 引数を受け取らないため、ページ既定のタイムアウトで掛ける。
         page.set_default_timeout(120_000)
         page.set_content(full_html, wait_until="load", timeout=120_000)
+        # 折り返しを実測検知した表をカード形式へ自動変換する（PM 2026-09-05 承認）。
+        # markdown 段階では判定できない「実際に折れている表」をここで確実に潰す。
+        # 変換に失敗しても誌面生成は止めない（_cr §36 配信絶対の原則）。
+        try:
+            cardified = int(page.evaluate(_TABLE_CARDIFY_JS) or 0)
+        except Exception as e:  # noqa: BLE001
+            cardified = 0
+            print(f"[md_to_pdf] cardify skipped: {e}", file=sys.stderr)
+        print(
+            f"[md_to_pdf] cardified tables: {cardified}（折り返し検知でカード形式へ変換）",
+            file=sys.stderr,
+        )
+        render_markdown_to_pdf.last_cardified = cardified
         page.pdf(
             path=str(out_path),
             format="A4",
@@ -663,3 +856,7 @@ def render_markdown_to_pdf(
         )
         browser.close()
     return out_path
+
+
+# 直近レンダリングでカード変換した表の数（呼び出し元が参照できるようにする）。
+render_markdown_to_pdf.last_cardified = 0
