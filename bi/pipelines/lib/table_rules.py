@@ -8,10 +8,17 @@
 の 3 点。本モジュールは (1)(2) をテキスト段階で塞ぐ。
 
 判定基準（PM 承認・agents/stock_analyst.md §誌面の書き方 C と同一）:
-  - 列は 3 列以内
-  - 本文セルは 25 字以内（全角も 1 字）
-  - 4 列の表は本文セルを 15 字以内
+  - 列は 3 列以内（5 列以上は違反）
+  - 本文セルは 13 字以内（全角も 1 字）
+  - 4 列の表は本文セルを 9 字以内
+  - 列幅を明示指定した表（§7 大株主表・§8 需給分析表）は列位置ごとの実容量を上限とする
   - 本文セルが全て数値・記号のみの表（業績推移等）は列数・字数の制限を受けない
+
+字数上限の由来（2026-09-07 改定）:
+  旧値（3 列以下 25 字 / 4 列 15 字）はレンダラの誌面の物理容量を超えており、規律を完全に
+  守って書いた表でも必ず折り返していた（2026-09-06 の個別銘柄レポート 23 本中 15 本で
+  カード自動変換が発動した）。本モジュールの上限は md_to_pdf.py の誌面幅・フォント・
+  padding から逆算した実容量に一致させる（BODY_WIDTH_PX / CELL_PADDING_PX / FONT_PX）。
 
 使い方:
     from table_rules import check_tables
@@ -46,6 +53,76 @@ _DECOR = re.compile(r"\*\*|__|`|<br\s*/?>|</?[a-zA-Z][^>]*>")
 
 REMEDY = "長文セルは表の下の文章へ移す／列を減らす"
 
+# ---------------------------------------------------------------------------
+# 誌面の物理容量から導く字数上限（2026-09-07 新設）
+#
+# md_to_pdf.py の実装値と 1 対 1 で対応させる。片方だけを変えることを禁止する。
+#   BODY_WIDTH_PX  … page = browser.new_page(viewport={"width": 612, ...})
+#                     A4 210mm − 左右マージン 24mm×2 ≒ 162mm ≒ 612px（96dpi）
+#   CELL_PADDING_PX… tbody td { padding:7px 10px } の左右合計
+#   FONT_PX        … table { font-size:10.5pt } = 14px。5 列以上は table.cols-N の
+#                     フォント縮小が効くため、その実寸を使う。
+# ---------------------------------------------------------------------------
+BODY_WIDTH_PX = 612
+CELL_PADDING_PX = 20
+FONT_PX = {5: 12.67, 6: 12.0, 7: 11.33}
+DEFAULT_FONT_PX = 14.0
+
+# 1 文字の実描画幅を「全角 1 字ぶん」を 1.0 とした比で表す（Playwright 実測・2026-09-07）。
+# 実測値（font-size:10.5pt・レンダラと同一の font-face）:
+#   全角のかな漢字・丸数字・全角記号 = 14.64px / 半角数字 = 9.34px
+#   半角英字 = 平均 8.72px / 半角記号 = 平均 8.39px / 半角空白 = 約 3.9px
+# 単純な文字数では、数値の多いセル（「729.2万株→781.8万株（+7.2%）」= 22 字だが実幅は
+# 全角 16.4 字ぶん）を過大に、和文セルを過小に評価する。実幅で数えることで、
+# レンダラで実際に折り返すセルだけを違反にできる。
+_W_FULL = 1.0
+_W_DIGIT = 9.34 / 14.64
+_W_ALPHA = 8.72 / 14.64
+_W_ASCII_SYM = 8.39 / 14.64
+_W_SPACE = 3.9 / 14.64
+
+# 列幅を明示指定した表: (先頭ヘッダ名, 列数) -> 各列の幅（%）。
+# md_to_pdf.py の table.shareholders / table.demand の width 指定と一致させる。
+COLUMN_WIDTHS = {
+    # §7 大株主表（3 列版）: 株主名 / 保有比率 / 会社との関係
+    ("株主名", 3): [34, 16, 50],
+    # §7 大株主表（4 列版）: 株主名 / 保有比率 / 前期末比 / 会社との関係
+    ("株主名", 4): [26, 15, 15, 44],
+    # §8 需給分析の統合テーブル: 軸 / 指標 / 現状 / 評価基準・判定
+    ("軸", 4): [20, 27, 24, 29],
+}
+
+
+def _font_px(ncols: int) -> float:
+    return FONT_PX.get(ncols, DEFAULT_FONT_PX)
+
+
+def cell_limits(ncols: int, header: list[str] | None = None) -> list[int]:
+    """列位置ごとの本文セル字数上限を返す（列幅指定のない表は全列同じ値）。
+
+    列幅を明示指定した表は列ごとに容量が違うため、単一の上限では
+    「大株主表の関係列（17 字）に合わせると保有比率列の 11 字超を見逃す」
+    「需給表の現状列（9 字）に 11 字を書いても素通りする」の取りこぼしが出る。
+    """
+    ncols = max(int(ncols or 1), 1)
+    # _visible_len は「全角 1 字 = 1」で数えるため、その 1 字の実描画幅で割る。
+    # 全角 1 字は font-size の 1.046 倍（実測 10.5pt = 14px 指定に対し 14.64px）。
+    px = _font_px(ncols) * 1.046
+    # 余裕（slack）は取らない。1 字の余裕を入れると、境界上のセル
+    # （全角 13 字の株主名等）が実際には折り返すのに検査を通る（23 本の実測で
+    # 見逃し 35 件）。見逃し 0 件を優先する。
+    slack = 0
+    key = ((header[0].strip() if header else ""), ncols)
+    widths = COLUMN_WIDTHS.get(key)
+    if widths and len(widths) == ncols:
+        return [
+            max(1, int((BODY_WIDTH_PX * w / 100 - CELL_PADDING_PX) // px) + slack)
+            for w in widths
+        ]
+    lim = max(1, int((BODY_WIDTH_PX / ncols - CELL_PADDING_PX) // px) + slack)
+    return [lim] * ncols
+
+
 
 def _split_row(line: str) -> list[str]:
     """`| a | b |` → ['a', 'b']。前後のパイプを外してから分割する。"""
@@ -57,9 +134,33 @@ def _split_row(line: str) -> list[str]:
     return [c.strip() for c in s.split("|")]
 
 
+def _char_width(ch: str) -> float:
+    """1 文字の実描画幅を「全角 1 字 = 1.0」の比で返す（Playwright 実測に基づく）。"""
+    o = ord(ch)
+    if ch == " ":
+        return _W_SPACE
+    if o < 128:
+        if ch.isdigit():
+            return _W_DIGIT
+        if ch.isalpha():
+            return _W_ALPHA
+        return _W_ASCII_SYM
+    return _W_FULL
+
+
 def _visible_len(cell: str) -> int:
-    """装飾を除いた見た目の文字数（全角も 1 字として数える）。"""
-    return len(_DECOR.sub("", cell).strip())
+    """装飾を除いた見た目の幅を「全角 1 字 = 1」で数え、切り上げた整数で返す。
+
+    全角も半角も 1 字と数えていた旧実装は、数値・半角記号の多いセル
+    （「729.2万株→781.8万株（+7.2%）」= 22 字・実幅は全角 16.4 字ぶん）を
+    実際には折り返さないのに違反と判定していた。レンダラの実測幅で数える。
+    """
+    body = _DECOR.sub("", cell).strip()
+    if not body:
+        return 0
+    import math
+
+    return math.ceil(sum(_char_width(c) for c in body) - 1e-9)
 
 
 def _is_numeric_cell(cell: str) -> bool:
@@ -160,11 +261,23 @@ def check_tables(md_text: str) -> list[dict]:
             )
             continue
 
-        # (b)(c) 字数上限。4 列は 15 字、3 列以下は 25 字。
-        limit = 15 if ncols == 4 else 25
-        over = [c for c in body_cells if _visible_len(c) > limit]
+        # (b)(c) 字数上限。レンダラの誌面幅からの逆算値（2026-09-07 改定）。
+        # 本文幅 612px ÷ 列数 − 左右 padding 20px を全角 1 字 14px（10.5pt）で割る。
+        # 旧値（4 列 15 字 / 3 列以下 25 字）は誌面の実容量（4 列 9 字 / 3 列 13 字）を
+        # 超えており、規律を守った表でも折り返していた。
+        # 列幅を明示指定した表（§7 大株主表・§8 需給分析表）は列位置ごとに上限が違う。
+        limits = cell_limits(ncols, header)
+        over: list[tuple[str, int]] = []  # (セル, その列の上限)
+        for r in rows:
+            for i, c in enumerate(r):
+                lim_i = limits[i] if i < len(limits) else limits[-1]
+                if _visible_len(c) > lim_i:
+                    over.append((c, lim_i))
         if over:
-            longest = max(over, key=_visible_len)
+            # 「上限をどれだけ超えたか」が最も大きいセルを代表として報告する。
+            longest, limit = max(over, key=lambda x: _visible_len(x[0]) - x[1])
+            widthed = (header[0].strip() if header else "", ncols) in COLUMN_WIDTHS
+            note = "・列幅指定表のため列位置ごとの上限" if widthed else ""
             violations.append(
                 {
                     "line": line,
@@ -175,8 +288,8 @@ def check_tables(md_text: str) -> list[dict]:
                     "limit": limit,
                     "remedy": REMEDY,
                     "message": (
-                        f"L{line}: {ncols}列の表に{limit}字超の本文セルが{len(over)}件"
-                        f"（上限{limit}字）。最長 {_visible_len(longest)}字「"
+                        f"L{line}: {ncols}列の表に字数上限超の本文セルが{len(over)}件"
+                        f"（この列の上限{limit}字{note}）。最長 {_visible_len(longest)}字「"
                         f"{_DECOR.sub('', longest).strip()[:40]}」 → 対処: {REMEDY}"
                     ),
                 }
@@ -196,7 +309,7 @@ def check_tables(md_text: str) -> list[dict]:
 #   - 個別銘柄レポート（PM が都度依頼して受け取る）→ error として送信中止
 #   - GHA が定時発行するレポート（マクロ・セクター・動意・テーマ・大型株）
 #     → 送信は止めず、違反を GHA ログへ error 相当の強い警告として残す
-#     （誌面側はレンダラのカード自動変換が受け皿になる）
+#     （カード自動変換は 2026-09-07 に廃止したため誌面上の受け皿は無い）
 # ---------------------------------------------------------------------------
 
 # 送信を止めてよい種別（PM が都度受け取るレポート）。
@@ -219,6 +332,7 @@ def gate_report_tables(md_text: str, kind: str) -> tuple[list[str], list[str]]:
     head = (
         f"表の折り返し違反が {len(violations)} 件あります"
         f"（種別 {kind} は配信絶対の原則により送信は継続します。"
-        "誌面はレンダラのカード自動変換で救済されますが、次回の生成で本文を直してください）"
+        "カード自動変換は 2026-09-07 に廃止しており誌面上の救済はありません。"
+        "次回の生成で本文を直してください）"
     )
     return [], [head] + msgs

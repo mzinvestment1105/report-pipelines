@@ -1457,6 +1457,69 @@ def _check_ex_dividend_date(md: str, code: str) -> tuple:
     return [], f"[権利落ち日の一致] 権利落ちを主因とする記述の日付整合を確認（{path.name}）"
 
 
+# --- §8 需給テーブルの数値必須検査（errors・PM 2026-09-07 指摘）-----------------
+# 背景: 「③ 買残トレンド」「⑤ 売残トレンド」の現状セルが「減」「増加」「良い兆候」のみで、
+# 6 週前 → 直近の実数と変化率が書かれていなかった（2026-09-06 の 22 本中 13 本）。
+# 生データ research/stocks/{コード}_{日付}_data.md には
+# 「③ トレンド（6週前→直近の信用買残） | 346,400株 → 304,700株（-12.0%）」が常に入って
+# おり、データ側の欠落ではなく執筆側が数値を落としたことによる。
+# 検査対象は §8 の統合テーブル（先頭ヘッダが「軸」の 4 列表）のみ。
+# 見つからない誌面ではスキップする（後方互換）。
+
+# 方向・評価だけを示す語（これだけで構成された「現状」セルを違反とする）。
+_DIRECTION_ONLY = re.compile(
+    r"^(増|減|横ばい|横這い|増加|減少|やや増|やや減|概ね横ばい|微増|微減|"
+    r"良い兆候|悪い兆候|悪化|改善|ポジティブ|ネガティブ|中立|警戒|安全|"
+    r"蓄積なし|変化なし|変わらず|なし|―|─|-)"
+    r"[\s。、・（）()の＝=傾向基調で]*$"
+)
+
+
+def check_demand_table_numbers(md: str) -> tuple[list[str], str]:
+    """§8 需給テーブルの各行の「現状」セルが数値を含むかを検査する。
+
+    - 「現状」セルに数字が 1 文字も無い行を error とする。
+    - 方向語・評価語だけで構成された行を error とする。
+    - 軸名に「トレンド」を含む行は起点 → 終点の形式（→ / ->）を必須とする。
+
+    返り値: (errors, info メッセージ)
+    """
+    errors: list[str] = []
+    checked = 0
+    for line, header, rows in _tables_with_lines(md):
+        head = [h.strip() for h in header]
+        if not head or head[0] != "軸":
+            continue
+        if "現状" not in head:
+            continue
+        i_cur = head.index("現状")
+        for row in rows:
+            if len(row) <= i_cur:
+                continue
+            axis = row[0].strip()
+            cur = re.sub(r"\*\*|__|`", "", row[i_cur]).strip()
+            checked += 1
+            if not re.search(r"\d", cur):
+                errors.append(
+                    f"[需給テーブル] L{line} 台「{axis}」の現状セルに数値がありません"
+                    f"（記載:「{cur}」） → 対処: 生データの需給セクションから"
+                    "株数・%・日数・倍率のいずれかの実数を書く"
+                )
+            elif _DIRECTION_ONLY.match(cur):
+                errors.append(
+                    f"[需給テーブル] L{line} 台「{axis}」の現状セルが方向語のみです"
+                    f"（記載:「{cur}」） → 対処: 観測した実数を書く"
+                )
+            if "トレンド" in axis and not re.search(r"→|->", cur):
+                errors.append(
+                    f"[需給テーブル] L{line} 台「{axis}」は起点→終点の形式が必要です"
+                    f"（記載:「{cur}」・書式: ○○○,○○○株 → ○○○,○○○株（±○.○%））"
+                )
+    if not checked:
+        return [], "[需給テーブル] §8 の統合テーブルが見つからず検査スキップ"
+    return errors, f"[需給テーブル] {checked} 行を検査（違反 {len(errors)} 件）"
+
+
 def run_gate(md: str, code: str) -> tuple[list[str], list[str], list[str]]:
     """(errors, warnings, info) を返す。errors が空なら送信可。"""
     errors: list[str] = []
@@ -1649,6 +1712,14 @@ def run_gate(md: str, code: str) -> tuple[list[str], list[str], list[str]]:
     errors.extend(ex_errs)
     if ex_note:
         info.append(ex_note)
+
+    # 16. §8 需給テーブルの数値必須（errors・PM 2026-09-07）
+    #     「現状」列が方向語だけで数値を欠く行を不合格にする。
+    #     §8 の統合テーブルが無い誌面ではスキップする（後方互換）。
+    dt_errs, dt_note = check_demand_table_numbers(md)
+    errors.extend(dt_errs)
+    if dt_note:
+        info.append(dt_note)
 
     return errors, warnings, info
 

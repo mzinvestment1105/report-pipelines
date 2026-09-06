@@ -292,6 +292,31 @@ table.theme-today td:nth-child(2), table.theme-heat td:nth-child(5) {{ line-heig
 table.theme-heat td:nth-child(2), table.theme-heat td:nth-child(3),
 table.theme-heat td:nth-child(4) {{ text-align:center; }}
 
+/* ── 個別銘柄レポート §7 大株主表・§8 需給分析表の列幅（PM 2026-09-07 承認）──
+   table-layout:fixed の均等 4 分割では 1 列 153px（内容幅 133px ≒ 全角 9 字）しか取れず、
+   「取締役会長（代表取締役）」（12 字）「信用買残÷5日平均出来高」（12 字）等が必ず 2 行へ
+   折り返していた（2026-09-06 実測。個別銘柄レポート 23 本中 15 本で発生）。
+   どちらの表も「短い数値列 + 長い説明列」という偏りを持つため、偏りに合わせて配分する。
+   本 CSS の % を変えたら bi/pipelines/lib/table_rules.py の _WIDE_COL_TABLES も
+   同時に変えること（片方だけの変更を禁止する）。 */
+/* §7 大株主表（3 列版）: 株主名 / 保有比率 / 会社との関係。
+   前期末比を置かない誌面も多いため、均等 3 分割（各 204px）をやめて
+   数値列を狭め、関係列へ配分する。 */
+table.shareholders3 th:nth-child(1), table.shareholders3 td:nth-child(1) {{ width:34%; }}
+table.shareholders3 th:nth-child(2), table.shareholders3 td:nth-child(2) {{ width:16%; }}
+table.shareholders3 th:nth-child(3), table.shareholders3 td:nth-child(3) {{ width:50%; }}
+/* §7 大株主表（4 列版）: 株主名 / 保有比率 / 前期末比 / 会社との関係 */
+table.shareholders th:nth-child(1), table.shareholders td:nth-child(1) {{ width:26%; }}
+table.shareholders th:nth-child(2), table.shareholders td:nth-child(2) {{ width:15%; }}
+table.shareholders th:nth-child(3), table.shareholders td:nth-child(3) {{ width:15%; }}
+table.shareholders th:nth-child(4), table.shareholders td:nth-child(4) {{ width:44%; }}
+/* §8 需給分析の統合テーブル: 軸 / 指標 / 現状 / 評価基準・判定
+   §8 は 1 テーブル集約が必須で列を減らせないため、列幅で解決する。 */
+table.demand th:nth-child(1), table.demand td:nth-child(1) {{ width:20%; }}
+table.demand th:nth-child(2), table.demand td:nth-child(2) {{ width:27%; }}
+table.demand th:nth-child(3), table.demand td:nth-child(3) {{ width:24%; }}
+table.demand th:nth-child(4), table.demand td:nth-child(4) {{ width:29%; }}
+
 /* ── テーマ系銘柄表の共通列幅（v18・2026-09-03 PM 指示）──
    PM 却下事項: (1) 時価総額列が無い (2) 本日のテーマ表と単独材料表で列幅・見た目が
    揃っていない (3) セル内で「コード」が「コー／ド」に、「テクセンドフォトマスク」
@@ -357,7 +382,11 @@ h5 + table.theme-lead, h5 + p + table.theme-lead {{ margin-top:4px; }}
 .theme-block > h5:first-child {{ margin-top:14px; }}
 .theme-block > table.theme-lead:last-child {{ margin-bottom:15px; }}
 
-/* ── 折り返し表のカード変換（PM 2026-09-05 承認・全レポート種別横断）──
+/* ── 折り返し表のカード変換（2026-09-07 廃止・定義のみ残置）──
+   【廃止】PM はカード形式を承認していないため、カード自動変換の呼び出しを止めた
+   （PM 2026-09-07）。表は常に表として出力する。本 CSS と _TABLE_CARDIFY_JS は
+   不可逆な削除を避けて定義のまま残してあるが、実行経路からは外れており適用されない。
+   以下は廃止前の説明である。
    セルが折り返す表は誌面として読めないため、レンダラが折り返しを実測検知して
    表を「1行=1カード」形式へ自動変換する（実装は _TABLE_CARDIFY_JS）。
    配色・フォントは既存テーマ（thead の #1A2A44・罫線 #E3E8EF・縞 #F6F8FB）に合わせる。
@@ -605,7 +634,10 @@ def _tag_theme_tables(html: str) -> str:
     return re.sub(r"<table>.*?</table>", _repl, html, flags=re.DOTALL)
 
 
-# ── 折り返し表のカード変換（PM 2026-09-05 承認・全レポート種別横断）────────────
+# ── 折り返し表のカード変換（2026-09-07 廃止・定義のみ残置）────────────────────
+# 【廃止】本 JS は render_markdown_to_pdf() から呼ばれない（PM 2026-09-07）。
+# PM がカード形式を承認していないため、レンダラは表を常に表として出力する。
+# 不可逆な削除を避けて定義のまま残す。以下は廃止前の説明である。
 # set_content 後に page.evaluate で実行する。DOM を実測して折り返しを検知するため、
 # markdown 段階では判定できなかった「実際に折れている表」を確実に拾える。
 #
@@ -638,6 +670,19 @@ _TABLE_COLS_CLASS_JS = r"""
     else if (c === 6) cls = 'cols-6';
     else if (c === 5) cls = 'cols-5';
     if (cls) { t.classList.add(cls); n++; }
+    // 列幅を明示指定する表へクラスを付ける（ヘッダ名で判別する。PM 2026-09-07）。
+    // 見出し文字列ではなく表自身のヘッダで判別するため、誌面の見出し表記が変わっても効く。
+    // 条件を満たさない一般の表には一切影響しない。
+    const hs = Array.from(hrow.children).map((x) => (x.textContent || '').trim());
+    // §7 大株主表。前期末比列の有無で 4 列版・3 列版の両方が使われる。
+    if (hs[0] === '株主名' && hs.indexOf('会社との関係') >= 0) {
+      if (c === 4) t.classList.add('shareholders');
+      else if (c === 3) t.classList.add('shareholders3');
+    }
+    // §8 需給分析の統合テーブル: 軸 / 指標 / 現状 / 評価基準 / 判定
+    if (c === 4 && hs[0] === '軸' && hs[1] === '指標' && hs[2] === '現状') {
+      t.classList.add('demand');
+    }
   }
   return n;
 }
@@ -771,6 +816,60 @@ _TABLE_CARDIFY_JS = r"""
 """
 
 
+# ── 誌面の実測検査（PM 2026-09-07）───────────────────────────
+# PDF へ落とす直前の DOM を実測し、本文セルが 2 行以上へ折り返していないかを見る。
+# テキスト段階の字数検査（table_rules.py）は「全角 1 字 = 14px」の推定のため、
+# 数字・半角記号が多いセルを過小評価し、和文の多いセルを過大評価する。
+# 本検査は実際の誌面を測るため、字数の見積もりが将来ずれても必ず折り返しを捕まえる。
+# ラベル列（1 列目）の折り返しは旧カード判定と同じく許容する。
+_LAYOUT_AUDIT_JS = r"""
+() => {
+  const WRAP_FACTOR = 1.6;
+  const NUMERIC = /^[\s0-9,.+\-±%％〜～~/（）()円株倍日年月期件回名口万億兆千百人時分秒中間予想末初pt―ー—–−]*$/;
+  const lineHeightOf = (el) => {
+    const cs = getComputedStyle(el);
+    let lh = parseFloat(cs.lineHeight);
+    if (!isFinite(lh) || lh <= 0) lh = (parseFloat(cs.fontSize) || 12) * 1.2;
+    return lh;
+  };
+  const bodyRowsOf = (t) => {
+    const tb = t.querySelector('tbody');
+    return tb ? Array.from(tb.rows) : Array.from(t.rows).slice(1);
+  };
+  const wrapped = [];
+  const tables = Array.from(document.querySelectorAll('table'));
+  for (const t of tables) {
+    const hrow = t.querySelector('thead tr') || t.querySelector('tr');
+    const heads = hrow
+      ? Array.from(hrow.children).map((c) => (c.textContent || '').trim())
+      : [];
+    for (const tr of bodyRowsOf(t)) {
+      for (let i = 1; i < tr.cells.length; i++) {
+        const c = tr.cells[i];
+        const txt = (c.textContent || '').trim();
+        if (!txt) continue;
+        const sp = document.createElement('span');
+        sp.style.display = 'block';
+        while (c.firstChild) sp.appendChild(c.firstChild);
+        c.appendChild(sp);
+        const r = sp.getBoundingClientRect().height / lineHeightOf(c);
+        if (r > WRAP_FACTOR) {
+          wrapped.push({
+            table: heads[0] || '',
+            col: heads[i] || String(i),
+            text: txt.slice(0, 40),
+            lines: Math.round(r * 100) / 100,
+            numeric: NUMERIC.test(txt),
+          });
+        }
+      }
+    }
+  }
+  return { n_tables: tables.length, wrapped: wrapped };
+}
+"""
+
+
 def render_markdown_to_pdf(
     md_text: str,
     out_path: Path,
@@ -873,9 +972,8 @@ def render_markdown_to_pdf(
         # では timeout 引数を受け取らないため、ページ既定のタイムアウトで掛ける。
         page.set_default_timeout(120_000)
         page.set_content(full_html, wait_until="load", timeout=120_000)
-        # 折り返しを実測検知した表をカード形式へ自動変換する（PM 2026-09-05 承認）。
-        # markdown 段階では判定できない「実際に折れている表」をここで確実に潰す。
-        # 変換に失敗しても誌面生成は止めない（_cr §36 配信絶対の原則）。
+        # 列数に応じたフォント縮小クラスと、列幅を明示指定する表のクラスを付与する。
+        # 失敗しても誌面生成は止めない（_cr §36 配信絶対の原則）。
         try:
             scaled = int(page.evaluate(_TABLE_COLS_CLASS_JS) or 0)
             if scaled:
@@ -883,15 +981,46 @@ def render_markdown_to_pdf(
                     f"[md_to_pdf] col-scaled tables: {scaled}（5列以上の表を段階的に縮小）",
                     file=sys.stderr,
                 )
-            cardified = int(page.evaluate(_TABLE_CARDIFY_JS) or 0)
         except Exception as e:  # noqa: BLE001
-            cardified = 0
-            print(f"[md_to_pdf] cardify skipped: {e}", file=sys.stderr)
+            print(f"[md_to_pdf] col-class skipped: {e}", file=sys.stderr)
+        # カード自動変換は廃止した（PM 2026-09-07）。表は常に表として出力する。
+        # PM はカード形式（1行=1ブロック・先頭セルを見出し・残りを「ヘッダ名: 値」）を
+        # 承認しておらず、レンダラが誌面の形式を承認なく書き換えることを禁止する。
+        # 折り返す表は執筆側の規律違反であり、テキスト段階のゲート
+        # （bi/pipelines/lib/table_rules.py の check_tables()）が error で送信を止める。
+        # 折り返しの発生自体は §7・§8 の列幅明示指定と、実容量へ是正した字数上限で潰す。
+        # _TABLE_CARDIFY_JS と .md-cards / .md-card の CSS は復帰を容易にするため
+        # 定義のまま残し、呼び出しのみを止める（不可逆な削除をしない）。
+        cardified = 0
         print(
-            f"[md_to_pdf] cardified tables: {cardified}（折り返し検知でカード形式へ変換）",
+            f"[md_to_pdf] cardified tables: {cardified}"
+            "（カード自動変換は廃止・表は常に表として出力する）",
             file=sys.stderr,
         )
         render_markdown_to_pdf.last_cardified = cardified
+        # 誌面の実測検査（PM 2026-09-07）。page.pdf() の直前に DOM を測り、
+        # 2 行以上へ折り返した本文セルを last_layout_report へ格納する。
+        # 呼び出し元（send_report_pdf_discord.py）がこれを読み、個別銘柄レポートは
+        # 1 件でも折り返しがあれば送信を止め、定時発行は _cr §36 により警告に留める。
+        # 測定は DOM を書き換える（span で包む）が見た目は変わらない。
+        try:
+            layout = page.evaluate(_LAYOUT_AUDIT_JS) or {}
+        except Exception as e:  # noqa: BLE001
+            layout = {"error": str(e), "n_tables": 0, "wrapped": []}
+            print(f"[md_to_pdf] layout audit skipped: {e}", file=sys.stderr)
+        render_markdown_to_pdf.last_layout_report = layout
+        n_wrapped = len(layout.get("wrapped") or [])
+        print(
+            f"[md_to_pdf] layout audit: tables={layout.get('n_tables', 0)} "
+            f"wrapped_cells={n_wrapped}",
+            file=sys.stderr,
+        )
+        for w in (layout.get("wrapped") or [])[:8]:
+            print(
+                f"[md_to_pdf]   折り返し: 表「{w.get('table')}」列「{w.get('col')}」 "
+                f"{w.get('lines')}行 「{w.get('text')}」",
+                file=sys.stderr,
+            )
         page.pdf(
             path=str(out_path),
             format="A4",
@@ -907,3 +1036,6 @@ def render_markdown_to_pdf(
 
 # 直近レンダリングでカード変換した表の数（呼び出し元が参照できるようにする）。
 render_markdown_to_pdf.last_cardified = 0
+# 直近レンダリングの誌面実測結果（PM 2026-09-07）。
+# {"n_tables": int, "wrapped": [{"table","col","text","lines","numeric"}, ...]}
+render_markdown_to_pdf.last_layout_report = {"n_tables": 0, "wrapped": []}

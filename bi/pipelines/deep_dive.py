@@ -1639,6 +1639,363 @@ def _fmt_segments(segments: list[dict], max_years: int = 3) -> list[str]:
                 f"{_ratio_pct(s.get('revenueYoy'))} | {_ratio_pct(s.get('oiYoy'))} |"
             )
         lines.append("")
+
+    if len(periods) >= 2:
+        lines += [
+            "> 上の2期は基準日が異なる。比率の差は売買だけでなく発行済株式数の変動"
+            "（合併・増資・自己株式の消却等）でも生じるため、"
+            "株数と比率の両方を見て増減を判断すること。",
+            "",
+        ]
+
+    # --- 役員一覧（株主名との突合材料） ---
+    if directors:
+        fy_d = directors[0].get("fiscalYear")
+        lines += [
+            f"### 役員一覧（{('FY' + str(fy_d)) if fy_d is not None else '年度不明'}"
+            "・有価証券報告書「役員の状況」）",
+            "",
+            "| 役職 | 氏名 | 保有株数 |",
+            "|------|------|----------|",
+        ]
+        for d in directors:
+            lines.append(
+                f"| {d.get('officialTitle') or ''} | {d.get('officerName') or ''} | "
+                f"{_shares(d.get('sharesHeld'), '未開示')} |"
+            )
+        lines += [
+            "",
+            "> 保有株数の「未開示」は有報原文が「－」の行"
+            "（未開示か非保有かを区別できない）。ゼロと断定しないこと。",
+            "",
+        ]
+
+    # --- 資本関係 ---
+    parents = relations.get("parents", [])
+    subs    = relations.get("subsidiaries", [])
+    if parents or subs:
+        lines += ["### 資本関係（親会社・関係会社）", ""]
+        if parents:
+            lines += [
+                "| 報告元 | 関係 | 議決権比率 | 出典 |",
+                "|--------|------|------------|------|",
+            ]
+            for p in parents:
+                lines.append(
+                    f"| {p.get('reportingCompanyName') or ''} | "
+                    f"{p.get('relationType') or ''} | "
+                    f"{_pct_pt(p.get('votingRightsPct'))} | {p.get('source') or ''} |"
+                )
+            lines.append("")
+        if subs:
+            lines += [
+                "| 会社名 | 関係区分 | 議決権比率 | 事業内容 |",
+                "|--------|----------|------------|----------|",
+            ]
+            for s in subs:
+                lines.append(
+                    f"| {s.get('subsidiaryName') or ''} | {s.get('relationType') or ''} | "
+                    f"{_pct_pt(s.get('votingRightsPct'))} | "
+                    f"{s.get('subsidiaryBusiness') or ''} |"
+                )
+            lines.append("")
+
+    # --- 主要販売先 ---
+    customers = relations.get("customers", [])
+    if customers:
+        lines += [
+            "### 主要販売先（有報「主要な顧客ごとの情報」）", "",
+            "| 年度 | 顧客名 | セグメント | 売上高 | 売上構成比 | 確度 |",
+            "|------|--------|------------|--------|------------|------|",
+        ]
+        for c in customers:
+            share = c.get("salesSharePct")
+            if share is None:
+                share = c.get("salesSharePctFilled")
+            share_s = f"{float(share):.1f}%" if isinstance(share, (int, float)) else "N/A"
+            lines.append(
+                f"| {c.get('fiscalYear') or ''} | {c.get('customerName') or ''} | "
+                f"{c.get('segment') or ''} | {_yen_to_mn(c.get('salesAmountYen'))} | "
+                f"{share_s} | {c.get('confidence') or ''} |"
+            )
+        lines += [
+            "",
+            "> 主要販売先が空でも「大口顧客なし」を意味しない"
+            "（10%超の顧客がない場合や記載省略の場合がある）。",
+            "",
+        ]
+
+    # --- 大量保有報告書（保有目的のみ・比率は参考外） ---
+    if large_holdings:
+        lines += [
+            "### 大量保有報告書（保有目的の参考・⚠️ 比率は使用しないこと）", "",
+            "| 提出日 | 書類種別 | 提出者 | 保有者 | 提出時点の比率 | 提出時点の株数 | 保有目的 |",
+            "|--------|----------|--------|--------|----------------|----------------|----------|",
+        ]
+        for h in large_holdings:
+            lines.append(
+                f"| {h.get('submit_date') or ''} | {h.get('doc_type') or ''} | "
+                f"{h.get('filer_name') or ''} | {h.get('holder_name') or ''} | "
+                f"{_ratio_frac_pct(h.get('holding_ratio'))} | "
+                f"{_shares(h.get('shares_held'))} | {h.get('purpose') or ''} |"
+            )
+        lines += [
+            "",
+            "> **この表の比率・株数は提出日時点で固定された値であり、現在の持株比率ではない。**"
+            "レポート本文の持株比率には必ず上の「大株主の状況」の値を使うこと。"
+            "保有目的（安定株主・純投資・経営参画等）を読む目的でのみ参照する。",
+            "",
+        ]
+
+    return lines
+
+
+# ---------------------------------------------------------------------------
+# 株価時系列（日足 OHLCV・yfinance）
+# ---------------------------------------------------------------------------
+
+def fetch_price_history(code4: str, retries: int = 2):
+    """yfinance で日足 OHLCV を取得する（HTTP のみ・MCP 非依存・GHA でも動く）。
+
+    fetch_position_quotes.py と同じ取得作法に合わせる。
+      - シンボルは ``{code}.T``
+      - auto_adjust=False（終値は分割調整済み・配当未調整。TradingView の
+        SMA/BB と同じ基準に揃え、配当調整で過去終値がずれるのを防ぐ）
+
+    Returns:
+        DatetimeIndex を持つ DataFrame（Open/High/Low/Close/Volume）。
+        取得できなければ None を返す（推定・補完は一切しない）。
+    """
+    try:
+        import yfinance as yf
+    except Exception as e:
+        print(f"  → 取得失敗: yfinance import: {e}", file=sys.stderr)
+        return None
+
+    hist = None
+    last_err: object = None
+    for _ in range(retries + 1):
+        try:
+            ticker = yf.Ticker(f"{code4}.T")
+            hist = ticker.history(period=PRICE_HISTORY_PERIOD, interval="1d",
+                                  auto_adjust=False)
+            if hist is not None and not hist.empty:
+                break
+        except Exception as e:
+            last_err = e
+        time.sleep(0.6)
+
+    if hist is None or hist.empty:
+        print(f"  → 取得失敗: fetch_price_history({code4}): {last_err}", file=sys.stderr)
+        return None
+
+    cols = [c for c in ("Open", "High", "Low", "Close", "Volume") if c in hist.columns]
+    if "Close" not in cols:
+        print(f"  → 取得失敗: fetch_price_history({code4}): Close 列なし", file=sys.stderr)
+        return None
+    df = hist[cols].dropna(subset=["Close"])
+    return df if not df.empty else None
+
+
+def _levels_from_prices(df) -> dict:
+    """日足から水準（直近高値・安値・移動平均・ボリンジャーバンド）を算出する。
+
+    期間が足りず算出できない水準は None のまま残し、推定で埋めない。
+    """
+    close = df["Close"]
+    high  = df["High"] if "High" in df.columns else close
+    low   = df["Low"] if "Low" in df.columns else close
+    n     = len(close)
+    last  = float(close.iloc[-1])
+
+    levels: dict = {}
+
+    # 直近高値・安値
+    for win in PRICE_RANGE_WINDOWS:
+        if n < win:
+            levels[f"{win}日高値"] = None
+            levels[f"{win}日安値"] = None
+            continue
+        levels[f"{win}日高値"] = float(high.iloc[-win:].max())
+        levels[f"{win}日安値"] = float(low.iloc[-win:].min())
+
+    # 移動平均
+    for win in PRICE_MA_WINDOWS:
+        levels[f"{win}日移動平均"] = (
+            float(close.rolling(win).mean().iloc[-1]) if n >= win else None
+        )
+
+    # ボリンジャーバンド（25日・±2σ / ±3σ）
+    bb_win = PRICE_BB_WINDOW
+    if n >= bb_win:
+        ma_last = float(close.rolling(bb_win).mean().iloc[-1])
+        sd_last = float(close.rolling(bb_win).std(ddof=0).iloc[-1])
+        for k in (2, 3):
+            levels[f"BB+{k}シグマ"] = ma_last + k * sd_last
+            levels[f"BB-{k}シグマ"] = ma_last - k * sd_last
+    else:
+        for k in (2, 3):
+            levels[f"BB+{k}シグマ"] = None
+            levels[f"BB-{k}シグマ"] = None
+
+    return {"last_close": last, "levels": levels}
+
+
+def _touch_stats(df, level, horizons=(5, 10)) -> dict:
+    """ある価格水準に過去何回到達し、到達後どう動いたかを集計する。
+
+    到達の定義: その日の安値〜高値レンジが水準を跨いだ日（Low <= level <= High）。
+    連続到達は1回にまとめる（間に PRICE_TOUCH_GAP_DAYS 営業日以上あけば別回）。
+    到達後の値動きは、到達日終値を基準にした N 営業日後終値の騰落率。
+    先行きが N 営業日に満たない到達は、その horizon の集計から除外する。
+    """
+    if level is None or level != level:  # None / NaN
+        return {"touches": 0, "reactions": {}}
+
+    high  = df["High"] if "High" in df.columns else df["Close"]
+    low   = df["Low"] if "Low" in df.columns else df["Close"]
+    close = df["Close"]
+    n = len(close)
+
+    touch_idx: list[int] = []
+    last_i = None
+    for i in range(n):
+        h = high.iloc[i]
+        l = low.iloc[i]
+        if h != h or l != l:
+            continue
+        if float(l) <= level <= float(h):
+            if last_i is None or (i - last_i) >= PRICE_TOUCH_GAP_DAYS:
+                touch_idx.append(i)
+            last_i = i
+
+    reactions: dict = {}
+    for hz in horizons:
+        rets = []
+        for i in touch_idx:
+            j = i + hz
+            if j >= n:
+                continue
+            base = float(close.iloc[i])
+            if base == 0:
+                continue
+            rets.append((float(close.iloc[j]) / base - 1.0) * 100.0)
+        if rets:
+            rets_sorted = sorted(rets)
+            reactions[hz] = {
+                "samples": len(rets),
+                "avg_pct": sum(rets) / len(rets),
+                "median_pct": rets_sorted[len(rets_sorted) // 2],
+                "up_ratio_pct": sum(1 for r in rets if r > 0) / len(rets) * 100.0,
+                "max_pct": max(rets),
+                "min_pct": min(rets),
+            }
+        else:
+            reactions[hz] = None
+
+    return {"touches": len(touch_idx), "reactions": reactions}
+
+
+def build_price_level_stats(df) -> dict | None:
+    """各水準の到達回数と到達後の値動きを集計した dict を返す。
+
+    df が None（取得失敗）なら None を返し、呼び出し側でセクションごと省略する。
+    """
+    if df is None or len(df) == 0:
+        return None
+    base = _levels_from_prices(df)
+    stats = {}
+    for label, level in base["levels"].items():
+        stats[label] = {"level": level, **_touch_stats(df, level)}
+    return {
+        "last_close": base["last_close"],
+        "bars": len(df),
+        "first_date": df.index[0].strftime("%Y-%m-%d"),
+        "last_date": df.index[-1].strftime("%Y-%m-%d"),
+        "stats": stats,
+    }
+
+
+def _lv(val, fallback="N/A") -> str:
+    """価格水準を円建てで整形する。取れていなければ fallback。"""
+    if val is None or val != val:
+        return fallback
+    try:
+        return f"{float(val):,.1f} 円"
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _sp(val, fallback="N/A") -> str:
+    """騰落率（%）を符号付きで整形する。"""
+    if val is None or val != val:
+        return fallback
+    try:
+        return f"{float(val):+.1f}%"
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _rate(val, fallback="N/A") -> str:
+    """勝率（%）を整形する。"""
+    if val is None or val != val:
+        return fallback
+    try:
+        return f"{float(val):.0f}%"
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _fmt_price_levels(price_stats: dict | None) -> list[str]:
+    """株価水準の実績テーブルを生成する。取得できなければ空リストを返す。"""
+    if not price_stats or not price_stats.get("stats"):
+        return []
+
+    last = price_stats["last_close"]
+    lines = [
+        "## 株価水準の実績（日足・yfinance・生成時ライブ取得）",
+        "",
+        f"- **対象期間**: {price_stats['first_date']} 〜 {price_stats['last_date']}"
+        f"（{price_stats['bars']} 営業日）",
+        f"- **直近終値**: {_lv(last)}",
+        "- **到達の定義**: その日の安値〜高値レンジがその水準を跨いだ日。"
+        f"連続到達は1回に束ね、{PRICE_TOUCH_GAP_DAYS} 営業日以上あいたら別回として数える。",
+        "- **到達後の値動き**: 到達日の終値を基準にした N 営業日後終値の騰落率"
+        "（先行きが N 営業日に満たない到達はその集計から除外）。",
+        "",
+        "| 水準 | 価格 | 現値乖離 | 到達回数 | 5日後平均 | 5日後上昇率 | 5日後件数 "
+        "| 10日後平均 | 10日後上昇率 | 10日後件数 |",
+        "|------|------|----------|----------|-----------|------------|-----------"
+        "|-----------|-------------|-----------|",
+    ]
+
+    for label, s in price_stats["stats"].items():
+        lv = s.get("level")
+        if lv is None or lv != lv:
+            lines.append(f"| {label} | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |")
+            continue
+        gap = (last / lv - 1.0) * 100.0 if lv else None
+        reactions = s.get("reactions") or {}
+        r5  = reactions.get(5)
+        r10 = reactions.get(10)
+        lines.append(
+            f"| {label} | {_lv(lv)} | {_sp(gap)} | {s.get('touches', 0)} 回 "
+            f"| {_sp(r5.get('avg_pct')) if r5 else 'N/A'} "
+            f"| {_rate(r5.get('up_ratio_pct')) if r5 else 'N/A'} "
+            f"| {r5.get('samples') if r5 else 'N/A'} "
+            f"| {_sp(r10.get('avg_pct')) if r10 else 'N/A'} "
+            f"| {_rate(r10.get('up_ratio_pct')) if r10 else 'N/A'} "
+            f"| {r10.get('samples') if r10 else 'N/A'} |"
+        )
+
+    lines += [
+        "",
+        "> 到達回数 0 回の水準は対象期間中に一度も機能していない"
+        "（レポートで「機能した水準」として扱わないこと）。",
+        "> 件数が5件未満の水準は統計として弱いことを本文で明示すること。",
+        "> N/A は算出に必要な期間が足りず取得できなかったことを示す（推定値を入れない）。",
+        "",
+    ]
     return lines
 
 
