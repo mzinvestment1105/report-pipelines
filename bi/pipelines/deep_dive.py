@@ -62,6 +62,7 @@ for _stream in (sys.stdout, sys.stderr):
 
 from edinetdb_client import EdinetDBClient
 from jq_client_utils import normalize_code_4
+import reaction_supply_demand as rsd
 
 import edinet_client
 import edinet_pdf_extractor
@@ -112,6 +113,12 @@ REACTION_JQ_INDEX_CODES = {
     "TOPIX": "0000",
     "東証グロース市場250": "0070",
 }
+
+# 機関空売り残（空売り残高報告制度・発行済の0.5%以上で報告義務）の走査幅。
+# 公表日（DiscDate）は計算日（CalcDate）の約2営業日後になるため、対象日の前後に余裕を取る。
+# PM 2026-09-06 指示: 反応スコアの需給要因として機関空売りの増減を必ず確認する。
+SHORT_SALE_SCAN_BACK_DAYS = 21   # 対象日より前（直前の残高＝増減の比較対象を取るため）
+SHORT_SALE_SCAN_FWD_DAYS  = 6    # 対象日より後（対象日の CalcDate 分が公表されるまで）
 
 # 取得経路の記録（provenance）。値は "EDINET DB" / "EDINET公式API(有報)" / "取得不可"
 PROV_DB      = "EDINET DB"
@@ -3078,6 +3085,11 @@ def _fmt_provenance(prov: dict) -> list[str]:
 #   4. 為替の当日変化率 … ドル円（yfinance）
 #   5. 同業他社の当日騰落率と当日の開示 … peers.yml ＋ yfinance ＋ TDNet
 #   6. 当日のマクロ・動意レポートで当該銘柄／セクターに触れた段落
+#   7. 需給（PM 2026-09-06 追加指示）… reaction_supply_demand.py
+#      機関投資家の空売り残高と日次増減（機関名別）・信用取引の売残/買残と増減・
+#      立会外分売/自己株取得/大量保有報告書・信用規制・配当/分割の権利落ち日。
+#      3168 で 9/2 の -9.17% を「権利落ち」と誤って説明した原因が、需給が
+#      機械で揃える事実の中に無かったことにあるため追加した。
 # ---------------------------------------------------------------------------
 
 
@@ -3315,6 +3327,163 @@ def _fetch_jq_index_closes(days: list) -> dict:
     return out
 
 
+def _fetch_jq_short_sale_daily(code4: str, days: list, shares_out=None) -> dict:
+    """J-Quants /markets/short-sale-report から、対象銘柄の機関空売り残の日次増減を取得する。
+
+    空売り残高報告制度（発行済株式総数の 0.5% 以上の空売りポジションに報告義務）の
+    開示を、反応スコア対象日の前後について取得する。screening_master.parquet の
+    週次スナップショットは対象日時点の増減を持たないため、ここでライブ取得する。
+    PM 2026-09-06 指示: 反応スコアの需給要因として機関空売りの増減を必ず確認するため。
+
+    CalcDate（計算年月日 = 実際に空売り残高が動いた日）で日付を引き当てる。
+    DiscDate（公表日）は CalcDate の 2 営業日後になるため、値動きの当日と結びつけるには
+    CalcDate を使う必要がある。
+
+    JQUANTS_API_KEY が無い場合・取得失敗時は空 dict を返し、run は止めない（欠損扱い）。
+
+    Args:
+        code4: 4桁銘柄コード。
+        days: 反応スコア対象日（date のリスト）。
+        shares_out: 発行済株式総数（対発行済% の算出に使う。無ければ開示比率をそのまま使う）。
+    Returns:
+        {date: {"rows": [ ... 各機関の残高と増減 ... ], "total_shares": int, "total_pct": float}}
+    """
+    api_key = os.environ.get("JQUANTS_API_KEY", "").strip()
+    if not api_key or not days:
+        return {}
+    try:
+        import jquantsapi
+        from jq_client_utils import fetch_paginated_v2
+        client = jquantsapi.ClientV2(api_key=api_key)
+    except Exception as e:
+        print(f"  → 取得失敗: J-Quants クライアント生成（空売り残）: {e}", file=sys.stderr)
+        return {}
+
+    # 公表日は計算日の約2営業日後。対象日の前後に十分な余裕を取って走査する。
+    lo = min(days) - timedelta(days=SHORT_SALE_SCAN_BACK_DAYS)
+    hi = max(days) + timedelta(days=SHORT_SALE_SCAN_FWD_DAYS)
+    rows: list = []
+    d_scan = lo
+    while d_scan <= hi:
+        disc = d_scan.isoformat()
+        try:
+            got = fetch_paginated_v2(
+                client, "/markets/short-sale-report",
+                params={"disc_date": disc}, sleep_seconds=0.4,
+            )
+        except Exception as e:
+            print(f"  → 取得失敗: J-Quants 空売り残 {disc}: {e}", file=sys.stderr)
+            d_scan += timedelta(days=1)
+            continue
+        for r in (got or []):
+            if str(r.get("Code", ""))[:4] != code4:
+                continue
+            rows.append(r)
+        d_scan += timedelta(days=1)
+
+    if not rows:
+        return {}
+
+    def _to_date(s):
+        try:
+            return datetime.strptime(str(s)[:10], "%Y-%m-%d").date()
+        except (TypeError, ValueError):
+            return None
+
+    # CalcDate ごと・機関ごとに整理する。同一機関の同一 CalcDate は最後の1行を採る。
+    by_day: dict = {}
+    for r in rows:
+        cd = _to_date(r.get("CalcDate"))
+        if cd is None:
+            continue
+        inst = str(r.get("SSName") or r.get("DiscretionaryInvestmentContractorName") or "").strip()
+        by_day.setdefault(cd, {})[inst] = r
+
+    all_days = sorted(by_day)
+    out: dict = {}
+    for day in sorted(set(days)):
+        # 対象日そのもの、無ければ対象日以前で最新の CalcDate を使う（残高は継続するため）。
+        cur_day = day if day in by_day else next(
+            (x for x in reversed(all_days) if x <= day), None
+        )
+        if cur_day is None:
+            continue
+        # 直前の CalcDate（増減の比較対象）
+        prev_day = next((x for x in reversed(all_days) if x < cur_day), None)
+        prev_map = by_day.get(prev_day, {}) if prev_day else {}
+        cur_map = by_day[cur_day]
+
+        detail: list = []
+        for inst, r in cur_map.items():
+            shares = r.get("ShrtPosShares", r.get("ShortPositionsInSharesNumber"))
+            ratio = r.get("ShrtPosToSO", r.get("ShortPositionsToSharesOutstandingRatio"))
+            try:
+                shares = float(shares) if shares is not None else None
+            except (TypeError, ValueError):
+                shares = None
+            try:
+                ratio = float(ratio) if ratio is not None else None
+            except (TypeError, ValueError):
+                ratio = None
+            # 増減は前 CalcDate の残高から。無ければ PrevRptRatio から逆算する。
+            delta = None
+            prev_r = prev_map.get(inst)
+            if prev_r is not None:
+                try:
+                    ps = float(prev_r.get("ShrtPosShares", prev_r.get("ShortPositionsInSharesNumber")))
+                    if shares is not None:
+                        delta = shares - ps
+                except (TypeError, ValueError):
+                    pass
+            if delta is None and shares is not None:
+                try:
+                    pr = float(r.get("PrevRptRatio")) if r.get("PrevRptRatio") is not None else None
+                except (TypeError, ValueError):
+                    pr = None
+                if pr is not None and ratio:
+                    # 前回報告比率から前回株数を逆算する（同一の発行済株式数を前提）。
+                    delta = shares - (shares / ratio * pr)
+                elif str(r.get("PrevRptDate") or "").strip() in ("", "-"):
+                    # 前回報告が無い = 新規に報告義務が生じた（0.5% を超えた）
+                    delta = shares
+            detail.append({
+                "inst": inst,
+                "shares": shares,
+                "ratio": ratio,
+                "delta": delta,
+                "calc_date": cur_day,
+                "is_new": str(r.get("PrevRptDate") or "").strip() in ("", "-"),
+            })
+
+        tot = sum(x["shares"] for x in detail if x["shares"] is not None)
+        tot_delta = sum(x["delta"] for x in detail if x["delta"] is not None)
+        pct = None
+        if shares_out:
+            try:
+                pct = tot / float(shares_out) * 100.0
+            except (TypeError, ValueError, ZeroDivisionError):
+                pct = None
+        if pct is None:
+            rs = [x["ratio"] for x in detail if x["ratio"] is not None]
+            pct = sum(rs) * 100.0 if rs else None
+        delta_pct = None
+        if shares_out:
+            try:
+                delta_pct = tot_delta / float(shares_out) * 100.0
+            except (TypeError, ValueError, ZeroDivisionError):
+                delta_pct = None
+        out[day] = {
+            "rows": sorted(detail, key=lambda x: -(x["shares"] or 0)),
+            "total_shares": tot,
+            "total_pct": pct,
+            "total_delta": tot_delta,
+            "total_delta_pct": delta_pct,
+            "calc_date": cur_day,
+            "is_stale": cur_day != day,
+        }
+    return out
+
+
 def _tdnet_titles_on(tdnet_entries: list, day, include_prev_evening: bool = True) -> list:
     """TDNet 一覧から指定日（および前営業日の引け後）の開示表題を返す。
 
@@ -3362,7 +3531,7 @@ def _fetch_peer_tdnet_titles(peer_code: str, day) -> list:
 
 
 def build_reaction_context(code4: str, price_df, tdnet_entries: list,
-                           sector_name: str = "") -> dict:
+                           sector_name: str = "", shares_out=None) -> dict:
     """反応スコア上位日について、値動きの原因になりうる外部環境を機械的に集める。
 
     yfinance は「全ティッカー × 全対象日」を1回の download でまとめて取得する
@@ -3395,6 +3564,21 @@ def build_reaction_context(code4: str, price_df, tdnet_entries: list,
         for back in range(1, 6):
             jq_days.append(d - timedelta(days=back))
     jq = _fetch_jq_index_closes(sorted(set(jq_days)))
+
+    # 機関空売り残の日次増減（需給要因の主因判定に必須。PM 2026-09-06 指示）。
+    # 週次スナップショットの screening_master では対象日の増減が取れないためライブ取得する。
+    short_sale = _fetch_jq_short_sale_daily(code4, target_dates, shares_out=shares_out)
+
+    # 需給のうち空売り以外（信用残・権利落ち日・需給に関わる開示）。
+    # 3168 で 9/2 の -9.17% を「権利落ち」と誤って説明した原因は、
+    # 権利落ち日そのものを機械で持っていなかったことにある（実際は 8/28）。
+    # API 呼び出しは銘柄あたり空売り1回・信用残1回・権利落ち1回のみ。
+    try:
+        supply_demand = rsd.build_supply_demand(code4, target_dates)
+    except Exception as e:  # noqa: BLE001
+        print(f"  → 取得失敗: 需給データ({code4}): {e}", file=sys.stderr)
+        supply_demand = {"days": {}, "shares_outstanding": None, "actions": [],
+                         "reports": [], "margin": [], "sources": ["需給=取得できず"]}
 
     # 同業の開示は「同業社数 × 対象日」ではなく「同業社数」回だけ取得する。
     peer_tdnet: dict = {}
@@ -3483,15 +3667,36 @@ def build_reaction_context(code4: str, price_df, tdnet_entries: list,
             })
         rec["peers"] = peer_rows
 
-        # 6) 当日のマクロ・動意レポートで当該銘柄／セクターに触れた段落
+        # 6) 機関空売り残の当日残高と増減（需給要因）
+        rec["short_sale"] = short_sale.get(day)
+
+        # 7) 当日のマクロ・動意レポートで当該銘柄／セクターに触れた段落
         rec["market_excerpt"] = _market_report_excerpt(day, code4, sector_name)
+
+        # 8) 需給のうち空売り以外（信用残・権利落ち日・需給に関わる開示）。
+        #    空売りは rec["short_sale"] で既に出しているため include_short=False。
+        try:
+            sd_disc = rsd.supply_demand_disclosures(
+                tdnet_entries, day, _parse_pub_datetime
+            )
+            rec["supply_demand_rows"] = rsd.fmt_supply_demand_for_day(
+                supply_demand, day, sd_disc, include_short=False
+            )
+        except Exception as e:  # noqa: BLE001
+            print(f"  → 取得失敗: 需給の整形({code4} {day}): {e}", file=sys.stderr)
+            rec["supply_demand_rows"] = []
 
         out_days.append(rec)
 
     note = ""
     if not peers:
         note = "peers.yml に同業の定義がないため同業比較は実施していません（内部注記・誌面には書かない）"
-    return {"days": out_days, "peers": peers, "note": note}
+    return {
+        "days": out_days,
+        "peers": peers,
+        "note": note,
+        "supply_demand": supply_demand,
+    }
 
 
 def _fmt_reaction_context(ctx: dict) -> list:
@@ -3509,8 +3714,16 @@ def _fmt_reaction_context(ctx: dict) -> list:
     lines += [
         "> 反応スコア = 日中値幅（高値−安値の前日終値比%）× 出来高5日平均比。",
         "> その日の値動きの原因になりうる事実を機械的に集めたもの。",
-        "> **自社の開示が無い日は、同業 → 米国指数 → 国内指数 → ドル円 → 当日レポート言及 の順に"
-        "該当を探し、最初に該当したものを主因として書くこと。**",
+        "> **自社の開示が無い日は、需給（機関空売り残の増減 → 信用残の増減 → 信用規制 → 権利落ち）"
+        "→ 同業 → 米国指数 → 国内指数 → ドル円 → 当日レポート言及 の順に該当を探し、"
+        "最初に該当したものを主因として書くこと。**",
+        "> **機関空売り残に増減がある日は、それを需給の主因として必ず書く"
+        "（対発行済%を併記する）。テクニカルの水準を原因にしてはならない。**",
+        "> **「権利落ち」「権利付最終日」を主因として書けるのは、下の『権利落ち』行が"
+        "「当日と一致する」と書いている日だけである。一致しない日に権利落ちを主因として"
+        "書くことを禁止する（基準日と権利落ち日の取り違えを防ぐため）。**",
+        "> **信用残は週次（毎週金曜時点）のため対象日そのものの残高は存在しない。"
+        "対象日を挟む2回の公表値とその増減を示してある。信用倍率は使わない。**",
         "",
     ]
     if ctx.get("note"):
@@ -3547,6 +3760,41 @@ def _fmt_reaction_context(ctx: dict) -> list:
 
         for label in ("ドル円",):
             lines.append(f"| {label} | {_signed_pct((d.get('fx') or {}).get(label))} |")
+
+        # 機関空売り残（需給要因）。増減がある日はそれ自体が主因になりうる。
+        ss = d.get("short_sale")
+        if ss:
+            calc_s = ss["calc_date"].isoformat()
+            stale = "（対象日の開示なし・直近の残高）" if ss.get("is_stale") else ""
+            tot_pct = ss.get("total_pct")
+            tot_pct_s = f"（対発行済 {tot_pct:.2f}%）" if tot_pct is not None else ""
+            lines.append(
+                f"| 機関空売り残 合計（計算日 {calc_s}）{stale} "
+                f"| {ss['total_shares']:,.0f}株{tot_pct_s} |"
+            )
+            dlt = ss.get("total_delta")
+            if dlt:
+                dp = ss.get("total_delta_pct")
+                dp_s = f"（対発行済 {dp:+.2f}pt）" if dp is not None else ""
+                lines.append(f"| 機関空売り残 前回報告比 増減 | {dlt:+,.0f}株{dp_s} |")
+            for row in ss["rows"][:5]:
+                sh = f"{row['shares']:,.0f}株" if row["shares"] is not None else "取得できず"
+                rt = f" 対発行済 {row['ratio'] * 100:.2f}%" if row["ratio"] is not None else ""
+                dl = ""
+                if row["delta"] is not None:
+                    dl = f" 前回比 {row['delta']:+,.0f}株"
+                    if row.get("is_new"):
+                        dl += "（新規に報告義務が生じた）"
+                lines.append(f"| 機関空売り {row['inst']} | {sh}{rt}{dl} |")
+        else:
+            lines.append(
+                "| 機関空売り残 | 対象日の前後に空売り残高報告の開示なし"
+                "（発行済の0.5%未満のため報告義務が生じていない） |"
+            )
+
+        # 信用残・権利落ち日・需給に関わる開示（PM 2026-09-06 追加指示）。
+        # 「権利落ち」を主因にする場合はここの日付と一致することが必須。
+        lines += (d.get("supply_demand_rows") or [])
 
         peer_rows = d.get("peers") or []
         if peer_rows:
@@ -4195,8 +4443,11 @@ def main() -> None:
     # 7-2) 反応スコア対象日の外部環境。
     #      「特定できる材料が確認できなかった」で終わらせないため、値動きの原因に
     #      なりうる事実（自社開示・国内指数・米国指数・為替・同業）を機械で揃える。
-    print("[9/9] 反応スコア対象日の外部環境を取得中（yfinance・J-Quants・TDNet）...")
-    reaction_ctx = build_reaction_context(code, price_df, tdnet_entries, sector_name)
+    print("[9/9] 反応スコア対象日の外部環境を取得中（yfinance・J-Quants・TDNet・空売り残）...")
+    _shares_out = (sd_axes.get("raw") or {}).get("発行済株式総数")
+    reaction_ctx = build_reaction_context(
+        code, price_df, tdnet_entries, sector_name, shares_out=_shares_out
+    )
     _rdays = [d["date"] for d in reaction_ctx.get("days", [])]
     if _rdays:
         print("  → 対象日: " + " / ".join(d.isoformat() for d in _rdays))

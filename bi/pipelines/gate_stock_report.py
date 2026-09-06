@@ -1209,6 +1209,254 @@ def _check_mixed_script(md: str) -> list[str]:
     return warnings
 
 
+# --- 需給（空売り・権利落ち）の検査（PM 2026-09-06 指示）-----------------------
+# 背景: 3168 の 2026-09-02 の -9.17% を「8/31 基準日の期末配当が 9/1 に権利落ちした」と
+#   説明したが誤りだった。実際の権利落ち日は 2026-08-28 であり、真因は機関投資家の
+#   空売り残高の積み増し（計 +6.3万株）だった。値動きの最も直接的な原因である需給が
+#   誌面に反映されないまま、権利落ちという誤った説明が通ってしまったため機械検査を置く。
+#
+# 後方互換: 生データに需給の行が無ければ両検査ともスキップし、既存の判定に影響を与えない。
+
+# 生データの日付見出し「### 2026-09-02（反応スコア ...）」
+_DATA_DAY_HEAD = re.compile(r"^###\s+(\d{4})-(\d{2})-(\d{2})\s*[（(]", re.M)
+
+# 生データの空売りの行。concurrent に 2 系統の書式がありうるため両方を拾う。
+#   「| 機関空売り残 前回報告比 増減 | +62,900株（対発行済 +0.44pt） |」
+#   「| 空売り 当日合計の増減 | +6.3万株（発行済比 0.44%） |」
+#   「| 機関空売り {機関名} | 106,655株 対発行済 0.74% 前回比 +13,000株 |」
+#   「| 空売り {機関名} | 残 10.7万株（発行済比 0.74%） ／ 増減 +1.3万株 |」
+_SD_SHORT_ROW = re.compile(r"^\|\s*(?:機関)?空売り[^|]*\|([^|]*)\|", re.M)
+# 行の中の増減（符号つきの株数）。「+13,000株」「+1.3万株」「-2.1万株」
+_SD_DELTA_KABU = re.compile(r"([+\-＋−][\d,]+(?:\.\d+)?)\s*(万株|株)")
+# 対発行済 % の表記。「（対発行済 +0.44pt）」「（発行済比 0.44%）」「対発行済 0.74%」
+_SD_PCT = re.compile(r"(?:対発行済|発行済比)\s*([+\-]?\d+(?:\.\d+)?)\s*(?:%|pt|％)")
+
+# 生データの権利落ちの行。
+#   「| 権利落ち | 2026-08-28 に配当の権利落ち（20.0）。当日と一致するため主因として書いてよい |」
+#   「| 権利落ち | 当日は権利落ち日ではない（直近の権利落ちは 2026-08-28（配当））。… |」
+_SD_EX_ROW = re.compile(r"^\|\s*権利落ち\s*\|([^|]*)\|", re.M)
+_SD_EX_MATCH = "当日と一致"
+_SD_EX_NOMATCH = "当日は権利落ち日ではない"
+
+# 誌面が需給（空売り）に言及したとみなす語。
+_SHORT_MENTION_WORDS = ("空売り", "売り建て", "ショート", "空売残", "貸株")
+# 誌面が権利落ちを主因として書いたとみなす語。
+_EX_DIV_WORDS = ("権利落ち", "権利付最終日", "権利付き最終日", "配当落ち")
+
+# 誌面で言及を義務づける空売り増減の下限（reaction_supply_demand.py と同じ定義）。
+SD_NOTABLE_RATIO_PCT = 0.1     # 発行済株式数の 0.1%
+SD_NOTABLE_ABS_KABU = 10000    # または 1 万株（発行済比を取れなかった行の代替判定）
+
+SHORT_MENTION_REMEDY = (
+    "生データの「反応スコア対象日の外部環境」の当該日に空売り残の増減が記録されている。"
+    "機関名と増減株数を対発行済株式数 % つきで書き、値動きの説明に反映する"
+    "（agents/stock_analyst.md の必須確認手順 ②-(a)）"
+)
+EX_DIV_REMEDY = (
+    "生データの「権利落ち」行が示す権利落ち日と当該日が一致しない。"
+    "権利落ち・権利付最終日を主因とする記述を削除し、"
+    "需給（空売り残の増減・信用残の増減）から順に主因を書き直す"
+    "（配当の基準日と権利落ち日は別の日である）"
+)
+
+
+def _data_md_day_blocks(raw: str) -> dict:
+    """生データの「反応スコア対象日の外部環境」を {date文字列: その日の本文} に切る。
+
+    セクションが無ければ空 dict を返す（後方互換のスキップ判定に使う）。
+    """
+    m = re.search(r"^##\s*反応スコア対象日の外部環境\s*$", raw, re.M)
+    if not m:
+        return {}
+    tail = raw[m.end():]
+    nxt = re.search(r"^##\s", tail, re.M)
+    section = tail[: nxt.start()] if nxt else tail
+
+    blocks: dict = {}
+    heads = list(_DATA_DAY_HEAD.finditer(section))
+    for i, h in enumerate(heads):
+        key = f"{h.group(1)}-{h.group(2)}-{h.group(3)}"
+        end = heads[i + 1].start() if i + 1 < len(heads) else len(section)
+        blocks[key] = section[h.start(): end]
+    return blocks
+
+
+def _parse_short_delta(block: str) -> tuple:
+    """1 日ぶんの本文から、空売りの最大増減（株数, 発行済比%）を返す。
+
+    見つからなければ (None, None)。「増減なし」「報告なし」の日は (0.0, None)。
+    """
+    best_kabu = None
+    best_pct = None
+    saw_row = False
+    for m in _SD_SHORT_ROW.finditer(block):
+        saw_row = True
+        cell = m.group(1)
+        for dm in _SD_DELTA_KABU.finditer(cell):
+            num = dm.group(1).replace(",", "").replace("＋", "+").replace("−", "-")
+            try:
+                v = abs(float(num))
+            except ValueError:
+                continue
+            if dm.group(2) == "万株":
+                v *= 10000
+            if best_kabu is None or v > best_kabu:
+                best_kabu = v
+        for pm in _SD_PCT.finditer(cell):
+            try:
+                p = abs(float(pm.group(1)))
+            except ValueError:
+                continue
+            if best_pct is None or p > best_pct:
+                best_pct = p
+    if not saw_row:
+        return None, None
+    if best_kabu is None:
+        return 0.0, None
+    return best_kabu, best_pct
+
+
+def _check_supply_demand_mention(md: str, code: str) -> tuple:
+    """検査1: 生データに特筆すべき空売り増減があるのに誌面が触れていない（error）。
+
+    後方互換: 生データが無い／需給の行を持たない生データではスキップする。
+
+    Returns:
+        (errors, info メモ)
+    """
+    path = _latest_data_md(code)
+    if path is None:
+        return [], "[需給の言及] 生データが見つからず検査スキップ"
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        return [], f"[需給の言及] 生データ {path.name} を読めず検査スキップ"
+
+    blocks = _data_md_day_blocks(raw)
+    if not blocks:
+        return [], f"[需給の言及] 生データ {path.name} に需給セクションなし → スキップ（後方互換）"
+
+    section, sec_line = _reaction_section(md)
+    if not section.strip():
+        return [], "[需給の言及] 誌面に反応スコア節が無く検査スキップ"
+    items = _reaction_items(section)
+    if not items:
+        return [], "[需給の言及] 反応スコアの件が読み取れず検査スキップ"
+
+    checked = 0
+    errors: list = []
+    for day_key, block in blocks.items():
+        kabu, pct = _parse_short_delta(block)
+        if kabu is None:
+            continue  # 需給の行を持たない生データ（後方互換）
+        checked += 1
+        notable = False
+        if pct is not None and pct >= SD_NOTABLE_RATIO_PCT:
+            notable = True
+        elif pct is None and kabu >= SD_NOTABLE_ABS_KABU:
+            notable = True
+        if not notable:
+            continue
+
+        # 誌面の該当日の記述を探す。見出しは「N件目 — 9/2（反応スコア ...）」の形。
+        y, mo, dd = day_key.split("-")
+        pats = (
+            f"{int(mo)}/{int(dd)}",
+            f"{int(mo)}月{int(dd)}日",
+            day_key,
+        )
+        target = None
+        for head, body, _r in items:
+            if any(p in head for p in pats):
+                target = (head, body)
+                break
+        if target is None:
+            continue  # その日が誌面の 3 件に選ばれていない
+
+        head, body = target
+        if not any(w in body for w in _SHORT_MENTION_WORDS):
+            kabu_s = f"{kabu / 10000:.1f}万株"
+            pct_s = f"・発行済比 {pct:.2f}%" if pct is not None else ""
+            errors.append(
+                f"[需給の言及漏れ] 「{head}」（{day_key}）は生データに空売り残の増減 "
+                f"{kabu_s}{pct_s} が記録されているのに、誌面が空売りに触れていない。"
+                f" → 対処: {SHORT_MENTION_REMEDY}"
+            )
+
+    if errors:
+        return errors, ""
+    return [], f"[需給の言及] 空売り増減のある日への言及を確認（対象 {checked} 日・{path.name}）"
+
+
+def _check_ex_dividend_date(md: str, code: str) -> tuple:
+    """検査2: 誌面が権利落ちを主因としているのに生データの権利落ち日と一致しない（error）。
+
+    3168 で起きた誤りそのものを機械で塞ぐ。
+    後方互換: 生データに「権利落ち」行が無ければスキップする。
+
+    Returns:
+        (errors, info メモ)
+    """
+    path = _latest_data_md(code)
+    if path is None:
+        return [], "[権利落ち日の一致] 生データが見つからず検査スキップ"
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        return [], f"[権利落ち日の一致] 生データ {path.name} を読めず検査スキップ"
+
+    blocks = _data_md_day_blocks(raw)
+    if not blocks:
+        return [], f"[権利落ち日の一致] 生データ {path.name} に需給セクションなし → スキップ"
+
+    # 各日の権利落ち判定（一致 / 不一致 / 行なし）を取る。
+    verdict: dict = {}
+    for day_key, block in blocks.items():
+        m = _SD_EX_ROW.search(block)
+        if not m:
+            continue
+        cell = m.group(1)
+        if _SD_EX_NOMATCH in cell:
+            verdict[day_key] = False
+        elif _SD_EX_MATCH in cell:
+            verdict[day_key] = True
+    if not verdict:
+        return [], f"[権利落ち日の一致] 生データ {path.name} に権利落ち行なし → スキップ（後方互換）"
+
+    section, _sec_line = _reaction_section(md)
+    if not section.strip():
+        return [], "[権利落ち日の一致] 誌面に反応スコア節が無く検査スキップ"
+    items = _reaction_items(section)
+    if not items:
+        return [], "[権利落ち日の一致] 反応スコアの件が読み取れず検査スキップ"
+
+    errors: list = []
+    for head, body, _r in items:
+        if not any(w in body for w in _EX_DIV_WORDS):
+            continue
+        # この件がどの日を指すかを見出しから引き当てる。
+        matched_day = None
+        for day_key in verdict:
+            y, mo, dd = day_key.split("-")
+            if any(p in head for p in (f"{int(mo)}/{int(dd)}",
+                                       f"{int(mo)}月{int(dd)}日",
+                                       day_key)):
+                matched_day = day_key
+                break
+        if matched_day is None:
+            continue
+        if verdict[matched_day] is False:
+            errors.append(
+                f"[権利落ち日の不一致] 「{head}」（{matched_day}）は権利落ちを要因として"
+                "書いているが、生データの権利落ち行は「当日は権利落ち日ではない」としている。"
+                f" → 対処: {EX_DIV_REMEDY}"
+            )
+
+    if errors:
+        return errors, ""
+    return [], f"[権利落ち日の一致] 権利落ちを主因とする記述の日付整合を確認（{path.name}）"
+
+
 def run_gate(md: str, code: str) -> tuple[list[str], list[str], list[str]]:
     """(errors, warnings, info) を返す。errors が空なら送信可。"""
     errors: list[str] = []
@@ -1386,6 +1634,21 @@ def run_gate(md: str, code: str) -> tuple[list[str], list[str], list[str]]:
     warnings.extend(ms_warns)
     if not ms_warns:
         info.append("[英字と片仮名の混在] 同一固有名詞の二重表記なし")
+
+    # 14. 需給（空売り）の言及漏れ（errors・PM 2026-09-06）
+    #     生データに特筆すべき空売り増減があるのに誌面が触れていない場合を不合格にする。
+    #     生データに需給の行が無ければスキップする（後方互換）。
+    sd_errs, sd_note = _check_supply_demand_mention(md, code)
+    errors.extend(sd_errs)
+    if sd_note:
+        info.append(sd_note)
+
+    # 15. 権利落ち日の不一致（errors・PM 2026-09-06）
+    #     権利落ちを主因として書いているのに、生データの権利落ち日が当該日と一致しない場合。
+    ex_errs, ex_note = _check_ex_dividend_date(md, code)
+    errors.extend(ex_errs)
+    if ex_note:
+        info.append(ex_note)
 
     return errors, warnings, info
 
