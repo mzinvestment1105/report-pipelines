@@ -44,6 +44,11 @@ from verify_report_numbers import verify as verify_numbers  # noqa: E402
 # 7-B（IPO ロックアップ）は IPO 銘柄のみのため任意とする。
 STOCK_ANALYST_MD = REPO_ROOT / "agents" / "stock_analyst.md"
 OPTIONAL_SECTIONS = {"7-B"}
+# 4-B（会社が公表した将来目標）は「生データが将来見込みセクションを持つ場合のみ必須」の
+# 条件付き必須とする。本改修より前に生成された生データで書かれた既存レポートを
+# 遡って不合格にしないための後方互換措置（PM 2026-09-06）。判定は
+# _check_forward_guidance() が担い、必須セクション検査からは常に外す。
+CONDITIONAL_SECTIONS = {"4-B"}
 
 
 def _required_sections() -> list[tuple[str, str]]:
@@ -65,7 +70,7 @@ def _required_sections() -> list[tuple[str, str]]:
         if not m:
             continue
         num, title = m.group(1), m.group(2)
-        if num in OPTIONAL_SECTIONS:
+        if num in OPTIONAL_SECTIONS or num in CONDITIONAL_SECTIONS:
             continue
         # 「4. 業績トレンド」→ 主要語は括弧・注記を落とした先頭語
         key = re.split(r"[（(・]", title)[0].strip()
@@ -280,8 +285,8 @@ _SIGNED_PCT = re.compile(r"[+＋\-−－—–]\s?[0-9０-９]+(?:[.．][0-9０-
 _CANDLE = re.compile(r"陽線|陰線")
 
 REACTION_REMEDY = (
-    "株価の反応は冒頭で方向（前日比 ±X%・陽線/陰線）を明示し、"
-    "4本値（始値・高値・安値・終値）と出来高倍率を書く"
+    "株価の反応は 1 行・40 字以内で「前日比 ±X% の陽線／陰線」のみを書く"
+    "（4本値・出来高倍率・売買代金・日中値幅の記載は禁止）"
 )
 
 
@@ -337,6 +342,156 @@ def _check_reaction_format(md: str) -> list[str]:
 
     return errs
 
+
+# --- 反応スコア節の内容規律（PM 2026-09-06 明示指示）-----------------------------
+# 正本: agents/stock_analyst.md 「株価が反応した上位 3 件」 / prompts/_common_rules.md §44
+#   1. 要因の特定放棄を示す文言（error）
+#   2. 「株価の反応」への 4 本値の混入（error）
+#   3. 同義反復の禁止例（warning・語句ベースのため誤検知を避け warning から導入）
+#   4. 1 件あたりの分量超過（warning）
+# 既存の _check_reaction_format() とは独立した関数として実装し、既存検査には触れない。
+
+# 節の開始は「株価が反応した上位N件」の見出し。終了は次の同レベル以上の見出し。
+_REACTION_SECTION_HEAD = re.compile(
+    r"^(#{2,6})\s*.*株価が反応した上位\s*[0-9０-９]*\s*件.*$", re.M
+)
+
+# 1. 要因の特定放棄（error）
+_REACTION_GIVEUP = [
+    "特定できる材料が確認できなかった",
+    "特定できる材料は確認できなかった",
+    "特定できる材料が確認できません",
+    "材料は不明",
+    "材料が不明",
+    "要因は特定できな",
+    "要因を特定できな",
+    "要因は不明",
+    "要因が不明",
+    "材料は特定できな",
+    "材料を特定できな",
+    "明確な材料は確認できな",
+    "手掛かりとなる材料は確認できな",
+]
+
+# 2. 4 本値（「株価の反応」本文に複数同時出現で error）
+_OHLC_TERMS = ("始値", "高値", "安値", "終値")
+
+# 3. 同義反復（warning）
+_REACTION_TAUTOLOGY = [
+    "下値で買い",
+    "押し目買い",
+    "利益確定売り",
+    "戻り売り",
+    "買い戻しが入",
+    "売りが一巡",
+    "買いが優勢",
+    "売りが優勢",
+    "売り圧力が強",
+    "買い圧力が強",
+    "下値の堅さ",
+    "上値の重さ",
+    "上値が重",
+    "下値が堅",
+]
+
+# 4. 1 件あたりの分量上限（正本は 200 字。誤検知回避のため大幅超過のみ warning）
+_REACTION_CHARS_LIMIT = 200
+_REACTION_CHARS_WARN_AT = 300
+
+
+def _reaction_section(md: str) -> tuple[str, int]:
+    """反応スコア節の本文と、その開始行番号（1 始まり）を返す。無ければ ("", 0)。"""
+    m = _REACTION_SECTION_HEAD.search(md)
+    if not m:
+        return "", 0
+    level = len(m.group(1))
+    start = m.end()
+    tail = md[start:]
+    nxt = re.search(r"^#{1,%d}\s" % level, tail, re.M)
+    body = tail[: nxt.start()] if nxt else tail
+    start_line = md[: m.start()].count("\n") + 1
+    return body, start_line
+
+
+def _reaction_items(section: str) -> list[tuple[str, str, str]]:
+    """節を「N 件目」単位に切り、(見出し, 本文, 「株価の反応」本文) の一覧を返す。"""
+    items: list[tuple[str, str, str]] = []
+    parts = re.split(r"^\s*[-*]?\s*\*\*\s*[0-9０-９]+\s*件目.*?\*\*.*$", section, flags=re.M)
+    heads = re.findall(r"^\s*[-*]?\s*\*\*\s*([0-9０-９]+\s*件目.*?)\*\*.*$", section, flags=re.M)
+    for head, body in zip(heads, parts[1:]):
+        m = re.search(r"\*\*株価の反応\*\*(.*?)(?=\n\s*[-*]\s*\*\*|\Z)", body, re.S)
+        reaction = m.group(1) if m else ""
+        items.append((head.strip(), body, reaction))
+    return items
+
+
+def _visible_len(text: str) -> int:
+    """マークダウン記法・空白を除いた可視文字数を数える。"""
+    t = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)      # リンクは表示文字だけ
+    t = re.sub(r"[*`>#|]", "", t)                            # 記法記号
+    t = re.sub(r"^\s*[-＋]\s*", "", t, flags=re.M)           # 箇条書き記号
+    t = re.sub(r"\s+", "", t)                                # 空白・改行
+    return len(t)
+
+
+def _check_reaction_content(md: str) -> tuple[list[str], list[str]]:
+    """反応スコア節の内容規律を検査し (errors, warnings) を返す。
+
+    節の見出しが無い誌面では両方とも空リストを返す（検査スキップ）。
+    """
+    section, sec_line = _reaction_section(md)
+    if not section.strip():
+        return [], []
+
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    # 1. 要因の特定放棄（error）
+    hits = [w for w in _REACTION_GIVEUP if w in section]
+    if hits:
+        errors.append(
+            f"[反応スコアの要因特定放棄] 節（L{sec_line} 以降）に "
+            f"{' / '.join(hits)} がある。 → 対処: 自社の開示 → 同業他社の開示と値動き →"
+            " セクター・テーマ → 国内指数（日経平均・TOPIX・東証グロース市場250指数）→"
+            " 米国市場の前営業日（フィラデルフィア半導体株指数・ナスダック総合指数・S&P500種株価指数）→"
+            " 為替（ドル円）→ 当日の個別銘柄ニュース → 需給要因 の順に確認し、"
+            "主因が絞れない場合も「確認した範囲で最も関連が強い事実」を書く"
+        )
+
+    items = _reaction_items(section)
+
+    # 2. 「株価の反応」への 4 本値の混入（error）
+    for head, _body, reaction in items:
+        found = [t for t in _OHLC_TERMS if t in reaction]
+        if len(found) >= 2:
+            errors.append(
+                f"[反応スコアの4本値混入] 「{head}」の株価の反応に "
+                f"{' / '.join(found)} がある。 → 対処: {REACTION_REMEDY}"
+            )
+
+    # 3. 同義反復（warning）
+    for head, body, _reaction in items:
+        found = [w for w in _REACTION_TAUTOLOGY if w in body]
+        if found:
+            warnings.append(
+                f"[反応スコアの同義反復の疑い] 「{head}」に {' / '.join(found)} がある。"
+                " → 対処: 方向を示す語を取り除いて情報が残らない記述は、"
+                "ファンダメンタルズ（業績・開示・受注・製品・規制・格付・アナリスト評価）または"
+                "需給（誰が売り誰が買ったか・大株主の売却・自己株取得・信用残・指数組入／除外・"
+                "ロックアップ解除・同業や指数への連動）の事実へ書き換える"
+            )
+
+    # 4. 1 件あたりの分量（warning）
+    for head, body, _reaction in items:
+        n = _visible_len(body)
+        if n > _REACTION_CHARS_WARN_AT:
+            warnings.append(
+                f"[反応スコアの分量超過] 「{head}」が約 {n} 字"
+                f"（上限 {_REACTION_CHARS_LIMIT} 字）。 → 対処: "
+                "「何が起きた」80 字・「株価の反応」40 字・「なぜそう動いたか」120 字を目安に圧縮する"
+            )
+
+    return errors, warnings
 
 # --- 希薄化・資本異動セクションの記載形式検査（PM 2026-09-05）-------------------
 # 回数は希薄化の大きさを表さないため、回数列を禁止し希薄化率（%）を必須とする。
@@ -639,6 +794,421 @@ def _check_ipo_lockup(md: str, code: str) -> tuple[list[str], str]:
     return errs, note
 
 
+# --- 会社が公表した将来見込み（フォワードガイダンス）の言及検査 -------------------
+# （PM 2026-09-06 明示指示・_common_rules §43）
+#
+# 生データ research/stocks/{code}_{date}_data.md の
+# 「## 会社が公表した将来見込み（フォワードガイダンス）」セクションと誌面を突合する。
+#
+# 後方互換: 当該セクションを持たない生データ（本改修より前に生成されたもの）では
+#           検査を丸ごとスキップする。誤検知を避けるため、誌面側の判定は
+#           「目標年度らしい西暦」と「売上高・営業利益等の金額語」の共起で行う。
+_GUIDANCE_SECTION = re.compile(
+    r"^#{1,6}\s*.*会社が公表した将来見込み.*$", re.M
+)
+# 生データが「見つからなかった」と記録した場合の文言
+_GUIDANCE_ABSENT = re.compile(
+    r"該当する開示が確認できなかった|該当する開示なし|該当開示なし|"
+    r"複数年の数値目標(?:の開示)?は?確認できなかった"
+)
+# 目標年度らしい西暦（2020〜2049 年・「YYYY年」「YYYY年3月期」「FYYYYY」）
+_TARGET_YEAR = re.compile(r"(?:20[2-4][0-9])\s*年|FY\s*20[2-4][0-9]")
+# 金額・KPI を伴う目標であることの手がかり
+_TARGET_METRIC = re.compile(
+    r"売上高|売上収益|営業利益|経常利益|純利益|営業利益率|EBITDA|ARR|MRR|会員数|店舗数|"
+    r"受注残|契約高|出荷台数"
+)
+# 実額が入っていることの手がかり（数値 + 単位）
+_TARGET_AMOUNT = re.compile(
+    r"[0-9０-９][0-9０-９,，.．]*\s*(?:兆|億|百万|万)?\s*(?:円|ドル|件|人|店|台|%|％)"
+)
+# 誌面側で「会社の目標」を語っていることの手がかり
+_PLAN_WORD = re.compile(
+    r"中期経営計画|中期計画|中計|長期(?:経営)?(?:計画|ビジョン|目標)|"
+    r"成長可能性に関する説明資料|決算説明資料|決算説明会資料|統合報告書|"
+    r"経営計画|数値目標|目標年度|将来見込み|フォワードガイダンス"
+)
+# 誌面側の §4-B「会社が公表した将来目標」の見出し
+_GUIDANCE_HEADING = re.compile(
+    r"^#{2,6}\s*(?:4-B[.\s]|.*会社が公表した将来(?:目標|見込み))", re.M
+)
+# 誌面側で「未公表」を明記していることの手がかり
+_NO_TARGET_STATEMENT = re.compile(
+    r"複数年の数値目標[^\n]{0,20}(?:公表|開示)して(?:い)?な|"
+    r"中期経営計画[^\n]{0,20}(?:公表|開示)して(?:い)?な|"
+    r"数値目標[^\n]{0,20}(?:未公表|未開示)"
+)
+
+GUIDANCE_REMEDY = (
+    "生データの「会社が公表した将来見込み（フォワードガイダンス）」セクションから、"
+    "目標年度・目標値の実額・資料名と公表日・直近実績との差（必要年平均成長率）の 4 要素を "
+    "§4-B「会社が公表した将来目標」へ転記する。定性的な記述（「成長を目指す」等）で"
+    "数値を代替することを禁止する。公表主体と資料名を明示して書く限り "
+    "_common_rules §43 により推測語の禁止の対象外となる"
+)
+GUIDANCE_ABSENT_REMEDY = (
+    "生データが「該当する開示が確認できなかった」と記録している。"
+    "誌面 §4-B へ「会社は複数年の数値目標を公表していない」旨の 1 文を明記する"
+    "（無言の省略を禁止する）"
+)
+
+
+def _guidance_section_body(text: str) -> str | None:
+    """生データから将来見込みセクションの本文を切り出す。無ければ None。"""
+    m = _GUIDANCE_SECTION.search(text)
+    if not m:
+        return None
+    line = m.group(0).lstrip()
+    level = len(line) - len(line.lstrip("#"))
+    tail = text[m.end():]
+    for nxt in re.finditer(r"^(#{1,6})\s", tail, re.M):
+        if len(nxt.group(1)) <= level:
+            return tail[: nxt.start()]
+    return tail
+
+
+def _latest_data_md(code: str) -> Path | None:
+    """当該銘柄の生データのうち最も新しいものを返す。"""
+    cands = list((REPO_ROOT / "research" / "stocks").glob(f"{code}_*_data.md")) + list(
+        (REPO_ROOT / "research" / "stocks" / str(code)).glob(f"{code}_*_data.md")
+    )
+    if not cands:
+        return None
+    return sorted(cands, key=lambda p: p.name)[-1]
+
+
+def _check_forward_guidance(md: str, code: str) -> tuple[list[str], list[str], str]:
+    """(errors, warnings, info メモ) を返す。
+
+    後方互換: 生データが無い／将来見込みセクションを持たない生データでは
+    ([], [], スキップの理由) を返し、既存の判定に一切影響を与えない。
+    """
+    path = _latest_data_md(code)
+    if path is None:
+        return [], [], "[将来見込み] 生データが見つからず検査スキップ"
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        return [], [], f"[将来見込み] 生データ {path.name} を読めず検査スキップ"
+
+    body = _guidance_section_body(raw)
+    if body is None:
+        return (
+            [],
+            [],
+            f"[将来見込み] 生データ {path.name} に該当セクションなし → 検査スキップ（後方互換）",
+        )
+
+    # --- 生データが新セクションを持つ場合に限り、誌面 §4-B の見出しを必須とする ---
+    #     （必須セクション検査からは CONDITIONAL_SECTIONS で外してあるため、
+    #       本改修より前の生データで書かれた既存レポートは遡って不合格にならない）
+    if not _GUIDANCE_HEADING.search(md):
+        return (
+            [
+                f"[§4-B の欠落] 生データ {path.name} に将来見込みセクションがあるが、"
+                "誌面に §4-B「会社が公表した将来目標」の見出しが無い。"
+                f" → 対処: {GUIDANCE_REMEDY}"
+            ],
+            [],
+            "[将来見込み] 誌面に §4-B の見出しなし",
+        )
+
+    # --- 生データが「開示なし」と記録している場合 -> 誌面の未公表明記を確認（warning）---
+    has_numeric_target = bool(
+        _TARGET_YEAR.search(body) and _TARGET_METRIC.search(body) and _TARGET_AMOUNT.search(body)
+    )
+    if _GUIDANCE_ABSENT.search(body) and not has_numeric_target:
+        if _NO_TARGET_STATEMENT.search(md):
+            return [], [], "[将来見込み] 生データは開示なし・誌面に未公表の明記あり"
+        return (
+            [],
+            [
+                f"[将来見込みの未公表明記なし] 生データ {path.name} は「該当する開示が"
+                f"確認できなかった」と記録しているが、誌面に「会社は複数年の数値目標を"
+                f"公表していない」旨の記述が無い。 → 対処: {GUIDANCE_ABSENT_REMEDY}"
+            ],
+            "[将来見込み] 生データは開示なし",
+        )
+
+    if not has_numeric_target:
+        return (
+            [],
+            [],
+            f"[将来見込み] 生データ {path.name} に数値目標を確認できず → 検査スキップ",
+        )
+
+    # --- 生データに数値目標がある -> 誌面へ転記されているかを確認（error）---
+    # 誌面側は「会社の計画を指す語」＋「目標年度らしい西暦」＋「金額語」＋「実額」の
+    # 4 点共起で判定する。1 語だけの偶然一致では error にしない。
+    hits = (
+        bool(_PLAN_WORD.search(md)),
+        bool(_TARGET_YEAR.search(md)),
+        bool(_TARGET_METRIC.search(md)),
+        bool(_TARGET_AMOUNT.search(md)),
+    )
+    if all(hits):
+        return [], [], "[将来見込み] 生データの数値目標が誌面へ転記されている"
+
+    lacking = [
+        name
+        for name, ok in zip(
+            ("会社計画を指す語", "目標年度（西暦）", "売上高・営業利益等の項目語", "実額（数値＋単位）"),
+            hits,
+        )
+        if not ok
+    ]
+    return (
+        [
+            f"[将来見込みの取りこぼし] 生データ {path.name} に会社の複数年の数値目標が"
+            f"あるが、誌面に {' / '.join(lacking)} が見当たらない。"
+            f" → 対処: {GUIDANCE_REMEDY}"
+        ],
+        [],
+        "[将来見込み] 生データに数値目標あり",
+    )
+
+
+
+# --- 表記揺れ・内部タグの検査（PM 2026-09-06 指摘）--------------------------------
+# 285A の誌面で同一の固有名詞が「ベインキャピタル」「バインキャピタル」の 2 通りで
+# 書かれ、さらに本文へ内部タグ `[TDNet]` が残っていたことへの機械的な歯止め。
+#
+# 設計方針: 語彙リストを事前登録する方式は採らない（新しい固有名詞が出るたびに
+#           登録が必要で運用が破綻するため）。レポート 1 本の中で閉じた自己整合検査
+#           として、同一誌面に現れた語同士を突き合わせて揺れを見つける。
+#
+# 正本: agents/stock_analyst.md 「誌面の書き方」F / prompts/_common_rules.md §45
+
+# 片仮名語のトークン（長音符・中黒を含む 2 文字以上の連なり）
+_KATAKANA_TOKEN = re.compile(r"[ァ-ヴー・ヵヶ]{2,}")
+
+# 揺れ検出の対象にする最短の語長。実測（2026-09-06 の 12 銘柄）で、5 文字以下は
+# 「バランス／リバランス」「ベース／ペース」「コスト／テスト」等の正当に異なる
+# 一般語が支配的だったため、6 文字以上を error の対象とする。
+_NOTATION_MIN_LEN = 6
+# 短い語でも「片方が 1 回だけ・もう片方が 5 回以上」なら誤記の疑いが強いため warning。
+_NOTATION_WARN_MIN_LEN = 4
+_NOTATION_WARN_RARE = 1
+_NOTATION_WARN_COMMON = 5
+
+NOTATION_REMEDY = (
+    "同一の固有名詞はレポート全体で 1 つの表記へ統一する。"
+    "出現回数の少ない方が誤記である場合が多いため、一次情報（開示・会社サイト）で"
+    "正しい表記を確認したうえでどちらへ寄せるかを決め、全箇所を置換する"
+    "（機械は多寡を示すだけで正誤を判定しない）"
+)
+
+
+def _notation_text(md: str) -> str:
+    """表記検査の対象本文。コードブロック・HTML コメント・インラインコード・
+    リンク URL を落とし、誤検知の材料を減らす。"""
+    t = re.sub(r"```.*?```", " ", md, flags=re.S)
+    t = re.sub(r"<!--.*?-->", " ", t, flags=re.S)
+    t = re.sub(r"`[^`\n]*`", " ", t)
+    t = re.sub(r"\]\([^)]*\)", "] ", t)
+    return t
+
+
+def _is_levenshtein_1(a: str, b: str) -> bool:
+    """編集距離がちょうど 1 か。距離 2 以上と分かった時点で打ち切る。"""
+    la, lb = len(a), len(b)
+    if a == b or abs(la - lb) > 1:
+        return False
+    if la == lb:  # 置換 1 回
+        return sum(1 for x, y in zip(a, b) if x != y) == 1
+    if la > lb:  # 短い方を a に揃える（挿入 1 回）
+        a, b, la, lb = b, a, lb, la
+    i = j = 0
+    skipped = False
+    while i < la and j < lb:
+        if a[i] == b[j]:
+            i += 1
+            j += 1
+            continue
+        if skipped:
+            return False
+        skipped = True
+        j += 1
+    return True
+
+
+def _katakana_counts(md: str) -> dict[str, int]:
+    """誌面に現れた片仮名語 -> 出現回数。記号のみ・記号混じりの切り出しは除外する。"""
+    counts: dict[str, int] = {}
+    for m in _KATAKANA_TOKEN.finditer(_notation_text(md)):
+        w = m.group(0)
+        if len(w) < 3:
+            continue
+        # 長音符・中黒が語頭・語末に付いた切り出し（「・タクシー」等）と、
+        # 記号だけの語は誤検知の元になるため対象から外す。
+        if w.strip("ー・") != w or not w.strip("ー・"):
+            continue
+        counts[w] = counts.get(w, 0) + 1
+    return counts
+
+
+def _check_katakana_notation(md: str) -> tuple[list[str], list[str]]:
+    """検査A: 片仮名の固有名詞の表記揺れ。(errors, warnings) を返す。
+
+    誌面に現れた片仮名語のうち、編集距離 1 の組み合わせを総当たりで探す。
+    語彙リストを持たないため、正誤の判定はせず「併存している事実」と
+    それぞれの出現回数だけを示す。
+    """
+    counts = _katakana_counts(md)
+    words = sorted(counts)
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    for i, a in enumerate(words):
+        for b in words[i + 1:]:
+            if not _is_levenshtein_1(a, b):
+                continue
+            na, nb = counts[a], counts[b]
+            longest = max(len(a), len(b))
+            hi, lo = (a, b) if na >= nb else (b, a)
+            n_hi, n_lo = (na, nb) if na >= nb else (nb, na)
+            msg = (
+                f"「{a}」{na}回 と「{b}」{nb}回 が 1 文字違いで併存している"
+                f"（多い方=「{hi}」{n_hi}回・少ない方=「{lo}」{n_lo}回）。"
+                f" → 対処: {NOTATION_REMEDY}"
+            )
+            if longest >= _NOTATION_MIN_LEN:
+                errors.append(f"[片仮名表記の揺れ] {msg}")
+            elif (
+                longest >= _NOTATION_WARN_MIN_LEN
+                and n_lo <= _NOTATION_WARN_RARE
+                and n_hi >= _NOTATION_WARN_COMMON
+            ):
+                warnings.append(f"[片仮名表記の揺れの疑い] {msg}")
+    return errors, warnings
+
+
+# --- 検査B: 内部タグの残存（error）-------------------------------------------
+# 取得元・母集団定義・作成手順の内部メモを本文へ残すことの禁止（_common_rules §29）。
+# 角括弧で囲まれたデータソース名・取得手段名を機械的に拾う。
+# markdown のリンク記法 `[表示テキスト](URL)` は直後が `(` のため除外する。
+_INTERNAL_TAG = re.compile(
+    r"\[\s*(TDNet|TDnet|EDINET|edinet|yfinance|JQuants|J-Quants|jquants|"
+    r"screening_master|kabutan|株探|掲示板|Yahoo掲示板|WebSearch|WebFetch|"
+    r"推察|推定|IR|適時開示|有報|短信)\s*\](?!\()"
+)
+
+INTERNAL_TAG_REMEDY = (
+    "誌面から内部タグを削除する。取得元を読者へ示す必要がある事実は、タグではなく"
+    "文中の言葉で「◯年◯月◯日の適時開示によると」等と書く"
+    "（本文に内部メモ＝取得元・母集団定義・作成手順を書かない）"
+)
+
+
+def _internal_tag_text(md: str) -> str:
+    """内部タグ検査の対象本文。
+
+    内部タグは `[TDNet]` のようにバッククォートで囲まれた形で誌面へ残るため、
+    _notation_text() のインラインコード除去を通すと検出できない。ここでは
+    コードブロックと HTML コメントだけを落とし、インラインコードは残す。
+    """
+    t = re.sub(r"```.*?```", " ", md, flags=re.S)
+    t = re.sub(r"<!--.*?-->", " ", t, flags=re.S)
+    return t
+
+
+def _check_internal_tags(md: str) -> list[str]:
+    """検査B: 本文に残った内部タグを行番号つきで報告する。"""
+    hits: list[tuple[int, str]] = []
+    for i, line in enumerate(_internal_tag_text(md).splitlines(), 1):
+        for m in _INTERNAL_TAG.finditer(line):
+            hits.append((i, m.group(0)))
+    if not hits:
+        return []
+    tags = sorted({t for _i, t in hits})
+    detail = " / ".join(f"L{i}: {t}" for i, t in hits[:5])
+    more = f"（他 {len(hits) - 5} 件）" if len(hits) > 5 else ""
+    return [
+        f"[内部タグの残存] {len(hits)}件（{' '.join(tags)}）: {detail}{more}"
+        f" → 対処: {INTERNAL_TAG_REMEDY}"
+    ]
+
+
+# --- 検査C: 英字表記と片仮名表記の混在（warning）-------------------------------
+# 同一の固有名詞が「Bain Capital」と「ベインキャピタル」のように 2 系統で書かれる
+# ケース。辞書を持たない方針のため、両者を「子音の並び（音写の骨格）」へ落として
+# 一致を見る。母音・長音・促音の差は無視されるため判定は warning に留める。
+_ALPHA_TOKEN = re.compile(r"\b[A-Z][A-Za-z][A-Za-z'\-]{2,}\b")
+# 初出時の対訳（`Astemo（アステモ）`）は正当な書き方のため検出から外す。
+_GLOSS_PAIR = re.compile(r"[A-Za-z][A-Za-z .&'\-]{1,24}\s*[（(]\s*[ァ-ヴー・]{2,}\s*[）)]")
+
+_KANA_CONSONANT = {
+    "カ": "k", "キ": "k", "ク": "k", "ケ": "k", "コ": "k",
+    "ガ": "g", "ギ": "g", "グ": "g", "ゲ": "g", "ゴ": "g",
+    "サ": "s", "シ": "s", "ス": "s", "セ": "s", "ソ": "s",
+    "ザ": "z", "ジ": "z", "ズ": "z", "ゼ": "z", "ゾ": "z",
+    "タ": "t", "チ": "t", "ツ": "t", "テ": "t", "ト": "t",
+    "ダ": "d", "ヂ": "d", "ヅ": "d", "デ": "d", "ド": "d",
+    "ナ": "n", "ニ": "n", "ヌ": "n", "ネ": "n", "ノ": "n",
+    "ハ": "h", "ヒ": "h", "フ": "f", "ヘ": "h", "ホ": "h",
+    "バ": "b", "ビ": "b", "ブ": "b", "ベ": "b", "ボ": "b",
+    "パ": "p", "ピ": "p", "プ": "p", "ペ": "p", "ポ": "p",
+    "マ": "m", "ミ": "m", "ム": "m", "メ": "m", "モ": "m",
+    "ヤ": "y", "ユ": "y", "ヨ": "y",
+    "ラ": "r", "リ": "r", "ル": "r", "レ": "r", "ロ": "r",
+    "ワ": "w", "ヲ": "w", "ン": "n", "ヴ": "v",
+}
+_ALPHA_CONSONANT_MAP = {"l": "r", "c": "k", "j": "z", "q": "k", "x": "ks"}
+_VOWELS = set("aeiou")
+
+MIXED_SCRIPT_REMEDY = (
+    "同一の固有名詞を英字と片仮名で書き分けない。どちらか一方へ統一し、"
+    "読者に読みを示す必要がある場合は初出 1 箇所だけ「英字（片仮名）」の形で併記する"
+)
+
+
+def _kana_skeleton(word: str) -> str:
+    return "".join(_KANA_CONSONANT.get(ch, "") for ch in word)
+
+
+def _alpha_skeleton(word: str) -> str:
+    out = []
+    for ch in word.lower():
+        if ch.isalpha() and ch not in _VOWELS:
+            out.append(_ALPHA_CONSONANT_MAP.get(ch, ch))
+    return "".join(out)
+
+
+def _check_mixed_script(md: str) -> list[str]:
+    """検査C: 同一固有名詞の英字表記と片仮名表記の併存（warning）。"""
+    text = _notation_text(md)
+    # 初出対訳の並びは正当な書き方なので、判定の前に本文から落とす。
+    text = _GLOSS_PAIR.sub(" ", text)
+
+    alpha: dict[str, int] = {}
+    for m in _ALPHA_TOKEN.finditer(text):
+        w = m.group(0)
+        alpha[w] = alpha.get(w, 0) + 1
+    kata: dict[str, int] = {}
+    for m in _KATAKANA_TOKEN.finditer(text):
+        w = m.group(0).strip("ー・")
+        if len(w) < 3:
+            continue
+        kata[w] = kata.get(w, 0) + 1
+
+    warnings: list[str] = []
+    seen: set[tuple[str, str]] = set()
+    for a, na in alpha.items():
+        sa = _alpha_skeleton(a)
+        if len(sa) < 3:
+            continue
+        for k, nk in kata.items():
+            if _kana_skeleton(k) != sa or (a, k) in seen:
+                continue
+            seen.add((a, k))
+            warnings.append(
+                f"[英字と片仮名の混在の疑い] 「{a}」{na}回 と「{k}」{nk}回 が"
+                "同一の固有名詞を指している可能性がある。"
+                f" → 対処: {MIXED_SCRIPT_REMEDY}"
+            )
+    return warnings
+
+
 def run_gate(md: str, code: str) -> tuple[list[str], list[str], list[str]]:
     """(errors, warnings, info) を返す。errors が空なら送信可。"""
     errors: list[str] = []
@@ -678,6 +1248,17 @@ def run_gate(md: str, code: str) -> tuple[list[str], list[str], list[str]]:
             info.append("[反応形式] 3ラベル・方向明示（前日比 ±X%・陽線/陰線）すべて在籍")
     else:
         info.append("[反応形式] 「株価が反応した上位N件」の見出しなし → 検査スキップ")
+
+    # 2c. 反応スコア節の内容規律（PM 2026-09-06）
+    #     要因の特定放棄・4本値の混入は error、同義反復と分量超過は warning。
+    #     見出しが無い誌面では _check_reaction_content 内でスキップされる。
+    rc_err, rc_warn = _check_reaction_content(md)
+    errors.extend(rc_err)
+    warnings.extend(rc_warn)
+    if _REACTION_SECTION_HEAD.search(md) and not rc_err and not rc_warn:
+        info.append(
+            "[反応スコア内容] 要因特定放棄・4本値混入・同義反復・分量超過なし"
+        )
 
     # 3. 数値整合の検算（verify_report_numbers）
     v_err, v_warn = verify_numbers(md, code)
@@ -775,6 +1356,36 @@ def run_gate(md: str, code: str) -> tuple[list[str], list[str], list[str]]:
         errors.append(sh_err)
     else:
         info.append("[大株主表の基準日] 明示あり")
+
+    # 10. 会社が公表した将来見込み（フォワードガイダンス）の言及
+    #     （errors / warnings・PM 2026-09-06・_common_rules §43）
+    #     生データに該当セクションが無い場合はスキップする（後方互換）。
+    fg_errs, fg_warns, fg_note = _check_forward_guidance(md, code)
+    errors.extend(fg_errs)
+    warnings.extend(fg_warns)
+    info.append(fg_note)
+
+    # 11. 片仮名の固有名詞の表記揺れ（errors / warnings・PM 2026-09-06・_common_rules §45）
+    #     語彙リストは持たず、同一誌面の語同士の編集距離 1 で機械的に検出する。
+    nt_errs, nt_warns = _check_katakana_notation(md)
+    errors.extend(nt_errs)
+    warnings.extend(nt_warns)
+    if not nt_errs and not nt_warns:
+        info.append("[片仮名表記の揺れ] 1 文字違いの併存なし")
+
+    # 12. 本文に残った内部タグ（errors・PM 2026-09-06・_common_rules §29・§45）
+    tag_errs = _check_internal_tags(md)
+    if tag_errs:
+        errors.extend(tag_errs)
+    else:
+        info.append("[内部タグ] 本文への残存なし")
+
+    # 13. 英字表記と片仮名表記の混在（warnings・PM 2026-09-06・_common_rules §45）
+    #     音写の骨格一致による推定のため warning に留める。
+    ms_warns = _check_mixed_script(md)
+    warnings.extend(ms_warns)
+    if not ms_warns:
+        info.append("[英字と片仮名の混在] 同一固有名詞の二重表記なし")
 
     return errors, warnings, info
 

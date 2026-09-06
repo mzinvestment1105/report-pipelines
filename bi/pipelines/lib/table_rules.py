@@ -183,3 +183,42 @@ def check_tables(md_text: str) -> list[dict]:
             )
 
     return violations
+# ---------------------------------------------------------------------------
+# 全レポート種別横断の表ゲート（PM 2026-09-06 指示）
+#
+# 背景: check_tables() は 2026-09-05 に新設したが、呼び出し元が
+# gate_stock_report.py（個別銘柄レポート専用）だけだったため、マクロ・セクター・
+# 動意・テーマ・週次大型株の各レポートは列数・セル長の検査を一切受けずに送信
+# されていた。実際に週次大型株 2026-09-05 の md は 8 列・最長 32 字の横断比較表を
+# 3 つ含み、PDF で銘柄名が 1 文字ずつ縦に折り返した。
+#
+# 送信を止めるかどうかは種別で分ける（_cr §36 配信絶対の原則）:
+#   - 個別銘柄レポート（PM が都度依頼して受け取る）→ error として送信中止
+#   - GHA が定時発行するレポート（マクロ・セクター・動意・テーマ・大型株）
+#     → 送信は止めず、違反を GHA ログへ error 相当の強い警告として残す
+#     （誌面側はレンダラのカード自動変換が受け皿になる）
+# ---------------------------------------------------------------------------
+
+# 送信を止めてよい種別（PM が都度受け取るレポート）。
+BLOCKING_KINDS = frozenset({"stock"})
+
+
+def gate_report_tables(md_text: str, kind: str) -> tuple[list[str], list[str]]:
+    """レポート種別を問わず表を検査し (errors, warnings) を返す。
+
+    kind が BLOCKING_KINDS に含まれる場合のみ違反を errors へ入れる。
+    それ以外の種別は warnings へ入れて送信を継続させる（_cr §36）。
+    呼び出し元は errors が非空なら PDF を生成せず中止する。
+    """
+    violations = check_tables(md_text)
+    if not violations:
+        return [], []
+    msgs = [f"表の折り返し: {v['message']}" for v in violations]
+    if kind in BLOCKING_KINDS:
+        return msgs, []
+    head = (
+        f"表の折り返し違反が {len(violations)} 件あります"
+        f"（種別 {kind} は配信絶対の原則により送信は継続します。"
+        "誌面はレンダラのカード自動変換で救済されますが、次回の生成で本文を直してください）"
+    )
+    return [], [head] + msgs

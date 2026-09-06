@@ -242,6 +242,26 @@ tbody td:not(:first-child):not(:last-child) {{
 /* 説明文など長文を含む最終列のみ折り返しを許可するが、文節は割らない */
 tbody td:last-child {{ white-space:normal; word-break:normal; overflow-wrap:break-word; }}
 tbody tr:nth-child(even) td {{ background:#F6F8FB; }}
+
+/* ── 列数に応じた自動縮小（PM 2026-09-06 指示・折り返しの予防）──
+   table-layout:fixed は列幅を均等割りするため、列数が増えるほど 1 列の幅が狭まる。
+   本文幅 612px の場合、5 列で約 122px・8 列で約 76px となり、10.5pt の和文では
+   8 列の表の銘柄名（「7532 パン・パシフィック…」等）が 1 文字ずつ縦に折り返した
+   （週次大型株 2026-09-05 実測）。列数はレンダリング前に markdown から数えられるため、
+   JS の実測を待たずに CSS 側で先に文字を縮めて折り返しの発生自体を減らす。
+   カード自動変換（_TABLE_CARDIFY_JS）は最後の受け皿として残し、本規則はその手前で効く。
+   フォント縮小を選んだ理由: 列ごとの width 指定は表の意味を知らないと決められず
+   全レポート共通には書けないが、列数による一律縮小は種別非依存で安全に効くため。 */
+table.cols-5 {{ font-size:9.5pt; }}
+table.cols-6 {{ font-size:9pt; }}
+table.cols-7 {{ font-size:8.5pt; }}
+table.cols-8plus {{ font-size:8pt; }}
+table.cols-5 thead th, table.cols-6 thead th,
+table.cols-7 thead th, table.cols-8plus thead th {{ font-size:inherit; padding:6px 7px; }}
+table.cols-5 tbody td, table.cols-6 tbody td,
+table.cols-7 tbody td, table.cols-8plus tbody td {{ padding:5px 6px; }}
+/* 横あふれの保険（HTML 表示用。PDF では効かないため列数制限とカード変換で担保する）*/
+.table-scroll {{ overflow-x:auto; }}
 tbody tr:last-child td {{ border-bottom:1pt solid #C8D1DD; }}
 
 /* ── テーマ表の列幅（動意・夜間PTS の「本日のテーマ」「直近2週間の熱いテーマ」）──
@@ -602,6 +622,27 @@ def _tag_theme_tables(html: str) -> str:
 #   </div>…</div>
 #
 # theme-lead / theme-solo / theme-today / theme-heat も対象に含める（PM 指示）。
+# 列数に応じたフォント縮小クラスを付与する（PM 2026-09-06）。
+# カード変換（_TABLE_CARDIFY_JS）の「実測して折れていたら変換する」判定より前に走らせ、
+# そもそも折れない誌面幅へ収める。列数が多い表ほど 1 列が狭くなるため段階的に縮める。
+_TABLE_COLS_CLASS_JS = r"""
+() => {
+  let n = 0;
+  for (const t of document.querySelectorAll('table')) {
+    const hrow = t.querySelector('thead tr') || t.querySelector('tr');
+    if (!hrow) continue;
+    const c = hrow.children.length;
+    let cls = null;
+    if (c >= 8) cls = 'cols-8plus';
+    else if (c === 7) cls = 'cols-7';
+    else if (c === 6) cls = 'cols-6';
+    else if (c === 5) cls = 'cols-5';
+    if (cls) { t.classList.add(cls); n++; }
+  }
+  return n;
+}
+"""
+
 _TABLE_CARDIFY_JS = r"""
 () => {
   const WRAP_FACTOR = 1.6;   // 行高の何倍を超えたら「折り返している」とみなすか
@@ -836,6 +877,12 @@ def render_markdown_to_pdf(
         # markdown 段階では判定できない「実際に折れている表」をここで確実に潰す。
         # 変換に失敗しても誌面生成は止めない（_cr §36 配信絶対の原則）。
         try:
+            scaled = int(page.evaluate(_TABLE_COLS_CLASS_JS) or 0)
+            if scaled:
+                print(
+                    f"[md_to_pdf] col-scaled tables: {scaled}（5列以上の表を段階的に縮小）",
+                    file=sys.stderr,
+                )
             cardified = int(page.evaluate(_TABLE_CARDIFY_JS) or 0)
         except Exception as e:  # noqa: BLE001
             cardified = 0

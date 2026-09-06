@@ -27,6 +27,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gate_stock_report import run_gate  # noqa: E402
 from lib.md_to_pdf import render_markdown_to_pdf  # noqa: E402
+from lib.table_rules import gate_report_tables  # noqa: E402
 from lib.quality_gate import (  # noqa: E402
     find_duplication,
     strip_repeated_annotations,
@@ -144,6 +145,23 @@ def main() -> int:
     out_dir = REPO_ROOT / "bi" / "outputs" / "report_pdfs"
     out_dir.mkdir(parents=True, exist_ok=True)
     md_text = md_path.read_text(encoding="utf-8")
+
+    # 全レポート種別横断の表ゲート（PM 2026-09-06 指示）。
+    # 列数・セル長の検査を stock 以外の種別へも及ぼす（従来は stock のみだったため、
+    # 週次大型株の 8 列横断比較表が無検査で送信され PDF で 1 文字ずつ縦に折り返していた）。
+    # GHA 定時発行の種別は _cr §36 により送信を止めず、ログへ強い警告を残す。
+    tbl_errors, tbl_warnings = ([], [])
+    if args.skip_gate:
+        print("TABLE GATE: --skip-gate 指定のため表ゲートを飛ばしました（緊急バイパス）")
+    else:
+        tbl_errors, tbl_warnings = gate_report_tables(md_text, args.kind)
+    for m in tbl_warnings:
+        print("  TABLE WARN " + m)
+    for m in tbl_errors:
+        print("  TABLE NG   " + m)
+    if tbl_errors:
+        print("TABLE GATE: FAIL（送信中止・PDF は生成しません）")
+        return 1
 
     # 個別銘柄レポートの送信前機械ゲート（PM 2026-08-30 承認・gate_stock_report.py）
     # errors があれば PDF を生成せずに中止する。warnings は表示のみで続行する。
