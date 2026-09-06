@@ -1520,6 +1520,481 @@ def check_demand_table_numbers(md: str) -> tuple[list[str], str]:
     return errors, f"[需給テーブル] {checked} 行を検査（違反 {len(errors)} 件）"
 
 
+# ==========================================================================
+# 誌面骨格の 12 検査（PM 2026-09-07 承認・context/2026-09-07_format_skeleton_spec.md E 節）
+#
+# 見出し・小見出し・要素種類・表の列・装飾・住所を機械的に固定する。
+# 骨格の定義は本ファイルへハードコードせず、bi/pipelines/lib/report_skeleton.py が
+# 正本 agents/stock_analyst.md の「誌面骨格」節をパースして供給する（二重管理の防止）。
+# 正本の骨格節が読めない場合は Skeleton.loaded が False になり、
+# 骨格系の検査は丸ごとスキップされる（フェイルオープン・_cr §36 絶対配信原則）。
+# ==========================================================================
+
+import report_skeleton as _skel  # noqa: E402
+
+# --- 段階導入（spec E-3）------------------------------------------------
+# #8（太字位置）・#9（住所表）・#10（数値の§跨ぎ重複）は誤検知が出やすいため、
+# 骨格適用の最初の 3 本は warning で運用する。誤検知が出ないことを確認した後に
+# 下の 3 定数を True へ変えて error へ昇格させる（PM 承認済みの段階導入手順）。
+BOLD_POSITION_AS_ERROR = False
+ADDRESS_TABLE_AS_ERROR = False
+NUMERIC_DUP_AS_ERROR = False
+
+_H1_TITLE = re.compile(
+    r"^#\s+([0-9]{3}[0-9A-Z])\s+(.+?)\s+Deep Dive レポート（(\d{4}-\d{2}-\d{2})）\s*$"
+)
+_ANY_HEADING = re.compile(r"^(#{1,6})\s+(.*?)\s*$")
+
+# 絵文字・記号の範囲（★ ☆ と誌面で許可する記号は除外する）
+_ALLOWED_SYMBOLS = set("★☆▲▼△▽―—–→←↑↓")
+_EMOJI_RANGES = (
+    (0x1F000, 0x1FAFF),
+    (0x2600, 0x27BF),
+    (0x2B00, 0x2BFF),
+    (0xFE0F, 0xFE0F),
+)
+
+_HTML_TAG = re.compile(r"<span\b|<font\b|</?b>|</?i>|style\s*=")
+
+# 住所表（骨格）の違反キーワード
+_SEC6_FORBIDDEN = re.compile(
+    r"希薄化|第三者割当|公募増資|海外募集|新株予約権|ストックオプション|ワラント|MSCB|転換社債|ロックアップ"
+)
+_SEC7_LOCKUP_FORBIDDEN = re.compile(r"ロックアップ|公募価格|初値")
+_SEC7_FINANCE_FORBIDDEN = re.compile(
+    r"自己資本比率|営業CF|営業キャッシュフロー|財務制限条項|コベナンツ"
+)
+
+# #10 数値の § 跨ぎ重複
+_NUM_TOKEN = re.compile(
+    r"[0-9]{1,3}(?:,[0-9]{3})+\s*(?:株|百万円|億円|千円|円)|(?<![0-9,.])[0-9]{6,}(?![0-9,.])"
+)
+# 意図的な再掲を許すトークン（当面は空。§1 の発行済株式総数・株価は運用で追加する）
+ALLOWED_CROSS_SECTION_TOKENS: set[str] = set()
+
+
+def _h2_spans(md: str) -> list[tuple[str, int, int, list[str]]]:
+    """[(h2 文言, 見出しの行番号(1始まり), 終了行, 本文行)] を返す。"""
+    lines = md.splitlines()
+    starts: list[tuple[int, str]] = []
+    for i, line in enumerate(lines):
+        m = re.match(r"^##\s+(?!#)(.*?)\s*$", line)
+        if m:
+            starts.append((i, m.group(1)))
+    out = []
+    for k, (i, title) in enumerate(starts):
+        end = starts[k + 1][0] if k + 1 < len(starts) else len(lines)
+        out.append((title, i + 1, end, lines[i + 1:end]))
+    return out
+
+
+def _skeleton_headings(md: str) -> list[tuple[int, int, str]]:
+    """[(行番号, レベル, 文言)]。コードフェンス内は除く。"""
+    out = []
+    in_fence = False
+    for i, line in enumerate(md.splitlines(), 1):
+        s = line.strip()
+        if s.startswith("```") or s.startswith("~~~"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        m = _ANY_HEADING.match(line)
+        if m:
+            out.append((i, len(m.group(1)), m.group(2)))
+    return out
+
+
+# --- #1 題名の書式 --------------------------------------------------------
+def _check_title_format(md: str) -> list[str]:
+    h1 = [(ln, t) for ln, lv, t in _skeleton_headings(md) if lv == 1]
+    if not h1:
+        return [
+            "[骨格/題名] h1（`# ...`）が 1 個もありません"
+            " → 対処: `# {コード} {銘柄名} Deep Dive レポート（{YYYY-MM-DD}）` を先頭に置く"
+        ]
+    errs = []
+    if len(h1) > 1:
+        errs.append(
+            f"[骨格/題名] h1 が {len(h1)} 個あります（L"
+            + "・L".join(str(l) for l, _ in h1)
+            + "） → 対処: 題名は 1 個だけにし、他は `##` 以下へ下げる"
+        )
+    ln, title = h1[0]
+    if not _H1_TITLE.match("# " + title):
+        errs.append(
+            f"[骨格/題名] L{ln}「{title}」が固定書式に一致しません"
+            " → 対処: `{コード} {銘柄名} Deep Dive レポート（{YYYY-MM-DD}）` へ直す"
+            "（em-dash での区切り・「個別銘柄」の語の挿入・日付の省略を禁止）"
+        )
+    return errs
+
+
+# --- #2 h2 の集合と順序 ---------------------------------------------------
+def _check_h2_set(md: str, sk) -> list[str]:
+    """必須の欠落は既存の [必須セクションの欠落] が担う。ここは一覧外と順序のみ。"""
+    if not sk.loaded:
+        return []
+    found = [(ln, t) for ln, lv, t in _skeleton_headings(md) if lv == 2]
+    allowed = set(sk.h2_order)
+    errs = []
+    extra = [(ln, t) for ln, t in found if t not in allowed]
+    if extra:
+        detail = " / ".join(f"L{ln}「{t}」" for ln, t in extra[:6])
+        errs.append(
+            f"[骨格/セクション見出し] 骨格の一覧にない `##` が {len(extra)} 件: {detail}"
+            " → 対処: 正本 agents/stock_analyst.md「誌面骨格」節のセクション見出し 16 個の"
+            "いずれかへ文言を合わせるか、内容を該当セクションへ移して見出しを削る"
+        )
+    order = {t: i for i, t in enumerate(sk.h2_order)}
+    seq = [order[t] for _, t in found if t in order]
+    if seq != sorted(seq):
+        errs.append(
+            "[骨格/セクション見出し] セクションの並び順が骨格と異なります"
+            " → 対処: 正本「誌面骨格」節の順序（事業モデル → 直近材料 → 1 → 2 → … → 12）へ並べ替える"
+        )
+    return errs
+
+
+# --- #3 小見出しのホワイトリスト -----------------------------------------
+def _check_h3_whitelist(md: str, sk) -> list[str]:
+    if not sk.loaded:
+        return []
+    errs = []
+    for title, start, _end, body in _h2_spans(md):
+        for off, line in enumerate(body, 1):
+            m = re.match(r"^###\s+(?!#)(.*?)\s*$", line)
+            if not m:
+                continue
+            h3 = m.group(1)
+            if h3 in sk.h3_whitelist:
+                continue
+            errs.append(
+                f"[骨格/小見出し] L{start + off}「### {h3}」（{title} 内）は許可一覧にありません"
+                " → 対処: 正本「誌面骨格」節の小見出し許可一覧 21 個の文言へ完全一致で置き換えるか、"
+                "見出しを外して本文へ組み込む"
+            )
+    return errs
+
+
+# --- #4 各セクションの必須小見出し ---------------------------------------
+def _check_h3_required(md: str, sk) -> list[str]:
+    if not sk.loaded:
+        return []
+    errs = []
+    for title, _start, _end, body in _h2_spans(md):
+        key = re.sub(r"\s+", "", title)
+        required = sk.h3_by_section.get(key)
+        if not required:
+            continue
+        got = [
+            re.match(r"^###\s+(?!#)(.*?)\s*$", l).group(1)
+            for l in body
+            if re.match(r"^###\s+(?!#)", l)
+        ]
+        missing = [h for h in required if h not in got]
+        if missing:
+            errs.append(
+                f"[骨格/小見出し] 「{title}」に必須の小見出しが欠けています: "
+                + " / ".join(f"### {h}" for h in missing)
+                + " → 対処: 骨格が定めた順序で見出しを置き、中身を一次情報で埋める"
+            )
+        inorder = [h for h in got if h in required]
+        if inorder != [h for h in required if h in inorder]:
+            errs.append(
+                f"[骨格/小見出し] 「{title}」の小見出しの順序が骨格と異なります"
+                f"（骨格: {' → '.join(required)}） → 対処: 骨格の順序へ並べ替える"
+            )
+    return errs
+
+
+# --- #5 見出しレベル ------------------------------------------------------
+def _check_heading_level(md: str, sk) -> list[str]:
+    errs = []
+    deep = [(ln, lv, t) for ln, lv, t in _skeleton_headings(md) if lv >= 4]
+    if deep:
+        detail = " / ".join(f"L{ln}「{'#' * lv} {t}」" for ln, lv, t in deep[:6])
+        errs.append(
+            f"[骨格/見出しレベル] `####` 以下の見出しが {len(deep)} 件: {detail}"
+            " → 対処: 見出しは `#`・`##`・`###` の 3 段のみ。骨格の許可一覧にある `###` へ上げるか、"
+            "見出しを外して太字リードの段落にする"
+        )
+    if not sk.loaded:
+        return errs
+    for title, start, _end, body in _h2_spans(md):
+        key = re.sub(r"\s+", "", title)
+        if key not in sk.h3_forbidden_sections:
+            continue
+        for off, line in enumerate(body, 1):
+            m = re.match(r"^###\s+(?!#)(.*?)\s*$", line)
+            if m:
+                errs.append(
+                    f"[骨格/見出しレベル] L{start + off}「### {m.group(1)}」: "
+                    f"「{title}」は小見出しを禁止したセクションです"
+                    " → 対処: 見出しを外し、太字リードの段落または表の直前の 1 文へ書き換える"
+                )
+    return errs
+
+
+# --- #6 絵文字 ------------------------------------------------------------
+def _check_emoji(md: str) -> list[str]:
+    hits: list[tuple[int, str]] = []
+    for i, line in enumerate(md.splitlines(), 1):
+        for ch in line:
+            if ch in _ALLOWED_SYMBOLS:
+                continue
+            cp = ord(ch)
+            if any(lo <= cp <= hi for lo, hi in _EMOJI_RANGES):
+                hits.append((i, ch))
+    if not hits:
+        return []
+    detail = " / ".join(f"L{ln}「{ch}」" for ln, ch in hits[:8])
+    more = f"（他 {len(hits) - 8} 件）" if len(hits) > 8 else ""
+    return [
+        f"[骨格/装飾] 誌面に絵文字が {len(hits)} 件: {detail}{more}"
+        " → 対処: 誌面へ書いてよい記号は §9 の ★ / ☆ のみ。警告の意味は文章で書く"
+    ]
+
+
+# --- #7 色指定 HTML -------------------------------------------------------
+def _check_html_tags(md: str) -> list[str]:
+    hits = [
+        (i, l.strip()) for i, l in enumerate(md.splitlines(), 1) if _HTML_TAG.search(l)
+    ]
+    if not hits:
+        return []
+    detail = " / ".join(f"L{ln}: {t[:40]}" for ln, t in hits[:5])
+    return [
+        f"[骨格/装飾] 誌面 md に HTML タグが {len(hits)} 件: {detail}"
+        " → 対処: `<span style=`・`<font`・`<b>`・`<i>` を全て削る。色はレンダラが決める"
+    ]
+
+
+# --- #8 太字の位置（当面 warning）----------------------------------------
+_BOLD = re.compile(r"\*\*[^*\n]+\*\*")
+_TECH_LEADS = ("年足の値動き", "月足の値動き", "日足の値動き", "現時点の主要価格水準")
+
+
+def _check_bold_position(md: str) -> list[str]:
+    """許可 5 箇所以外の太字を検出する（骨格の装飾表）。"""
+    out: list[str] = []
+    for title, start, _end, body in _h2_spans(md):
+        num = _skel.section_key(title)
+        in_reaction = False
+        for off, line in enumerate(body, 1):
+            s = line.strip()
+            if s.startswith("###"):
+                in_reaction = "株価が反応した上位" in s
+                continue
+            if not _BOLD.search(line):
+                continue
+            ln = start + off
+            if num == "10" and any(s.startswith(f"**{w}**") for w in _TECH_LEADS):
+                continue
+            if num == "11" and re.match(r"^(?:[-*+]\s|\d+[.)]\s)?\*\*", s):
+                continue
+            if num == "9" and s.startswith("★★★"):
+                continue
+            if in_reaction:
+                continue
+            if s.startswith("|"):
+                out.append(
+                    f"[骨格/太字] L{ln}（{title}）表のセル内に太字があります"
+                    " → 対処: 表の中の `**` を全て外す"
+                )
+                continue
+            nxt = ""
+            for j in range(off, len(body)):
+                if body[j].strip():
+                    nxt = body[j].strip()
+                    break
+            if nxt.startswith("|"):
+                continue
+            out.append(
+                f"[骨格/太字] L{ln}（{title}）許可されていない位置の太字です: {s[:44]}"
+                " → 対処: 太字は §10 のリード 4 語・§11 のリスク名・§9 の ★★★ 行・"
+                "表の直前の結論 1 文・直近材料の反応 3 件の見出し語だけに限る"
+            )
+    return out
+
+
+# --- #9 住所表（当面 warning）--------------------------------------------
+def _check_address_table(md: str) -> list[str]:
+    out: list[str] = []
+    for title, start, _end, body in _h2_spans(md):
+        num = _skel.section_key(title)
+        if num == "6":
+            hits = [
+                (start + o, l.strip())
+                for o, l in enumerate(body, 1)
+                if _SEC6_FORBIDDEN.search(l)
+            ]
+            if hits:
+                detail = " / ".join(f"L{ln}: {t[:32]}" for ln, t in hits[:5])
+                out.append(
+                    f"[骨格/住所] §6 財務健全性に希薄化系の記述が {len(hits)} 件: {detail}"
+                    " → 対処: 資本異動・希薄化・新株予約権・大株主は §7「大株主・資本異動」へ移す"
+                    "（§6 は BS/CF・自己資本比率・有利子負債・財務制限条項・現預金のみ）"
+                )
+        elif num == "7":
+            hits = [
+                (start + o, l.strip())
+                for o, l in enumerate(body, 1)
+                if _SEC7_LOCKUP_FORBIDDEN.search(l)
+            ]
+            if hits:
+                detail = " / ".join(f"L{ln}: {t[:32]}" for ln, t in hits[:4])
+                out.append(
+                    f"[骨格/住所] §7 にロックアップ・IPO 価格の記述が {len(hits)} 件: {detail}"
+                    " → 対処: §7-B「IPO ロックアップ・新規上場株主分析」へ移す"
+                )
+            hits2 = [
+                (start + o, l.strip())
+                for o, l in enumerate(body, 1)
+                if _SEC7_FINANCE_FORBIDDEN.search(l)
+            ]
+            if hits2:
+                detail = " / ".join(f"L{ln}: {t[:32]}" for ln, t in hits2[:4])
+                out.append(
+                    f"[骨格/住所] §7 に財務健全性の記述が {len(hits2)} 件: {detail}"
+                    " → 対処: 自己資本比率・営業CF・財務制限条項は §6 財務健全性へ移す"
+                )
+    return out
+
+
+# --- #10 数値の § 跨ぎ重複（当面 warning）--------------------------------
+def _check_numeric_duplication(md: str) -> list[str]:
+    where: dict[str, set[str]] = {}
+    for title, _start, _end, body in _h2_spans(md):
+        for line in body:
+            for tok in _NUM_TOKEN.findall(line):
+                t = re.sub(r"\s+", "", tok)
+                if t in ALLOWED_CROSS_SECTION_TOKENS:
+                    continue
+                where.setdefault(t, set()).add(title)
+    dup = {t: s for t, s in where.items() if len(s) >= 2}
+    if not dup:
+        return []
+    items = sorted(dup.items(), key=lambda kv: (-len(kv[1]), kv[0]))[:6]
+    detail = " / ".join(f"「{t}」= {'・'.join(sorted(s))}" for t, s in items)
+    more = f"（他 {len(dup) - 6} 件）" if len(dup) > 6 else ""
+    return [
+        f"[骨格/数値重複] 同一の数値が 2 つ以上のセクションに出現: {len(dup)} 件: {detail}{more}"
+        " → 対処: 骨格の住所表で所有セクションを決め、他セクションでは実数を再掲せず % か解釈だけを書く"
+    ]
+
+
+# --- #11 表のヘッダと枚数 -------------------------------------------------
+_SKEL_TABLE_SEP = re.compile(r"^\s*\|[\s:\-|]+\|\s*$")
+
+
+def _tables_in_section(body: list[str], start: int) -> list[tuple[int, list[str]]]:
+    """[(ヘッダ行番号, ヘッダのセル)] を返す。"""
+    out = []
+    for i in range(len(body) - 1):
+        if body[i].strip().startswith("|") and _SKEL_TABLE_SEP.match(body[i + 1]):
+            cells = [c.strip() for c in body[i].strip().strip("|").split("|")]
+            out.append((start + i + 1, cells))
+    return out
+
+
+def _check_table_headers(md: str, sk) -> list[str]:
+    if not sk.loaded:
+        return []
+    errs = []
+    for title, start, _end, body in _h2_spans(md):
+        tables = _tables_in_section(body, start)
+        if len(tables) > 3:
+            errs.append(
+                f"[骨格/表] 「{title}」に表が {len(tables)} 枚あります（上限 3 枚）"
+                " → 対処: 骨格の要素種類表が定めた表だけを残し、残りは箇条書きか文章へ移す"
+            )
+        for ln, cells in tables:
+            sig = _skel.normalize_header(cells)
+            if sig in sk.table_headers:
+                continue
+            # §5 同業比較は列の「型」だけを検査する（社名が列名に入るため）
+            if (
+                len(cells) >= 3
+                and re.sub(r"\s+", "", cells[0]) == "指標"
+                and cells[-1].endswith("平均")
+            ):
+                continue
+            errs.append(
+                f"[骨格/表] L{ln}（{title}）の列構成が固定表 17 表に一致しません: 「{sig}」"
+                " → 対処: 正本「誌面骨格」節の固定表の列名・列順へ完全一致で合わせる"
+            )
+    return errs
+
+
+# --- #12 blockquote の範囲 ------------------------------------------------
+def _check_blockquote_scope(md: str) -> list[str]:
+    errs = []
+    for title, start, _end, body in _h2_spans(md):
+        num = _skel.section_key(title)
+        if num == "3":
+            continue
+        hits = [
+            (start + o, l.strip())
+            for o, l in enumerate(body, 1)
+            if l.lstrip().startswith(">")
+        ]
+        if hits:
+            detail = " / ".join(f"L{ln}: {t[:36]}" for ln, t in hits[:4])
+            errs.append(
+                f"[骨格/装飾] 引用ブロック（`>`）が §3 の外に {len(hits)} 件: {detail}（{title}）"
+                " → 対処: `>` は §3 の掲示板注記 1 行のみ。他は通常の段落へ直す"
+            )
+    return errs
+
+
+def check_skeleton(md: str) -> tuple[list[str], list[str], list[str]]:
+    """誌面骨格の 12 検査。(errors, warnings, info) を返す。"""
+    sk = _skel.load()
+    if not sk.loaded:
+        return [], [], ["[骨格] 正本の「誌面骨格」節を読めず検査スキップ"]
+
+    errors: list[str] = []
+    warnings: list[str] = []
+    info: list[str] = []
+
+    hard = [
+        ("題名", _check_title_format(md)),
+        ("セクション見出し", _check_h2_set(md, sk)),
+        ("小見出しの一覧", _check_h3_whitelist(md, sk)),
+        ("小見出しの必須", _check_h3_required(md, sk)),
+        ("見出しレベル", _check_heading_level(md, sk)),
+        ("絵文字", _check_emoji(md)),
+        ("HTML タグ", _check_html_tags(md)),
+        ("表の列と枚数", _check_table_headers(md, sk)),
+        ("引用の範囲", _check_blockquote_scope(md)),
+    ]
+    for name, es in hard:
+        if es:
+            errors.extend(es[:8])
+            if len(es) > 8:
+                errors.append(f"[骨格/{name}] 他 {len(es) - 8} 件")
+        else:
+            info.append(f"[骨格/{name}] 違反なし")
+
+    # 段階導入: 誤検知が出やすい 3 検査は当面 warning（3 本通過後に error へ昇格）。
+    soft = [
+        ("太字の位置", _check_bold_position(md), BOLD_POSITION_AS_ERROR),
+        ("住所", _check_address_table(md), ADDRESS_TABLE_AS_ERROR),
+        ("数値重複", _check_numeric_duplication(md), NUMERIC_DUP_AS_ERROR),
+    ]
+    for name, es, as_error in soft:
+        if not es:
+            info.append(f"[骨格/{name}] 違反なし")
+            continue
+        shown = es[:6]
+        if len(es) > 6:
+            shown = shown + [f"[骨格/{name}] 他 {len(es) - 6} 件"]
+        (errors if as_error else warnings).extend(shown)
+
+    return errors, warnings, info
+
+
 def run_gate(md: str, code: str) -> tuple[list[str], list[str], list[str]]:
     """(errors, warnings, info) を返す。errors が空なら送信可。"""
     errors: list[str] = []
@@ -1720,6 +2195,14 @@ def run_gate(md: str, code: str) -> tuple[list[str], list[str], list[str]]:
     errors.extend(dt_errs)
     if dt_note:
         info.append(dt_note)
+
+    # 17. 誌面骨格の 12 検査（errors / warnings・PM 2026-09-07）
+    #     見出し 3 段・小見出し 21 個の完全一致・固定表 17 表・装飾・住所・数値重複。
+    #     太字位置・住所・数値重複は誤検知が出やすいため当面 warning（3 本通過後に error へ）。
+    sk_errs, sk_warns, sk_info = check_skeleton(md)
+    errors.extend(sk_errs)
+    warnings.extend(sk_warns)
+    info.extend(sk_info)
 
     return errors, warnings, info
 

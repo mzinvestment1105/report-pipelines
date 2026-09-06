@@ -93,6 +93,40 @@ COLUMN_WIDTHS = {
 }
 
 
+# 誌面骨格が列名・列順を固定した表のヘッダ署名（5 列以上のものだけを持つ）。
+# 正本 agents/stock_analyst.md の「誌面骨格」節が唯一の定義元であり、
+# report_skeleton.load() がそれをパースして供給する（ここへ値を写さない）。
+_SKELETON_FIXED_HEADERS: set[str] | None = None
+
+
+def _skeleton_fixed_headers() -> set[str]:
+    global _SKELETON_FIXED_HEADERS
+    if _SKELETON_FIXED_HEADERS is None:
+        try:
+            import report_skeleton  # noqa: PLC0415
+
+            sk = report_skeleton.load()
+            _SKELETON_FIXED_HEADERS = set(sk.table_headers) if sk.loaded else set()
+        except Exception:  # noqa: BLE001
+            _SKELETON_FIXED_HEADERS = set()
+    return _SKELETON_FIXED_HEADERS
+
+
+def _is_skeleton_fixed_table(header: list[str]) -> bool:
+    """骨格が列名・列順を固定した表か（§5 同業比較は列の「型」で判定する）。"""
+    sig = " / ".join(re.sub(r"\s+", "", c.strip()) for c in header)
+    if sig in _skeleton_fixed_headers():
+        return True
+    # §5 同業比較は社名が列名に入るため型だけで判定する。
+    if (
+        len(header) >= 3
+        and re.sub(r"\s+", "", header[0].strip()) == "指標"
+        and header[-1].strip().endswith("平均")
+    ):
+        return True
+    return False
+
+
 def _font_px(ncols: int) -> float:
     return FONT_PX.get(ncols, DEFAULT_FONT_PX)
 
@@ -241,7 +275,11 @@ def check_tables(md_text: str) -> list[dict]:
             continue
 
         # (a) 列数 5 以上
-        if ncols >= 5:
+        # 例外: 誌面骨格（agents/stock_analyst.md「誌面骨格」節）が列名・列順を固定した表は、
+        # PM 2026-09-07 承認の骨格が列数まで含めて確定させているため列数検査から外す
+        # （レンダラは cols-5/6/7 のクラスで font-size を自動縮小して折り返しを防ぐ）。
+        # 字数の検査（(b)(c)）は骨格固定表にもそのまま適用する。
+        if ncols >= 5 and not _is_skeleton_fixed_table(header):
             longest = max(body_cells, key=_visible_len)
             violations.append(
                 {
