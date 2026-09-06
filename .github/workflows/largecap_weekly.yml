@@ -19,8 +19,9 @@ name: 週次大型株速報（セクター輪番）
         type: boolean
         required: false
         default: false
-  schedule:
-    - cron: '0 12 * * 5'
+  # 2026-09-06 PM 指示により自動実行を停止（手動実行のみ）
+  # schedule:
+  #   - cron: '0 12 * * 5'
 
 # 二重発火を GHA 内部ロックで防ぐ（mover_weekly / sector_full 準拠）。
 concurrency:
