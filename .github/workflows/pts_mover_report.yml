@@ -63,6 +63,11 @@ jobs:
           WINDOW_START_JST: '12:00'
           WINDOW_END_JST: '23:30'
           WAIT_MINUTES: '30'
+          # 2026-09-07 追加: 枠切れ（Spending cap）由来の失敗を retry_cap から除外する。
+          # 枠切れは設備障害ではなく時間で必ず戻るため、一般の失敗と同列に数えると
+          # 枠が戻ってからの自動復旧経路を自分で塞ぐ（実測: run 33875929742 が retry_cap で skip）。
+          CAP_AWARE_RETRY: 'true'
+          CAP_RETRY_LIMIT: '3'
         run: bash .github/scripts/standby_guard.sh
 
       # 2026-08-19: 予備タイマー通知の文面へ実測値を埋めるためだけの補助ステップ。
@@ -121,12 +126,26 @@ jobs:
     # PM 2026-08-19: 529 自動リトライ（2 回・待機 60/180 秒）を足したため枠を再計算して拡張。
     # 最悪ケース = 前段（clone/setup/raw 生成）15 分 + 1 回目 30 分 + 待機 1 分 + 2 回目 30 分
     #            + 待機 3 分 + 3 回目 30 分 + 注記/フォント/playwright/送信/commit 16 分 = 125 分 → 135 分。
-    timeout-minutes: 135
+    #
+    # 2026-09-07 変更: 枠切れ時の待機リトライ（最大 2 回・55/115 分）を足したため再計算。
+    # 最悪ケース = 従来 135 分 + 待機 170 分 + 復旧生成 2 回 60 分 = 上限に収めるため
+    # 6 時間（GHA の job 上限）へ。待機ゲート（wait_for_cap_reset.sh）が残り時間を見て
+    # 待ちきれない場合は待たずに降りるため、この枠を使い切るのは枠切れが実際に起きた日だけで、
+    # 通常日は新ステップが全て skip され従来と同じ時間で終わる。
+    timeout-minutes: 360
     # 実配信ジョブだけを直列化する（workflow 単位の concurrency は本命の 21 時発火を塞ぐため置かない）。
     concurrency:
       group: pts_mover_report-send
       cancel-in-progress: false
     steps:
+      - name: この job の終了期限を記録（待機ゲートの判断材料）
+        id: deadline
+        env:
+          TIMEOUT_MIN: '360'
+        run: |
+          # 待機ゲートが「あと何分待てるか」を判断するための基準。
+          echo "epoch=$(( $(date +%s) + TIMEOUT_MIN * 60 ))" >> $GITHUB_OUTPUT
+
       - name: Determine target date
         id: date
         env:
@@ -305,15 +324,119 @@ jobs:
           PRIVATE_REPO_ROOT: private-repo
           CLAUDE_CODE_MAX_OUTPUT_TOKENS: 64000
 
+      # ================================================================
+      # 枠切れ（Spending cap）からの自動復旧（2026-09-07 追加）
+      # ================================================================
+      # gen1〜gen3 が枠切れで落ちた場合、従来はここで当日未配信が確定していた。
+      # 枠切れは設備障害ではなく時間が経てば必ず戻るため、同一 run 内で待機して再生成する。
+      # raw は既に同一 run 内に揃っているため再取得は不要（時間もトークンも節約できる）。
+      #
+      # リセット時刻を絶対時刻として使わない理由:
+      #   実測の文言 "Spending cap reached resets 1:10pm" にタイムゾーンも日付も含まれず、
+      #   候補タイムゾーンによって待ち時間が 5 分〜953 分まで割れる（実ログで検証済み）。
+      #   そのため待機は固定間隔（55/115 分）を主軸にし、
+      #   リセット文字列からは「分」だけを起床時刻の微調整に使う。
+      - name: 枠切れマーカーを記録（guard の retry_cap 切り分け用）
+        id: capmark
+        if: steps.cap1.outputs.capped == 'true' || steps.cap2.outputs.capped == 'true'
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+        run: |
+          mkdir -p /tmp/capmark
+          {
+            echo "target_date=${TARGET_DATE}"
+            echo "run_id=${{ github.run_id }}"
+            echo "resets=${{ steps.cap1.outputs.resets }}${{ steps.cap2.outputs.resets }}"
+          } > /tmp/capmark/spending_cap.txt
+          echo "枠切れマーカーを作成しました（後続 run の guard が retry_cap から除外するために使います）"
+
+      - name: 枠切れマーカーをアーティファクトへ退避
+        if: steps.capmark.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: spending-cap-${{ steps.date.outputs.value }}-${{ github.run_id }}
+          path: /tmp/capmark/spending_cap.txt
+          retention-days: 2
+
+      # ---- 復旧 1 回目 ----
+      - name: 枠リセット待機（復旧 1 回目）
+        id: wait1
+        if: steps.cap1.outputs.capped == 'true' || steps.cap2.outputs.capped == 'true'
+        env:
+          ATTEMPT: '1'
+          RESETS_MINUTE: ${{ steps.cap1.outputs.resets_minute || steps.cap2.outputs.resets_minute }}
+          JOB_DEADLINE_EPOCH: ${{ steps.deadline.outputs.epoch }}
+        run: bash report-pipelines/.github/scripts/wait_for_cap_reset.sh
+
+      - name: Generate report via Claude Code (復旧 1 回目)
+        id: rec1
+        if: steps.wait1.outputs.should_retry == 'true'
+        continue-on-error: true
+        uses: anthropics/claude-code-base-action@beta
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          model: claude-opus-5
+          prompt_file: report-pipelines/prompts/pts-mover-report.md
+          allowed_tools: "Read,Write,Edit,Bash,Grep,Glob"
+          timeout_minutes: "30"
+          claude_env: |
+            CLAUDE_CODE_EFFORT_LEVEL: high
+            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 64000
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+          PRIVATE_REPO_ROOT: private-repo
+          CLAUDE_CODE_MAX_OUTPUT_TOKENS: 64000
+
+      - name: Detect spending cap (復旧 1 回目)
+        id: reccap1
+        if: steps.rec1.outcome == 'failure'
+        env:
+          EXECUTION_FILE: ${{ steps.rec1.outputs.execution_file }}
+          ATTEMPT: 'recovery-1'
+        run: bash report-pipelines/.github/scripts/detect_spending_cap.sh
+
+      # ---- 復旧 2 回目（1 回目でも枠が戻っていなかった場合のみ） ----
+      - name: 枠リセット待機（復旧 2 回目）
+        id: wait2
+        if: steps.reccap1.outputs.capped == 'true'
+        env:
+          ATTEMPT: '2'
+          RESETS_MINUTE: ${{ steps.reccap1.outputs.resets_minute }}
+          JOB_DEADLINE_EPOCH: ${{ steps.deadline.outputs.epoch }}
+        run: bash report-pipelines/.github/scripts/wait_for_cap_reset.sh
+
+      - name: Generate report via Claude Code (復旧 2 回目)
+        id: rec2
+        if: steps.wait2.outputs.should_retry == 'true'
+        continue-on-error: true
+        uses: anthropics/claude-code-base-action@beta
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          model: claude-opus-5
+          prompt_file: report-pipelines/prompts/pts-mover-report.md
+          allowed_tools: "Read,Write,Edit,Bash,Grep,Glob"
+          timeout_minutes: "30"
+          claude_env: |
+            CLAUDE_CODE_EFFORT_LEVEL: high
+            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 64000
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+          PRIVATE_REPO_ROOT: private-repo
+          CLAUDE_CODE_MAX_OUTPUT_TOKENS: 64000
+
       - name: Verify generated PTS mover report (成否の一元判定)
         # 上の 3 ステップは全て continue-on-error のため、ジョブの成否はここだけで決まる。
         # 「どの試行で成功したか」に依存せず成果物の実在で判定するので、リトライ成功を失敗扱いする
         # / 失敗を成功扱いする判定崩れが起きない。
+        #
+        # 2026-09-07: 復旧ステップ（rec1/rec2）を足したが、判定は従来どおり
+        # 「成果物ファイルが非空か」の 1 点のみ。どの段で成功しても同じ扱いになるため
+        # ここのロジックは変更しない（復旧で生成できていれば success になる）。
         env:
           TARGET_DATE: ${{ steps.date.outputs.value }}
         run: |
           F="private-repo/market/daily/pts_movers/${TARGET_DATE}.md"
-          echo "attempt outcomes: gen1=${{ steps.gen1.outcome }} gen2=${{ steps.gen2.outcome }} gen3=${{ steps.gen3.outcome }}"
+          echo "attempt outcomes: gen1=${{ steps.gen1.outcome }} gen2=${{ steps.gen2.outcome }} gen3=${{ steps.gen3.outcome }} rec1=${{ steps.rec1.outcome }} rec2=${{ steps.rec2.outcome }}"
           if [ ! -s "$F" ]; then
             echo "::error::夜間PTS動意レポートが 3 回の試行で生成されませんでした: $F"
             exit 1

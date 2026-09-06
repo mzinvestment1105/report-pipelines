@@ -23,6 +23,15 @@
 # 出力: $GITHUB_OUTPUT へ
 #   capped=true|false  枠切れなら true
 #   resets=<文字列>    リセット時刻が読み取れた場合のみ（例: 1:10pm）。読めなければ空。
+#   resets_minute=<0-59>  リセット時刻の「分」のみ（2026-09-07 追加）。読めなければ空。
+#
+# 【2026-09-07 追加・resets_minute の位置づけ】
+#   実測の文言 "Spending cap reached resets 1:10pm" にはタイムゾーンも日付も含まれない。
+#   2 サンプル（2026-09-04 PTS / 2026-09-05 マクロ）に候補タイムゾーンを当てはめると
+#   待ち時間は 5 分〜953 分まで割れ、実ログから 1 つに絞る材料は存在しない（検証済み）。
+#   よって resets を絶対時刻へ変換してはならない。
+#   一方「分」だけはタイムゾーンに依存せず意味を持つため、
+#   待機ゲート（wait_for_cap_reset.sh）が起床時刻の分を寄せる用途にのみ使う。
 #
 set -euo pipefail
 
@@ -37,9 +46,11 @@ CAP_RE='[Ss]pending cap reached|[Uu]sage limit reached|[Cc]laude usage limit'
 emit() {
   echo "capped=$1"
   echo "resets=$2"
+  echo "resets_minute=${3:-}"
   if [ -n "${GITHUB_OUTPUT:-}" ]; then
     echo "capped=$1" >> "$GITHUB_OUTPUT"
     echo "resets=$2" >> "$GITHUB_OUTPUT"
+    echo "resets_minute=${3:-}" >> "$GITHUB_OUTPUT"
   fi
 }
 
@@ -70,6 +81,16 @@ RESETS=$(echo "$HAYSTACK" \
   | head -1 \
   | sed -E 's/^[Rr]esets[[:space:]]+//' || true)
 
-echo "attempt ${ATTEMPT}: Claude 利用枠の上限を検出しました（後続の再試行は打ち切ります）"
-[ -n "$RESETS" ] && echo "attempt ${ATTEMPT}: リセット時刻の表記: ${RESETS}"
-emit "true" "${RESETS}"
+# リセット時刻の「分」だけを取り出す（例: "1:10pm" -> 10 / "9:30pm" -> 30）。
+# 分の表記が無い形（"resets 1pm" 等）では空のままにする。
+RESETS_MINUTE=""
+if echo "$RESETS" | grep -qE '^[0-9]{1,2}:[0-9]{2}'; then
+  RESETS_MINUTE=$(echo "$RESETS" | sed -E 's/^[0-9]{1,2}:([0-9]{2}).*$/\1/' | sed -E 's/^0([0-9])$/\1/')
+fi
+
+echo "attempt ${ATTEMPT}: Claude 利用枠の上限を検出しました（同一 run 内の即時再試行は打ち切ります）"
+if [ -n "$RESETS" ]; then
+  echo "attempt ${ATTEMPT}: リセット時刻の表記: ${RESETS}"
+  echo "attempt ${ATTEMPT}: 注: この表記にはタイムゾーンが含まれないため絶対時刻としては扱いません（分のみ待機の微調整に使用）。"
+fi
+emit "true" "${RESETS}" "${RESETS_MINUTE}"

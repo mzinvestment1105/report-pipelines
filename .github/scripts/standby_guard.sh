@@ -33,6 +33,19 @@
 #   WINDOW_END_JST    : 既定 "23:30"（これより遅い着火は日付ズレ扱いで skip）
 #   WAIT_MINUTES      : 既定 30（本命 run の完了を待つ上限）
 #   DISPATCH_OVERRIDES: "true" なら workflow_dispatch は配信済みでも実行する（朝刊系の既存仕様用）
+#   CAP_AWARE_RETRY   : "true" で枠切れ由来の失敗を retry_cap から除外する（2026-09-07 追加・既定 false）
+#   CAP_RETRY_LIMIT   : 枠切れ由来の失敗を許容する上限（既定 3）。これを超えたら cron を止める。
+#
+# 【2026-09-07 追加・CAP_AWARE_RETRY の背景】
+#   従来の retry_cap は「当日 2 回失敗で cron の自動リトライ停止」だが、
+#   Claude 利用枠切れ（Spending cap）由来の失敗も同じ 2 回に数えていた。
+#   枠切れは設備障害ではなく時間が経てば必ず戻るため、これを数えると
+#   枠が戻ってからの自動復旧経路を自分で塞ぐことになる。
+#   実測: 2026-09-04 run 33875929742 が
+#     「本日すでに 2 回配信に失敗しており、cron の自動リトライ上限（2 回）に達した」
+#   で skip し、当日未配信のまま終わった。
+#   そこで枠切れ由来を別枠（CAP_RETRY_LIMIT）で数え、実質失敗数だけを retry_cap に掛ける。
+#   既定は false のため、この env を渡さない既存 workflow の挙動は一切変わらない。
 #
 set -euo pipefail
 
@@ -47,6 +60,8 @@ WINDOW_START_JST="${WINDOW_START_JST:-12:00}"
 WINDOW_END_JST="${WINDOW_END_JST:-23:30}"
 WAIT_MINUTES="${WAIT_MINUTES:-30}"
 DISPATCH_OVERRIDES="${DISPATCH_OVERRIDES:-false}"
+CAP_AWARE_RETRY="${CAP_AWARE_RETRY:-false}"
+CAP_RETRY_LIMIT="${CAP_RETRY_LIMIT:-3}"
 
 jst_min()  { echo $(( 10#$(TZ=Asia/Tokyo date +%H) * 60 + 10#$(TZ=Asia/Tokyo date +%M) )); }
 jst_hhmm() { TZ=Asia/Tokyo date +%H:%M; }
@@ -116,8 +131,21 @@ if [ "$EVENT" = "schedule" ]; then
   done
 fi
 
+# ---------- 3.5) 枠切れ由来の失敗を切り分ける（CAP_AWARE_RETRY=true のときのみ） ----------
+# 既定は false のため、この env を渡さない既存 workflow ではここは素通りし挙動は変わらない。
+CAPPED_FAILED=0
+EFFECTIVE_FAILED="$FAILED"
+if [ "$CAP_AWARE_RETRY" = "true" ]; then
+  CAPPED_FAILED=$(bash "$(dirname "$0")/count_capped_failures.sh" "$TARGET_DATE" "$MY_RUN_ID" 2>/dev/null || echo 0)
+  # 数え損ねた場合（API 失敗等）は 0 に倒す＝従来どおり厳しい側で止める（安全側）。
+  case "$CAPPED_FAILED" in (''|*[!0-9]*) CAPPED_FAILED=0 ;; esac
+  if [ "$CAPPED_FAILED" -gt "$FAILED" ]; then CAPPED_FAILED="$FAILED"; fi
+  EFFECTIVE_FAILED=$(( FAILED - CAPPED_FAILED ))
+  echo "枠切れの切り分け: failed=${FAILED} のうち ${CAPPED_FAILED} 件が Claude 利用枠切れ由来（設備障害ではなく時間で戻るもの）。実質失敗数=${EFFECTIVE_FAILED}"
+fi
+
 # ---------- 4) 判定 ----------
-echo "判定材料 (${TARGET_DATE} / $(jst_hhmm) JST / event=${EVENT}): delivered=${DELIVERED} sending=${SENDING} dispatch_pending=${DISPATCH_PENDING} failed=${FAILED}"
+echo "判定材料 (${TARGET_DATE} / $(jst_hhmm) JST / event=${EVENT}): delivered=${DELIVERED} sending=${SENDING} dispatch_pending=${DISPATCH_PENDING} failed=${FAILED} capped_failed=${CAPPED_FAILED} effective_failed=${EFFECTIVE_FAILED}"
 
 if [ "$DELIVERED" -gt 0 ] && [ "$EVENT" = "workflow_dispatch" ] && [ "$DISPATCH_OVERRIDES" = "true" ]; then
   echo "本日すでに配信済みですが、手動/Worker の dispatch は意図的発火のため再発行します。"
@@ -131,10 +159,15 @@ elif [ "$SENDING" -gt 0 ]; then
   echo "skip 理由: 別 run が今まさに配信中（sending=${SENDING}）のため。"
   echo "proceed=false" >> "$GITHUB_OUTPUT"
   echo "reason=skip (another run is delivering: sending=${SENDING})" >> "$GITHUB_OUTPUT"
-elif [ "$EVENT" = "schedule" ] && [ "$FAILED" -ge 2 ]; then
-  echo "skip 理由: 本日すでに ${FAILED} 回配信に失敗しており、cron の自動リトライ上限（2 回）に達したため。"
+elif [ "$EVENT" = "schedule" ] && [ "$EFFECTIVE_FAILED" -ge 2 ]; then
+  echo "skip 理由: 本日すでに ${EFFECTIVE_FAILED} 回（枠切れ由来を除く）配信に失敗しており、cron の自動リトライ上限（2 回）に達したため。"
   echo "proceed=false" >> "$GITHUB_OUTPUT"
-  echo "reason=retry_cap (cron stopped: failed=${FAILED})" >> "$GITHUB_OUTPUT"
+  echo "reason=retry_cap (cron stopped: effective_failed=${EFFECTIVE_FAILED} capped=${CAPPED_FAILED})" >> "$GITHUB_OUTPUT"
+elif [ "$EVENT" = "schedule" ] && [ "$CAP_AWARE_RETRY" = "true" ] && [ "$CAPPED_FAILED" -ge "$CAP_RETRY_LIMIT" ]; then
+  # 枠切れ由来だけで上限に達した場合。無限に cron を回して枠を焼かないための別枠上限。
+  echo "skip 理由: 本日は Claude 利用枠切れによる失敗が ${CAPPED_FAILED} 回に達し、枠切れ用の再試行上限（${CAP_RETRY_LIMIT} 回）を超えたため。"
+  echo "proceed=false" >> "$GITHUB_OUTPUT"
+  echo "reason=cap_retry_limit (capped=${CAPPED_FAILED}/${CAP_RETRY_LIMIT})" >> "$GITHUB_OUTPUT"
 else
   echo "proceed=true" >> "$GITHUB_OUTPUT"
   if [ "$FAILED" -gt 0 ]; then
