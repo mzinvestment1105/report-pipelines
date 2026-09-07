@@ -329,7 +329,8 @@ EARLY_MOVE_PCT = 3.0
 # +3%以上で動いた銘柄の最低本数（1社の急騰だけでテーマ扱いしないための担保）
 EARLY_MIN_NUP3 = 2
 # +3%以上で動いた銘柄の売買代金合計の下限（億円・実弾が入っていることの担保）
-EARLY_MIN_TURN3_OKU = 100
+# 2026-09-07 PM 承認・根拠は backfill 検証（100→200 億円が閾値格子の最良。適合率 4.1%・リフト 2.02 倍）
+EARLY_MIN_TURN3_OKU = 200
 # 誌面へ出す最大件数（2026-09-03 PM 決定で枠5。3か月後に early_candidates_daily.parquet で再検証）
 EARLY_MAX_ROWS = 5
 # 局面判定に使う直近営業日数（当日を除く）。既存の lit_days と同じ窓を使う。
@@ -2052,7 +2053,9 @@ def render_early_candidates(
     lines = ["## 初動候補テーマ（機械抽出）", ""]
     if not rows:
         lines += [
-            "本日は基準（上位10位以内・上昇4銘柄以上・うち+3%以上が2銘柄以上・その売買代金合計100億円以上）を"
+            f"本日は基準（上位{EARLY_TOP_POOL}位以内・上昇{EARLY_MIN_NUP}銘柄以上・"
+            f"うち+{EARLY_MOVE_PCT:.0f}%以上が{EARLY_MIN_NUP3}銘柄以上・"
+            f"その売買代金合計{EARLY_MIN_TURN3_OKU:.0f}億円以上）を"
             "満たすテーマがありません",
             "",
         ]

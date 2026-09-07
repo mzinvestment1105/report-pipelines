@@ -28,6 +28,7 @@ theme_radar の関数を一切書き換えず、誌面出力にも触れない�
   theme_radar.RADAR_MIN_TURNOVER_OKU / RADAR_MIN_MCAP_OKU / RADAR_PRIME_TOP_N
   theme_radar.EARLY_TOP_POOL / EARLY_MIN_NUP / EARLY_MOVE_PCT / EARLY_MIN_NUP3
   theme_radar.EARLY_MIN_TURN3_OKU   判定 E5 の 3 閾値
+  （2026-09-07 PM 承認で代金閾値 100→200 億円。旧条件は D1_prev100 列に残す）
   theme_radar.HEAT_WINDOW_DAYS / ACCEL_DELTA_RATIO / SUSTAIN_MIN_CODES
 
 後知恵の明記（報告書へ必ず転記すること）
@@ -90,6 +91,10 @@ R4_LEAD_SHARE = 0.08        # 代金シェア 20 日平均がこれ以上なら�
 R4_BREAK_RATIO = 0.85       # その 5 日平均が 20 日平均のこの倍率以下なら「折れている」
 
 D3_NEW_WINDOW = 10          # D3「新規」= 前 10 営業日の点数が 0
+
+# D1 の旧閾値（2026-09-07 の PM 承認で E5 の代金閾値を 100→200 億円へ変更したため、
+# 旧条件の点灯を D1_prev100 列として併記し、変更前後の履歴比較を可能にする）。
+D1_PREV_TURN3_OKU = 100     # 旧 E5 の +3% 銘柄の売買代金合計の下限（億円）
 
 # 先行リターン（--fill-forward）
 FWD_HORIZONS = (5, 20, 60, 120)   # 何営業日先まで測るか
@@ -386,12 +391,22 @@ def compute_history(panel: pd.DataFrame, dates: list) -> pd.DataFrame:
         heat = float(r["score"])
         r["phase"] = tr._phase(heat, prev, lit_today=True)
 
-        # --- D1 = 現行 E5 ---
-        d1 = (
+        # --- D1 = 現行 E5（閾値は theme_radar の定数をそのまま参照するため自動追随） ---
+        # 2026-09-07 PM 承認で EARLY_MIN_TURN3_OKU を 100→200 億円へ変更
+        # （根拠は backfill 検証。適合率 4.1%・リフト 2.02 倍）。
+        # 旧閾値 100 億円の点灯は D1_prev100 として併記し、履歴比較を可能にする。
+        _base_gate = (
             r["rank"] <= tr.EARLY_TOP_POOL
             and r["n_up"] >= tr.EARLY_MIN_NUP
             and r["n_up3"] >= tr.EARLY_MIN_NUP3
+        )
+        d1 = bool(
+            _base_gate
             and r["turnover_up3"] >= float(tr.EARLY_MIN_TURN3_OKU)
+        )
+        d1_prev100 = bool(
+            _base_gate
+            and r["turnover_up3"] >= float(D1_PREV_TURN3_OKU)
         )
         # --- D2 = E5 かつ 直近 5 営業日で 2 回目以上の点灯 ---
         lit_prev5 = 0
@@ -411,6 +426,7 @@ def compute_history(panel: pd.DataFrame, dates: list) -> pd.DataFrame:
         d5 = bool(d1 and r4_state.get(d, False))
 
         r["D1"], r["D2"], r["D3"], r["D4"], r["D5"] = bool(d1), d2, d3, d4, d5
+        r["D1_prev100"] = d1_prev100
         r["r4_state"] = bool(r4_state.get(d, False))
         r["lit_prev5"] = int(lit_prev5)
         # 先行リターン列は後半担当が埋める（設計書の指定により空のまま）
@@ -423,7 +439,7 @@ def compute_history(panel: pd.DataFrame, dates: list) -> pd.DataFrame:
     cols = [
         "date", "theme", "merged_names", "score", "rank", "n_up", "n_up3",
         "turnover_up3", "n_members", "breadth_ratio", "share", "share_5d",
-        "share_20d", "phase", "D1", "D2", "D3", "D4", "D5",
+        "share_20d", "phase", "D1", "D1_prev100", "D2", "D3", "D4", "D5",
         "r4_state", "n_fired_d4", "lit_prev5",
         "fwd_5", "fwd_20", "fwd_60", "fwd_120",
         "excess_5", "excess_20", "excess_60", "excess_120", "rally_120",
