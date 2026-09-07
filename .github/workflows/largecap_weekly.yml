@@ -20,6 +20,7 @@ name: 週次大型株速報（セクター輪番）
         required: false
         default: false
   # 2026-09-06 PM 指示により自動実行を停止（手動実行のみ）
+  # 停止: 2026-09-06／理由: PM 指示／再開条件: PM 判断（再開時は schedule を戻す）
   # schedule:
   #   - cron: '0 12 * * 5'
 
