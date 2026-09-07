@@ -757,6 +757,10 @@ jobs:
           cp -f ../report-pipelines/bi/pipelines/ops/rotate_report_archives.py bi/pipelines/ops/
           python bi/pipelines/ops/rotate_report_archives.py
 
+        # 2026-09-07 修正: commit 対象へ market/archive を追加した。rotate は超過分を
+        # market/archive/{レーン}/ へ move するが（CONSOLIDATED_LANES）、従来の commit 範囲は
+        # market/daily だけだったため「移動元の削除」だけが commit され、移動先が push されず、
+        # 2026-08-19 以降の過去号がリポから消えていた（実測: market/archive/macro の最新が 8/18）。
       - name: Commit and push to private repo
         # rebase 方式は履歴書き換え・並行 push で index.lock 残留の構造的弱点があるため、
         # fresh-base 方式の共通ヘルパー（Public 側から直接実行・repo 内コピー禁止）へ置換。
@@ -767,7 +771,7 @@ jobs:
           TARGET_DATE: ${{ needs.setup-raw.outputs.target_date }}
         run: |
           bash ../report-pipelines/bi/pipelines/ops/ci_commit_push.sh \
-            -m "data: mover report ${TARGET_DATE}" market/daily
+            -m "data: mover report ${TARGET_DATE}" market/daily market/archive
 
       - name: Discord 通知（⚠️ 配信済み・品質注記あり）
         # PM 2026-07-12（絶対配信原則）: 品質問題があってもレポートは配信済み。何が注記されたかを PM へ通知。

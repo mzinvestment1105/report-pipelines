@@ -109,6 +109,32 @@ jobs:
           meaning: 当日 2 回以上失敗したため cron の自動再実行を停止しました。本日未配信です。
           action_required: run ログ確認 → 原因解消後に手動 dispatch（force_rerun=true）で再実行
 
+      # 2026-09-07 追加: guard が「実行しない」と判定した経路のうち、当日未配信のまま終わる
+      # 理由（cap_retry_limit / 想定外時間帯）は従来どこにも通知が出ず、PM から見て
+      # レポートが黙って欠ける状態だった（実測: 9/4・9/7 が未着で通知なし）。
+      # 「本日配信済み」「別 run が配信中」は当日レポートが届くため通知しない（無用な通知を増やさない）。
+      - name: Discord 通知（🚨 枠切れ再試行の上限到達）
+        if: contains(steps.check.outputs.reason, 'cap_retry_limit')
+        uses: ./.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
+          state: alert
+          label: 夜間PTS動意レポート 未発行（枠切れ再試行の上限）
+          date: ${{ steps.check.outputs.target_date }}
+          meaning: 'Claude の利用枠切れによる失敗が本日の再試行上限に達したため、これ以上の自動再実行を止めました。本日は未配信です（判定: ${{ steps.check.outputs.reason }}）。'
+          action_required: 枠のリセット後に手動 dispatch（force_rerun=true）で再実行
+
+      - name: Discord 通知（🚨 想定外の時間帯で中止）
+        if: contains(steps.check.outputs.reason, 'outside window')
+        uses: ./.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
+          state: alert
+          label: 夜間PTS動意レポート 未発行（発行時間帯を外れた）
+          date: ${{ steps.check.outputs.target_date }}
+          meaning: 'cron の着火が想定の発行時間帯（12:00〜23:30 JST）を外れたため、日付ズレ配信を避けて中止しました。本日は未配信です（判定: ${{ steps.check.outputs.reason }}）。'
+          action_required: 当日中に読む必要があれば手動 dispatch（force_rerun=true）で再実行
+
       - name: Discord 通知（guard 失敗）
         if: failure() || cancelled()
         uses: ./.github/actions/notify-discord
@@ -118,6 +144,57 @@ jobs:
           label: 夜間PTS動意レポート guard 失敗
           meaning: 実行前チェック（当日配信済み判定）自体がエラーになり、生成ジョブが起動していません。
           action_required: run ログ確認 → 手動 dispatch（force_rerun=true）で再実行
+
+  # 2026-09-07 追加: guard が未配信のまま終わった日の理由を Private 側へ 1 行残す。
+  # Discord 通知は流れて消えるため、後から「あの日なぜ届かなかったか」を辿れる追記型の台帳を持つ。
+  # 追記先 market/daily/pts_movers/skip_log.txt は既存 commit 経路（market/daily）の範囲内なので
+  # 新しい commit ステップを増やさずそのまま push できる。
+  record-skip:
+    needs: guard
+    if: needs.guard.outputs.proceed != 'true' && !contains(needs.guard.outputs.reason, 'already delivered') && !contains(needs.guard.outputs.reason, 'another run is delivering')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout report-pipelines
+        uses: actions/checkout@v4
+        with:
+          path: report-pipelines
+
+      - name: Setup SSH for private repo
+        env:
+          PRIVATE_REPO_DEPLOY_KEY: ${{ secrets.PRIVATE_REPO_DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$PRIVATE_REPO_DEPLOY_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+      - name: Clone private repo (mizuki-fund)
+        run: git clone git@github.com:mzinvestment1105/mizuki-fund.git private-repo
+
+      - name: 未発行の理由を 1 行追記
+        working-directory: ./private-repo
+        env:
+          TARGET_DATE: ${{ needs.guard.outputs.target_date }}
+          REASON: ${{ needs.guard.outputs.reason }}
+        run: |
+          mkdir -p market/daily/pts_movers
+          LOG=market/daily/pts_movers/skip_log.txt
+          # 同一日・同一理由の重複追記を避ける（予備 cron が複数本走るため）。
+          LINE="${TARGET_DATE} 未発行 ${REASON}"
+          if [ -f "$LOG" ] && grep -qxF "$LINE" "$LOG"; then
+            echo "同一行が既にあるため追記しません: $LINE"
+          else
+            echo "$LINE" >> "$LOG"
+            echo "追記: $LINE"
+          fi
+
+      - name: Commit and push to private repo
+        working-directory: ./private-repo
+        env:
+          TARGET_DATE: ${{ needs.guard.outputs.target_date }}
+        run: |
+          bash ../report-pipelines/bi/pipelines/ops/ci_commit_push.sh             -m "data: pts mover skip log ${TARGET_DATE}" market/daily
 
   build-and-send:
     needs: guard
@@ -547,13 +624,17 @@ jobs:
           cp -f ../report-pipelines/bi/pipelines/ops/rotate_report_archives.py bi/pipelines/ops/
           python bi/pipelines/ops/rotate_report_archives.py
 
+        # 2026-09-07 修正: commit 対象へ market/archive を追加した。rotate は超過分を
+        # market/archive/{レーン}/ へ move するが（CONSOLIDATED_LANES）、従来の commit 範囲は
+        # market/daily だけだったため「移動元の削除」だけが commit され、移動先が push されず、
+        # 2026-08-19 以降の過去号がリポから消えていた（実測: market/archive/macro の最新が 8/18）。
       - name: Commit and push to private repo
         working-directory: ./private-repo
         env:
           TARGET_DATE: ${{ steps.date.outputs.value }}
         run: |
           bash ../report-pipelines/bi/pipelines/ops/ci_commit_push.sh \
-            -m "data: pts mover report ${TARGET_DATE}" market/daily
+            -m "data: pts mover report ${TARGET_DATE}" market/daily market/archive
 
       - name: Discord 通知（⚠️ 配信済み・品質注記あり）
         if: steps.annotate.outputs.annotated == 'true' && steps.send.outcome == 'success'

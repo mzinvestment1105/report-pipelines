@@ -433,6 +433,10 @@ jobs:
           cp -f ../report-pipelines/bi/pipelines/ops/rotate_report_archives.py bi/pipelines/ops/
           python bi/pipelines/ops/rotate_report_archives.py
 
+        # 2026-09-07 修正: commit 対象へ market/archive を追加した。rotate は超過分を
+        # market/archive/{レーン}/ へ move するが（CONSOLIDATED_LANES）、従来の commit 範囲は
+        # market/daily だけだったため「移動元の削除」だけが commit され、移動先が push されず、
+        # 2026-08-19 以降の過去号がリポから消えていた（実測: market/archive/macro の最新が 8/18）。
       - name: Commit and push to private repo
         # 生成物（market/daily/largecap/{date}.md・更新後 research/largecap/sector_ledger.json）を
         # private repo に commit-back（既存方式・Public へは出さない）。
@@ -443,7 +447,7 @@ jobs:
         run: |
           bash ../report-pipelines/bi/pipelines/ops/ci_commit_push.sh \
             -m "data: largecap weekly ${{ steps.date.outputs.value }}" \
-            market/daily/largecap research/largecap
+            market/daily/largecap research/largecap market/archive/largecap
 
       - name: Discord 通知（⛔ 生成確認で送信中止）
         if: failure() && steps.gate.outputs.exit_code == '3'
