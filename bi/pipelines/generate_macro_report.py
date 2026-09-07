@@ -72,10 +72,16 @@ SEGMENT_INDEX_CODES = {
     "グロース": "0070",
 }
 
-# 市場区分（MarketCodeName）と ETF/REIT 除外の結合元。screening_master は生成時点で
-# 個別株のみを収録（ETF・REIT・上場投信は除外済み）のため、これと結合することで
-# 市場別サマリーのブレッドス集計が自然に個別株のみに絞られる。
+# 市場区分（MarketCodeName）・東証17業種（Sector17CodeName）と ETF/REIT 除外の結合元。
+# screening_master は生成時点で個別株のみを収録（ETF・REIT・上場投信は除外済み）のため、
+# これと結合することで市場別サマリーのブレッドス集計・セクター強弱の集計が
+# 自然に個別株のみに絞られる（追加の除外コードは不要）。
 SCREENING_MASTER_PATH = REPO_ROOT / "bi" / "outputs" / "screening_master.parquet"
+
+# セクター強弱（PM 2026-09-07 承認）で採用する最小構成銘柄数。
+# 構成が極端に少ない区分（screening_master 上で1銘柄しかない「その他」等）は
+# 単純平均が個別銘柄1本の値になり地合いを表さないため除外する。
+SECTOR_MIN_CONSTITUENTS = 3
 
 def _is_stale(path: Path, target_date: date, max_age_minutes: int) -> bool:
     """
@@ -173,10 +179,75 @@ def get_market_snapshot(target_date: str | None = None) -> str:
 
 # ---------------------------------------------------------------------------
 # 市場別サマリー（プライム / スタンダード / グロース・PM 2026-07-07 指示）
+# ＋ セクター強弱（東証17業種の上位3・下位3・PM 2026-09-07 承認）
 # ---------------------------------------------------------------------------
 
-def get_market_segment_summary(target_date: str | None = None) -> str | None:
-    """市場別サマリー（3市場の指数前日比 + ブレッドス）の md ブロックを返す。
+def _build_sector_strength_block(
+    eq_t: dict[str, float],
+    eq_p: dict[str, float],
+    sm,
+    day_t,
+) -> str | None:
+    """東証17業種の騰落率（構成銘柄の単純平均）から上位3・下位3の md ブロックを返す。
+
+    - eq_t / eq_p は市場別サマリーが J-Quants から取得済みの {Code先頭4桁: 終値}。
+      セクター強弱のために J-Quants へ再アクセスはしない（同じデータを再利用する）。
+    - 母集団は screening_master との内部結合。screening_master は個別株のみを収録するため
+      ETF・REIT・上場投信は構造的に除外される（追加の除外コードは不要）。
+    - 各業種は「構成銘柄の日次騰落率（対象日終値/前営業日終値 - 1）×100 の単純平均」を
+      小数2桁で算出する。構成が SECTOR_MIN_CONSTITUENTS 未満の区分は除外する。
+    - 誌面では「下落した業種」ではなく必ず「下位3」と表記する（下位3がプラス圏の日があるため）。
+    - 算出できない場合は None を返す（呼び出し側でブロックごと省略・注記も書かない・§25 流儀）。
+    """
+    if "Sector17CodeName" not in sm.columns:
+        print("[WARN] セクター強弱: Sector17CodeName 列が無いためブロックを省略します", file=sys.stderr)
+        return None
+
+    sector_changes: dict[str, list[float]] = {}
+    for sec, c4 in zip(
+        sm["Sector17CodeName"].astype(str), sm["Code"].astype(str), strict=False
+    ):
+        if not sec or sec == "nan":
+            continue
+        t_close, p_close = eq_t.get(c4), eq_p.get(c4)
+        if t_close is not None and p_close:
+            sector_changes.setdefault(sec, []).append((t_close / p_close - 1.0) * 100.0)
+
+    # 構成 SECTOR_MIN_CONSTITUENTS 銘柄未満の区分は除外（単純平均が地合いを表さないため）
+    avgs = [
+        (sec, round(sum(vals) / len(vals), 2))
+        for sec, vals in sector_changes.items()
+        if len(vals) >= SECTOR_MIN_CONSTITUENTS
+    ]
+    if len(avgs) < 6:
+        print(
+            f"[WARN] セクター強弱: 有効な業種が {len(avgs)} 区分のみのためブロックを省略します",
+            file=sys.stderr,
+        )
+        return None
+
+    top3 = sorted(avgs, key=lambda x: x[1], reverse=True)[:3]  # 上位3（降順）
+    bottom3 = sorted(avgs, key=lambda x: x[1])[:3]             # 下位3（昇順）
+
+    def _fmt(pairs: list[tuple[str, float]]) -> str:
+        return " ／ ".join(f"{sec} {pct:+.2f}%" for sec, pct in pairs)
+
+    return "\n".join(
+        [
+            f"### セクター強弱（17業種・{day_t.month}/{day_t.day} 終値）",
+            "",
+            f"- 上位3　{_fmt(top3)}",
+            f"- 下位3　{_fmt(bottom3)}",
+            "",
+            "※構成3銘柄未満の区分は除外。",
+        ]
+    )
+
+
+def get_market_segment_summary(
+    target_date: str | None = None,
+) -> tuple[str | None, str | None]:
+    """市場別サマリーとセクター強弱の md ブロックを `(市場別サマリー, セクター強弱)` で返す。
 
     データソースは J-Quants v2（キーは JQUANTS_API_KEY 環境変数・GHA でも動く HTTP）:
     - 指数: /indices/bars/daily の 0500/0501/0070（SEGMENT_INDEX_CODES 参照）
@@ -187,7 +258,10 @@ def get_market_segment_summary(target_date: str | None = None) -> str | None:
       /markets/calendar ベースの recent_trading_days_v2 を再利用する。
     - 取得行の Date が対象日と一致しない場合は採用しない（古い日付での黙ったフォールバック禁止）。
       データが揃わない市場は行ごと省略し、「取得失敗」等のフォールバック表記は書かない（§25 流儀）。
-    - 全体が取得できない場合は None を返して stderr に警告する（レポート生成自体は止めない）。
+    - 全体が取得できない場合は (None, None) を返して stderr に警告する（レポート生成自体は止めない）。
+    - セクター強弱（東証17業種の上位3・下位3・PM 2026-09-07 承認）は、この関数が既に取得した
+      株価日足（eq_t / eq_p）をそのまま再利用して算出する。J-Quants への重複アクセスを避けるため
+      別関数での再取得は行わない。片方だけ取得できた場合はもう片方を None として返す。
     """
     import statistics
     from datetime import date as date_cls
@@ -201,7 +275,7 @@ def get_market_segment_summary(target_date: str | None = None) -> str | None:
         api_key = os.environ.get("JQUANTS_API_KEY", "").strip()
         if not api_key:
             print("[WARN] 市場別サマリー: JQUANTS_API_KEY 未設定のためブロックを省略します", file=sys.stderr)
-            return None
+            return None, None
 
         end: date_cls | None = None
         if target_date:
@@ -216,7 +290,7 @@ def get_market_segment_summary(target_date: str | None = None) -> str | None:
         days = recent_trading_days_v2(client, 2, end=end)  # [対象日, 前営業日]
         if len(days) < 2:
             print("[WARN] 市場別サマリー: 営業日2日分を解決できずブロックを省略します", file=sys.stderr)
-            return None
+            return None, None
         day_t, day_p = days[0], days[1]
 
         def _index_closes(d: date_cls) -> dict[str, float]:
@@ -261,10 +335,16 @@ def get_market_segment_summary(target_date: str | None = None) -> str | None:
         eq_p = _equity_closes(day_p)
         if not eq_t or not eq_p:
             print("[WARN] 市場別サマリー: 株価日足が取得できずブロックを省略します", file=sys.stderr)
-            return None
+            return None, None
 
         # ETF/REIT 除外と市場区分の結合元（モジュール定数 SCREENING_MASTER_PATH のコメント参照）
-        sm = pd.read_parquet(SCREENING_MASTER_PATH, columns=["Code", "MarketCodeName"])
+        sm = pd.read_parquet(
+            SCREENING_MASTER_PATH, columns=["Code", "MarketCodeName", "Sector17CodeName"]
+        )
+
+        # セクター強弱（東証17業種）は上で取得済みの eq_t / eq_p をそのまま再利用する
+        # （J-Quants への重複アクセスを避けるため別関数で再取得しない）
+        sector_block = _build_sector_strength_block(eq_t, eq_p, sm, day_t)
 
         rows_out: list[str] = []
         for mkt, idx_code in SEGMENT_INDEX_CODES.items():
@@ -295,9 +375,9 @@ def get_market_segment_summary(target_date: str | None = None) -> str | None:
 
         if not rows_out:
             print("[WARN] 市場別サマリー: 全市場でデータが揃わずブロックを省略します", file=sys.stderr)
-            return None
+            return None, sector_block
 
-        return "\n".join(
+        segment_block = "\n".join(
             [
                 f"### 市場別サマリー（{day_t.month}/{day_t.day} 終値）",
                 "",
@@ -306,9 +386,10 @@ def get_market_segment_summary(target_date: str | None = None) -> str | None:
                 *rows_out,
             ]
         )
+        return segment_block, sector_block
     except Exception as e:  # noqa: BLE001 — 補助ブロックの失敗でレポート全体を止めない（既存流儀）
         print(f"[WARN] 市場別サマリー取得失敗（ブロック省略）: {type(e).__name__}: {e}", file=sys.stderr)
-        return None
+        return None, None
 
 
 # ---------------------------------------------------------------------------
@@ -349,11 +430,14 @@ def build_prompt(
     finnhub_raw: str | None = None,
     tachibana_raw: str | None = None,
     segment_summary: str | None = None,
+    sector_strength: str | None = None,
 ) -> str:
     agent_spec = (AGENTS_DIR / "macro_analyst.md").read_text(encoding="utf-8")
 
-    # 市場別サマリー（取得失敗時は None → ブロックごと省略・注記も書かない）
+    # 市場別サマリー・セクター強弱（取得失敗時は None → ブロックごと省略・注記も書かない）
     segment_section = f"\n{segment_summary}\n" if segment_summary else ""
+    if sector_strength:
+        segment_section += f"\n{sector_strength}\n"
 
     delta_section = ""
     if yesterday_report:
@@ -447,6 +531,14 @@ def build_prompt(
    - (d) 各材料はいずれか **1 テーマでのみ**説明し、他セクションでは 1 行ポインタ（「→ テーマ◯参照」）か結論だけにする。同じ固有名詞が 4 セクション以上に説明として登場する状態を作らない。
 
 6. **市場別サマリー表の転記（PM 2026-07-07 指示）**：上の市況スナップショットに「### 市場別サマリー（M/D 終値）」ブロックがある場合、市況スナップショット表の直後に**見出し（対象日含む）・数値とも一字一句そのまま転記**する（§21-A 準用）。再計算・丸め直し・行/列の追加・削除・並べ替え・コメント列の付加を禁止し、raw にある行だけを転記する。ブロックが無い日は市場別サマリーを書かず、取得失敗等の注記も書かない。
+
+7. **セクター強弱の転記（PM 2026-09-07 承認）**：上の市況スナップショットに「### セクター強弱（17業種・M/D 終値）」ブロックがある場合、市場別サマリーの直後に**見出し（対象日含む）・業種名・数値・区切り記号・末尾の注記行とも一字一句そのまま転記**する（§21-A 準用）。守る点：
+   - **再計算・丸め直し・小数桁の増減・並べ替え・行の追加/削除・業種の入れ替えを禁止**する。raw にある2行（上位3・下位3）と注記行だけを転記する。
+   - **「下位3」の表記を維持する**。「下落した業種」「下がった業種」等へ言い換えない（下位3がプラス圏で並ぶ日があるため事実と食い違う）。
+   - **絵文字（📈📉 等）を付けない**。誌面で使える記号は ★☆▲▼△▽― のみ（§41）。
+   - **個別銘柄名・銘柄コードを書かない**。業種名のみを扱う。
+   - **「この業種を買え」型の売買推奨を書かない**（§22）。地合いの読みとして本文で言及する場合も、業種単位の観察に留める。
+   - ブロックが無い日はセクター強弱を書かず、取得失敗等の注記も書かない。
 """
 
 
@@ -478,9 +570,12 @@ def main() -> None:
         print(f"市況データ取得中 (yfinance) target_date={target_date_str}...")
         print(get_market_snapshot(target_date_str))
         print(f"市場別サマリー取得中 (J-Quants v2) target_date={target_date_str}...")
-        segment_summary = get_market_segment_summary(target_date_str)
+        segment_summary, sector_strength = get_market_segment_summary(target_date_str)
         if segment_summary:
             print(segment_summary)
+        if sector_strength:
+            print()
+            print(sector_strength)
         sys.exit(EXIT_OK)
 
     # news_raw.md を読み込む
@@ -545,12 +640,19 @@ def main() -> None:
     print(f"市況データ取得中 (yfinance) target_date={target_date_str}...")
     snapshot = get_market_snapshot(target_date_str)
 
-    # 市場別サマリー取得（J-Quants v2・取得失敗時は None → raw からブロックごと省略）
+    # 市場別サマリー・セクター強弱（J-Quants v2・取得失敗時は None → raw からブロックごと省略）
     print(f"市場別サマリー取得中 (J-Quants v2) target_date={target_date_str}...")
-    segment_summary = get_market_segment_summary(target_date_str)
+    segment_summary, sector_strength = get_market_segment_summary(target_date_str)
 
     prompt = build_prompt(
-        today_raw, yesterday_report, snapshot, target_date_str, finnhub_raw, tachibana_raw, segment_summary
+        today_raw,
+        yesterday_report,
+        snapshot,
+        target_date_str,
+        finnhub_raw,
+        tachibana_raw,
+        segment_summary,
+        sector_strength,
     )
 
     # rawファイルに保存（後続の Claude 分析用）
