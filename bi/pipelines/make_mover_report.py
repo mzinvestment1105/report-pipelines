@@ -73,6 +73,18 @@ from theme_radar import (
     set_mcap_lookup,
 )
 
+# テーマ点数の日次台帳（2026-09-07 PM 承認・第2段階）。theme_ledger は価格パネルを
+# import 時には読まない（読むのは --backfill / --fill-forward / --features のときだけ）
+# ので、GHA の runner で価格パネルが無くても import 自体は通る。万一失敗しても
+# 誌面生成を止めないよう、取り込めなければ何もしない no-op へ差し替える。
+try:
+    from theme_ledger import append_theme_score_daily
+except Exception as _e:   # pragma: no cover - runner 環境差の保険
+    print(f"[WARN] theme_ledger を取り込めませんでした（日次台帳はスキップ）: {_e}")
+
+    def append_theme_score_daily(*_a, **_kw):
+        return None
+
 # ---------------------------------------------------------------------------
 # パス定義
 # ---------------------------------------------------------------------------
@@ -2052,6 +2064,23 @@ def build_report(
                     print(f"初動候補の日次記録: {_rec}（上位{len(_pool)}件）")
             except Exception as _e:
                 print(f"  [WARN] append_early_candidates: {_e}")
+            # 2026-09-07 PM 承認（テーマ初動検知 v3 第2段階）: 上位10件だけでなく
+            # **当日の全テーマ行**を月次 parquet へ残す。答え合わせ台帳
+            # （theme_score_history.parquet）は価格パネル 92MB を要するため GHA では
+            # 作れないが、この日次行は theme_radar が誌面生成の過程で既に計算し終えた
+            # 値をそのまま書くだけなので、runner 上でも動く。月次パーティションにして
+            # 1 ファイルを小さく保つ（1 か月あたり約 2,000 行）。
+            # 誌面と送信には一切影響させない（配信絶対の原則・_cr §36）。
+            try:
+                _all_rows = _today_res.get("rows") or []
+                _full = evaluate_early_pool(
+                    _all_rows, lit_history=_lit_hist, top_pool=len(_all_rows)
+                )
+                _dpath = append_theme_score_daily(_full, today)
+                if _dpath:
+                    print(f"テーマ点数の日次台帳: {_dpath}（全{len(_full)}件）")
+            except Exception as _e:
+                print(f"  [WARN] append_theme_score_daily: {_e}")
         except Exception as _e:
             print(f"  [WARN] select_early_candidates: {_e}")
         # 熱量部はテーマごとのブロック（見出し行＋主導銘柄の4列表）。熱量降順・当日1位を必ず含める。

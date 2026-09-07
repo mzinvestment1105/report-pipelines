@@ -589,6 +589,374 @@ def fill_forward_returns(hist: pd.DataFrame, panel: pd.DataFrame) -> pd.DataFram
     return hist
 
 
+# ---------------------------------------------------------------------------
+# エントリー特徴量（--features）
+# ---------------------------------------------------------------------------
+# 第 2 段階（2026-09-07 PM 承認「3」）で追加する列。第 1 段階の結論
+# 「E5 は大相場の的中率を上げるが対市場超過は中央値ゼロ」を受け、
+# 「いつ・何を買うと +20/+60 営業日の超過が出るか」を測るための材料を台帳へ足す。
+# 既存列は 1 つも書き換えない（追加のみ）。
+EPISODE_GAP_DAYS = 3        # 何営業日空いたら別エピソードとみなすか
+LIT_WINDOW = 10             # lit_days_10 の窓（当日を除く直近営業日数）
+NEW_ENTRANT_WINDOW = 20     # new_entrants / laggard_ratio の参照窓
+BREADTH_ACCEL_WINDOW = 5    # breadth_accel の分母（直近営業日数の n_up 平均）
+RANK_IMPROVE_MIN = 10       # rank_new_entry: 順位がこれ以上改善したら 1
+THEME_MOMENTUM = (OUTROOT / "theme_momentum.parquet").resolve()
+STOCK_CONTEXT = (OUTROOT / "analysis/theme_radar/stock_context_daily.parquet").resolve()
+
+FEATURE_COLS = [
+    "lit_days_10", "episode_day", "breadth_accel", "share_accel",
+    "new_entrants", "new_entrant_ratio", "laggard_ratio",
+    "pullback_from_high", "rank_new_entry", "catalyst_days_10",
+]
+
+
+def _load_rank_history() -> dict:
+    """みんかぶランキング（theme_momentum.parquet）を {日付: {テーマ: 最良順位}} で返す。
+
+    履歴は 2026-05-16 以降の 56 スナップショットしかない。取れない日は
+    rank_new_entry を NaN にして「判定不可」と「該当なし(0)」を区別する。
+    """
+    if not THEME_MOMENTUM.exists():
+        print(f"[feat] みんかぶランキングが無い: {THEME_MOMENTUM}", flush=True)
+        return {}
+    df = pd.read_parquet(THEME_MOMENTUM)
+    df = df[df["source"].astype(str) == "minkabu"]
+    if df.empty:
+        return {}
+    out: dict = defaultdict(dict)
+    for snap, theme, rk in zip(df["snapshot_date"].astype(str),
+                               df["theme_name"].astype(str),
+                               pd.to_numeric(df["rank"], errors="coerce")):
+        if not np.isfinite(rk):
+            continue
+        d = pd.Timestamp(snap).normalize()
+        cur = out[d].get(theme)
+        # rank_type が popular / rise の 2 系統あるので、より上位（数字が小さい）を採る
+        if cur is None or rk < cur:
+            out[d][theme] = float(rk)
+    if out:
+        print(f"[feat] みんかぶランキング {len(out)} 営業日分 "
+              f"({min(out).date()}〜{max(out).date()})", flush=True)
+    return dict(out)
+
+
+def _load_catalyst_days() -> dict:
+    """「なぜ動いた」記録（stock_context_daily.parquet）を {日付: {銘柄}} で返す。
+
+    materials 列が空でない銘柄だけを「その日 材料の記録がある銘柄」と数える。
+    蓄積は 2026-09-03 以降しかないため、それ以前は NaN（判定不可）にする。
+    """
+    if not STOCK_CONTEXT.exists():
+        print(f"[feat] 銘柄コンテキスト蓄積が無い: {STOCK_CONTEXT}", flush=True)
+        return {}
+    df = pd.read_parquet(STOCK_CONTEXT)
+    if df.empty:
+        return {}
+    mat = df["materials"].astype(str).str.strip()
+    df = df[mat.ne("") & mat.ne("None") & mat.ne("nan")]
+    out: dict = defaultdict(set)
+    for d, c in zip(df["date"].astype(str), df["code"].astype(str)):
+        out[pd.Timestamp(d).normalize()].add(c)
+    if out:
+        print(f"[feat] 材料記録 {len(out)} 営業日分 "
+              f"({min(out).date()}〜{max(out).date()})", flush=True)
+    return dict(out)
+
+
+def add_entry_features(hist: pd.DataFrame, panel: pd.DataFrame) -> pd.DataFrame:
+    """台帳へエントリー判定用の特徴量 10 列を追加する（既存列は無改変）。"""
+    code_to_themes, _theme_size, _stale, _exc = tr.load_theme_map()
+    theme_members: dict = defaultdict(set)
+    for code, ts in code_to_themes.items():
+        for t in ts:
+            theme_members[t].add(str(code))
+
+    dates = sorted(pd.to_datetime(panel["Date"].unique()))
+    dpos = {d: i for i, d in enumerate(dates)}
+
+    hist = hist.copy().reset_index(drop=True)
+    hist["date"] = pd.to_datetime(hist["date"])
+
+    # 統合テーマ群のキー（fill_forward_returns と同じ作り方）
+    gkeys = []
+    for t, mg in zip(hist["theme"], hist["merged_names"]):
+        names = {str(t)}
+        if isinstance(mg, str) and mg:
+            names |= {s for s in mg.split("|") if s}
+        gkeys.append("|".join(sorted(names)))
+    hist["_gkey"] = gkeys
+
+    # --- 銘柄 × 日の行列（バスケット指数・20 日リターン・当日母集団） ---
+    ret_wide = panel.pivot_table(index="Date", columns="Code",
+                                 values="DailyReturn", aggfunc="mean").reindex(pd.Index(dates))
+    ret_arr = ret_wide.to_numpy(dtype=float)
+    col_pos = {str(c): j for j, c in enumerate(ret_wide.columns)}
+
+    # 20 営業日リターン（laggard_ratio 用・銘柄 × 日）
+    px_wide = panel.pivot_table(index="Date", columns="Code",
+                                values="AdjClose", aggfunc="mean").reindex(pd.Index(dates))
+    px_wide = px_wide[ret_wide.columns]
+    px_arr = px_wide.to_numpy(dtype=float)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        r20_arr = np.full_like(px_arr, np.nan)
+        r20_arr[NEW_ENTRANT_WINDOW:] = (
+            px_arr[NEW_ENTRANT_WINDOW:] / px_arr[:-NEW_ENTRANT_WINDOW] - 1.0) * 100.0
+        r20_med = np.nanmedian(r20_arr, axis=1)   # 母集団中央値（日ごと）
+
+    # 各群のバスケット指数（pullback_from_high 用）
+    gcols: dict = {}
+    baskets: dict = {}
+    gmembers: dict = {}
+    for gk in hist["_gkey"].unique():
+        codes: set = set()
+        for nm in gk.split("|"):
+            if nm:
+                codes |= theme_members.get(nm, set())
+        gmembers[gk] = codes
+        cols = sorted({col_pos[c] for c in codes if c in col_pos})
+        gcols[gk] = cols
+        baskets[gk] = _cum_index(ret_arr[:, cols]) if cols else None
+
+    # 当日「点灯していた」銘柄集合（= その日の母集団 ∩ 群構成銘柄）
+    univ_by_day: dict = {}
+    for d, g in panel.groupby("Date", sort=True):
+        u = day_universe(g)
+        univ_by_day[pd.Timestamp(d)] = (
+            set(u["Code"].astype(str)) if len(u) else set())
+
+    rank_hist = _load_rank_history()
+    rank_days = sorted(rank_hist.keys())
+    catalyst = _load_catalyst_days()
+    cat_days = sorted(catalyst.keys())
+
+    # --- 群 × 日の系列（点灯フラグ・n_up・点灯銘柄集合） ---
+    lit_map: dict = defaultdict(dict)       # gkey -> {date_idx: True}
+    nup_map: dict = defaultdict(dict)       # gkey -> {date_idx: n_up}
+    litcodes_map: dict = defaultdict(dict)  # gkey -> {date_idx: set(codes)}
+    for gk, d, nu in zip(hist["_gkey"], hist["date"], hist["n_up"]):
+        i = dpos.get(pd.Timestamp(d))
+        if i is None:
+            continue
+        lit_map[gk][i] = True
+        nup_map[gk][i] = int(nu)
+    for gk, idxs in lit_map.items():
+        codes = gmembers.get(gk, set())
+        for i in idxs:
+            litcodes_map[gk][i] = codes & univ_by_day.get(dates[i], set())
+
+    m = len(hist)
+    F = {c: np.full(m, np.nan) for c in FEATURE_COLS}
+
+    t0 = time.time()
+    for i_row, (gk, d, nu, sh5, sh20) in enumerate(
+            zip(hist["_gkey"], hist["date"], hist["n_up"],
+                hist["share_5d"], hist["share_20d"])):
+        i = dpos.get(pd.Timestamp(d))
+        if i is None:
+            continue
+        lit_idx = lit_map[gk]
+
+        # --- lit_days_10: 当日を除く直近 10 営業日の点灯日数 ---
+        lo = max(0, i - LIT_WINDOW)
+        F["lit_days_10"][i_row] = float(sum(1 for k in range(lo, i) if k in lit_idx))
+
+        # --- episode_day: 連続点灯エピソードの何日目か（3 営業日以上空いたら新規） ---
+        day_no = 1
+        k = i
+        while True:
+            prev = None
+            for kk in range(k - 1, max(-1, k - 1 - EPISODE_GAP_DAYS), -1):
+                if kk in lit_idx:
+                    prev = kk
+                    break
+            if prev is None:
+                break
+            day_no += 1
+            k = prev
+        F["episode_day"][i_row] = float(day_no)
+        ep_start = k   # エピソード開始日の位置
+
+        # --- breadth_accel: n_up ÷ 直近 5 営業日の n_up 平均（点灯日のみで平均） ---
+        lo5 = max(0, i - BREADTH_ACCEL_WINDOW)
+        prev_nups = [nup_map[gk][kk] for kk in range(lo5, i) if kk in nup_map[gk]]
+        if prev_nups:
+            avg = float(np.mean(prev_nups))
+            F["breadth_accel"][i_row] = float(nu) / avg if avg > 0 else np.nan
+
+        # --- share_accel: share_5d ÷ share_20d ---
+        s5, s20 = float(sh5), float(sh20)
+        if np.isfinite(s5) and np.isfinite(s20) and s20 > 0:
+            F["share_accel"][i_row] = s5 / s20
+
+        # --- new_entrants: 当日点灯銘柄のうち直近 20 営業日に一度も点灯していなかった数 ---
+        today_codes = litcodes_map[gk].get(i, set())
+        if today_codes:
+            lo20 = max(0, i - NEW_ENTRANT_WINDOW)
+            past: set = set()
+            for kk in range(lo20, i):
+                past |= litcodes_map[gk].get(kk, set())
+            newc = today_codes - past
+            F["new_entrants"][i_row] = float(len(newc))
+            F["new_entrant_ratio"][i_row] = len(newc) / len(today_codes)
+        else:
+            F["new_entrants"][i_row] = 0.0
+
+        # --- laggard_ratio: 構成銘柄のうち 20 営業日リターンが母集団中央値以下の比率 ---
+        cols = gcols.get(gk) or []
+        if cols and np.isfinite(r20_med[i]):
+            vals = r20_arr[i, cols]
+            ok = np.isfinite(vals)
+            if ok.sum() > 0:
+                F["laggard_ratio"][i_row] = float((vals[ok] <= r20_med[i]).mean())
+
+        # --- pullback_from_high: エピソード開始以降のバスケット高値からの下落率 ---
+        bidx = baskets.get(gk)
+        if bidx is not None and np.isfinite(bidx[i]) and bidx[i] > 0:
+            seg = bidx[ep_start:i + 1]
+            seg = seg[np.isfinite(seg)]
+            if len(seg) > 0:
+                hi = float(np.max(seg))
+                if hi > 0:
+                    F["pullback_from_high"][i_row] = (float(bidx[i]) / hi - 1.0) * 100.0
+
+        # --- rank_new_entry: みんかぶランキングに新規参入 or 10 位以上改善 ---
+        if rank_days and rank_days[0] <= dates[i] <= rank_days[-1]:
+            names = [nm for nm in gk.split("|") if nm]
+            cur_ranks = [rank_hist.get(dates[i], {}).get(nm) for nm in names]
+            cur_ranks = [x for x in cur_ranks if x is not None]
+            # 直前のランキング取得日
+            prev_day = None
+            for dd in reversed(rank_days):
+                if dd < dates[i]:
+                    prev_day = dd
+                    break
+            if cur_ranks:
+                cur = min(cur_ranks)
+                if prev_day is None:
+                    F["rank_new_entry"][i_row] = np.nan
+                else:
+                    prev_ranks = [rank_hist.get(prev_day, {}).get(nm) for nm in names]
+                    prev_ranks = [x for x in prev_ranks if x is not None]
+                    if not prev_ranks:
+                        F["rank_new_entry"][i_row] = 1.0     # 新規参入
+                    else:
+                        F["rank_new_entry"][i_row] = (
+                            1.0 if (min(prev_ranks) - cur) >= RANK_IMPROVE_MIN else 0.0)
+            elif dates[i] in rank_hist:
+                F["rank_new_entry"][i_row] = 0.0             # ランキング外
+
+        # --- catalyst_days_10: 構成銘柄に「なぜ動いた」記録がある日数（直近 10 営業日） ---
+        if cat_days and cat_days[0] <= dates[i]:
+            codes_set = gmembers.get(gk, set())
+            lo10 = max(0, i - LIT_WINDOW + 1)
+            cnt = 0
+            for kk in range(lo10, i + 1):
+                if dates[kk] < cat_days[0]:
+                    continue
+                if catalyst.get(dates[kk], set()) & codes_set:
+                    cnt += 1
+            F["catalyst_days_10"][i_row] = float(cnt)
+
+        if (i_row + 1) % 20000 == 0:
+            print(f"[feat] {i_row+1:,}/{m:,} 行 経過 {(time.time()-t0)/60:.1f}分", flush=True)
+
+    for c in FEATURE_COLS:
+        hist[c] = F[c]
+    hist = hist.drop(columns=["_gkey"])
+    cov = " ".join(f"{c}={hist[c].notna().mean()*100:.1f}%" for c in FEATURE_COLS)
+    print(f"[feat] 充填完了 経過 {(time.time()-t0)/60:.1f}分 / 非欠損率 {cov}", flush=True)
+    return hist
+
+
+# ---------------------------------------------------------------------------
+# 日次の点数行を月次パーティションへ残す（GHA・価格パネル非依存）
+# ---------------------------------------------------------------------------
+# theme_radar が誌面生成時に既に計算し終えている当日の全テーマ行を、そのまま
+# bi/outputs/analysis/theme_radar/theme_score_daily/YYYY-MM.parquet へ追記する。
+# 価格パネル（92MB・未追跡）を必要としないので GHA の runner でも動く。
+# 誌面と送信には一切影響しない（呼び出し側が try/except で包む契約）。
+DAILY_DIR = (OUTROOT / "analysis/theme_radar/theme_score_daily").resolve()
+
+DAILY_COLS = ["date", "theme", "merged_names", "score", "rank", "n_up", "n_up3",
+              "turnover_up3", "n_members", "breadth_ratio", "phase", "E5"]
+
+
+def append_theme_score_daily(rows, trade_date, out_dir: Path | None = None) -> str | None:
+    """theme_radar が当日計算したテーマ行を月次 parquet へ追記する。
+
+    Parameters
+    ----------
+    rows : list[dict]
+        theme_radar.evaluate_early_pool(top_pool=全件) が返す当日の全テーマ行。
+        使うキー: theme / score / rank / n_up / n3(=n_up3) / turn3_oku /
+        passed_gate(=E5) / phase / merged_names / theme_size。キー名の揺れは吸収する。
+        evaluate_early_pool は E5 の 3 閾値を theme_radar の定数から読むため、
+        誌面の判定と台帳の E5 列が構造的にずれない。
+    trade_date : str | date
+        対象営業日。
+    out_dir : Path
+        省略時は bi/outputs/analysis/theme_radar/theme_score_daily/。
+
+    Returns
+    -------
+    str | None
+        書いたファイルのパス。行が無ければ None。
+    """
+    if not rows:
+        return None
+    d = pd.Timestamp(str(trade_date)).normalize()
+    out_dir = Path(out_dir) if out_dir else DAILY_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    def _g(r, *keys, default=None):
+        for k in keys:
+            if k in r and r[k] is not None:
+                return r[k]
+        return default
+
+    recs = []
+    for i, r in enumerate(rows, 1):
+        if not isinstance(r, dict):
+            continue
+        theme = str(_g(r, "theme", "name", default="") or "").strip()
+        if not theme:
+            continue
+        merged = _g(r, "merged_names", default=None)
+        if isinstance(merged, (list, tuple, set)):
+            merged = "|".join(sorted(str(x) for x in merged))
+        recs.append({
+            "date": d,
+            "theme": theme,
+            "merged_names": str(merged or ""),
+            "score": float(_g(r, "score", default=float("nan")) or float("nan")),
+            "rank": int(_g(r, "rank", default=i) or i),
+            "n_up": int(_g(r, "n_up", "nup", default=0) or 0),
+            "n_up3": int(_g(r, "n3", "n_up3", default=0) or 0),
+            "turnover_up3": float(_g(r, "turn3_oku", "turnover_up3", default=float("nan"))
+                                  or float("nan")),
+            "n_members": int(_g(r, "n_members", "theme_size", "size", default=0) or 0),
+            "breadth_ratio": float(_g(r, "breadth_ratio", default=float("nan"))
+                                   or float("nan")),
+            "phase": str(_g(r, "phase", default="") or ""),
+            "E5": bool(_g(r, "passed_gate", "early", "E5", default=False)),
+        })
+    if not recs:
+        return None
+    new = pd.DataFrame(recs)[DAILY_COLS]
+
+    path = out_dir / f"{d.strftime('%Y-%m')}.parquet"
+    if path.exists():
+        old = pd.read_parquet(path)
+        old = old[pd.to_datetime(old["date"]) != d]          # 同一日を差し替える（冪等）
+        new = pd.concat([old, new], ignore_index=True)
+    new = new.sort_values(["date", "rank"]).reset_index(drop=True)
+    tmp = path.with_suffix(".parquet.tmp")
+    new.to_parquet(tmp, index=False)
+    os.replace(tmp, path)
+    return str(path)
+
+
 def write_history(df: pd.DataFrame, mode: str) -> None:
     """台帳を書く。--daily は同一 date の行を差し替えて追記する（原子的置換）。"""
     HISTORY_OUT.parent.mkdir(parents=True, exist_ok=True)
@@ -596,6 +964,17 @@ def write_history(df: pd.DataFrame, mode: str) -> None:
         old = pd.read_parquet(HISTORY_OUT)
         new_dates = set(pd.to_datetime(df["date"]).unique())
         old = old[~pd.to_datetime(old["date"]).isin(new_dates)]
+        # --daily が計算するのは compute_history の列（先行リターンと特徴量を含まない）
+        # だけなので、concat すると足りない列がその日の行だけ NaN で埋まる。黙って
+        # 欠損を作ると「計算した結果ゼロ件」と「まだ計算していない」の区別が付かなく
+        # なるため、どの列が未計算のまま入るかを必ず表示する（欠損は残す方が正しい。
+        # 埋めるには --fill-forward と --features を後から流す）。
+        pending = [c for c in old.columns if c not in df.columns]
+        if pending:
+            print(f"[write] --daily は次の列を計算しません（当日行は欠損のまま）: "
+                  f"{pending}\n"
+                  f"        先行リターンは `--fill-forward`、特徴量は `--features` を"
+                  f"後から流して埋めてください。", flush=True)
         df = pd.concat([old, df], ignore_index=True)
     df = df.sort_values(["date", "rank"]).reset_index(drop=True)
     tmp = HISTORY_OUT.with_suffix(".parquet.tmp")
@@ -616,9 +995,12 @@ def main() -> int:
                     help="price_turnover_panel.parquet を作り直す")
     ap.add_argument("--fill-forward", action="store_true",
                     help="既存の台帳へ先行リターン（fwd_*/excess_*/rally_120）を充填する")
+    ap.add_argument("--features", action="store_true",
+                    help="既存の台帳へエントリー判定用の特徴量 10 列を追加する")
     args = ap.parse_args()
-    if not (args.backfill or args.daily or args.fill_forward):
-        ap.error("--backfill / --daily / --fill-forward のいずれかを指定してください")
+    if not (args.backfill or args.daily or args.fill_forward or args.features):
+        ap.error("--backfill / --daily / --fill-forward / --features "
+                 "のいずれかを指定してください")
 
     t0 = time.time()
     panel = build_price_turnover_panel(force=args.rebuild_panel)
@@ -632,6 +1014,23 @@ def main() -> int:
         hist = pd.read_parquet(HISTORY_OUT)
         print(f"[fwd] 台帳 {len(hist):,} 行 を読み込み", flush=True)
         hist = fill_forward_returns(hist, panel)
+        write_history(hist, "backfill")
+        print(f"[done] 経過 {(time.time()-t0)/60:.1f} 分", flush=True)
+        return 0
+
+    if args.features:
+        if not HISTORY_OUT.exists():
+            raise FileNotFoundError(f"台帳がありません: {HISTORY_OUT}")
+        hist = pd.read_parquet(HISTORY_OUT)
+        print(f"[feat] 台帳 {len(hist):,} 行 × {len(hist.columns)} 列 を読み込み", flush=True)
+        before = list(hist.columns)
+        hist = add_entry_features(hist, panel)
+        added = [c for c in hist.columns if c not in before]
+        # 既存列を 1 つも壊していないことを確認してから書く
+        missing = [c for c in before if c not in hist.columns]
+        if missing:
+            raise RuntimeError(f"既存列が失われた: {missing}")
+        print(f"[feat] 追加列 {added}", flush=True)
         write_history(hist, "backfill")
         print(f"[done] 経過 {(time.time()-t0)/60:.1f} 分", flush=True)
         return 0
