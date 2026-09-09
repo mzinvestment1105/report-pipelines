@@ -59,10 +59,15 @@ from theme_radar import (
     build_desc_lookup,
     build_material_lookup,
     build_own_theme_lookup,
+    build_sustain_context,
     compute_lit_history,
     compute_theme_heat_v2,
     evaluate_early_pool,
     detect_today,
+    load_earnings_flags,
+    load_rank_history,
+    load_theme_map,
+    _load_history as _tr_load_history,
     parse_own_themes_block,
     render_early_candidates,
     render_heat_section,
@@ -2042,6 +2047,32 @@ def build_report(
         # 誌面位置は `## 本日のテーマ` の直後・`## 直近2週間の熱いテーマ` の前。
         # 本日のテーマ欄・2週間欄との重複は除外せず、重複時は注記列で示す（PM 指示）。
         # ここが失敗しても本体レポートは止めない（配信絶対の原則・_cr §36）。
+        # 持続文脈（2026-09-07 PM 承認）: テーマ見出しの直後へ「点灯の持続・
+        # ランキング推移・構成銘柄の業績トレンド」を機械で添え、誌面の駆動要因を
+        # 材料から書けるようにする。入力は全て追跡済み parquet（動意蓄積・テーマ
+        # ランキング・開示付き業績）で GHA の runner 上でも読める。取れない項目は
+        # 行ごと省略し、全て取れなければ 0 行（＝従来と同一の raw）になる。
+        # 誌面の見出し行・表・OWN_THEMES_JSON には一切影響しない。
+        _sustain = None
+        _s_c2t = None
+        try:
+            _s_hist = _tr_load_history(None)
+            _s_c2t, _s_size, _s_stale, _s_exc = load_theme_map()
+            _s_rank = load_rank_history()
+            _s_fin = load_earnings_flags(str(today))
+
+            def _sustain(_row):
+                return build_sustain_context(
+                    _row, hist=_s_hist, code_to_themes=_s_c2t,
+                    rank_hist=_s_rank, fin_flags=_s_fin, end=str(today),
+                )
+            print(
+                "持続文脈: ランキング{}日分・業績フラグ{}件".format(
+                    len(_s_rank), len(_s_fin))
+            )
+        except Exception as _e:
+            print(f"  [WARN] 持続文脈の準備: {_e}")
+            _sustain = None
         try:
             _lit_hist = compute_lit_history(trade_date=str(today))
             _early = select_early_candidates(
@@ -2050,12 +2081,15 @@ def build_report(
             _today_labels = {
                 r.get("theme") for r in (_today_res.get("rows") or [])[:MAX_ROWS_TODAY_MAX]
             }
-            lines += render_early_candidates(_early, today_labels=_today_labels)
+            lines += render_early_candidates(
+                _early, today_labels=_today_labels, sustain_ctx=_sustain
+            )
             # 2026-09-03 PM 決定: 枠5で誌面へ出しつつ、**ゲート通過前の上位10件全て**を
             # 日次 parquet へ残す（3か月後に枠数・閾値を変えて再検証するため）。
             try:
                 _pool = evaluate_early_pool(
-                    _today_res.get("rows") or [], lit_history=_lit_hist
+                    _today_res.get("rows") or [], lit_history=_lit_hist,
+                    code_to_themes=_s_c2t,
                 )
                 _rec = append_early_candidates(
                     _pool, today, shown_themes={r.get("theme") for r in _early}
@@ -2074,7 +2108,8 @@ def build_report(
             try:
                 _all_rows = _today_res.get("rows") or []
                 _full = evaluate_early_pool(
-                    _all_rows, lit_history=_lit_hist, top_pool=len(_all_rows)
+                    _all_rows, lit_history=_lit_hist, top_pool=len(_all_rows),
+                    code_to_themes=_s_c2t,
                 )
                 _dpath = append_theme_score_daily(_full, today)
                 if _dpath:
@@ -2091,6 +2126,7 @@ def build_report(
             desc_lookup=_desc,
             material_lookup=_material,
             own_theme_lookup=build_own_theme_lookup(trade_date=str(today)),
+            sustain_ctx=_sustain,
         )
         # 理由素材: raw 内に既にある動意理由（TDNet 開示タイトル・Yahoo ニュース見出し）を
         # 主導銘柄ごとに集めて別掲する。誌面には出さず Claude の「動いた理由」列の材料にする。

@@ -72,8 +72,13 @@ from theme_radar import (
     build_desc_lookup,
     build_material_lookup,
     build_own_theme_lookup,
+    build_sustain_context,
     compute_theme_heat_v2,
     detect_night,
+    load_earnings_flags,
+    load_rank_history,
+    load_theme_map,
+    _load_history as _tr_load_history,
     render_heat_section,
     render_internal_flags,
     render_reason_material,
@@ -712,6 +717,29 @@ def main() -> None:
             pct_key="pts_pct",
             heading="## 本夜の動意母集団（材料一覧・Claude がここからテーマを括る）",
         )
+        # 持続文脈（2026-09-07 PM 承認）: テーマ見出しの直後へ「点灯の持続・
+        # ランキング推移・構成銘柄の業績トレンド」を機械で添え、誌面の駆動要因を
+        # 材料から書けるようにする。入力は全て追跡済み parquet で GHA でも読める。
+        # 取れなければ 0 行（＝従来と同一の raw）になり、誌面へは影響しない。
+        _sustain = None
+        try:
+            _s_hist = _tr_load_history(None)
+            _s_c2t, _s_size, _s_stale, _s_exc = load_theme_map()
+            _s_rank = load_rank_history()
+            _s_fin = load_earnings_flags(str(target))
+
+            def _sustain(_row):
+                return build_sustain_context(
+                    _row, hist=_s_hist, code_to_themes=_s_c2t,
+                    rank_hist=_s_rank, fin_flags=_s_fin, end=str(target),
+                )
+            print(
+                "持続文脈: ランキング{}日分・業績フラグ{}件".format(
+                    len(_s_rank), len(_s_fin))
+            )
+        except Exception as _e:
+            print(f"  [WARN] 持続文脈の準備: {_e}")
+            _sustain = None
         # 熱量表は熱量降順。当夜1位テーマは必ず含める（night を渡す）。
         # own_theme_lookup: 過去に Claude が材料から作った自前テーマ名を優先表示する（改修4）。
         lines += render_heat_section(
@@ -720,6 +748,7 @@ def main() -> None:
             desc_lookup=_desc,
             material_lookup=_material,
             own_theme_lookup=build_own_theme_lookup(trade_date=str(target)),
+            sustain_ctx=_sustain,
         )
         lines += render_reason_material(night, heat, _material)
         internal_flags += render_internal_flags(night)

@@ -49,6 +49,19 @@ THEME_MASTER_PATH = BASE_DIR / ".." / "outputs" / "theme_master_minkabu.parquet"
 # 動意上位100銘柄の日次蓄積先
 MOVERS_HISTORY_PATH = _THEME_RADAR_OUT_DIR / "movers_top100_daily.parquet"
 
+# 持続文脈ブロック（2026-09-07 PM 承認）。誌面の理由文で「資金が入り続けている理由」を
+# 材料から書けるように、テーマ見出しの直後へ機械が数値を添える。誌面の見出し・表・
+# OWN_THEMES_JSON には一切影響しない（raw への追記のみ）。
+SUSTAIN_CTX_MAX_BYTES = 600      # 1テーマあたりの持続文脈ブロックの上限バイト数
+SUSTAIN_CTX_EARN_DAYS = 90       # 業績トレンドで見る開示の遡り日数
+SUSTAIN_CTX_EARN_MAX = 3         # 業績トレンドの最大行数（上限超過時はここまで絞る）
+SUSTAIN_CTX_GUIDANCE_MIN = 0.10  # 会社予想の上方修正とみなす営業利益の増加率
+SUSTAIN_CTX_YOY_MIN = 50.0       # 四半期営業利益 YoY の閾値（%）
+# みんかぶ／株探テーマランキングの日次蓄積（fetch_theme_momentum.py が更新）
+THEME_MOMENTUM_PATH = BASE_DIR / ".." / "outputs" / "theme_momentum.parquet"
+# 開示日付き四半期業績（GHA が更新・追跡済み）
+FINANCIAL_HISTORY_PATH = BASE_DIR / ".." / "outputs" / "financial_history_master.parquet"
+
 # 銘柄コンテキスト（「何の会社」＋「なぜ動いた」材料）の日次蓄積先。
 # 2026-08-31 PM 指示。当日の動意上位100銘柄しか EDINET 事業概要・材料テキストを取得しない
 # ため、熱量テーマの主導銘柄が当日 Top100 圏外だと「何の会社」が空欄（―）になり、材料も
@@ -1645,6 +1658,7 @@ def evaluate_early_pool(
     entries_merged: list[dict],
     lit_history: dict | None = None,
     top_pool: int = EARLY_TOP_POOL,
+    code_to_themes: dict | None = None,
 ) -> list[dict]:
     """当日 score 上位 `top_pool` 件を**ゲート判定前のまま**評価して返す（記録用）。
 
@@ -2022,6 +2036,7 @@ def render_early_candidates(
     pct_key: str = "return_pct",
     today_labels: set | None = None,
     max_codes: int = EARLY_LEAD_CODES,
+    sustain_ctx=None,
 ) -> list[str]:
     """`## 初動候補テーマ（機械抽出）` の raw ブロックを返す（v17・2026-09-03 PM 指示）。
 
@@ -2093,6 +2108,13 @@ def render_early_candidates(
         )
         lines.append(head)
         lines.append("")
+        # 持続文脈（2026-09-07 PM 承認）: `材料:` プレースホルダの直前へ置く。
+        # 取れない場合は 0 行になり、従来の出力と完全に一致する。
+        if sustain_ctx is not None:
+            try:
+                lines += sustain_ctx(r)
+            except Exception:
+                pass
         lines.append("材料: （ここに1文）")
         lines.append("")
         lines.append("| コード | 銘柄名 | 何の会社 | 時価総額 | 騰落率 |")
@@ -3004,6 +3026,7 @@ def render_heat_section(
     candidates: int = HEAT_CANDIDATES,
     material_lookup=None,
     own_theme_lookup=None,
+    sustain_ctx=None,
 ) -> list[str]:
     """`## 直近2週間の熱いテーマ` をテーマごとのブロック形式で返す（2026-08-31 PM 確定）。
 
@@ -3082,6 +3105,13 @@ def render_heat_section(
             head += "　【当日掲載済み】"
         lines.append(head)
         lines.append("")
+        # 持続文脈（2026-09-07 PM 承認）: 駆動要因を材料から書くための機械値。
+        # 取れない場合は 0 行になり、従来の出力と完全に一致する。
+        if sustain_ctx is not None:
+            try:
+                lines += sustain_ctx(r)
+            except Exception:
+                pass
         # 共通理由の1文は Claude が書く（raw では空行のプレースホルダを置かない）。
         if r["codes"]:
             lines += _lead_stock_table(
@@ -3097,6 +3127,304 @@ def render_heat_section(
         else:
             lines += ["（主導銘柄なし）", ""]
     return lines
+
+
+# --------------------------------------------------------------------------
+# 持続文脈ブロック（2026-09-07 PM 承認）
+# --------------------------------------------------------------------------
+# 誌面の理由文（_cr §38 の2段構成）の駆動要因側を「材料から」書けるようにするため、
+# テーマ見出しの直後へ機械が次の3点を添える。誌面の見出し行・表・OWN_THEMES_JSON へは
+# 一切触れない（raw への追記だけ）。取れない項目は行ごと省略する（空欄・「なし」を書かない）。
+#   1. 点灯の持続   … 直近10営業日の点灯日数と、点灯日の +3% 銘柄の売買代金の推移
+#   2. ランキング推移 … みんかぶランキングの順位推移（辞書名の完全一致のみ）
+#   3. 業績トレンド … 構成銘柄の上方修正・黒字転換・営業利益 YoY +50% 以上
+# 入力は全て追跡済みファイル（movers_top100_daily / theme_momentum /
+# financial_history_master）で、GHA の runner 上でも読める。価格パネル（未追跡・92MB）
+# には依存しない。例外は全て握りつぶし、誌面生成を止めない（配信絶対の原則・_cr §36）。
+
+
+def _sustain_theme_names(row: dict) -> list:
+    """そのテーマの辞書名（統合された構成テーマ名を含む）を返す。"""
+    names = [str(row.get("theme") or "").strip()]
+    for n in (row.get("merged_names") or []):
+        n = str(n).strip()
+        if n and n not in names:
+            names.append(n)
+    return [n for n in names if n]
+
+
+def _sustain_lit_trend(row: dict, hist, code_to_themes: dict, end: str,
+                       window: int = HEAT_WINDOW_DAYS):
+    """「点灯の持続」1行。点灯日数と、点灯日の +3% 銘柄の売買代金の推移。
+
+    点灯の定義は compute_theme_heat_v2 と同一（SUSTAIN_MIN_CODES 銘柄以上）。
+    売買代金は EARLY_MOVE_PCT 以上動いた銘柄の合計（E5 の turn3 と同じ定義）。
+    """
+    if hist is None or getattr(hist, "empty", True) or not code_to_themes:
+        return None
+    names = set(_sustain_theme_names(row))
+    if not names:
+        return None
+    dates = sorted(d for d in hist["date"].unique() if d <= end)
+    past = [d for d in dates if d != end][-int(window):]
+    if not past:
+        return None
+
+    lit = 0
+    series = []  # [(日付, +3%銘柄の売買代金[億円])]
+    for d in past + [end]:
+        day = hist[hist["date"] == d].drop_duplicates(subset=["code"]).to_dict("records")
+        if not day:
+            continue
+        scored = score_one_day(day, code_to_themes)
+        hit = None
+        for t in names:
+            v = scored.get(t)
+            if v and len(v.get("codes") or []) >= SUSTAIN_MIN_CODES:
+                if hit is None or len(v.get("codes") or []) > len(hit.get("codes") or []):
+                    hit = v
+        if hit is None:
+            continue
+        if d != end:
+            lit += 1
+        turn3 = 0.0
+        for c in (hit.get("codes") or []):
+            try:
+                if float(c.get("return_pct") or 0) >= EARLY_MOVE_PCT:
+                    turn3 += float(c.get("turnover") or 0)
+            except (TypeError, ValueError):
+                continue
+        if turn3 > 0:
+            series.append((d, turn3 / 1e8))
+
+    if lit <= 0 and not series:
+        return None
+    out = "点灯 {}/{} 日".format(lit, len(past))
+    if series:
+        tail = series[-3:]
+        parts = []
+        for d, oku in tail:
+            if d == end:
+                label = "当日"
+            else:
+                back = len(past) - past.index(d) if d in past else 0
+                label = "{}日前".format(back)
+            parts.append("{} {:.0f}億".format(label, oku))
+        if parts:
+            out += "・+3%銘柄の代金 " + "→".join(parts)
+    return out
+
+
+def _sustain_rank_trend(row: dict, rank_hist: dict, end: str):
+    """「ランキングの推移」1行。辞書名の完全一致のみ（曖昧一致で誤テーマを付けない）。"""
+    if not rank_hist:
+        return None
+    names = _sustain_theme_names(row)
+    days = sorted(d for d in rank_hist if d <= end)[-(HEAT_WINDOW_DAYS + 1):]
+    if not days:
+        return None
+    for name in names:                       # 完全一致のみ
+        seen = [(d, rank_hist[d][name]) for d in days if name in rank_hist[d]]
+        if not seen:
+            continue
+        picks, used = [], set()
+        for target in (days[0], days[len(days) // 2], days[-1]):
+            for d, rk in seen:
+                if d == target and d not in used:
+                    used.add(d)
+                    picks.append((d, rk))
+        if len(picks) < 2:
+            picks = seen[-2:]
+        if len(picks) < 2:
+            return None
+        parts = []
+        for d, rk in picks:
+            back = len(days) - 1 - days.index(d)
+            label = "当日" if back == 0 else "{}日前".format(back)
+            parts.append("{} {}位".format(label, int(rk)))
+        return "みんかぶ順位 " + "→".join(parts)
+    return None
+
+
+def _sustain_earnings(row: dict, fin_flags: dict, limit: int = SUSTAIN_CTX_EARN_MAX) -> list:
+    """「構成銘柄の業績トレンド」行のリスト。該当なしなら空リスト（行を出さない）。"""
+    if not fin_flags:
+        return []
+    out = []
+    for c in (row.get("codes") or []):
+        code = str(c.get("code") or "").strip()
+        f = fin_flags.get(code)
+        if not f:
+            continue
+        name = str(c.get("name") or "").strip()
+        out.append("{}: {} {} {} {}".format(
+            f["kind"], code, name, f["date"], f["detail"]).rstrip())
+        if len(out) >= max(int(limit or 0), 0):
+            break
+    return out
+
+
+def load_rank_history(path=None) -> dict:
+    """みんかぶランキングを {日付文字列: {テーマ名: 最良順位}} で返す（失敗時は空）。"""
+    p = Path(path) if path else THEME_MOMENTUM_PATH
+    try:
+        if not p.exists():
+            return {}
+        df = pd.read_parquet(p)
+        df = df[df["source"].astype(str) == "minkabu"]
+        if df.empty:
+            return {}
+    except Exception:
+        return {}
+    out = defaultdict(dict)
+    try:
+        for snap, theme, rk in zip(df["snapshot_date"].astype(str),
+                                   df["theme_name"].astype(str),
+                                   pd.to_numeric(df["rank"], errors="coerce")):
+            if rk != rk:                      # NaN
+                continue
+            cur = out[snap].get(theme)
+            if cur is None or rk < cur:       # popular / rise のうち上位を採る
+                out[snap][theme] = float(rk)
+    except Exception:
+        return {}
+    return dict(out)
+
+
+def load_earnings_flags(end: str, path=None, days: int = SUSTAIN_CTX_EARN_DAYS) -> dict:
+    """開示日付き業績から {コード: {kind, date, detail}} を返す（失敗時は空）。
+
+    判定は build_star_signals.build_earnings_flags と同じ定義。
+      - 上方修正 : 同一年度内で ForecastOperatingProfit が直前開示比 +10% 以上
+      - 黒字転換 : 単独四半期の営業利益が前年同四半期の赤字から黒字へ
+      - 営業増益 : 四半期営業利益 YoY が +50% 以上
+    価格パネル（未追跡・92MB）を必要としないよう、鮮度は開示日と対象営業日の差で見る。
+    """
+    p = Path(path) if path else FINANCIAL_HISTORY_PATH
+    try:
+        if not p.exists():
+            return {}
+        fin = pd.read_parquet(p, columns=[
+            "Code", "AnnouncementDate", "FiscalQuarter", "FiscalYear",
+            "OperatingProfit", "ForecastOperatingProfit", "YoY_OP",
+        ])
+    except Exception:
+        return {}
+    try:
+        end_ts = pd.Timestamp(str(end)).normalize()
+        fin = fin.copy()
+        fin["Code"] = fin["Code"].astype(str)
+        fin["AnnouncementDate"] = pd.to_datetime(fin["AnnouncementDate"], errors="coerce")
+        fin = fin[fin["AnnouncementDate"].notna()]
+        fin = fin[fin["AnnouncementDate"] <= end_ts]
+        fin = fin[fin["AnnouncementDate"] >= end_ts - pd.Timedelta(days=int(days) * 4)]
+        if fin.empty:
+            return {}
+        fin["FYkey"] = fin["FiscalYear"].astype(str)
+
+        # 上方修正: 同一年度内で直前開示の会社予想と比べる
+        fin = fin.sort_values(["Code", "FYkey", "AnnouncementDate"])
+        prev = pd.to_numeric(
+            fin.groupby(["Code", "FYkey"])["ForecastOperatingProfit"].shift(1),
+            errors="coerce")
+        cur = pd.to_numeric(fin["ForecastOperatingProfit"], errors="coerce")
+        fin["fcast_chg"] = (cur / prev - 1).where(prev.notna() & (prev.abs() > 0))
+
+        # 黒字転換: 単独四半期の営業利益（累計の差分）が前年同期の赤字から黒字へ
+        qn = {"1Q": 1, "2Q": 2, "3Q": 3, "FY": 4, "4Q": 4}
+        fs = fin[fin["FiscalQuarter"].isin(qn)].copy()
+        turn = {}
+        if not fs.empty:
+            fs["qn"] = fs["FiscalQuarter"].map(qn)
+            fs = fs.sort_values(["Code", "FYkey", "qn", "AnnouncementDate"])
+            fs = fs.drop_duplicates(["Code", "FYkey", "qn"], keep="last")
+            fs = fs.sort_values(["Code", "FYkey", "qn"])
+            op = pd.to_numeric(fs["OperatingProfit"], errors="coerce")
+            cum_prev = pd.to_numeric(
+                fs.groupby(["Code", "FYkey"])["OperatingProfit"].shift(1), errors="coerce")
+            prev_qn = fs.groupby(["Code", "FYkey"])["qn"].shift(1)
+            contiguous = (prev_qn == fs["qn"] - 1)
+            fs["std_op"] = op.where(fs["qn"] == 1, (op - cum_prev).where(contiguous))
+            fs = fs.sort_values(["Code", "qn", "FYkey"])
+            fs["std_prev_yr"] = fs.groupby(["Code", "qn"])["std_op"].shift(1)
+            fired = fs[(fs["std_op"] > 0) & fs["std_prev_yr"].notna() & (fs["std_prev_yr"] <= 0)]
+            for code, d in zip(fired["Code"].astype(str), fired["AnnouncementDate"]):
+                turn[(code, d)] = True
+
+        cutoff = end_ts - pd.Timedelta(days=int(days))
+        out = {}
+        yoy = pd.to_numeric(fin["YoY_OP"], errors="coerce")
+        for code, d, chg, y in zip(fin["Code"].astype(str), fin["AnnouncementDate"],
+                                   fin["fcast_chg"], yoy):
+            if d < cutoff:
+                continue
+            kind = detail = None
+            if chg == chg and chg >= SUSTAIN_CTX_GUIDANCE_MIN:
+                kind, detail = "上方修正", "通期営業利益 +{:.0f}%".format(chg * 100)
+            elif turn.get((code, d)):
+                kind, detail = "黒字転換", "四半期営業利益が黒字へ"
+            elif y == y and y >= SUSTAIN_CTX_YOY_MIN:
+                kind, detail = "営業増益", "四半期営業利益 YoY +{:.0f}%".format(y)
+            if not kind:
+                continue
+            old = out.get(code)
+            if old is None or old["_d"] < d:
+                out[code] = {"kind": kind, "date": "{}/{}".format(d.month, d.day),
+                             "detail": detail, "_d": d}
+        for v in out.values():
+            v.pop("_d", None)
+        return out
+    except Exception:
+        return {}
+
+
+def build_sustain_context(row: dict, hist=None, code_to_themes=None,
+                          rank_hist=None, fin_flags=None, end=None,
+                          max_bytes: int = SUSTAIN_CTX_MAX_BYTES) -> list:
+    """1テーマ分の `持続文脈:` ブロック（行のリスト）を返す。取れなければ空リスト。
+
+    出力はテーマ見出しの直後・材料一覧（`{M/D}時点の材料:`）の直前へ置く。
+    各項目は取れない場合に行ごと省略する（空欄や「なし」を書かない）。
+    合計が max_bytes を超える場合は業績トレンドを上位から削って収める。
+    """
+    end = str(end or datetime.now(JST).date().isoformat())
+    items = []
+    try:
+        s = _sustain_lit_trend(row, hist, code_to_themes or {}, end)
+        if s:
+            items.append(s)
+    except Exception:
+        pass
+    try:
+        s = _sustain_rank_trend(row, rank_hist or {}, end)
+        if s:
+            items.append(s)
+    except Exception:
+        pass
+    try:
+        earn = _sustain_earnings(row, fin_flags or {})
+    except Exception:
+        earn = []
+
+    def _pack(extra):
+        # 1行目は点灯の持続とランキング推移（テーマ全体の数値）、業績トレンドは
+        # 銘柄ごとの事実なので必ず箇条書きへ分ける（項目の種類で置き場所を固定する）。
+        if not items and not extra:
+            return []
+        if items:
+            # 1行目にテーマ全体の数値、業績トレンドは箇条書きへ。
+            return ["持続文脈: " + "／".join(items)] + ["  - " + x for x in extra]
+        # 持続の数値が取れず業績だけの場合は、空ラベルを作らず先頭を業績にする
+        # （空欄・「なし」を書かない）。
+        return ["持続文脈: " + extra[0]] + ["  - " + x for x in extra[1:]]
+
+    lines = _pack(earn)
+    while lines and len("\n".join(lines).encode("utf-8")) > int(max_bytes) and earn:
+        earn = earn[:-1]
+        lines = _pack(earn)
+    if lines and len("\n".join(lines).encode("utf-8")) > int(max_bytes):
+        return []
+    return (lines + [""]) if lines else []
 
 
 def render_reason_material(
