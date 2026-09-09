@@ -28,17 +28,52 @@ from playwright.sync_api import sync_playwright
 _FONT_DIR = Path(__file__).resolve().parent.parent / "assets" / "fonts"
 
 # レポート種別 → (英語キッカー, 日本語ラベル, アクセント色)
+# PM 2026-09-08 指示: 誌面の色を PALETTE（本ファイル冒頭の唯一の正）へ完全に規則化したため、
+# 種別ごとのアクセント色は廃止し全種別を黒 #1A1A1A に揃えた（旧のレンガ色はパレット外のため全廃）。
+# 現在アクセント色を参照するのは廃止済みの .md-card（カード自動変換・呼び出し停止中）だけで、
+# 実際に描画される見出し・マストヘッド・引用ブロックはいずれも固定色（黒 / 濃紺）である。
+# 3 要素タプルの形は呼び出し元（send_report_pdf_discord.py 等）が依存するため変えない。
 KIND_META = {
-    "macro":    ("MACRO REPORT",   "マクロレポート",     "#2F6DB5"),
-    "sector":   ("SECTOR REPORT",  "セクターレポート",   "#2E8B6B"),
-    "movers":   ("MARKET MOVERS",  "動意銘柄レポート",   "#C8762F"),
-    "ideas":    ("INVESTMENT IDEAS","投資アイデア",      "#7A5AA6"),
-    "earnings": ("EARNINGS",       "決算レポート",       "#1F8A8A"),
-    "themes":   ("THEMES",         "テーマレポート",     "#B8902A"),
-    "stock":    ("EQUITY RESEARCH","個別銘柄レポート",   "#B5483D"),
-    "largecap_weekly": ("LARGE CAP WEEKLY", "週次大型株速報", "#1F3A93"),
-    "review": ("DEV REVIEW", "開発レビュー資料", "#555F73"),
+    "macro":    ("MACRO REPORT",   "マクロレポート",     "#1A1A1A"),
+    "sector":   ("SECTOR REPORT",  "セクターレポート",   "#1A1A1A"),
+    "movers":   ("MARKET MOVERS",  "動意銘柄レポート",   "#1A1A1A"),
+    "ideas":    ("INVESTMENT IDEAS","投資アイデア",      "#1A1A1A"),
+    "earnings": ("EARNINGS",       "決算レポート",       "#1A1A1A"),
+    "themes":   ("THEMES",         "テーマレポート",     "#1A1A1A"),
+    "stock":    ("EQUITY RESEARCH","個別銘柄レポート",   "#1A1A1A"),
+    "largecap_weekly": ("LARGE CAP WEEKLY", "週次大型株速報", "#1A1A1A"),
+    "review": ("DEV REVIEW", "開発レビュー資料", "#1A1A1A"),
 }
+
+# ── 誌面パレット（PM 2026-09-08 指示・唯一の正）──────────────────────
+# 誌面に出てよい色はこの集合だけである。PDF 生成の直前に最終 HTML（CSS を含む）から
+# 全ての色指定を抽出し、この集合に無い色が 1 つでもあれば PaletteViolation を投げて
+# 生成を失敗させる（_palette_check）。「雰囲気で色を使う」ことを機械的に不可能にする。
+#
+#   #1A1A1A 黒   : 本文・見出し（h1/h2/h3）・本文太字・code・リンク・結論行の本文
+#   #1A2A44 濃紺 : 表ヘッダ背景・結論行の箱の左罫・表紙帯の罫線と kicker
+#   #E8EEF6 薄紺 : 結論行の箱の背景
+#   #F6F8FB 薄灰 : 表の偶数行
+#   #E3E8EF 灰罫 : 表の行間罫
+#   #C8D1DD 灰罫 : 表の最終行罫
+#   #EEF1F5 灰   : code の背景
+#   #DBE1E9 灰罫 : 見出しの上罫・hr
+#   #8A94A6 灰   : 箇条書きのマーカー
+#   #6B7686 灰   : マストヘッドのメタ行・フッタのページ番号
+#   #9AA3B0 灰   : .md-card（廃止済み・残置 CSS）の区切り記号
+#   #FFFFFF 白   : 表ヘッダの文字・紙面
+#   #1F8A4C 緑   : プラスの増減数値（レンダラ自動）
+#   #C0392B 赤   : マイナスの増減数値と ▼▽（レンダラ自動）／結論行の箱の中の太字 1 つ
+PALETTE = frozenset({
+    "#1A1A1A", "#1A2A44", "#E8EEF6", "#F6F8FB", "#E3E8EF", "#C8D1DD",
+    "#EEF1F5", "#DBE1E9", "#8A94A6", "#6B7686", "#9AA3B0",
+    "#FFFFFF", "#1F8A4C", "#C0392B",
+})
+
+
+class PaletteViolation(RuntimeError):
+    """誌面 HTML にパレット外の色が現れた（PDF 生成を失敗させる）。"""
+
 
 _WEEKDAY_JP = ["月", "火", "水", "木", "金", "土", "日"]
 
@@ -117,7 +152,7 @@ html {{ -webkit-print-color-adjust:exact; print-color-adjust:exact; }}
 }}
 body {{
   font-family:{sans};
-  font-size:12pt; line-height:1.8; color:#222222;
+  font-size:12pt; line-height:1.8; color:#1A1A1A;
   margin:0; padding:0;
   letter-spacing:.04em; font-feature-settings:"palt" 0;
   font-synthesis:none; -webkit-font-synthesis:none;
@@ -126,9 +161,11 @@ body {{
 }}
 
 /* ── マストヘッド ── */
-.masthead {{ margin:0 0 20px; padding:0 0 13px; border-bottom:2.2pt solid {accent}; }}
+/* PM 2026-09-08: 表紙帯（マストヘッドの下罫）とキッカーは濃紺 #1A2A44 に固定する
+   （種別ごとのアクセント色をやめ、誌面の色を許可リストへ揃える）。 */
+.masthead {{ margin:0 0 14px; padding:0 0 10px; border-bottom:2.2pt solid #1A2A44; }}
 .masthead .kicker {{
-  font-size:9pt; font-weight:700; letter-spacing:.34em; color:{accent};
+  font-size:9pt; font-weight:700; letter-spacing:.34em; color:#1A2A44;
   text-transform:uppercase; margin:0 0 6px;
 }}
 .masthead h1 {{
@@ -149,7 +186,7 @@ body {{
    強制改ページ（break-before:page）は掛けない（_cr §39 の 1/3 空白禁止に抵触するため）。 */
 h1 {{
   font-family:{serif}; font-weight:700; font-size:22pt; color:#1A1A1A;
-  margin:32px 0 15px; padding:0;
+  margin:22px 0 10px; padding:0;
   line-height:1.25; letter-spacing:.04em; text-align:left;
   white-space:nowrap; overflow:hidden;
 }}
@@ -157,23 +194,29 @@ h1 {{
 /* ── 見出し（1.25 タイポグラフィックスケール）── */
 h2 {{
   font-weight:700; font-size:17.5pt; color:#1A1A1A;
-  margin:26px 0 10px; padding:9px 0 0; border-top:1.2pt solid #DBE1E9;
+  margin:18px 0 7px; padding:7px 0 0; border-top:1.2pt solid #DBE1E9;
   letter-spacing:.02em; text-align:left;
 }}
+/* PM 2026-09-08 指示: 誌面の色は許可リスト（濃紺＝表ヘッダ・引用ブロック左線・表紙帯／
+   緑赤＝増減数値と ▼▽（レンダラ自動））のみとし、それ以外は黒へ統一する。
+   h3 は従来アクセント色（個別銘柄 = レンガ色の赤）で描いていたが、その直下に h5 昇格した
+   太字 1 行も同じ赤で並び、色とサイズが混在して読みづらかったため黒へ戻す。 */
 h3 {{
-  font-size:14pt; font-weight:700; color:{accent}; margin:18px 0 7px;
+  font-size:14pt; font-weight:700; color:#1A1A1A; margin:13px 0 5px;
   letter-spacing:.02em; text-align:left;
 }}
-h4 {{ font-size:12pt; font-weight:700; color:#3C4A63; margin:13px 0 5px; text-align:left; }}
-/* ── h5 = テーマ内の小見出し（「何が起きたか」等）。色付きでインライン太字と区別する。
-   PM 2026-09-05 指示: 見出しの背景塗り・装飾バーは全面禁止（_cr §41）。 ── */
+/* h4 / h5 は使用しない（PM 2026-09-08）。文字サイズ階層は h1 / h2 / h3 / 本文の 4 段に固定し、
+   レンダラが見出し階層を自動で増やすこと（太字 1 行段落の h5 昇格）を廃止した。
+   誌面 md 側でも `####` 以下の見出しはゲートが error で止める。
+   定義は不可逆な削除を避けて残すが、サイズ・色は h3 と本文に揃えて階層を増やさない。 */
+h4 {{ font-size:14pt; font-weight:700; color:#1A1A1A; margin:13px 0 5px; text-align:left; }}
 h5 {{
-  font-size:11pt; font-weight:700; color:{accent};
+  font-size:12pt; font-weight:700; color:#1A1A1A;
   margin:17px 0 6px; padding:0;
-  letter-spacing:.06em; text-align:left;
+  letter-spacing:.02em; text-align:left;
 }}
 
-p {{ margin:9px 0 11px; }}
+p {{ margin:6px 0 8px; }}
 /* 太字は実ボールド字形（NotoSansJP-700 / BIZ UDPGothic-700 を @font-face 埋め込み済み）を使う。
    合成太字を禁じ、字間は親の .04em を継承させて詰め処理を挟ませない。 */
 strong, b, th {{
@@ -183,20 +226,25 @@ strong, b, th {{
 }}
 strong, b {{ color:#1A1A1A; }}
 
-/* ── リード（冒頭サマリー）= エディトリアルな前文 ── */
+/* ── 引用ブロック = 個別銘柄レポートの結論行 / 冒頭リード / 品質注記 ──
+   PM 2026-09-08 指示（結論行の箱を視覚的にはっきり目立たせる）: 背景は薄紺 #E8EEF6
+   （旧のほぼ白い背景は箱として認識できなかった）、左罫は濃紺 #1A2A44、文字色は
+   黒 #1A1A1A、文字サイズは本文継承（12pt）。padding はページ削減のため詰める。 */
 blockquote {{
-  margin:0 0 20px; padding:14px 18px; background:#FAFBFD;
-  border-left:3pt solid {accent};
-  font-size:12.5pt; line-height:1.95; color:#2A3654;
+  margin:0 0 13px; padding:9px 13px; background:#E8EEF6;
+  border-left:4pt solid #1A2A44;
+  line-height:1.8; color:#1A1A1A;
 }}
 blockquote p {{ margin:0; }}
-/* リード内太字はアクセント色（PM 2026-07-13: 黒は読みづらい・青へ戻す）。
-   可読性は色を消すのでなく太字の比率で制御する（prompts 側 §24 でリードの太字を文字数比 1/3 以下に制限）。 */
-blockquote strong {{ color:{accent}; }}
+/* 引用ブロック内の太字は赤（#C0392B）。PM 2026-09-08 指示: 赤の用途は
+   (a) マイナスの増減数値と ▼▽（レンダラ自動） (b) 結論行の箱の中の太字 1 つ の 2 つのみ。
+   書き手は結論行の中の最重要の数値または判定語を `**…**` で 1 つだけ指定し、
+   レンダラがそれを赤太字で描く（2 つ以上は機械ゲートが error で止める）。 */
+blockquote strong {{ color:#C0392B; }}
 
 /* ── リスト ── */
-ul, ol {{ margin:9px 0 12px; padding-left:22px; }}
-li {{ margin:5px 0; padding-left:4px; text-align:left; line-height:1.75; }}
+ul, ol {{ margin:6px 0 9px; padding-left:22px; }}
+li {{ margin:3px 0; padding-left:4px; text-align:left; line-height:1.7; }}
 li::marker {{ color:#8A94A6; }}
 
 /* ── 表（金融レポート調・大きい表はページ分割を許可）── */
@@ -207,57 +255,74 @@ li::marker {{ color:#8A94A6; }}
    に依存するため、同じ設定でも銘柄ごとに実測 8.0pt / 11.0pt とサイズが変動していた
    （動意・決算・週次大型株は幅超過の表が無く実測 12.0pt だったため、個別銘柄だけが潰れていた）。
    fixed + word-break:normal で列幅を本文幅内に固定し、全レポート種別・全銘柄で実測 12.0pt に揃える。 */
+/* PM 2026-09-08 指示: 全ての表を 10.5pt の 1 サイズに固定する（本文 12pt とは別の
+   「表」という粒度として統一する）。列数ごとの段階縮小（旧 cols-5〜8plus の 9.5〜8pt）は
+   同じ誌面で表ごとにサイズが変わる原因だったため復活させない。
+   例外は table.theme-lead / theme-solo の 8.5pt のみ（PM 決定で現状維持）。 */
+/* ── 列幅を内容へ合わせる（PM 2026-09-10 指示）──────────────────
+   【変更】既定を table-layout:fixed → auto にする。fixed は列を等幅に割るため、
+   4 列の CF 表では 1 列目が 153px（内容幅 133px ≒ 全角 9 字）しか取れず
+   「営業キャッシュフロー」（10 字）が必ず「営業キャッシュフ／ロー」と 2 行に折れる一方、
+   数値列（`1,879`）は幅が大量に余っていた（2026-09-10 PM 指摘）。
+   auto は Chromium が内容から列幅を配分するため、項目名列は必要なだけ広がり、
+   数値列は必要なだけに縮む。1 列目と数値セル（レンダラが class="num" を付ける）へ
+   nowrap を当てて「折れないことを Chromium への幅の要求として伝える」ことで、
+   本文セル（長文）だけが折り返す配分になる。
+   幅の上限は width:100% + max-width:100% で本文幅 612px に固定し、
+   はみ出す表だけ後処理 JS（_TABLE_OVERFLOW_FIX_JS）が fixed へ戻す安全弁を持つ
+   （2026-08-30 に fixed を必須化した「表が本文幅を超えるとページ全体が縮小し
+   本文 12pt が実測 8pt まで潰れる」回帰を、その安全弁で構造的に防ぐ）。
+   列幅を % で明示指定した表（theme-lead / theme-solo / shareholders / demand /
+   theme-today / theme-heat）は従来どおり fixed のまま個別に指定する。 */
 table {{
-  border-collapse:collapse; width:100%; margin:13px 0 17px;
-  table-layout:fixed;
-  font-size:10.5pt; line-height:1.6; font-variant-numeric:tabular-nums;
+  border-collapse:collapse; width:100%; max-width:100%; margin:9px 0 12px;
+  table-layout:auto; font-size:10.5pt;
+  line-height:1.55; font-variant-numeric:tabular-nums;
   text-align:left;
 }}
 th {{ white-space:normal; word-break:normal; overflow-wrap:break-word; }}
 thead th {{
-  background:#1A2A44; color:#FFFFFF; font-weight:700; font-size:10.5pt;
-  text-align:left; padding:8px 11px; letter-spacing:.02em;
+  background:#1A2A44; color:#FFFFFF; font-weight:700;
+  text-align:left; padding:6px 9px; letter-spacing:.02em;
   white-space:normal; word-break:normal; overflow-wrap:break-word;
 }}
 /* ヘッダも文節単位で折り返す（nowrap はページ全体の縮小を招くため使わない） */
-thead th:first-child {{ white-space:normal; word-break:normal; overflow-wrap:break-word; }}
+thead th:first-child {{ white-space:nowrap; }}
 tbody td {{
-  padding:7px 10px; border-bottom:0.6pt solid #E3E8EF; vertical-align:middle;
-  line-height:1.55;
+  padding:5px 8px; border-bottom:0.6pt solid #E3E8EF; vertical-align:middle;
+  line-height:1.5;
 }}
-/* 先頭列（項目名）・数値セルの折り返し制御（PM 2026-08-30 実測修正）:
-   white-space:nowrap を全セルに掛けると、長いセルが1行に収まらない場合に Chromium が
-   ページ全体を縮小して辻褄を合わせるため、本文が実測 12pt → 8pt まで潰れる
-   （動意・決算レポートは実測 12.0pt なのに個別銘柄だけ 8.0pt だった原因）。
-   1文字改行の根絶は overflow-wrap:anywhere を使わないことで足り、nowrap は不要。
-   word-break:keep-all により和文は文節を割らずに折り返す。 */
-tbody td:first-child {{ white-space:normal; word-break:normal; overflow-wrap:break-word; }}
-/* 中間列は「短い数値なら折り返さない・長い和文なら文節で折り返す」を両立させる。
-   nowrap を一律に掛けると、条件表や観測方法など長文を中間列に持つ表で1行が page 幅を
-   超え、Chromium がページ全体を縮小する（本文 12pt → 実測 7pt）。max-width で
-   上限を与えたうえで文節折り返しを許可し、数値列は短いため実質的に折り返されない。 */
-tbody td:not(:first-child):not(:last-child) {{
+/* 先頭列（項目名）は折り返さない（PM 2026-09-10 指示）。
+   「営業キャッシュフロー」「フリーキャッシュフロー」のような項目名が途中で折れるのを
+   根絶する。table-layout:auto と組み合わせることで、nowrap は「この列にはこれだけの
+   幅が要る」という要求として Chromium の列幅配分に効く（fixed 下の nowrap は
+   等幅の枠から溢れるだけで意味を成さなかった）。 */
+tbody td:first-child {{ white-space:nowrap; }}
+/* 中間列・最終列は長文を文節で折り返す（説明文列はここに該当する）。
+   数値セルは下の td.num が nowrap で上書きするため折り返さない。 */
+tbody td:not(:first-child) {{
   white-space:normal; word-break:normal; overflow-wrap:break-word;
 }}
-/* 説明文など長文を含む最終列のみ折り返しを許可するが、文節は割らない */
-tbody td:last-child {{ white-space:normal; word-break:normal; overflow-wrap:break-word; }}
+/* 数値セル（レンダラが後処理 JS で class="num" を付ける）。
+   符号・数字・カンマ・小数点・単位記号だけで構成されるセルが対象で、
+   `1,879` `▼4,659` `137.7〜206.6倍` `＋213.4%` のような値が 2 行に折れるのを防ぐ。
+   右揃え + tabular-nums で桁を縦に揃え、金融レポートの体裁にする。 */
+tbody td.num, thead th.num {{
+  white-space:nowrap; text-align:right; font-variant-numeric:tabular-nums;
+}}
 tbody tr:nth-child(even) td {{ background:#F6F8FB; }}
 
-/* ── 列数に応じた自動縮小（PM 2026-09-06 指示・折り返しの予防）──
-   table-layout:fixed は列幅を均等割りするため、列数が増えるほど 1 列の幅が狭まる。
-   本文幅 612px の場合、5 列で約 122px・8 列で約 76px となり、10.5pt の和文では
-   8 列の表の銘柄名（「7532 パン・パシフィック…」等）が 1 文字ずつ縦に折り返した
-   （週次大型株 2026-09-05 実測）。列数はレンダリング前に markdown から数えられるため、
-   JS の実測を待たずに CSS 側で先に文字を縮めて折り返しの発生自体を減らす。
-   カード自動変換（_TABLE_CARDIFY_JS）は最後の受け皿として残し、本規則はその手前で効く。
-   フォント縮小を選んだ理由: 列ごとの width 指定は表の意味を知らないと決められず
-   全レポート共通には書けないが、列数による一律縮小は種別非依存で安全に効くため。 */
-table.cols-5 {{ font-size:9.5pt; }}
-table.cols-6 {{ font-size:9pt; }}
-table.cols-7 {{ font-size:8.5pt; }}
-table.cols-8plus {{ font-size:8pt; }}
+/* ── 列数に応じた自動縮小（2026-09-08 廃止）──
+   【廃止】PM 2026-09-08 指示: 誌面の文字サイズは h1 / h2 / h3 / 本文の 4 階層へ固定し、
+   同一階層（表・段落・箇条書き・引用ブロック）は同一サイズで描く。列数による段階縮小
+   （5 列 9.5pt → 8 列 8pt）は同じ表でも列数次第でサイズが変わり、誌面の文字サイズが
+   ばらつく直接の原因だった。表の折り返しは列数そのものを絞ることで防ぐ（_cr §39 の
+   「表は 3 列以内」が前提であり、列数が増えないなら段階縮小は不要である）。
+   クラス付与 JS（_TABLE_COLS_CLASS_JS）は列幅指定クラス（shareholders / demand）の
+   付与も兼ねるため残すが、cols-N のフォントサイズ指定は外す。パディングだけは
+   列が多い表の詰めとして残す（文字サイズに影響しない）。 */
 table.cols-5 thead th, table.cols-6 thead th,
-table.cols-7 thead th, table.cols-8plus thead th {{ font-size:inherit; padding:6px 7px; }}
+table.cols-7 thead th, table.cols-8plus thead th {{ padding:6px 7px; }}
 table.cols-5 tbody td, table.cols-6 tbody td,
 table.cols-7 tbody td, table.cols-8plus tbody td {{ padding:5px 6px; }}
 /* 横あふれの保険（HTML 表示用。PDF では効かないため列数制限とカード変換で担保する）*/
@@ -270,6 +335,23 @@ tbody tr:last-child td {{ border-bottom:1pt solid #C8D1DD; }}
    何行にも折り返して誌面が読めなくなる（2026-08-31 実測）。列数で表を判別し、
    内容量に比例した幅を colgroup 相当の nth-child で与える。fixed は維持するため
    ページ全体の縮小（本文 12pt → 8pt）は起きない。 */
+/* 列幅を % で明示指定する表は table-layout:fixed を保つ（PM 2026-09-10）。
+   既定を auto へ変えたため、% 指定を効かせるにはこれらの表だけ fixed へ戻す必要がある
+   （auto は width 指定を「目安」としてしか扱わず、内容で押し広げられて配分が崩れる）。
+   これらの表は列幅の実測を PM 承認済みであり、内容任せの再配分をさせない。 */
+table.theme-today, table.theme-heat, table.theme-lead, table.theme-solo,
+table.shareholders, table.shareholders3, table.demand {{ table-layout:fixed; }}
+/* fixed の表では 1 列目 nowrap（枠から溢れて隣列へ被る）を打ち消し、従来の折り返しへ戻す。
+   これらの表は 1 列目にも列幅を % で与えているため、その幅の中で折り返すのが正しい。 */
+table.theme-today tbody td:first-child, table.theme-heat tbody td:first-child,
+table.theme-lead tbody td:first-child, table.theme-solo tbody td:first-child,
+table.shareholders tbody td:first-child, table.shareholders3 tbody td:first-child,
+table.demand tbody td:first-child,
+table.theme-today thead th:first-child, table.theme-heat thead th:first-child,
+table.shareholders thead th:first-child, table.shareholders3 thead th:first-child,
+table.demand thead th:first-child {{
+  white-space:normal; word-break:normal; overflow-wrap:break-word;
+}}
 /* 3列＝本日のテーマ: テーマ / 主導銘柄 / 動いた理由 */
 table.theme-today th:nth-child(1), table.theme-today td:nth-child(1) {{ width:26%; }}
 table.theme-today th:nth-child(2), table.theme-today td:nth-child(2) {{ width:38%; }}
@@ -410,13 +492,16 @@ h5 + table.theme-lead, h5 + p + table.theme-lead {{ margin-top:4px; }}
   white-space:nowrap;
 }}
 .md-card .md-card-key::after {{ content:"："; color:#9AA3B0; font-weight:400; }}
-.md-card .md-card-val {{ color:#222222; }}
+.md-card .md-card-val {{ color:#1A1A1A; }}
 
+/* PM 2026-09-08: 文字色を黒へ（赤は引用ブロック内の太字のみ）。サイズは本文を継承する。 */
 code {{
-  background:#EEF1F5; padding:1px 5px; border-radius:3px; color:#B5483D;
-  font-family:'Consolas','Courier New',monospace; font-size:10pt;
+  background:#EEF1F5; padding:1px 5px; border-radius:3px; color:#1A1A1A;
+  font-family:'Consolas','Courier New',monospace;
 }}
-hr {{ border:0; border-top:0.8pt solid #DBE1E9; margin:20px 0; }}
+/* PM 2026-09-08: リンクは黒・下線なし（既定の青リンクを誌面から排除する）。 */
+a {{ color:#1A1A1A; text-decoration:none; }}
+hr {{ border:0; border-top:0.8pt solid #DBE1E9; margin:14px 0; }}
 
 /* ── 改ページ制御（改ページ由来の空白をページの 1/3 以上作らない・_cr §39）──
    鉄則（2026-09-01 PM 承認で改定）: **ブロックの塊送りより空白最小を優先する**。
@@ -463,8 +548,35 @@ _NEG = "#C0392B"  # 下落=赤
 # （PM 2026-08-30: ▲22百万円・+271百万円 が黒のままだった不具合の是正）。
 _SIGNED_UNIT = "百万円|千円|億円|兆円|円|株|口|件|社|倍|pt|ポイント|%|％"
 _RE_SIGNED = re.compile(
-    r"([+＋−\-▲△])(\d[\d,]*(?:\.\d+)?)(\s*(?:" + _SIGNED_UNIT + r"))?"
+    r"([+＋−\-▲△▼▽ー])(\d[\d,]*(?:\.\d+)?)(\s*(?:" + _SIGNED_UNIT + r"))?"
 )
+
+
+# ── 符号の正規化（PM 2026-09-09 指示）────────────────────────
+# 文章中の数値へ色を使うのを止めたため、増減の向きは記号そのもので読ませる。
+# プラスは全角 `＋`（U+FF0B）、マイナスは `▼` に統一し、半角 `+` / `-`（および
+# `−` U+2212・全角長音 `ー` の誤用）を符号として誌面に残さない。
+# 対象の判定は着色と同一（単位付き または 小数を含む 符号付き数値）であり、
+# 単位も小数点も無い裸の符号付き整数（年号 2026-09-08・銘柄コード 485A-…・
+# `-2σ` のような単位なし表記）は対象外になる。
+# `▲`（和文会計のマイナス）は書き手の意図した表記として保存し、触らない。
+_SIGN_NORMALIZE = {"+": "＋", "＋": "＋", "-": "▼", "−": "▼", "ー": "▼"}
+
+
+def _normalize_sign(sign: str) -> str:
+    """符号 1 文字を誌面表記（＋ / ▼）へ正規化する。▲△▼▽ はそのまま返す。"""
+    return _SIGN_NORMALIZE.get(sign, sign)
+
+
+def _normalize_signed_text(text: str) -> str:
+    """符号付き数値の符号を ＋ / ▼ へ正規化する（着色はしない）。"""
+    def _repl(m: "re.Match[str]") -> str:
+        sign, num, unit = m.group(1), m.group(2), m.group(3) or ""
+        if not unit and "." not in num:
+            return m.group(0)
+        return f"{_normalize_sign(sign)}{num}{unit}"
+
+    return _RE_SIGNED.sub(_repl, text)
 
 
 def _colorize_signed(m: "re.Match[str]") -> str:
@@ -472,27 +584,262 @@ def _colorize_signed(m: "re.Match[str]") -> str:
     # 単位も小数点も無い符号付き整数（コード/年/順位）は着色しない
     if not unit and "." not in num:
         return m.group(0)
-    color = _NEG if sign in "−-▲△" else _POS
-    return f'<span style="color:{color};font-weight:700">{sign}{num}{unit}</span>'
+    color = _NEG if sign in "−-▲△▼▽ー" else _POS
+    # 表セルでも符号は ＋ / ▼ へ正規化したうえで着色する（本文と表記を揃える）。
+    return (
+        f'<span style="color:{color};font-weight:700">'
+        f"{_normalize_sign(sign)}{num}{unit}</span>"
+    )
+
+
+# 既に着色済みの span（`<span style="color:…">…</span>`）を丸ごと 1 トークンとして拾う。
+# 単独矢印の着色でこの中の ▼▽ を二重に包まないための境界検出に使う。
+_RE_COLORED_SPAN = re.compile(r'<span style="color:[^"]*"[^>]*>.*?</span>', re.S)
+
+
+def _colorize_cell_text(text: str) -> str:
+    """テキストノード 1 個へ符号付き数値・▼▽ の着色を適用する。
+
+    段落・箇条書き・結論行の箱・表セルのいずれのテキストノードにも同じ処理を使う
+    （PM 2026-09-09: 文章中の着色を復活）。
+
+    符号付き数値（`▼8.1%` 等）は `_colorize_signed` が符号ごと 1 つの span に包む。
+    そのあとで単独の ▼▽（数値を伴わないトレンド矢印）だけを着色するため、
+    既に span に包まれた区間を除外してから置換する（二重に span を入れ子にすると
+    パレット検査は通るが不要なタグが増え、フォントウェイトも重複するため）。
+    """
+    text = _RE_SIGNED.sub(_colorize_signed, text)
+
+    # 単独の ▲△ は着色しない（和文会計では ▲12.3% がマイナスを意味するため、
+    # 上昇矢印として緑に塗ると増減を逆に読ませる）。▼▽ のみ下落として扱う。
+    def _arrows(seg: str) -> str:
+        return (seg.replace("▼", f'<span style="color:{_NEG}">▼</span>')
+                   .replace("▽", f'<span style="color:{_NEG}">▽</span>'))
+
+    out: list[str] = []
+    pos = 0
+    for m in _RE_COLORED_SPAN.finditer(text):
+        out.append(_arrows(text[pos:m.start()]))
+        out.append(m.group(0))  # 着色済み区間はそのまま
+        pos = m.end()
+    out.append(_arrows(text[pos:]))
+    return "".join(out)
+
+
+# HTML のテキストノード（タグの外側）だけを取り出す。`<...>` に挟まれない区間が対象で、
+# タグの属性値（href・style・class 等）へ正規化が及ばないことをこの分割で保証する。
+_RE_HTML_TAG = re.compile(r"<[^>]+>")
+
+
+def _normalize_signs_in_text_nodes(html: str) -> str:
+    """HTML 全体のテキストノードに対して符号を ＋ / ▼ へ正規化する。
+
+    PM 2026-09-09 指示: 文章中の数値に色を使わなくなったため、増減の向きは符号そのもので
+    はっきり読ませる。`+9.5%` → `＋9.5%`、`-8.1%` → `▼8.1%` とし、半角 `+` / `-` を
+    符号として誌面に残さない。段落・箇条書き・結論行・表セルの全てに適用し、
+    レポート種別（kind）による差は設けない。
+
+    対象は着色と同一の判定（単位付き または 小数を含む 符号付き数値）であり、
+    年号（2026-09-08）・銘柄コード（485A-…）・範囲のハイフン・`-2σ` のような
+    単位も小数点も無い表記は判定条件から外れるため触らない。
+    """
+    out: list[str] = []
+    pos = 0
+    for m in _RE_HTML_TAG.finditer(html):
+        out.append(_normalize_signed_text(html[pos:m.start()]))
+        out.append(m.group(0))  # タグはそのまま（属性値を書き換えない）
+        pos = m.end()
+    out.append(_normalize_signed_text(html[pos:]))
+    return "".join(out)
+
+
+# ── 表セル限定・単位なし符号付き整数（PM 2026-09-10 指示）─────────────
+# `_RE_SIGNED` の着色・正規化は「単位付き または 小数を含む」符号付き数値だけを対象とし、
+# 単位も小数点も無い裸の符号付き整数（年号 2026・銘柄コード・`-2σ` の σ 抜き表記・順位）
+# は年号・コードの誤爆を避けるため意図的に除外している。
+# その結果 §6 の CF 表の `-4,659`・`+2,515` が半角符号のまま黒で描かれていた（PM 指摘）。
+#
+# 表の中では「セル全体が符号付き整数だけで構成される」ことが増減値であることの十分な根拠に
+# なる（年号は `2026年12月期` のように単位・接尾語を伴い、銘柄コードは符号を持たず、
+# 順位は `3位` のように単位を伴うため、いずれもセル全体一致の条件を満たさない）。
+# よって表セル限定・セル全体一致に限って ＋／▼ へ正規化し緑赤で着色する。
+# 段落・箇条書き・結論行の単位なし整数は従来どおり対象外のまま変えない。
+#
+# 適用は `_normalize_signs_in_text_nodes` → 着色 の一連より **前** に行い、完成した
+# 着色済み span を置く。後段は `_RE_COLORED_SPAN` でその区間を丸ごと 1 トークンとして
+# 読み飛ばすため、span が二重に入れ子になることはない（既存の順序と不変条件を維持する）。
+_RE_TABLE_CELL = re.compile(r"(<t[dh](?:\s[^>]*)?>)(.*?)(</t[dh]>)", re.S)
+# セル全体が符号付き整数（カンマ可）であること。前後の空白のみ許す。
+# 小数・単位・和文・他の文字が 1 つでも混じれば一致しない。
+_RE_CELL_SIGNED_INT = re.compile(r"^\s*([+＋−\-])(\d[\d,]*)\s*$")
+# セルが `<strong>` / `<em>` だけで包まれている場合はその中身をセル本体とみなす
+# （誌面 md が `| **-100** |` と書いた形。包みタグは保存して中身だけを着色する）。
+_RE_CELL_WRAPPER = re.compile(
+    r"^\s*(<(strong|b|em|i)>)(.*?)(</\2>)\s*$", re.S
+)
+
+
+def _colorize_table_signed_ints(html: str) -> str:
+    """表セルのうち「セル全体が符号付き整数」のものを ＋／▼ へ正規化し着色する。
+
+    `-4,659` → `<span …赤…>▼4,659</span>` / `+2,515` → `<span …緑…>＋2,515</span>`。
+    セル全体一致に限るため、`2026年12月期`（単位あり）・`485A`（符号なし）・
+    `1,331〜1,520`（範囲）・`-1,073 → 黒字化`（他の文字を含む）はいずれも対象外になる。
+    """
+
+    def _repl(m: "re.Match[str]") -> str:
+        open_tag, inner, close_tag = m.group(1), m.group(2), m.group(3)
+        # `<strong>-100</strong>` のように包みタグ 1 枚だけが挟まる形も本体として扱う。
+        pre, post = "", ""
+        w = _RE_CELL_WRAPPER.match(inner)
+        if w:
+            pre, post, inner = w.group(1), w.group(4), w.group(3)
+        mm = _RE_CELL_SIGNED_INT.match(inner)
+        if not mm:
+            return m.group(0)
+        sign, num = mm.group(1), mm.group(2)
+        color = _NEG if sign in "−-" else _POS
+        return (
+            f'{open_tag}{pre}<span style="color:{color};font-weight:700">'
+            f"{_normalize_sign(sign)}{num}</span>{post}{close_tag}"
+        )
+
+    return _RE_TABLE_CELL.sub(_repl, html)
 
 
 def _colorize_numbers(html: str) -> str:
-    """生成 HTML 中の騰落率・トレンド矢印を上昇=緑/下落=赤で確定着色する（renderer 側で保証・LLM 非依存）。
+    """符号を ＋ / ▼ へ正規化し、全テキストノードを上昇=緑/下落=赤で確定着色する。
 
-    金融レポートの一目可読性のため、本文・表セル内の +X%/−X%・符号付きリターンと 8 週トレンド帯の
-    ▲▼ を色分けする。着色は render 後の HTML に対して行い、タグ属性へ符号付き数値は出ないため安全。
+    PM 2026-09-09 指示（着色・確定）: 着色の適用範囲は **HTML の全テキストノード**
+    （段落 `<p>` / 箇条書き `<li>` / 結論行の箱 `<blockquote>` / 表セル `<td>` `<th>`）である。
+    一度「表セルの中だけ」に限定したが、増減の視認性を優先して文章中の着色を復活させた
+    （PM 2026-09-09 撤回指示）。書き手は色を指定せず、レンダラが機械的に塗る。
+
+    PM 2026-09-09 指示（符号）: 増減の符号は全要素で ＋ / ▼ に正規化する。正規化を
+    着色より先に全要素へ適用し、そのうえで同じテキストノードを緑赤で着色する。
+
+    処理は render 後の HTML に対して行い、テキストノード（`<...>` に挟まれない区間）
+    のみを対象とするため、タグの属性値（href・style・class 等）は書き換わらない。
+    着色は各テキストノードにつき 1 回だけ走り、その時点でノード内に span は存在しない
+    ため、着色済み span が二重に入れ子になることはない。
     """
-    html = _RE_SIGNED.sub(_colorize_signed, html)
-    # 単独の ▲△ は着色しない（和文会計では ▲12.3% がマイナスを意味するため、
-    # 上昇矢印として緑に塗ると増減を逆に読ませる）。▼▽ のみ下落として扱う。
-    html = (html.replace("▼", f'<span style="color:{_NEG}">▼</span>')
-                .replace("▽", f'<span style="color:{_NEG}">▽</span>'))
-    return html
+    # 表セル限定の単位なし符号付き整数を先に処理する（PM 2026-09-10）。
+    # ここで完成した着色済み span を置き、以降の正規化・着色はその区間へ触れない。
+    html = _colorize_table_signed_ints(html)
+
+    def _pass(fn, text: str) -> str:
+        """着色済み span の区間を丸ごと保存したまま、その外側だけへ fn を適用する。
+
+        span の中身へ再び正規化・着色を掛けると、`▼4,659` の ▼ が単独矢印として
+        もう一度 span に包まれ、span が二重に入れ子になる（PM 2026-09-10 の
+        表セル限定処理を先に走らせるため、この保護が必要になった）。
+        """
+        parts: list[str] = []
+        p = 0
+        for mm in _RE_COLORED_SPAN.finditer(text):
+            parts.append(fn(text[p:mm.start()]))
+            parts.append(mm.group(0))  # 着色済み区間はそのまま
+            p = mm.end()
+        parts.append(fn(text[p:]))
+        return "".join(parts)
+
+    html = _pass(_normalize_signs_in_text_nodes, html)
+
+    def _colorize_text_nodes(seg: str) -> str:
+        out: list[str] = []
+        pos = 0
+        for m in _RE_HTML_TAG.finditer(seg):
+            out.append(_colorize_cell_text(seg[pos:m.start()]))
+            out.append(m.group(0))  # タグはそのまま（属性値を書き換えない）
+            pos = m.end()
+        out.append(_colorize_cell_text(seg[pos:]))
+        return "".join(out)
+
+    return _pass(_colorize_text_nodes, html)
+
+
+# ── パレット検査（PM 2026-09-08 指示）──────────────────────────
+# 最終 HTML（CSS を含む）に現れる色指定を全て抽出し、PALETTE 以外が 1 つでもあれば
+# PaletteViolation を投げて PDF 生成を失敗させる。「雰囲気で色を使う」ことを機械的に
+# 不可能にするための最終防波堤であり、CSS・レンダラの自動着色・誌面 md の直書きの
+# どこから混入しても同じ場所で捕まる。
+#
+# 検査対象は「HTML/CSS として色を指定している箇所」だけである。base64 で埋め込んだ
+# フォント（@font-face の data: URL）は英数字の羅列に `#RRGGBB` と同じ並びが偶然
+# 現れうるため、検査前に丸ごと除外する。
+_RE_FONT_DATA = re.compile(r"src:url\(data:font/woff2;base64,[^)]*\)")
+_RE_HEX = re.compile(r"#([0-9A-Fa-f]{6}|[0-9A-Fa-f]{3})\b")
+_RE_FUNC_COLOR = re.compile(r"\brgba?\s*\(|\bhsla?\s*\(", re.I)
+# `color:` / `background:` / `border:` 等の色を取りうるプロパティに CSS 色名
+# （red・blue・crimson 等）が書かれていないかを見る。色名は 1 つも許可しない
+# （パレットは hex でのみ定義するため、色名で書けた時点で規則外である）。
+_RE_COLOR_PROP = re.compile(
+    r"\b(?:color|background|background-color"
+    r"|border(?:-(?:top|right|bottom|left|color))?"
+    r"|outline|fill|stroke)"
+    r"\s*:\s*([^;\}\"']+)",
+    re.I,
+)
+# 色名ではない安全な値（レイアウト用のキーワード・単位・none 等）。
+_COLOR_SAFE_TOKENS = frozenset({
+    "none", "transparent", "inherit", "initial", "unset", "currentcolor", "auto",
+    "solid", "dashed", "dotted", "double", "groove", "ridge", "inset", "outset",
+    "hidden", "exact", "left", "right", "center", "top", "bottom", "repeat",
+    "no-repeat", "cover", "contain", "border-box", "content-box", "padding-box",
+})
+
+
+def _expand_hex(h: str) -> str:
+    """`#abc` → `#AABBCC`（大文字正規化）。"""
+    h = h.upper()
+    if len(h) == 4:
+        return "#" + "".join(c * 2 for c in h[1:])
+    return h
+
+
+def _palette_check(full_html: str) -> None:
+    """最終 HTML の色指定を検査し、PALETTE 外があれば PaletteViolation を投げる。"""
+    html = _RE_FONT_DATA.sub("src:url()", full_html)
+
+    bad_hex = sorted({
+        _expand_hex(m.group(0)) for m in _RE_HEX.finditer(html)
+        if _expand_hex(m.group(0)) not in PALETTE
+    })
+    bad_func = sorted({m.group(0).strip() for m in _RE_FUNC_COLOR.finditer(html)})
+
+    bad_names: set[str] = set()
+    for m in _RE_COLOR_PROP.finditer(html):
+        for tok in re.split(r"[\s,]+", m.group(1).strip()):
+            t = tok.strip().lower()
+            if not t or t in _COLOR_SAFE_TOKENS:
+                continue
+            if t.startswith("#") or t.startswith("rgb") or t.startswith("hsl"):
+                continue  # hex / 関数形は上の検査が担当する
+            if re.fullmatch(r"[-+]?[\d.]+(?:px|pt|em|rem|%|mm|cm|in|vw|vh)?", t):
+                continue  # 太さ・サイズの数値
+            if re.fullmatch(r"[a-z]{3,}", t):
+                bad_names.add(t)
+
+    if not (bad_hex or bad_func or bad_names):
+        return
+    parts = []
+    if bad_hex:
+        parts.append("パレット外の hex: " + " / ".join(bad_hex))
+    if bad_func:
+        parts.append("関数形の色指定: " + " / ".join(bad_func))
+    if bad_names:
+        parts.append("色名での指定: " + " / ".join(sorted(bad_names)))
+    raise PaletteViolation(
+        "誌面にパレット外の色があります（"
+        + "、".join(parts)
+        + "） → 対処: bi/pipelines/lib/md_to_pdf.py の PALETTE にある色へ寄せるか、"
+        "PM 承認のうえ PALETTE へ追加する。誌面 md へ色を直書きしている場合はそれを削る"
+    )
 
 
 # 時価総額サイズ目印（PM 2026-06-30 確定・LLM 非依存で renderer が付与）。
 # 個別株を列挙する見出し（### …（… 時価総額 X億/兆円 …））に対し時価総額で区分タグを挿入:
-#   100億以上=無印 / 50〜100億未満=〔小型 ◯◯億〕 / 50億未満=〔極小 ◯◯億・対象外〕（赤太字）。
+#   100億以上=無印 / 50〜100億未満=〔小型 ◯◯億〕 / 50億未満=〔極小 ◯◯億・対象外〕（黒太字）。
 # PM は100億未満を基本回避・50億以下は禁止リスト（playbook/entry_exit_rules.md §3-6）。
 _SIZE_MCAP_RE = re.compile(r"時価総額\s*([\d,]+(?:\.\d+)?)\s*(兆|億)円")
 _SIZE_PCT_RE = re.compile(r"(\s*[+\-−][\d.]+\s*%\s*)(（)")
@@ -502,14 +849,16 @@ def _size_tag(mcap_oku: float | None) -> str | None:
     if mcap_oku is None:
         return None
     if mcap_oku <= 50:
-        return f'<span style="color:{_NEG};font-weight:700">〔極小 {mcap_oku:.0f}億・対象外〕</span>'
+        # PM 2026-09-08: 赤を外し黒太字にする（誌面で赤くなるのは引用ブロック内の太字と
+        # 増減数値・▼▽ のみ。サイズ目印は警告だが色ではなく文言と太字で示す）。
+        return '<span style="font-weight:700">〔極小 %.0f億・対象外〕</span>' % mcap_oku
     if mcap_oku < 100:
         return f'〔小型 {mcap_oku:.0f}億〕'
     return None
 
 
 def _inject_size_tags(md_text: str) -> str:
-    """個別株見出し行の時価総額からサイズ目印タグを銘柄名直後に挿入する（極小は赤太字）。"""
+    """個別株見出し行の時価総額からサイズ目印タグを銘柄名直後に挿入する（極小は黒太字）。"""
     out = []
     for line in md_text.split("\n"):
         if line.startswith("### ") and "時価総額" in line and "〔" not in line:
@@ -688,6 +1037,89 @@ _TABLE_COLS_CLASS_JS = r"""
 }
 """
 
+# ── 数値セルへ class="num" を付ける（PM 2026-09-10 指示）─────────────
+# 表の既定を table-layout:auto へ変えたことに伴い、数値セルを nowrap・右揃え・
+# tabular-nums にして「数値が 2 行に折れる」「桁が縦に揃わない」を同時に潰す。
+# 対象は「セル全体が符号・数字・カンマ・小数点・％・円・株・倍・pt・▼▲△▽・→・
+# 全角＋・― のみで構成される」セルであり、和文を 1 文字でも含むセルは対象外。
+# 1 列目（項目名）は既に nowrap のため対象から外す（右揃えにすると項目名が右へ寄る）。
+# ヘッダ側は「その列の本文セルが全て数値セル」の時だけ .num を付け、見出しと数値の
+# 揃えを一致させる（数値列だけ右揃えの列見出しになる）。
+# 列幅を % 指定した表（theme-lead / theme-solo / shareholders / demand 等）は
+# 既に個別の text-align 指定を持つため、右揃えの上書き事故を避けて対象外にする。
+_TABLE_NUM_CLASS_JS = r"""
+() => {
+  // セル全体が数値・記号のみか。table_rules.py の _NUMERIC_CELL と同じ趣旨で運用する。
+  // 和文（かな漢字）を含むセルは false になるため、項目名・説明文は対象にならない。
+  const NUM = /^[\s0-9,.+\-±%％〜～~/()（）＋▲△▼▽→円株倍pt―ー—–−]+$/;
+  const SKIP = ['theme-lead','theme-solo','theme-today','theme-heat',
+                'shareholders','shareholders3','demand'];
+  let n = 0;
+  for (const t of document.querySelectorAll('table')) {
+    if (SKIP.some((c) => t.classList.contains(c))) continue;
+    const hrow = t.querySelector('thead tr') || t.querySelector('tr');
+    if (!hrow) continue;
+    const ncols = hrow.children.length;
+    const tb = t.querySelector('tbody');
+    const rows = tb ? Array.from(tb.rows) : Array.from(t.rows).slice(1);
+    if (!rows.length) continue;
+    // 1 列目は項目名列として除外する（既定 CSS が nowrap・左揃えで扱う）。
+    for (let i = 1; i < ncols; i++) {
+      let seen = 0, numeric = 0;
+      for (const tr of rows) {
+        const c = tr.cells[i];
+        if (!c) continue;
+        const txt = (c.textContent || '').trim();
+        if (!txt) continue;          // 空欄は判定に影響させない
+        seen++;
+        if (NUM.test(txt)) numeric++;
+      }
+      if (!seen || numeric !== seen) continue;  // 1 つでも和文があれば数値列にしない
+      for (const tr of rows) {
+        const c = tr.cells[i];
+        if (c) { c.classList.add('num'); n++; }
+      }
+      if (hrow.children[i]) hrow.children[i].classList.add('num');
+    }
+  }
+  return n;
+}
+"""
+
+
+# ── はみ出しの安全弁（PM 2026-09-10 指示）───────────────────────
+# 1 列目 nowrap ＋ 数値列 nowrap の合計が本文幅（612px）を超える表は、その表だけ
+# table-layout:fixed へ戻す。fixed は等幅割りのため必ず本文幅へ収まり、
+# 「表が本文幅を超えると Chromium がページ全体を縮小し本文 12pt が実測 8pt まで潰れる」
+# という 2026-08-30 の回帰を構造的に防ぐ。フォント縮小はしない（PM 指示で表は 10.5pt 固定）。
+# 戻した表は _LAYOUT_AUDIT_JS が overflow として記録し、呼び出し元のログへ残る。
+_TABLE_OVERFLOW_FIX_JS = r"""
+() => {
+  const SLACK = 2;
+  const fixed = [];
+  for (const t of document.querySelectorAll('table')) {
+    const pw = t.parentElement ? t.parentElement.clientWidth : t.clientWidth;
+    const avail = (pw || t.clientWidth) + SLACK;
+    if (t.scrollWidth <= avail) continue;
+    const hrow = t.querySelector('thead tr') || t.querySelector('tr');
+    const heads = hrow
+      ? Array.from(hrow.children).map((c) => (c.textContent || '').trim())
+      : [];
+    const before = t.scrollWidth;
+    t.style.tableLayout = 'fixed';
+    t.classList.add('overflow-fixed');
+    fixed.push({
+      table: heads[0] || '',
+      cols: heads.length,
+      width_px: before,
+      avail_px: Math.round(avail),
+    });
+  }
+  return fixed;
+}
+"""
+
+
 _TABLE_CARDIFY_JS = r"""
 () => {
   const WRAP_FACTOR = 1.6;   // 行高の何倍を超えたら「折り返している」とみなすか
@@ -821,7 +1253,12 @@ _TABLE_CARDIFY_JS = r"""
 # テキスト段階の字数検査（table_rules.py）は「全角 1 字 = 14px」の推定のため、
 # 数字・半角記号が多いセルを過小評価し、和文の多いセルを過大評価する。
 # 本検査は実際の誌面を測るため、字数の見積もりが将来ずれても必ず折り返しを捕まえる。
-# ラベル列（1 列目）の折り返しは旧カード判定と同じく許容する。
+#
+# PM 2026-09-10 改定: 1 列目（項目名）も検査対象に含める。従来は「営業キャッシュフロー」等の
+# 項目名が 2 行に折れることを許容していたが、PM 指摘（「営業キャッシュフ／ロー」が不細工）を
+# 受けて 1 列目 nowrap を導入したため、折り返しは許容されない事象になった。
+# 併せて、はみ出しの安全弁（_TABLE_OVERFLOW_FIX_JS）が fixed へ戻した表を overflow として
+# 記録する（`table.overflow-fixed` の有無で判別する。フォント縮小はしない）。
 _LAYOUT_AUDIT_JS = r"""
 () => {
   const WRAP_FACTOR = 1.6;
@@ -837,14 +1274,27 @@ _LAYOUT_AUDIT_JS = r"""
     return tb ? Array.from(tb.rows) : Array.from(t.rows).slice(1);
   };
   const wrapped = [];
+  const overflow = [];
   const tables = Array.from(document.querySelectorAll('table'));
   for (const t of tables) {
     const hrow = t.querySelector('thead tr') || t.querySelector('tr');
     const heads = hrow
       ? Array.from(hrow.children).map((c) => (c.textContent || '').trim())
       : [];
+    // 安全弁が fixed へ戻した表・いま実際に本文幅を超えている表を overflow として記録する。
+    const pw = t.parentElement ? t.parentElement.clientWidth : t.clientWidth;
+    if (t.classList.contains('overflow-fixed') || t.scrollWidth > (pw || t.clientWidth) + 2) {
+      overflow.push({
+        table: heads[0] || '',
+        cols: heads.length,
+        width_px: t.scrollWidth,
+        avail_px: pw || t.clientWidth,
+        refit: t.classList.contains('overflow-fixed'),
+      });
+    }
+    // 1 列目（i=0）も含めて全ての本文セルを測る（PM 2026-09-10）。
     for (const tr of bodyRowsOf(t)) {
-      for (let i = 1; i < tr.cells.length; i++) {
+      for (let i = 0; i < tr.cells.length; i++) {
         const c = tr.cells[i];
         const txt = (c.textContent || '').trim();
         if (!txt) continue;
@@ -857,6 +1307,7 @@ _LAYOUT_AUDIT_JS = r"""
           wrapped.push({
             table: heads[0] || '',
             col: heads[i] || String(i),
+            first_col: i === 0,
             text: txt.slice(0, 40),
             lines: Math.round(r * 100) / 100,
             numeric: NUMERIC.test(txt),
@@ -865,7 +1316,7 @@ _LAYOUT_AUDIT_JS = r"""
       }
     }
   }
-  return { n_tables: tables.length, wrapped: wrapped };
+  return { n_tables: tables.length, wrapped: wrapped, overflow: overflow };
 }
 """
 
@@ -896,39 +1347,15 @@ def render_markdown_to_pdf(
             del lines[i]
             break
 
-    # 行全体が太字だけの段落（**…**）= テーマ内の小見出し。GHA 生成 Claude が `#####` でなく
-    # `**太字**` で書くため、ここで確定的に h5 へ昇格し、本文中のインライン強調太字と体裁を明確に
-    # 分ける（PM 指示・LLM 出力に依存せず renderer 側で保証する）。
-    _bold_only = re.compile(r"^\*\*([^*]+)\*\*$")
-    # テーマ2部の見出し行 `**テーマ名**｜局面 加速・熱量 171・前2週比 +146`（_cr §38）。
-    # 行全体が太字ではないため上の _bold_only では拾えないが、意味は同じ小見出しなので
-    # 併せて h5 へ昇格する（2026-08-31 追加）。全角縦棒の後ろはメタ情報として残す。
-    _bold_head_meta = re.compile(r"^\*\*([^*]+)\*\*(｜.+)$")
-    # 初動候補テーマの見出し行 `**1位 …継続11日目**　（本日のテーマ欄にも掲載）`（v18）。
-    # 閉じ `**` の直後に全角スペース+注記が続くだけで `｜` を伴わないため上の
-    # _bold_head_meta では拾えず、行全体も太字ではないため _bold_only にも掛からない。
-    # そのため 1位/3位/5位（継続テーマ＝注記あり）だけ h5 昇格から漏れ、7位/8位（新規
-    # テーマ＝注記なし・_bold_only で昇格）とオレンジ帯装飾が食い違っていた
-    # （2026-09-03 実測）。先頭を `**N位 …**` に限定する（`**何の会社**：…`・
-    # `**なぜ動いた**：…` 等の本文中の太字プレフィックス段落を誤って見出し化しないため）。
-    _bold_head_note = re.compile(r"^\*\*(\d+位[^*]+)\*\*(\s*\S.+)$")
-    promoted = []
-    for ln in lines:
-        stripped = ln.strip()
-        m2 = _bold_only.match(stripped)
-        if m2:
-            promoted.append(f"##### {m2.group(1).strip()}")
-            continue
-        m3 = _bold_head_meta.match(stripped)
-        if m3:
-            promoted.append(f"##### {m3.group(1).strip()}{m3.group(2).rstrip()}")
-            continue
-        m4 = _bold_head_note.match(stripped)
-        if m4:
-            promoted.append(f"##### {m4.group(1).strip()}{m4.group(2).rstrip()}")
-            continue
-        promoted.append(ln)
-    lines = promoted
+    # 太字 1 行の段落を h5 へ自動昇格する処理は廃止した（PM 2026-09-08）。
+    # 旧仕様は `**…**` だけの行・`**テーマ名**｜…` 行・`**N位 …**　（注記）` 行を
+    # `##### …` へ書き換えてアクセント色 11pt の見出しとして描いていた。これにより
+    # (1) 誌面 md に無い見出し階層をレンダラが勝手に増やす (2) `###`（赤 14pt）の直下へ
+    # h5（赤 11pt）が並び、色と文字サイズが混在する という 2 つの問題が起きていた。
+    # 現在は文字サイズ階層を h1 / h2 / h3 / 本文の 4 段に固定し、行全体が太字の段落は
+    # 通常の段落として太字のまま描く（小見出しにしたい場合は誌面 md 側で `###` を使う）。
+    # テーマブロックのラッパ（_wrap_theme_blocks）は `<p><strong>…</strong>…</p>` の形も
+    # 見出しとして拾うため、昇格を止めても改ページ制御は従来どおり効く。
 
     body_md = "\n".join(lines).strip()
     # 内部メタ表現の確定除去（PM 2026-06-27・LLM が本文に書いても renderer 側で必ず削除する）
@@ -952,12 +1379,17 @@ def render_markdown_to_pdf(
 <body>{masthead}{html_body}</body></html>"""
 
     footer_tpl = (
-        f'<div style="width:100%; font-family:sans-serif; font-size:7pt; color:#9aa3b0;'
+        f'<div style="width:100%; font-family:sans-serif; font-size:7pt; color:#6B7686;'
         f' padding:0 14mm; display:flex; justify-content:space-between;">'
         f'<span>{brand}</span>'
         f'<span class="pageNumber"></span>/<span class="totalPages"></span>'
         f'</div>'
     )
+
+    # パレット検査（PM 2026-09-08）。CSS・レンダラの自動着色・誌面 md のどこから
+    # パレット外の色が混入しても、ここで PaletteViolation を投げて生成を失敗させる。
+    # 紙面本体とページ番号フッタの両方を検査する。
+    _palette_check(full_html + footer_tpl)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with sync_playwright() as p:
@@ -983,6 +1415,37 @@ def render_markdown_to_pdf(
                 )
         except Exception as e:  # noqa: BLE001
             print(f"[md_to_pdf] col-class skipped: {e}", file=sys.stderr)
+        # 数値セルへ class="num" を付ける（PM 2026-09-10）。
+        # 表の既定を table-layout:auto へ変えたことと対で、数値列を nowrap・右揃え・
+        # tabular-nums にして「`1,879` が 2 行に折れる」「桁が縦に揃わない」を潰す。
+        try:
+            numed = int(page.evaluate(_TABLE_NUM_CLASS_JS) or 0)
+            print(
+                f"[md_to_pdf] numeric cells: {numed}（数値列を nowrap・右揃えにした）",
+                file=sys.stderr,
+            )
+        except Exception as e:  # noqa: BLE001
+            print(f"[md_to_pdf] num-class skipped: {e}", file=sys.stderr)
+        # はみ出しの安全弁（PM 2026-09-10）。1 列目 nowrap ＋ 数値列 nowrap の合計が
+        # 本文幅を超えた表だけ table-layout:fixed へ戻す（フォント縮小はしない）。
+        # 戻さないと Chromium がページ全体を縮小し本文 12pt が実測 8pt まで潰れる。
+        try:
+            refit = page.evaluate(_TABLE_OVERFLOW_FIX_JS) or []
+            if refit:
+                print(
+                    f"[md_to_pdf] overflow refit: {len(refit)}"
+                    "（本文幅を超えた表を table-layout:fixed へ戻した）",
+                    file=sys.stderr,
+                )
+                for r in refit[:8]:
+                    print(
+                        f"[md_to_pdf]   はみ出し: 表「{r.get('table')}」"
+                        f"{r.get('cols')}列 実幅{r.get('width_px')}px / "
+                        f"本文幅{r.get('avail_px')}px",
+                        file=sys.stderr,
+                    )
+        except Exception as e:  # noqa: BLE001
+            print(f"[md_to_pdf] overflow refit skipped: {e}", file=sys.stderr)
         # カード自動変換は廃止した（PM 2026-09-07）。表は常に表として出力する。
         # PM はカード形式（1行=1ブロック・先頭セルを見出し・残りを「ヘッダ名: 値」）を
         # 承認しておらず、レンダラが誌面の形式を承認なく書き換えることを禁止する。
@@ -1006,19 +1469,27 @@ def render_markdown_to_pdf(
         try:
             layout = page.evaluate(_LAYOUT_AUDIT_JS) or {}
         except Exception as e:  # noqa: BLE001
-            layout = {"error": str(e), "n_tables": 0, "wrapped": []}
+            layout = {"error": str(e), "n_tables": 0, "wrapped": [], "overflow": []}
             print(f"[md_to_pdf] layout audit skipped: {e}", file=sys.stderr)
         render_markdown_to_pdf.last_layout_report = layout
         n_wrapped = len(layout.get("wrapped") or [])
+        n_overflow = len(layout.get("overflow") or [])
         print(
             f"[md_to_pdf] layout audit: tables={layout.get('n_tables', 0)} "
-            f"wrapped_cells={n_wrapped}",
+            f"wrapped_cells={n_wrapped} overflow_tables={n_overflow}",
             file=sys.stderr,
         )
         for w in (layout.get("wrapped") or [])[:8]:
             print(
                 f"[md_to_pdf]   折り返し: 表「{w.get('table')}」列「{w.get('col')}」 "
                 f"{w.get('lines')}行 「{w.get('text')}」",
+                file=sys.stderr,
+            )
+        for o in (layout.get("overflow") or [])[:8]:
+            print(
+                f"[md_to_pdf]   overflow: 表「{o.get('table')}」{o.get('cols')}列 "
+                f"実幅{o.get('width_px')}px / 本文幅{o.get('avail_px')}px "
+                f"（fixed へ戻した={o.get('refit')}）",
                 file=sys.stderr,
             )
         page.pdf(
@@ -1028,7 +1499,10 @@ def render_markdown_to_pdf(
             display_header_footer=True,
             header_template="<div></div>",
             footer_template=footer_tpl,
-            margin={"top": "20mm", "bottom": "16mm", "left": "24mm", "right": "24mm"},
+            # PM 2026-09-08 指示（ページ削減）: 上下マージンを 20/16mm → 16/13mm へ詰める。
+            # 左右 24mm は本文 1 行の全角字数（≒38 字・CJK 最適 35〜40 字）を決めており、
+            # 折り返し実測の前提幅（612px）でもあるため変えない。
+            margin={"top": "16mm", "bottom": "13mm", "left": "24mm", "right": "24mm"},
         )
         browser.close()
     return out_path
@@ -1037,5 +1511,9 @@ def render_markdown_to_pdf(
 # 直近レンダリングでカード変換した表の数（呼び出し元が参照できるようにする）。
 render_markdown_to_pdf.last_cardified = 0
 # 直近レンダリングの誌面実測結果（PM 2026-09-07）。
-# {"n_tables": int, "wrapped": [{"table","col","text","lines","numeric"}, ...]}
-render_markdown_to_pdf.last_layout_report = {"n_tables": 0, "wrapped": []}
+# {"n_tables": int,
+#  "wrapped":  [{"table","col","first_col","text","lines","numeric"}, ...],
+#  "overflow": [{"table","cols","width_px","avail_px","refit"}, ...]}
+render_markdown_to_pdf.last_layout_report = {
+    "n_tables": 0, "wrapped": [], "overflow": []
+}

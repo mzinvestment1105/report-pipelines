@@ -72,6 +72,11 @@ def _required_sections() -> list[tuple[str, str]]:
         num, title = m.group(1), m.group(2)
         if num in OPTIONAL_SECTIONS or num in CONDITIONAL_SECTIONS:
             continue
+        # 廃止セクション（見出しに「（廃止）」を付けたもの）は必須から外す。
+        # PM 2026-09-09: §10 テクニカルの廃止に伴い以降の番号を繰り上げたため、
+        # 正本の見出しは 1〜11 の連番（4-B・7-B を含む）で欠番を持たない。
+        if "廃止" in title:
+            continue
         # 「4. 業績トレンド」→ 主要語は括弧・注記を落とした先頭語
         key = re.split(r"[（(・]", title)[0].strip()
         if key:
@@ -275,34 +280,32 @@ def _check_shareholder_asof(md: str) -> str | None:
 # 直近材料の各件は「何が起きた」「株価の反応」「なぜそう動いたか」の3ラベルを持ち、
 # 「株価の反応」は冒頭で方向（前日比 ±X%・陽線/陰線）を明示する。
 _REACTION_HEADING = re.compile(r"株価が反応した上位\s*[0-9０-９]*\s*件")
-_REACTION_LABELS = (
-    ("**何が起きた**", r"\*\*何が起きた\*\*"),
-    ("**株価の反応**", r"\*\*株価の反応\*\*"),
-    ("**なぜそう動いたか**", r"\*\*なぜそう動いたか\*\*"),
+# PM 2026-09-09: 3 ラベル（`**何が起きた**` 等）の書式は廃止した。本文の太字を全面
+# 禁止したため、各件は見出しなし・太字なしの 1 段落で書き、段落の書き出しを
+# `6/4（反応スコア 77.98）` の形に固定する。この書き出しが件の区切りになる。
+_REACTION_ITEM_HEAD = re.compile(
+    r"^(\s*[0-9０-９]{1,2}\s*/\s*[0-9０-９]{1,2}\s*"
+    r"[（(]\s*反応スコア\s*[0-9０-９.．]+\s*[）)])",
+    re.M,
 )
-# 符号付きパーセンテージ。全角マイナス（−・－）とハイフン各種を許容する。
-_SIGNED_PCT = re.compile(r"[+＋\-−－—–]\s?[0-9０-９]+(?:[.．][0-9０-９]+)?\s*[%％]")
+# 符号付きパーセンテージ。全角マイナス（−・－）とハイフン各種に加え、
+# PM 2026-09-09 の誌面表記（プラス＝全角 `＋`・マイナス＝`▼`）と和文会計の
+# `▲`（マイナス）を許容する。
+_SIGNED_PCT = re.compile(
+    r"[+＋\-−－—–▼▽▲△]\s?[0-9０-９]+(?:[.．][0-9０-９]+)?\s*[%％]"
+)
 _CANDLE = re.compile(r"陽線|陰線")
 
 REACTION_REMEDY = (
-    "株価の反応は 1 行・40 字以内で「前日比 ±X% の陽線／陰線」のみを書く"
-    "（4本値・出来高倍率・売買代金・日中値幅の記載は禁止）"
+    "各件を見出しなし・太字なしの 1 段落で書く。段落の書き出しは"
+    "`6/4（反応スコア 77.98）` の形に固定し、続けて「何が起きたか」"
+    "「株価の反応（前日比 ＋X.XX% / ▼X.XX% の陽線／陰線）」「なぜそう動いたか」を文章で書く"
+    "（`何が起きた:` 等のラベルは付けない。4本値・出来高倍率・売買代金・日中値幅の記載は禁止）"
 )
 
 
-def _reaction_body(md: str, label_line_idx: int, lines: list[str]) -> str:
-    """`**株価の反応**:` 行と、それに続く本文（次の空行または次のラベルまで）を返す。"""
-    buf = [lines[label_line_idx]]
-    for k in range(label_line_idx + 1, min(label_line_idx + 4, len(lines))):
-        s = lines[k].strip()
-        if not s or s.startswith("- **") or s.startswith("**"):
-            break
-        buf.append(lines[k])
-    return "\n".join(buf)
-
-
 def _check_reaction_format(md: str) -> list[str]:
-    """反応3件ブロックのラベル・方向明示を検査する。
+    """反応3件ブロックの段落書式・方向明示を検査する（PM 2026-09-09 新書式）。
 
     「株価が反応した上位N件」の見出しが無い誌面（該当セクションを持たない
     レポート種別）では検査をスキップして空リストを返す。
@@ -310,33 +313,43 @@ def _check_reaction_format(md: str) -> list[str]:
     if not _REACTION_HEADING.search(md):
         return []
 
+    section, sec_line = _reaction_section(md)
+    if not section.strip():
+        return []
+
     errs: list[str] = []
-    lines = md.replace("\r\n", "\n").split("\n")
 
-    # (a) 3ラベルがそれぞれ 3 回以上出現するか
-    for name, pat in _REACTION_LABELS:
-        n = len(re.findall(pat, md))
-        if n < 3:
-            errs.append(
-                f"[反応形式のラベル欠落] 「{name}」の出現が {n} 回（3 回未満）。"
-                f" → 対処: {REACTION_REMEDY}"
-            )
+    # (a) `M/D（反応スコア X）` で書き出す段落が 3 件あるか
+    items = _reaction_items(section)
+    if len(items) < 3:
+        errs.append(
+            f"[反応形式の件数不足] 「M/D（反応スコア X）」で書き出す段落が "
+            f"{len(items)} 件（3 件必要）。 → 対処: {REACTION_REMEDY}"
+        )
 
-    # (b)(c) 「株価の反応」の各行に 前日比 + 符号付き% + 陽線/陰線 があるか
-    for i, raw in enumerate(lines):
-        if not re.search(r"\*\*株価の反応\*\*", raw):
-            continue
-        body = _reaction_body(md, i, lines)
+    # (b) 旧書式のラベルが残っていないか（太字ラベルは全面禁止）
+    old_labels = [
+        lb for lb in ("何が起きた", "株価の反応", "なぜそう動いたか")
+        if re.search(r"\*\*\s*" + lb + r"\s*\*\*", section)
+    ]
+    if old_labels:
+        errs.append(
+            f"[反応形式の旧ラベル残存] 太字ラベル {' / '.join(old_labels)} が残っている。"
+            f" → 対処: {REACTION_REMEDY}"
+        )
+
+    # (c) 各件に 前日比 + 符号付き% + 陽線/陰線 があるか
+    for head, body, _reaction in items:
         lacking: list[str] = []
         if "前日比" not in body:
             lacking.append("「前日比」")
         if not _SIGNED_PCT.search(body):
-            lacking.append("符号付きパーセンテージ（例 +9.5% / -9.88%）")
+            lacking.append("符号付きパーセンテージ（例 ＋9.5% / ▼9.88%）")
         if not _CANDLE.search(body):
             lacking.append("「陽線」または「陰線」")
         if lacking:
             errs.append(
-                f"[反応形式の方向明示] L{i + 1} の株価の反応に "
+                f"[反応形式の方向明示] 「{head}」の段落に "
                 f"{' / '.join(lacking)} が無い。 → 対処: {REACTION_REMEDY}"
             )
 
@@ -414,14 +427,23 @@ def _reaction_section(md: str) -> tuple[str, int]:
 
 
 def _reaction_items(section: str) -> list[tuple[str, str, str]]:
-    """節を「N 件目」単位に切り、(見出し, 本文, 「株価の反応」本文) の一覧を返す。"""
+    """節を 1 件 = 1 段落として切り、(見出し相当, 本文, 「株価の反応」本文) の一覧を返す。
+
+    PM 2026-09-09 で書式を変更した。旧書式は `**N 件目 — M/D（反応スコア X）**` の
+    見出し行と `**何が起きた**:` 等の 3 ラベルを持っていたが、本文の太字を全面禁止した
+    ため見出しもラベルも無くなった。新書式では各件が見出しなし・太字なしの 1 段落で、
+    段落の書き出しが `6/4（反応スコア 77.98）` の形に固定される。
+    その書き出しを件の区切りとして段落単位に切る。
+
+    「株価の反応」は独立したラベルを持たないため、段落全体を反応本文として返す
+    （4 本値の混入検査は段落全体に対して行う）。
+    """
     items: list[tuple[str, str, str]] = []
-    parts = re.split(r"^\s*[-*]?\s*\*\*\s*[0-9０-９]+\s*件目.*?\*\*.*$", section, flags=re.M)
-    heads = re.findall(r"^\s*[-*]?\s*\*\*\s*([0-9０-９]+\s*件目.*?)\*\*.*$", section, flags=re.M)
-    for head, body in zip(heads, parts[1:]):
-        m = re.search(r"\*\*株価の反応\*\*(.*?)(?=\n\s*[-*]\s*\*\*|\Z)", body, re.S)
-        reaction = m.group(1) if m else ""
-        items.append((head.strip(), body, reaction))
+    for m in _REACTION_ITEM_HEAD.finditer(section):
+        start = m.start()
+        nxt = _REACTION_ITEM_HEAD.search(section, m.end())
+        body = section[start:nxt.start()] if nxt else section[start:]
+        items.append((m.group(1).strip(), body, body))
     return items
 
 
@@ -1533,10 +1555,11 @@ def check_demand_table_numbers(md: str) -> tuple[list[str], str]:
 import report_skeleton as _skel  # noqa: E402
 
 # --- 段階導入（spec E-3）------------------------------------------------
-# #8（太字位置）・#9（住所表）・#10（数値の§跨ぎ重複）は誤検知が出やすいため、
-# 骨格適用の最初の 3 本は warning で運用する。誤検知が出ないことを確認した後に
-# 下の 3 定数を True へ変えて error へ昇格させる（PM 承認済みの段階導入手順）。
-BOLD_POSITION_AS_ERROR = False
+# #9（住所表）・#10（数値の§跨ぎ重複）は誤検知が出やすいため warning で運用する。
+# 誤検知が出ないことを確認した後に定数を True へ変えて error へ昇格させる。
+# #8（太字位置）は PM 2026-09-09 指示により True 固定へ移行した
+# （本文の太字を全面禁止し、太字は結論行の箱の中の 1 語だけに限る）。
+BOLD_POSITION_AS_ERROR = True
 ADDRESS_TABLE_AS_ERROR = False
 NUMERIC_DUP_AS_ERROR = False
 
@@ -1643,7 +1666,7 @@ def _check_h2_set(md: str, sk) -> list[str]:
         detail = " / ".join(f"L{ln}「{t}」" for ln, t in extra[:6])
         errs.append(
             f"[骨格/セクション見出し] 骨格の一覧にない `##` が {len(extra)} 件: {detail}"
-            " → 対処: 正本 agents/stock_analyst.md「誌面骨格」節のセクション見出し 16 個の"
+            " → 対処: 正本 agents/stock_analyst.md「誌面骨格」節のセクション見出し一覧の"
             "いずれかへ文言を合わせるか、内容を該当セクションへ移して見出しを削る"
         )
     order = {t: i for i, t in enumerate(sk.h2_order)}
@@ -1710,15 +1733,14 @@ def _check_h3_required(md: str, sk) -> list[str]:
 
 # --- #5 見出しレベル ------------------------------------------------------
 def _check_heading_level(md: str, sk) -> list[str]:
-    errs = []
-    deep = [(ln, lv, t) for ln, lv, t in _skeleton_headings(md) if lv >= 4]
-    if deep:
-        detail = " / ".join(f"L{ln}「{'#' * lv} {t}」" for ln, lv, t in deep[:6])
-        errs.append(
-            f"[骨格/見出しレベル] `####` 以下の見出しが {len(deep)} 件: {detail}"
-            " → 対処: 見出しは `#`・`##`・`###` の 3 段のみ。骨格の許可一覧にある `###` へ上げるか、"
-            "見出しを外して太字リードの段落にする"
-        )
+    """小見出しを禁止したセクションでの `###` を検出する。
+
+    `####` 以上の深さの検査は _check_heading_depth が一手に担当する（PM 2026-09-08）。
+    かつては本関数でも同じ違反を error に積んでおり、1 つの `####` が 2 件の error として
+    二重に報告されていた。検査の責務を「深さ = _check_heading_depth」「セクション別の
+    `###` 可否 = 本関数」へ分離する。
+    """
+    errs: list[str] = []
     if not sk.loaded:
         return errs
     for title, start, _end, body in _h2_spans(md):
@@ -1772,50 +1794,187 @@ def _check_html_tags(md: str) -> list[str]:
 
 # --- #8 太字の位置（当面 warning）----------------------------------------
 _BOLD = re.compile(r"\*\*[^*\n]+\*\*")
-_TECH_LEADS = ("年足の値動き", "月足の値動き", "日足の値動き", "現時点の主要価格水準")
+# §10 テクニカルは 2026-09-08 に廃止したため、リード語の太字免除は撤去した。
 
 
 def _check_bold_position(md: str) -> list[str]:
-    """許可 5 箇所以外の太字を検出する（骨格の装飾表）。"""
+    """結論行（`>` 行）以外の太字を全て検出する（error）。
+
+    PM 2026-09-09 指示: 本文の太字を全面禁止する。旧仕様は §11 のリスク名・§9 の
+    ★★★ 行・表の直前の結論 1 文・直近材料の反応 3 件の見出し語の 4 箇所を許可して
+    いたが、項目名・日付・リスク名・イベント名へ太字が散ることで視覚的な雑音が多く
+    読みにくいと PM が判定した。太字が存在してよいのは結論行の箱の中の 1 語だけ
+    （その 1 語をレンダラが赤太字で描く。個数の検査は _check_key_lines が担う）。
+    表のセル内の太字も error とする。
+    """
     out: list[str] = []
     for title, start, _end, body in _h2_spans(md):
-        num = _skel.section_key(title)
-        in_reaction = False
         for off, line in enumerate(body, 1):
             s = line.strip()
-            if s.startswith("###"):
-                in_reaction = "株価が反応した上位" in s
-                continue
             if not _BOLD.search(line):
                 continue
+            # 結論行（`> `）の中の太字だけが唯一の許可箇所。
+            # 個数の検査は _check_key_lines が error で行うため、ここでは対象外にする。
+            if s.startswith(">"):
+                continue
             ln = start + off
-            if num == "10" and any(s.startswith(f"**{w}**") for w in _TECH_LEADS):
-                continue
-            if num == "11" and re.match(r"^(?:[-*+]\s|\d+[.)]\s)?\*\*", s):
-                continue
-            if num == "9" and s.startswith("★★★"):
-                continue
-            if in_reaction:
-                continue
             if s.startswith("|"):
                 out.append(
                     f"[骨格/太字] L{ln}（{title}）表のセル内に太字があります"
                     " → 対処: 表の中の `**` を全て外す"
                 )
                 continue
-            nxt = ""
-            for j in range(off, len(body)):
-                if body[j].strip():
-                    nxt = body[j].strip()
-                    break
-            if nxt.startswith("|"):
-                continue
             out.append(
-                f"[骨格/太字] L{ln}（{title}）許可されていない位置の太字です: {s[:44]}"
-                " → 対処: 太字は §10 のリード 4 語・§11 のリスク名・§9 の ★★★ 行・"
-                "表の直前の結論 1 文・直近材料の反応 3 件の見出し語だけに限る"
+                f"[骨格/太字] L{ln}（{title}）本文の太字は禁止です: {s[:44]}"
+                " → 対処: `**` を外して素の文で書く。太字が許されるのは"
+                "結論行（`>` の箱）の中の 1 語だけ"
             )
     return out
+
+
+# --- 箇条書きの禁止（PM 2026-09-09・error）--------------------------------
+# 本文は段落で書く。箇条書きが許されるのは §9 カタリストの ★ 行の一覧だけ。
+_BULLET_LINE = re.compile(r"^(?:[-*+]\s|・)")
+# §9 で許される箇条書きは ★ で始まるもののみ（`- ★★★ …` / `★★★ …`）。
+_BULLET_STAR = re.compile(r"^(?:[-*+]\s*)?[★☆]")
+
+BULLETS_REMEDY = (
+    "箇条書きをやめて段落（素の文）で書く。項目名を立てたい場合は"
+    "「項目名は〜」と文の主語にする。箇条書きが許されるのは §9 カタリストの ★ 行の一覧のみ"
+)
+
+
+def _check_bullets(md: str) -> list[str]:
+    """§9 カタリストの ★ 行以外の箇条書きを検出する（error）。
+
+    表の行（`|`）・見出し（`#`）・結論行（`>`）・コードフェンス内は対象外。
+    """
+    out: list[str] = []
+    for title, start, _end, body in _h2_spans(md):
+        num = _skel.section_key(title)
+        in_fence = False
+        hits: list[tuple[int, str]] = []
+        for off, line in enumerate(body, 1):
+            s = line.strip()
+            if s.startswith("```") or s.startswith("~~~"):
+                in_fence = not in_fence
+                continue
+            if in_fence or not s:
+                continue
+            if s.startswith("|") or s.startswith("#") or s.startswith(">"):
+                continue
+            if not _BULLET_LINE.match(s):
+                continue
+            if num == "9" and _BULLET_STAR.match(s):
+                continue  # §9 カタリストの ★ 行の一覧だけは許可
+            hits.append((start + off, s))
+        if not hits:
+            continue
+        detail = " / ".join(f"L{ln}: {t[:36]}" for ln, t in hits[:5])
+        more = f"（他 {len(hits) - 5} 件）" if len(hits) > 5 else ""
+        if num == "9":
+            out.append(
+                f"[骨格/箇条書き] §9 カタリストに ★ で始まらない箇条書きが "
+                f"{len(hits)} 件: {detail}{more}"
+                " → 対処: §9 の箇条書きは `★★★ イベント名 — 説明` の形の ★ 行だけに限る。"
+                "それ以外は段落で書く"
+            )
+        else:
+            out.append(
+                f"[骨格/箇条書き] {title} に箇条書きが {len(hits)} 件: {detail}{more}"
+                f" → 対処: {BULLETS_REMEDY}"
+            )
+    return out
+
+
+# --- 中黒の連打（PM 2026-09-09・warning）----------------------------------
+# 1 文（`。` 区切り）に中黒 `・` が 3 個以上あると読点の代用として羅列に見え読みにくい。
+# 固有名詞に含まれる中黒（「ソフトバンク・ビジョン・ファンド」等）は避けられないため
+# error にはせず warning に留める。
+_NAKAGURO_LIMIT = 3
+
+NAKAGURO_REMEDY = (
+    "1 文の中黒を 2 個以下にする。読点「、」や「と」への置換、"
+    "または文を分けることで羅列を解く（固有名詞に含まれる中黒はそのままでよい）"
+)
+
+
+def _check_nakaguro(md: str) -> list[str]:
+    """1 文に中黒が 3 個以上ある箇所を検出する（warning）。
+
+    表の行・見出し・コードフェンス内は対象外（表は列で区切るため中黒が並びやすい）。
+    """
+    hits: list[tuple[int, str]] = []
+    in_fence = False
+    for i, line in enumerate(md.splitlines(), 1):
+        s = line.strip()
+        if s.startswith("```") or s.startswith("~~~"):
+            in_fence = not in_fence
+            continue
+        if in_fence or not s:
+            continue
+        if s.startswith("|") or s.startswith("#"):
+            continue
+        for sentence in s.split("。"):
+            if sentence.count("・") >= _NAKAGURO_LIMIT:
+                hits.append((i, sentence.strip()))
+                break
+    if not hits:
+        return []
+    detail = " / ".join(f"L{ln}: {t[:40]}" for ln, t in hits[:5])
+    more = f"（他 {len(hits) - 5} 件）" if len(hits) > 5 else ""
+    return [
+        f"[骨格/中黒] 1 文に中黒 {_NAKAGURO_LIMIT} 個以上の箇所が {len(hits)} 件: "
+        f"{detail}{more} → 対処: {NAKAGURO_REMEDY}"
+    ]
+
+
+# --- 半角符号の残存（PM 2026-09-09・warning）------------------------------
+# 文章中の数値に色を使わなくなったため、増減の向きは符号そのもので読ませる。
+# プラスは全角 `＋`、マイナスは `▼` と書き、半角 `+` / `-` を符号として原稿に残さない。
+# レンダラ（bi/pipelines/lib/md_to_pdf.py）が描画時に必ず正規化するため誌面は正しく
+# 出る。原稿側の表記を揃えるための注意喚起であり error にはしない。
+_SIGN_UNIT = "百万円|千円|億円|兆円|円|株|口|件|社|倍|pt|ポイント|%|％"
+_RE_HALF_SIGNED = re.compile(
+    r"([+\-−])(\d[\d,]*(?:\.\d+)?)(\s*(?:" + _SIGN_UNIT + r"))?"
+)
+
+HALF_SIGN_REMEDY = (
+    "増減の符号を全角 `＋` とマイナスの `▼` で書く（`+9.5%` → `＋9.5%`、"
+    "`-8.1%` → `▼8.1%`）。半角 `+` / `-` を符号として本文・表に残さない"
+    "（レンダラが描画時に正規化するため誌面の表示は正しいが、原稿側も揃える）"
+)
+
+
+def _check_half_width_signs(md: str) -> list[str]:
+    """段落・結論行に半角符号の付いた数値が残っている箇所を検出する（warning）。
+
+    対象はレンダラの正規化と同じ判定（単位付き または 小数を含む 符号付き数値）。
+    年号（2026-09-08）・銘柄コード・`-2σ` のような単位も小数点も無い表記は対象外。
+    コードフェンス内と見出しは検査しない。
+    """
+    hits: list[tuple[int, str]] = []
+    in_fence = False
+    for i, line in enumerate(md.splitlines(), 1):
+        s = line.strip()
+        if s.startswith("```") or s.startswith("~~~"):
+            in_fence = not in_fence
+            continue
+        if in_fence or not s or s.startswith("#"):
+            continue
+        for m in _RE_HALF_SIGNED.finditer(line):
+            num, unit = m.group(2), m.group(3) or ""
+            if not unit and "." not in num:
+                continue
+            hits.append((i, m.group(0)))
+    if not hits:
+        return []
+    detail = " / ".join(f"L{ln}: {t}" for ln, t in hits[:6])
+    more = f"（他 {len(hits) - 6} 件）" if len(hits) > 6 else ""
+    return [
+        f"[骨格/符号] 半角符号の付いた数値が {len(hits)} 件: {detail}{more}"
+        f" → 対処: {HALF_SIGN_REMEDY}"
+    ]
 
 
 # --- #9 住所表（当面 warning）--------------------------------------------
@@ -1927,29 +2086,302 @@ def _check_table_headers(md: str, sk) -> list[str]:
     return errs
 
 
-# --- #12 blockquote の範囲 ------------------------------------------------
-def _check_blockquote_scope(md: str) -> list[str]:
-    errs = []
-    for title, start, _end, body in _h2_spans(md):
-        num = _skel.section_key(title)
-        if num == "3":
+# --- #12 結論行（PM 2026-09-08 承認・旧「blockquote の範囲」を置換）-----------
+# 各 `##` セクションの直下に `> ` で始まる結論行を 1 本ずつ置く誌面へ変更した。
+# 旧仕様は「`>` は §3 の掲示板注記 1 行のみ」で、§3 以外の `>` を error にしていた。
+# 検査するのは (1) 位置と本数 (2) 1 本あたりの字数 (3) 全体の合計字数 (4) 太字の個数
+# (5) 指示語での書き出し（warning）。品質注記（`> ⚠️ **品質注記**`）は本数・位置とも
+# 対象外とする（_cr §36 の唯一の絵文字例外であり、結論行ではないため）。
+KEY_LINE_MIN = 40          # 1 本の下限字数
+KEY_LINE_MAX = 180         # 1 本の上限字数
+KEY_LINE_TOTAL_MAX = 3000  # 全結論行の合計上限字数
+_QUALITY_NOTE = re.compile(r"^>\s*\u26a0")
+# 指示語で書き出すと単独で意味が通らない（PM 2026-09-08）
+_DEICTIC = ("これ", "この", "それ", "その", "上記", "前述")
+
+
+def _key_line_text(block: list[str]) -> str:
+    """引用ブロックの行群から `> ` と空白を除いた本文を返す（`**` は残す）。"""
+    out = []
+    for line in block:
+        t = re.sub(r"^>\s?", "", line.lstrip())
+        out.append(t)
+    return "".join(out).replace(" ", "").replace("\u3000", "")
+
+
+def _quote_blocks(body: list[str], start: int) -> list[tuple[int, list[str]]]:
+    """セクション本文中の引用ブロックを [(開始行番号, 行群)] で返す（連続する `>` を 1 塊）。"""
+    blocks: list[tuple[int, list[str]]] = []
+    cur: list[str] = []
+    cur_ln = 0
+    in_fence = False
+    for off, line in enumerate(body, 1):
+        s = line.strip()
+        if s.startswith("```") or s.startswith("~~~"):
+            in_fence = not in_fence
+            if cur:
+                blocks.append((cur_ln, cur))
+                cur = []
             continue
-        hits = [
-            (start + o, l.strip())
-            for o, l in enumerate(body, 1)
-            if l.lstrip().startswith(">")
-        ]
-        if hits:
-            detail = " / ".join(f"L{ln}: {t[:36]}" for ln, t in hits[:4])
+        if in_fence:
+            continue
+        if line.lstrip().startswith(">"):
+            if not cur:
+                cur_ln = start + off
+            cur.append(line)
+            continue
+        if cur:
+            blocks.append((cur_ln, cur))
+            cur = []
+    if cur:
+        blocks.append((cur_ln, cur))
+    return blocks
+
+
+def _is_quality_note(block: list[str]) -> bool:
+    return bool(block) and bool(_QUALITY_NOTE.match(block[0].strip()))
+
+
+def key_lines(md: str) -> list[tuple[str, str]]:
+    """[(## 見出し文言, 結論行本文)] を誌面の順に返す（5 分版の印字にも使う）。
+
+    本文は `> ` を外し空白を詰めるが `**` は残す（誌面の強調をそのまま見せるため）。
+    品質注記は結論行ではないため含めない。
+    """
+    out: list[tuple[str, str]] = []
+    for title, start, _end, body in _h2_spans(md):
+        for _ln, block in _quote_blocks(body, start):
+            if _is_quality_note(block):
+                continue
+            out.append((title, _key_line_text(block)))
+            break
+    return out
+
+
+def _check_key_lines(md: str) -> list[str]:
+    """全 `##` セクション直下の結論行 1 本ずつを検査する（error）。"""
+    errs: list[str] = []
+    total = 0
+    for title, start, _end, body in _h2_spans(md):
+        blocks = [b for b in _quote_blocks(body, start) if not _is_quality_note(b[1])]
+        if not blocks:
             errs.append(
-                f"[骨格/装飾] 引用ブロック（`>`）が §3 の外に {len(hits)} 件: {detail}（{title}）"
-                " → 対処: `>` は §3 の掲示板注記 1 行のみ。他は通常の段落へ直す"
+                f"[骨格/結論行] 「{title}」に結論行がありません"
+                " → 対処: `##` 見出しの直下に `> ` で始まる結論行を 1 本置く"
+                f"（{KEY_LINE_MIN}〜{KEY_LINE_MAX} 字・主語と根拠数値と判断を含め単独で意味が通る 1〜3 文）"
             )
+            continue
+        if len(blocks) > 1:
+            detail = " / ".join(f"L{ln}" for ln, _b in blocks[:4])
+            errs.append(
+                f"[骨格/結論行] 「{title}」に引用ブロックが {len(blocks)} 個あります（{detail}）"
+                " → 対処: 結論行は見出し直下の 1 本だけにし、他は通常の段落へ直す"
+                "（品質注記 `> \u26a0 **品質注記**` のみ例外）"
+            )
+        ln, block = blocks[0]
+        # 位置: 見出しと結論行の間には空行しか置けない
+        for off, line in enumerate(body, 1):
+            if start + off >= ln:
+                break
+            if line.strip():
+                errs.append(
+                    f"[骨格/結論行] 「{title}」の結論行が見出しの直下にありません"
+                    f"（L{start + off} に本文があり結論行は L{ln}）"
+                    " → 対処: 結論行を `##` 見出しのすぐ下（間は空行のみ）へ移す"
+                )
+                break
+        text = _key_line_text(block)
+        n = len(text)
+        total += n
+        if n < KEY_LINE_MIN or n > KEY_LINE_MAX:
+            errs.append(
+                f"[骨格/結論行] 「{title}」の結論行が {n} 字です"
+                f"（規定 {KEY_LINE_MIN}〜{KEY_LINE_MAX} 字）: {text[:40]}"
+                " → 対処: 短い場合は根拠数値を足し、長い場合は本文へ落として 1〜3 文へ収める"
+            )
+        n_bold = len(re.findall(r"\*\*[^*]+\*\*", text))
+        if n_bold > 1:
+            errs.append(
+                f"[骨格/結論行] 「{title}」の結論行に太字が {n_bold} 個あります（上限 1 個）"
+                " → 対処: 最重要の数値または判定語 1 つだけを `**` で囲み、残りの `**` を外す"
+            )
+    if total > KEY_LINE_TOTAL_MAX:
+        errs.append(
+            f"[骨格/結論行] 全結論行の合計が {total} 字です（上限 {KEY_LINE_TOTAL_MAX} 字）"
+            " → 対処: 長い結論行から順に本文へ落として合計を上限内へ収める"
+        )
     return errs
 
 
+def _check_key_line_deictic(md: str) -> list[str]:
+    """結論行が指示語で始まっていないかを見る（warning）。"""
+    warns: list[str] = []
+    for title, text in key_lines(md):
+        head = text.lstrip("*")
+        if head.startswith(_DEICTIC):
+            warns.append(
+                f"[骨格/結論行] 「{title}」の結論行が指示語で始まっています: {text[:32]}"
+                " → 対処: 結論行は単独で意味が通る必要がある。「これ／この／それ／その／上記／前述」"
+                "を主語の実体（会社名・指標名・セクション名）へ置き換える"
+            )
+    return warns
+
+
+# --- 章ごとの本文字数（冗長の排除・PM 2026-09-09 指示・warning）-------------
+# 正本は agents/stock_analyst.md「誌面骨格」E 項と prompts/_common_rules.md §48。
+# 数える対象は本文（段落）だけで、結論行（`>` の箱）・表・★ 行の箇条書き・
+# 見出し・空行は数えない。上限は目安であり warning に留める（送信を止めない）。
+SECTION_LENGTH_MAX: dict[str, int] = {
+    "事業モデル": 250,
+    "直近材料・カタリスト": 900,
+    "1": 150,
+    "2": 500,
+    "3": 500,
+    "4": 500,
+    "4-B": 300,
+    "5": 300,
+    "6": 300,
+    "7": 600,
+    "7-B": 600,
+    "8": 300,
+    "9": 300,
+    "10": 400,
+    "11": 500,
+}
+SECTION_LENGTH_TOTAL_MAX = 6400
+
+
+def _section_length_key(title: str) -> str:
+    """`10. リスク` -> `10`。番号なしの章は見出し文言そのものを返す。"""
+    m = re.match(r"^([0-9]+(?:-[A-Z])?)\.", title.strip())
+    return m.group(1) if m else title.strip()
+
+
+def _body_char_count(body: list[str]) -> int:
+    """段落の実文字数を数える（結論行・表・★ 行・見出し・空行・区切り線を除く）。"""
+    total = 0
+    in_fence = False
+    for line in body:
+        s = line.strip()
+        if s.startswith("```") or s.startswith("~~~"):
+            in_fence = not in_fence
+            continue
+        if in_fence or not s:
+            continue
+        if s.startswith(">"):          # 結論行・品質注記
+            continue
+        if s.startswith("|"):          # 表
+            continue
+        if s.startswith("#"):          # 小見出し
+            continue
+        if s.startswith("---") or s.startswith("==="):
+            continue
+        if s.startswith("★"):          # §9 の ★ 行（箇条書き）
+            continue
+        if s.startswith("→ "):         # 正本への参照行（誌面には出ない）
+            continue
+        total += len(re.sub(r"\s+", "", s))
+    return total
+
+
+def _check_section_length(md: str) -> list[str]:
+    """章ごとの本文字数が目安上限を超えていないかを見る（warning）。"""
+    warns: list[str] = []
+    total = 0
+    for title, _start, _end, body in _h2_spans(md):
+        n = _body_char_count(body)
+        total += n
+        limit = SECTION_LENGTH_MAX.get(_section_length_key(title))
+        if limit is None:
+            continue
+        if n > limit:
+            warns.append(
+                f"[骨格/文字数] 「{title}」の本文が {n} 字です（目安上限 {limit} 字・"
+                f"超過 {n - limit} 字）→ 対処: 表の数値を段落で読み上げ直していないか、"
+                "他章と同じ数値・事実を再掲していないか、結論行の内容を冒頭で繰り返して"
+                "いないか、前置きの言い回し（〜という点にある／言い換えれば／注目すべきは 等）"
+                "が無いかを順に削る。**数値・固有名詞・判断を落とす短縮を禁止する**"
+            )
+    if total > SECTION_LENGTH_TOTAL_MAX:
+        warns.append(
+            f"[骨格/文字数] 本文の合計が {total} 字です（目安上限 {SECTION_LENGTH_TOTAL_MAX} 字・"
+            f"超過 {total - SECTION_LENGTH_TOTAL_MAX} 字）→ 対処: 超過の大きい章から"
+            "冗長パターン (a)〜(f) を削る"
+        )
+    return warns
+
+
+# --- 見出しの深さ（`####` 以上を禁止）--------------------------------------
+def _check_heading_depth(md: str) -> list[str]:
+    deep = [(ln, lv, t) for ln, lv, t in _skeleton_headings(md) if lv >= 4]
+    if not deep:
+        return []
+    detail = " / ".join(f"L{ln}「{'#' * lv} {t}」" for ln, lv, t in deep[:6])
+    more = f"（他 {len(deep) - 6} 件）" if len(deep) > 6 else ""
+    return [
+        f"[骨格/見出しレベル] `####` 以上の深さの見出しが {len(deep)} 件: {detail}{more}"
+        " → 対処: 見出しは `#`・`##`・`###` の 3 段のみ。`###` へ上げるか、見出しを外して素の段落にする"
+    ]
+
+
+# --- 行全体が太字だけの段落を禁止 ------------------------------------------
+_BOLD_ONLY_LINE = re.compile(r"^\*\*[^*]+\*\*$")
+# PM 2026-09-09: 反応 3 件の見出し（`**N 件目 — M/D（反応スコア X）**`）は廃止した。
+# 各件は見出しなし・太字なしの 1 段落で書き、段落の書き出しを
+# `6/4（反応スコア 77.98）` の形に固定する。よって旧 _REACTION_HEAD による
+# 「行全体が太字だけの段落」からの除外は不要になったため撤去した。
+
+
+def _check_bold_only_paragraph(md: str) -> list[str]:
+    """行全体が `**…**` だけの段落を検出する（表の行・見出し行・結論行は対象外）。
+
+    レンダラの h5 自動昇格を廃止した（PM 2026-09-08）ため、この形の行は誌面上
+    「太字の段落」として本文と同じサイズで描かれる。見出しのつもりで書かれると
+    階層が誌面に出ないので、`###` か素の文へ書き直させる。
+    """
+    hits: list[tuple[int, str]] = []
+    in_fence = False
+    for i, line in enumerate(md.splitlines(), 1):
+        s = line.strip()
+        if s.startswith("```") or s.startswith("~~~"):
+            in_fence = not in_fence
+            continue
+        if in_fence or not s:
+            continue
+        if s.startswith("|") or s.startswith("#") or s.startswith(">"):
+            continue
+        if _BOLD_ONLY_LINE.match(s):
+            hits.append((i, s))
+    if not hits:
+        return []
+    detail = " / ".join(f"L{ln}: {t[:36]}" for ln, t in hits[:6])
+    more = f"（他 {len(hits) - 6} 件）" if len(hits) > 6 else ""
+    return [
+        f"[骨格/太字] 行全体が太字だけの段落が {len(hits)} 件: {detail}{more}"
+        " → 対処: 小見出しにするなら `###` を使い、文なら素の文（太字なし）で書く。"
+        "レンダラは太字 1 行を見出しへ昇格しないため、この形は本文サイズの太字段落として出る"
+    ]
+
+
+def print_five_minute_digest(md: str) -> None:
+    """結論行だけを『## 見出し名 → 結論行本文』の順で印字する（5 分版・PM 2026-09-08）。"""
+    rows = key_lines(md)
+    print("")
+    print("== 5 分版（結論行のみ）" + "=" * 30)
+    total = 0
+    for title, text in rows:
+        total += len(text)
+        print(f"## {title}")
+        print(f"   -> {text}")
+    minutes = total / 500.0
+    print(
+        f"== 合計 {total} 字 / 結論行 {len(rows)} 本 / 読了 約{minutes:.1f}分（500 字/分換算）"
+    )
+    print("")
+
+
 def check_skeleton(md: str) -> tuple[list[str], list[str], list[str]]:
-    """誌面骨格の 12 検査。(errors, warnings, info) を返す。"""
+    """誌面骨格の検査群。(errors, warnings, info) を返す。"""
     sk = _skel.load()
     if not sk.loaded:
         return [], [], ["[骨格] 正本の「誌面骨格」節を読めず検査スキップ"]
@@ -1967,7 +2399,12 @@ def check_skeleton(md: str) -> tuple[list[str], list[str], list[str]]:
         ("絵文字", _check_emoji(md)),
         ("HTML タグ", _check_html_tags(md)),
         ("表の列と枚数", _check_table_headers(md, sk)),
-        ("引用の範囲", _check_blockquote_scope(md)),
+        # PM 2026-09-08: 旧「引用の範囲」（§3 以外の `>` を禁止）を結論行検査へ置換した。
+        ("結論行", _check_key_lines(md)),
+        ("見出しの深さ", _check_heading_depth(md)),
+        ("太字のみ段落", _check_bold_only_paragraph(md)),
+        # PM 2026-09-09: 箇条書きは §9 カタリストの ★ 行の一覧のみ許可（本文は段落）。
+        ("箇条書き", _check_bullets(md)),
     ]
     for name, es in hard:
         if es:
@@ -1979,9 +2416,20 @@ def check_skeleton(md: str) -> tuple[list[str], list[str], list[str]]:
 
     # 段階導入: 誤検知が出やすい 3 検査は当面 warning（3 本通過後に error へ昇格）。
     soft = [
+        # 結論行の指示語書き出し（PM 2026-09-08）。単独で意味が通らない書き方の警告。
+        ("結論行の指示語", _check_key_line_deictic(md), False),
         ("太字の位置", _check_bold_position(md), BOLD_POSITION_AS_ERROR),
+        # PM 2026-09-09: 1 文に中黒 3 個以上は羅列に見えて読みにくい。固有名詞に
+        # 含まれる中黒は避けられないため warning に留める。
+        ("中黒の連打", _check_nakaguro(md), False),
+        # PM 2026-09-09: 増減は ＋ / ▼ で明示する。半角 +/- の残存は warning
+        # （レンダラが描画時に正規化するため誌面は正しく出る）。
+        ("符号", _check_half_width_signs(md), False),
         ("住所", _check_address_table(md), ADDRESS_TABLE_AS_ERROR),
         ("数値重複", _check_numeric_duplication(md), NUMERIC_DUP_AS_ERROR),
+        # PM 2026-09-09: 章ごとの本文字数の目安上限。冗長の排除のための警告であり、
+        # 上限を守るために数値・固有名詞・判断を削ることは禁止のため error にしない。
+        ("文字数", _check_section_length(md), False),
     ]
     for name, es, as_error in soft:
         if not es:
@@ -2224,7 +2672,12 @@ def main() -> int:
         print(f"ERROR: report not found: {md_path}")
         return 1
 
-    errors, warnings, info = run_gate(md_path.read_text(encoding="utf-8"), args.code)
+    md_text = md_path.read_text(encoding="utf-8")
+    errors, warnings, info = run_gate(md_text, args.code)
+
+    # 5 分版（結論行のみ）を印字する（PM 2026-09-08）。PM は誌面全文を読む前に
+    # ここだけを読んで筋が通っているかを確認し、送信の可否を判断する。
+    print_five_minute_digest(md_text)
 
     print(f"GATE: {md_path.name}（{args.code}）")
     for m in info:
