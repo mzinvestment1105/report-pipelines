@@ -126,8 +126,14 @@ def _date_label(target_date: str | None) -> str:
     return f"{d.year}年{d.month}月{d.day}日（{_WEEKDAY_JP[d.weekday()]}）"
 
 
-def _layout_css(accent: str, sans: str, serif: str) -> str:
+def _layout_css(accent: str, sans: str, serif: str, kind: str = "macro") -> str:
     """可読性の一次情報（W3C jlreq / Typotheque / WCAG / Butterick）に基づく組版。
+
+    kind: レポート種別。v6（2026-09-10）で導入した表組みの変更（table-layout:auto ＋
+    1 列目・数値列の nowrap）と結論行の赤太字は個別銘柄レポート専用の誌面設計であり、
+    kind == "stock" のときだけ適用する。マクロ・動意・セクター等の 7〜8 列の広い表は
+    v5 の table-layout:fixed ＋ 列数別フォント縮小（cols-5〜8plus）でなければ本文幅
+    612px に収まらず、セルが隣へ重なって描画される（2026-09-10 実測）。
 
     本文 12pt・line-height 1.8・字間 0.04em・色 #222（純黒のハレーション回避）・日本語は両端
     揃え。1 行は左右 24mm マージンで全角≈38 字（CJK 最適 35〜40 字）。見出しは 1.25 スケール。
@@ -138,6 +144,65 @@ def _layout_css(accent: str, sans: str, serif: str) -> str:
     Chromium は最も広い表に合わせてページ全体を縮小するため本文まで道連れに潰れる。
     table-layout:fixed + word-break:normal で表を本文幅に収め、全種別で実測 12.0pt に揃える。
     """
+    stock_layout = kind == "stock"
+
+    # ── 表組み（v6 = 個別銘柄のみ / v5 = それ以外の全種別）──────────────
+    if stock_layout:
+        # v6（PM 2026-09-10）: 列幅を内容へ合わせる。1 列目（項目名）と数値セルへ
+        # nowrap を当て「折れないこと」を Chromium への幅の要求として伝える。
+        # 個別銘柄レポートの表は 3〜4 列に絞られており、この配分が成立する。
+        table_css = """
+table {
+  border-collapse:collapse; width:100%; max-width:100%; margin:9px 0 12px;
+  table-layout:auto; font-size:10.5pt;
+  line-height:1.55; font-variant-numeric:tabular-nums;
+  text-align:left;
+}
+thead th:first-child { white-space:nowrap; }
+tbody td:first-child { white-space:nowrap; }
+tbody td:not(:first-child) {
+  white-space:normal; word-break:normal; overflow-wrap:break-word;
+}
+tbody td.num, thead th.num {
+  white-space:nowrap; text-align:right; font-variant-numeric:tabular-nums;
+}
+table.cols-5 thead th, table.cols-6 thead th,
+table.cols-7 thead th, table.cols-8plus thead th { padding:6px 7px; }
+table.cols-5 tbody td, table.cols-6 tbody td,
+table.cols-7 tbody td, table.cols-8plus tbody td { padding:5px 6px; }
+"""
+    else:
+        # v5（〜2026-09-08）を逐語で復帰。table-layout:fixed で列幅を本文幅内へ固定し、
+        # 列数別のフォント縮小（5 列 9.5pt 〜 8 列以上 8pt）で 7〜8 列の表を収める。
+        # nowrap は一切使わない（nowrap の合計幅が本文幅を超えるとセルが隣へ重なる）。
+        table_css = """
+table {
+  border-collapse:collapse; width:100%; margin:13px 0 17px;
+  table-layout:fixed;
+  font-size:10.5pt; line-height:1.6; font-variant-numeric:tabular-nums;
+  text-align:left;
+}
+thead th:first-child { white-space:normal; word-break:normal; overflow-wrap:break-word; }
+tbody td:first-child { white-space:normal; word-break:normal; overflow-wrap:break-word; }
+tbody td:not(:first-child):not(:last-child) {
+  white-space:normal; word-break:normal; overflow-wrap:break-word;
+}
+tbody td:last-child { white-space:normal; word-break:normal; overflow-wrap:break-word; }
+table.cols-5 { font-size:9.5pt; }
+table.cols-6 { font-size:9pt; }
+table.cols-7 { font-size:8.5pt; }
+table.cols-8plus { font-size:8pt; }
+table.cols-5 thead th, table.cols-6 thead th,
+table.cols-7 thead th, table.cols-8plus thead th { font-size:inherit; padding:6px 7px; }
+table.cols-5 tbody td, table.cols-6 tbody td,
+table.cols-7 tbody td, table.cols-8plus tbody td { padding:5px 6px; }
+"""
+
+    # 引用ブロック内の太字。v6 の赤（#C0392B）は個別銘柄の結論行の箱の専用色であり、
+    # マクロ等のリード段落は `**…**` を通常の強調に使うため v5 どおりアクセント色にする。
+    # KIND_META のアクセントは全種別 #1A1A1A（パレット内）である。
+    blockquote_strong_color = "#C0392B" if stock_layout else accent
+
     return f"""
 * {{ box-sizing:border-box; }}
 html {{ -webkit-print-color-adjust:exact; print-color-adjust:exact; }}
@@ -168,9 +233,15 @@ body {{
   font-size:9pt; font-weight:700; letter-spacing:.34em; color:#1A2A44;
   text-transform:uppercase; margin:0 0 6px;
 }}
+/* マストヘッドの表題は必ず全文を出す（PM 2026-09-10 修正）。
+   下の素の h1 は本文中の市場区切り（`# グロース市場`）を 1 行に固定するため
+   white-space:nowrap; overflow:hidden を持つが、その指定はマストヘッドの表題にも
+   継承され、長い表題（マクロの「…100ドル超えで米株3日続落、日経先物は大幅GD示唆」等）が
+   紙面右端で切り捨てられていた。子孫セレクタで明示的に打ち消して折り返させる。 */
 .masthead h1 {{
   font-family:{serif}; font-weight:700; font-size:24pt; color:#1A1A1A;
   margin:0 0 8px; line-height:1.32; letter-spacing:.01em; text-align:left;
+  white-space:normal; overflow:visible; overflow-wrap:anywhere;
 }}
 .masthead .meta {{ font-size:10pt; color:#6B7686; font-weight:500; letter-spacing:.02em; }}
 .masthead .meta .brand {{ color:#1A1A1A; font-weight:700; letter-spacing:.06em; }}
@@ -239,8 +310,11 @@ blockquote p {{ margin:0; }}
 /* 引用ブロック内の太字は赤（#C0392B）。PM 2026-09-08 指示: 赤の用途は
    (a) マイナスの増減数値と ▼▽（レンダラ自動） (b) 結論行の箱の中の太字 1 つ の 2 つのみ。
    書き手は結論行の中の最重要の数値または判定語を `**…**` で 1 つだけ指定し、
-   レンダラがそれを赤太字で描く（2 つ以上は機械ゲートが error で止める）。 */
-blockquote strong {{ color:#C0392B; }}
+   レンダラがそれを赤太字で描く（2 つ以上は機械ゲートが error で止める）。
+   PM 2026-09-10 修正: 赤は個別銘柄（kind=stock）の結論行の箱だけに限定する。
+   マクロ等のリード段落は `**…**` を通常の強調として使うため、v5 と同じアクセント色
+   （KIND_META 由来・現在は全種別 #1A1A1A）で描く。 */
+blockquote strong {{ color:{blockquote_strong_color}; }}
 
 /* ── リスト ── */
 ul, ol {{ margin:6px 0 9px; padding-left:22px; }}
@@ -274,57 +348,21 @@ li::marker {{ color:#8A94A6; }}
    本文 12pt が実測 8pt まで潰れる」回帰を、その安全弁で構造的に防ぐ）。
    列幅を % で明示指定した表（theme-lead / theme-solo / shareholders / demand /
    theme-today / theme-heat）は従来どおり fixed のまま個別に指定する。 */
-table {{
-  border-collapse:collapse; width:100%; max-width:100%; margin:9px 0 12px;
-  table-layout:auto; font-size:10.5pt;
-  line-height:1.55; font-variant-numeric:tabular-nums;
-  text-align:left;
-}}
+{table_css}
 th {{ white-space:normal; word-break:normal; overflow-wrap:break-word; }}
 thead th {{
   background:#1A2A44; color:#FFFFFF; font-weight:700;
   text-align:left; padding:6px 9px; letter-spacing:.02em;
   white-space:normal; word-break:normal; overflow-wrap:break-word;
 }}
-/* ヘッダも文節単位で折り返す（nowrap はページ全体の縮小を招くため使わない） */
-thead th:first-child {{ white-space:nowrap; }}
 tbody td {{
   padding:5px 8px; border-bottom:0.6pt solid #E3E8EF; vertical-align:middle;
   line-height:1.5;
 }}
-/* 先頭列（項目名）は折り返さない（PM 2026-09-10 指示）。
-   「営業キャッシュフロー」「フリーキャッシュフロー」のような項目名が途中で折れるのを
-   根絶する。table-layout:auto と組み合わせることで、nowrap は「この列にはこれだけの
-   幅が要る」という要求として Chromium の列幅配分に効く（fixed 下の nowrap は
-   等幅の枠から溢れるだけで意味を成さなかった）。 */
-tbody td:first-child {{ white-space:nowrap; }}
-/* 中間列・最終列は長文を文節で折り返す（説明文列はここに該当する）。
-   数値セルは下の td.num が nowrap で上書きするため折り返さない。 */
-tbody td:not(:first-child) {{
-  white-space:normal; word-break:normal; overflow-wrap:break-word;
-}}
-/* 数値セル（レンダラが後処理 JS で class="num" を付ける）。
-   符号・数字・カンマ・小数点・単位記号だけで構成されるセルが対象で、
-   `1,879` `▼4,659` `137.7〜206.6倍` `＋213.4%` のような値が 2 行に折れるのを防ぐ。
-   右揃え + tabular-nums で桁を縦に揃え、金融レポートの体裁にする。 */
-tbody td.num, thead th.num {{
-  white-space:nowrap; text-align:right; font-variant-numeric:tabular-nums;
-}}
 tbody tr:nth-child(even) td {{ background:#F6F8FB; }}
-
-/* ── 列数に応じた自動縮小（2026-09-08 廃止）──
-   【廃止】PM 2026-09-08 指示: 誌面の文字サイズは h1 / h2 / h3 / 本文の 4 階層へ固定し、
-   同一階層（表・段落・箇条書き・引用ブロック）は同一サイズで描く。列数による段階縮小
-   （5 列 9.5pt → 8 列 8pt）は同じ表でも列数次第でサイズが変わり、誌面の文字サイズが
-   ばらつく直接の原因だった。表の折り返しは列数そのものを絞ることで防ぐ（_cr §39 の
-   「表は 3 列以内」が前提であり、列数が増えないなら段階縮小は不要である）。
-   クラス付与 JS（_TABLE_COLS_CLASS_JS）は列幅指定クラス（shareholders / demand）の
-   付与も兼ねるため残すが、cols-N のフォントサイズ指定は外す。パディングだけは
-   列が多い表の詰めとして残す（文字サイズに影響しない）。 */
-table.cols-5 thead th, table.cols-6 thead th,
-table.cols-7 thead th, table.cols-8plus thead th {{ padding:6px 7px; }}
-table.cols-5 tbody td, table.cols-6 tbody td,
-table.cols-7 tbody td, table.cols-8plus tbody td {{ padding:5px 6px; }}
+/* 先頭列・数値列の折り返し制御と、列数に応じたフォント縮小は種別で分岐する
+   （上の table_css を参照）。個別銘柄（v6）は nowrap ＋ table-layout:auto、
+   それ以外の種別（v5）は table-layout:fixed ＋ cols-5〜8plus の段階縮小である。 */
 /* 横あふれの保険（HTML 表示用。PDF では効かないため列数制限とカード変換で担保する）*/
 .table-scroll {{ overflow-x:auto; }}
 tbody tr:last-child td {{ border-bottom:1pt solid #C8D1DD; }}
@@ -586,8 +624,11 @@ def _colorize_signed(m: "re.Match[str]") -> str:
         return m.group(0)
     color = _NEG if sign in "−-▲△▼▽ー" else _POS
     # 表セルでも符号は ＋ / ▼ へ正規化したうえで着色する（本文と表記を揃える）。
+    # white-space:nowrap は符号と数値の分断を防ぐ（PM 2026-09-10 修正）。span が
+    # 独立した折り返し候補になるため、箇条書きで「電気・ガス ＋」で改行し次行が
+    # 「0.75%」になる事故が起きていた。span 全体を 1 トークンとして扱わせる。
     return (
-        f'<span style="color:{color};font-weight:700">'
+        f'<span style="color:{color};font-weight:700;white-space:nowrap">'
         f"{_normalize_sign(sign)}{num}{unit}</span>"
     )
 
@@ -700,7 +741,8 @@ def _colorize_table_signed_ints(html: str) -> str:
         sign, num = mm.group(1), mm.group(2)
         color = _NEG if sign in "−-" else _POS
         return (
-            f'{open_tag}{pre}<span style="color:{color};font-weight:700">'
+            f'{open_tag}{pre}<span style="color:{color};font-weight:700;'
+            f'white-space:nowrap">'
             f"{_normalize_sign(sign)}{num}</span>{post}{close_tag}"
         )
 
@@ -1375,7 +1417,7 @@ def render_markdown_to_pdf(
 </header>"""
 
     full_html = f"""<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"/>
-<style>{_font_face_css()}{_layout_css(accent, sans_stack, serif_stack)}</style></head>
+<style>{_font_face_css()}{_layout_css(accent, sans_stack, serif_stack, kind)}</style></head>
 <body>{masthead}{html_body}</body></html>"""
 
     footer_tpl = (
@@ -1418,19 +1460,24 @@ def render_markdown_to_pdf(
         # 数値セルへ class="num" を付ける（PM 2026-09-10）。
         # 表の既定を table-layout:auto へ変えたことと対で、数値列を nowrap・右揃え・
         # tabular-nums にして「`1,879` が 2 行に折れる」「桁が縦に揃わない」を潰す。
-        try:
-            numed = int(page.evaluate(_TABLE_NUM_CLASS_JS) or 0)
-            print(
-                f"[md_to_pdf] numeric cells: {numed}（数値列を nowrap・右揃えにした）",
-                file=sys.stderr,
-            )
-        except Exception as e:  # noqa: BLE001
-            print(f"[md_to_pdf] num-class skipped: {e}", file=sys.stderr)
+        # 個別銘柄レポート（kind=stock）専用。他種別は table-layout:fixed ＋ 列数別
+        # フォント縮小（v5）で組むため、nowrap を足すとセルが隣へ重なる。
+        if kind == "stock":
+            try:
+                numed = int(page.evaluate(_TABLE_NUM_CLASS_JS) or 0)
+                print(
+                    f"[md_to_pdf] numeric cells: {numed}（数値列を nowrap・右揃えにした）",
+                    file=sys.stderr,
+                )
+            except Exception as e:  # noqa: BLE001
+                print(f"[md_to_pdf] num-class skipped: {e}", file=sys.stderr)
         # はみ出しの安全弁（PM 2026-09-10）。1 列目 nowrap ＋ 数値列 nowrap の合計が
         # 本文幅を超えた表だけ table-layout:fixed へ戻す（フォント縮小はしない）。
         # 戻さないと Chromium がページ全体を縮小し本文 12pt が実測 8pt まで潰れる。
+        # nowrap を当てる kind=stock でのみ意味を持つ（他種別は既に fixed である）。
         try:
-            refit = page.evaluate(_TABLE_OVERFLOW_FIX_JS) or []
+            refit = page.evaluate(_TABLE_OVERFLOW_FIX_JS) if kind == "stock" else []
+            refit = refit or []
             if refit:
                 print(
                     f"[md_to_pdf] overflow refit: {len(refit)}"
