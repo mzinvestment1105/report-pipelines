@@ -1542,6 +1542,455 @@ def check_demand_table_numbers(md: str) -> tuple[list[str], str]:
     return errors, f"[需給テーブル] {checked} 行を検査（違反 {len(errors)} 件）"
 
 
+
+# ==========================================================================
+# §6 財務健全性表の生データ突合検査（errors・PM 2026-09-10 承認）
+#
+# 誌面 §6 の固定表「指標 / 前期 / 当期 / 増減」に書かれた主要な財務数値が、
+# 生データ research/stocks/{code}_{date}_data.md の「財務時系列」に実在するかを
+# 機械照合する。§6 前期列に生データへ存在しない値が書かれた事案への歯止め。
+#
+# 設計方針:
+#   - 表の同定は骨格（report_skeleton）のヘッダ署名で行い、列名をハードコードしない。
+#   - 骨格は行ラベルを公開しないため、行ラベルの別名語彙のみ本ファイルが持つ。
+#   - 照合は絶対値の完全一致（±0.001）で行う。許容幅を持たせると生データ中の
+#     数千個の数値のどれかに必ず当たってしまい検出力が消えるため、幅は取らない。
+#   - フリーCF・増減列は生データに直接載らないため、算術で検算する。
+# ==========================================================================
+
+# 誌面の行ラベル -> 生データの行ラベル候補（正規化後の完全一致で引く）
+_FIN_ROW_ALIASES: dict[str, tuple[str, ...]] = {
+    "営業CF": ("営業CF", "営業キャッシュフロー", "営業活動によるCF"),
+    "投資CF": ("投資CF", "投資キャッシュフロー", "投資活動によるCF"),
+    "財務CF": ("財務CF", "財務キャッシュフロー", "財務活動によるCF"),
+    "自己資本比率": ("自己資本比率",),
+    # 有利子負債合計は内訳（短期借入金・長期借入金・社債等）の和であり、
+    # 生データの「財務時系列」に単独の行として載らない。同じ表の内訳行の
+    # 和で検算するため、生データ突合の対象からは外す（_FIN_DERIVED_SUM）。
+    "総資産": ("総資産", "資産合計"),
+    "純資産": ("純資産", "純資産合計"),
+    "現預金": ("現預金", "現金及び預金", "現金及び現金同等物", "現金同等物"),
+    "有利子負債": (
+        "有利子負債",
+        "有利子負債合計",
+        "有利子負債残高",
+        "有利子負債(短期借入)",
+        "有利子負債（短期借入）",
+        "短期借入金",
+        "長期借入金",
+        "1年内返済長期借入金",
+        "借入金",
+        "社債",
+    ),
+}
+
+# 誌面の行ラベルを正規化してキーへ寄せるための表記揺れ吸収
+_FIN_LABEL_NORMALIZE: tuple[tuple[str, str], ...] = (
+    ("キャッシュ・フロー", "CF"),
+    ("キャッシュフロー", "CF"),
+    ("（%）", ""),
+    ("(%)", ""),
+    ("（％）", ""),
+    ("(％)", ""),
+    ("（", "("),
+    ("）", ")"),
+)
+
+# 負号として扱う記号（和文会計の ▲ ▼ △ ▽・全角マイナス・各種ハイフン）
+_FIN_MINUS = "▲▼△▽−－‐‑–—-"
+
+# セル内の数値（符号 + 桁区切り + 小数）。単位・%・pt は後段で無視する。
+_FIN_NUM = re.compile("[" + _FIN_MINUS + r"]?\s*\d[\d,，]*(?:\.\d+)?")
+
+# 生データの「財務時系列」表
+_FIN_RAW_SECTION = re.compile(r"^##\s*財務時系列")
+
+
+# 同じ §6 表の内訳行の和で検算する行（生データ突合はしない）。
+# 値: (合計行のラベル候補, 内訳行のラベル候補)
+_FIN_DERIVED_SUM: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
+    (
+        ("有利子負債合計", "有利子負債残高", "有利子負債"),
+        (
+            "短期借入金",
+            "長期借入金",
+            "1年内返済長期借入金",
+            "1年内返済予定の長期借入金",
+            "借入金",
+            "社債",
+            "リース債務",
+            "転換社債",
+        ),
+    ),
+)
+
+# 上表の合計行ラベル（正規化後）。生データ突合の対象から外す。
+_FIN_SUM_LABELS = {
+    l for heads, _ in _FIN_DERIVED_SUM for l in heads
+}
+
+
+def _fin_norm_label(label: str) -> str:
+    s = re.sub(r"\*\*|__|`|\s", "", label)
+    for a, b in _FIN_LABEL_NORMALIZE:
+        s = s.replace(a, b)
+    return s
+
+
+def _fin_alias_key(label: str) -> str | None:
+    """誌面の行ラベルを _FIN_ROW_ALIASES のキーへ解決する（未知なら None）。"""
+    s = _fin_norm_label(label)
+    if s in _FIN_ROW_ALIASES:
+        return s
+    for key, aliases in _FIN_ROW_ALIASES.items():
+        for a in aliases:
+            if s == _fin_norm_label(a):
+                return key
+    return None
+
+
+def _fin_parse_num(cell: str) -> float | None:
+    """セルから最初の数値を取り出し、絶対値の float で返す。"""
+    text = re.sub(r"\*\*|__|`", "", cell)
+    m = _FIN_NUM.search(text)
+    if not m:
+        return None
+    body = m.group(0).lstrip(_FIN_MINUS + " ").replace(",", "").replace("，", "")
+    try:
+        return abs(float(body))
+    except ValueError:
+        return None
+
+
+def _fin_signed(cell: str) -> float | None:
+    """セルから最初の数値を符号つきで返す（増減・フリーCF の検算に使う）。"""
+    text = re.sub(r"\*\*|__|`", "", cell)
+    m = _FIN_NUM.search(text)
+    if not m:
+        return None
+    raw = m.group(0)
+    neg = raw[0] in _FIN_MINUS
+    body = raw.lstrip(_FIN_MINUS + " ").replace(",", "").replace("，", "")
+    try:
+        v = float(body)
+    except ValueError:
+        return None
+    return -v if neg else v
+
+
+def _fin_raw_rows(raw: str) -> dict[str, list[float]]:
+    """生データの「財務時系列」表を {正規化ラベル: [絶対値, ...]} で返す。"""
+    lines = raw.splitlines()
+    start = None
+    for i, line in enumerate(lines):
+        if _FIN_RAW_SECTION.match(line.strip()):
+            start = i
+            break
+    if start is None:
+        return {}
+    out: dict[str, list[float]] = {}
+    for line in lines[start + 1:]:
+        s = line.strip()
+        if s.startswith("## "):
+            break
+        if not s.startswith("|"):
+            continue
+        cells = [c.strip() for c in s.strip("|").split("|")]
+        if len(cells) < 2:
+            continue
+        label = _fin_norm_label(cells[0])
+        if not label or set(label) <= set("-:"):
+            continue
+        vals = [v for v in (_fin_parse_num(c) for c in cells[1:]) if v is not None]
+        if vals:
+            out.setdefault(label, []).extend(vals)
+    return out
+
+
+def _fin_all_numbers(raw: str) -> set[float]:
+    """生データ全体に現れる数値の絶対値の集合（S2 用の広いプール）。"""
+    return {
+        v
+        for v in (_fin_parse_num(m.group(0)) for m in _FIN_NUM.finditer(raw))
+        if v is not None
+    }
+
+
+def _fin_digit_blob(raw: str) -> str:
+    """生データから桁区切りを外し、数字と小数点だけを残した文字列（S3 用）。"""
+    return re.sub(r"[^0-9.]", " ", raw.replace(",", "").replace("，", ""))
+
+
+# 誌面と生データで単位の桁が違う場合の倍率（億円 <-> 百万円 <-> 千円）。
+# 3103 は誌面が「473.14億円」・生データが「47,314 百万円」で同一の値を指す。
+_FIN_SCALES = (1.0, 100.0, 0.01, 1000.0, 0.001, 10.0, 0.1)
+
+
+def _fin_hit(value: float, pool) -> bool:
+    """絶対値の完全一致（±0.001）。単位の桁違いも同一値として扱う。"""
+    pool = list(pool)
+    if not pool:
+        return False
+    for s in _FIN_SCALES:
+        v = value * s
+        tol = max(0.001, abs(v) * 1e-9)
+        if any(abs(v - p) <= tol for p in pool):
+            return True
+    return False
+
+
+def _check_financial_vs_raw(md: str, code: str) -> tuple[list[str], list[str], str]:
+    """検査3: 誌面 §6 の財務表の数値が生データに実在しない（error）。
+
+    （検査1 = 空売りの言及漏れ、検査2 = 権利落ち日の不一致 に続く 3 本目）
+
+    骨格の固定表署名「指標 / 前期 / 当期 / 増減」で対象表を同定し、主要行
+    （営業CF・投資CF・財務CF・自己資本比率・総資産・純資産・現預金・有利子負債）
+    の前期・当期セルを生データと突合する。フリーCF・増減列・有利子負債合計は
+    生データに直接載らないため算術で検算する。
+
+    severity の設計（29 本での実測にもとづく）:
+      - 算術検算（増減 = 当期 − 前期 / フリーCF = 営業CF ＋ 投資CF /
+        有利子負債合計 = 内訳の和）の不一致は error。誌面の中だけで閉じており
+        生データの鮮度に依存しないため、誤検知が出ない。
+      - 生データ突合の不一致は warning。生データの「財務時系列」は通期 5 期分
+        しか持たず、誌面 §6 がその後に出た四半期・半期の決算で書かれていると
+        値が正しくても突合できない。実測ではこの形が全件、期の基準違いだった。
+      - 生データ不在・読取不可・「財務時系列」なしも warning（_cr §36 配信絶対）。
+
+    返り値: (errors, warnings, info メモ)
+    """
+    sk = _skel.load()
+    if not sk.loaded:
+        return [], [], "[財務突合] 骨格の正本を読めず検査スキップ"
+    target_sig = None
+    for sig in sk.table_headers:
+        cols = [c.strip() for c in sig.split("/")]
+        if cols and cols[0] == "指標" and {"前期", "当期", "増減"} <= set(cols):
+            target_sig = sig
+            break
+    if target_sig is None:
+        return [], [], "[財務突合] 骨格に「指標/前期/当期/増減」表の定義がなく検査スキップ"
+
+    tables = [
+        (line, header, rows)
+        for line, header, rows in _tables_with_lines(md)
+        if _skel.normalize_header([h.strip() for h in header]) == target_sig
+    ]
+    if not tables:
+        return [], [], "[財務突合] §6 の「指標/前期/当期/増減」表が見つからず検査スキップ"
+
+    path = _latest_data_md(code)
+    if path is None:
+        return (
+            [],
+            [f"[財務突合] 生データが見つからず検査スキップ（{code}）"],
+            "[財務突合] 生データ不在",
+        )
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        return (
+            [],
+            [f"[財務突合] 生データ {path.name} を読めず検査スキップ"],
+            "[財務突合] 生データ読取不可",
+        )
+
+    raw_rows = _fin_raw_rows(raw)
+    if not raw_rows:
+        # EDINET の取得が 0 期で返ると「*財務時系列データなし*」だけの節になる。
+        # 突合の土台が無い状態で不一致を error にすると、実在する数値まで
+        # 不合格になるため検査を丸ごと落とす（_cr §36 配信絶対の原則）。
+        return (
+            [],
+            [
+                f"[財務突合] 生データ {path.name} に「財務時系列」の表がなく検査スキップ"
+                "（EDINET の取得期数 0）"
+            ],
+            "[財務突合] 生データに財務時系列なし → 検査スキップ",
+        )
+    all_nums = _fin_all_numbers(raw)
+    blob = _fin_digit_blob(raw)
+
+    errors: list[str] = []
+    checked = 0
+
+    pending: list[tuple[int, str, str, str, bool, list[float]]] = []
+
+    for line, header, rows in tables:
+        head = [h.strip() for h in header]
+        i_prev, i_cur, i_diff = head.index("前期"), head.index("当期"), head.index("増減")
+        cells: dict[str, tuple[str, str, str]] = {}
+        for row in rows:
+            if len(row) <= max(i_prev, i_cur, i_diff):
+                continue
+            label = row[0].strip()
+            cells[_fin_norm_label(label)] = (label, row[i_prev], row[i_cur])
+
+            key = _fin_alias_key(label)
+
+            # --- 増減列の検算（当期 − 前期・許容 ±0.15）--------------------
+            #     既知の財務行に限る。同じヘッダ署名を持つ KPI 表（利用者数・
+            #     実車数など）は増減を「％」で書くため、対象にすると誤検知になる。
+            d_prev, d_cur = _fin_signed(row[i_prev]), _fin_signed(row[i_cur])
+            d_diff = _fin_signed(row[i_diff])
+            if (
+                key is not None
+                and "%" not in row[i_diff]
+                and "％" not in row[i_diff]
+                and d_prev is not None
+                and d_cur is not None
+                and d_diff is not None
+            ):
+                if abs((d_cur - d_prev) - d_diff) > 0.15:
+                    errors.append(
+                        f"[検査18] L{line} 表「{label}」の増減列 {row[i_diff].strip()} が"
+                        f"当期 − 前期（{d_cur:g} − {d_prev:g} = {d_cur - d_prev:.4g}）と"
+                        f"一致しない → 対処: 生データ {path.name} の"
+                        "「財務時系列」から実値を転記する"
+                    )
+
+            if key is None:
+                continue  # 未知の行ラベルは黙ってスキップ
+            if _fin_norm_label(label) in _FIN_SUM_LABELS:
+                continue  # 内訳の和で検算する行（後段の合計検算が担当）
+
+            row_hits: list[tuple[str, str, bool, list[float]]] = []
+            for col, cell in (("前期", row[i_prev]), ("当期", row[i_cur])):
+                val = _fin_parse_num(cell)
+                if val is None:
+                    continue
+                checked += 1
+                # S1: 生データの同名行に完全一致があるか（高信号）
+                pool: list[float] = []
+                for alias in _FIN_ROW_ALIASES[key]:
+                    pool.extend(raw_rows.get(_fin_norm_label(alias), []))
+                if _fin_hit(val, pool):
+                    row_hits.append((col, cell, True, pool))
+                    continue
+                # S2: 生データ全体のどこかに完全一致があるか
+                if _fin_hit(val, all_nums):
+                    row_hits.append((col, cell, True, pool))
+                    continue
+                # S3: 桁区切りを外した数字列への部分一致。3 桁以下の整数は
+                #     何にでも当たるため、小数点あり／4 桁以上の値に限る。
+                hit_s3 = False
+                for s in _FIN_SCALES:
+                    txt = "%g" % (val * s)
+                    if "e" in txt or "+" in txt:
+                        continue
+                    digits = txt.replace(".", "").lstrip("0")
+                    if ("." in txt or len(digits) >= 4) and txt in blob:
+                        hit_s3 = True
+                        break
+                if hit_s3:
+                    row_hits.append((col, cell, True, pool))
+                    continue
+                row_hits.append((col, cell, False, pool))
+
+            # 前期・当期のどちらも生データに当たらない行は、生データの通期時系列
+            # とは別の期区分（半期・四半期・生データより新しい期）で書かれている。
+            # 捏造ではなく期の基準違いなので対象から外す。
+            if not any(h for _, _, h, _ in row_hits):
+                continue
+            for col, cell, hit, pool in row_hits:
+                pending.append((line, label, col, cell, hit, pool))
+
+        # --- 有利子負債合計 = 内訳の和（許容 ±1）----------------------------
+        for heads, parts in _FIN_DERIVED_SUM:
+            total = None
+            for h in heads:
+                if _fin_norm_label(h) in cells:
+                    total = cells[_fin_norm_label(h)]
+                    break
+            if total is None:
+                continue
+            comp = [
+                cells[_fin_norm_label(x)] for x in parts if _fin_norm_label(x) in cells
+            ]
+            if not comp:
+                continue
+            for idx, col in ((1, "前期"), (2, "当期")):
+                t_v = _fin_signed(total[idx])
+                vals = [_fin_signed(c[idx]) for c in comp]
+                if t_v is None or any(v is None for v in vals):
+                    continue
+                s = sum(vals)
+                if abs(t_v - s) > 1:
+                    errors.append(
+                        f"[検査18] L{line} 表「{total[0]}」の{col}列 {total[idx].strip()} が"
+                        f"同じ表の内訳行の合計（{s:.4g}）と一致しない"
+                        f" → 対処: 生データ {path.name} の「財務時系列」から実値を転記する"
+                    )
+
+        # --- フリーCF = 営業CF − |投資CF|（許容 ±1）------------------------
+        free = None
+        for k, v in cells.items():
+            if k in ("フリーCF", "FCF", "フリーCF(FCF)"):
+                free = v
+                break
+        ope, inv = cells.get("営業CF"), cells.get("投資CF")
+        if free and ope and inv:
+            for idx, col in ((1, "前期"), (2, "当期")):
+                f_v, o_v, i_v = (
+                    _fin_signed(free[idx]),
+                    _fin_signed(ope[idx]),
+                    _fin_signed(inv[idx]),
+                )
+                if f_v is None or o_v is None or i_v is None:
+                    continue
+                # 投資CF が資産売却でプラスになる期があるため、絶対値ではなく
+                # 符号つきの合計（営業CF + 投資CF）で検算する。
+                expect = o_v + i_v
+                if abs(f_v - expect) > 1:
+                    errors.append(
+                        f"[検査18] L{line} 表「{free[0]}」の{col}列 {free[idx].strip()} が"
+                        f"営業CF ＋ 投資CF（{o_v:g} ＋ {i_v:g} = {expect:.4g}）と"
+                        f"一致しない → 対処: 生データ {path.name} の"
+                        "「財務時系列」から実値を転記する"
+                    )
+
+    # --- 列の期の基準を見てから、外れたセルを不合格にする ---------------------
+    #
+    #  生データの「財務時系列」は通期（年度）5 期分しか持たない。誌面 §6 が
+    #  その後に出た四半期・半期の決算で書かれていると、値が正しくても生データ
+    #  には載らない。この「期の基準違い」と「捏造」を分けるのが列の当たり方。
+    #
+    #   - 当たりが 1 つも無い列: 列まるごと生データの覆う期の外にある
+    #     （半期の数値・生データより新しい決算期）。突合の土台が無いので
+    #     warning に留める（_cr §36 配信絶対の原則。誤検知で配信を止めない）。
+    #   - 当たりと外れが混在する列: 同じ期の基準で書かれた列の中に、生データに
+    #     無い数値が混じっている。これが捏造の形（4371 §6 の前期列は
+    #     営業CF 983 が当たり・投資CF ▼198 だけが外れた）なので error にする。
+    per_col: dict[tuple[int, str], list[int]] = {}
+    for line, _label, col, _cell, hit, _pool in pending:
+        cnt = per_col.setdefault((line, col), [0, 0])
+        cnt[0 if hit else 1] += 1
+    warnings: list[str] = []
+    for line, label, col, cell, hit, pool in pending:
+        if hit:
+            continue
+        n_hit, _n_miss = per_col.get((line, col), (0, 0))
+        near = "/".join(f"{p:g}" for p in sorted(set(pool))[:5]) or "該当行なし"
+        msg = (
+            f"[検査18] L{line} 表「{label}」の{col}列 {cell.strip()} が"
+            f"生データのどこにも存在しない（生データの同名行の近い値: {near}）"
+            f" → 対処: 生データ {path.name} の「財務時系列」から実値を転記する"
+        )
+        if n_hit == 0:
+            warnings.append(msg + "（列全体が生データの覆う期の外にある可能性）")
+        else:
+            # 同じ列に当たりがある中での外れは捏造の形だが、生データの通期
+            # 時系列より新しい四半期・半期の実数（正しい数値）も同じ形になる。
+            # 実測（29 本）ではこの形の全件が期の基準違いだったため、単独では
+            # 不合格にせず warning に留め、算術検算（増減・フリーCF・
+            # 有利子負債合計）だけを error として送信を止める。
+            warnings.append(msg)
+
+    note = f"[財務突合] {checked} セルを生データ {path.name} と突合（違反 {len(errors)} 件）"
+    return errors, warnings, note
+
+
 # ==========================================================================
 # 誌面骨格の 12 検査（PM 2026-09-07 承認・context/2026-09-07_format_skeleton_spec.md E 節）
 #
@@ -2643,6 +3092,16 @@ def run_gate(md: str, code: str) -> tuple[list[str], list[str], list[str]]:
     errors.extend(dt_errs)
     if dt_note:
         info.append(dt_note)
+
+    # 18. §6 財務表の生データ突合（errors・PM 2026-09-10）
+    #     誌面 §6 の「指標/前期/当期/増減」表の主要行を生データと突合し、
+    #     生データに存在しない数値（逆算・推定で埋めたセル）を不合格にする。
+    #     生データが無い場合は warning に留める（_cr §36 配信絶対の原則）。
+    fv_errs, fv_warns, fv_note = _check_financial_vs_raw(md, code)
+    errors.extend(fv_errs)
+    warnings.extend(fv_warns)
+    if fv_note:
+        info.append(fv_note)
 
     # 17. 誌面骨格の 12 検査（errors / warnings・PM 2026-09-07）
     #     見出し 3 段・小見出し 21 個の完全一致・固定表 17 表・装飾・住所・数値重複。
