@@ -40,6 +40,8 @@ python make_sector_raw.py --anchor today --date ${TARGET_DATE} --no-ensure-fresh
 
 ## レポート構成（出力セクション）
 
+**本文の目標文字数: 23,000 字（許容 19,000〜27,000 字・`_cr` §49）**。範囲上限を超えそうなら各セクションを圧縮し、セクション削除・途中打ち切り・分割 Write は禁止。Write 直前に文字数を数えて確認する。
+
 `${PRIVATE_REPO_ROOT}/market/daily/sector/${TARGET_DATE}.md` に Write で保存。以下のセクションを必須出力：
 
 ### 【冒頭必須】用語定義ブロック（PM 2026-05-26 確定・全レポート冒頭に明示）

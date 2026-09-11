@@ -86,6 +86,8 @@ cd "${PRIVATE_REPO_ROOT}/bi/pipelines" && python weekly_largecap_sectors.py --se
 
 ## Step 6: 本文生成（顧客提出水準・厳守）
 
+**本文の目標文字数: 10,000 字（許容 9,000〜12,000 字・`_cr` §49）**。範囲上限を超えそうなら各セクションを圧縮し、セクション削除・途中打ち切り・分割 Write は禁止。Write 直前に文字数を数えて確認する。
+
 `${PRIVATE_REPO_ROOT}/research/sectors/` の当該セクターマップ（`01_automotive.md`〜`22_steel.md` 等）と Step 5 の `sector_data_{date}.json` を一次情報に、以下を満たす本文を組む。会社・セグメント説明は当該セクターマップから記述する（GHA では EDINET 等の MCP は使えないため、マップとヘルパー出力だけで完結させる・記憶ベース禁止）。
 
 **冒頭ヘッダ（必須・顧客提出水準）**:
@@ -160,5 +162,6 @@ cd "${PRIVATE_REPO_ROOT}/bi/pipelines" && python weekly_largecap_sectors.py --se
 
 - `${PRIVATE_REPO_ROOT}/market/daily/largecap/{date}.md` が存在し、冒頭の「今週の特集セクターと選定理由」＋特集約3セクター×（解説／横断比較表／ミニプロフィール3〜5社）が揃っている。
 - 全数値が一次情報（ヘルパー出力・screening_master・EDINET・セクターマップ）由来で、記憶ベース・推測語・フォールバック表記・内部メモがない。
+- [ ] 本文文字数が 9,000〜12,000 字の範囲内（`_cr` §49）
 
 ここまでで Claude のタスクは終了。**Discord 送信・PDF 化・commit は workflow の後続ステップが行う**（このタスクでは送信しない）。
