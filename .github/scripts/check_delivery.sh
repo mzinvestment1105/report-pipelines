@@ -102,11 +102,19 @@ while IFS=$'\t' read -r RID REV RST RCC; do
       ;;
   esac
 
-  case "$JOB_STATUS" in
-    queued|in_progress|waiting|pending|requested)
-      SENDING=$((SENDING + 1))
-      ;;
-  esac
+  # 2026-09-12 修正: 「配信中（sending）」は run 全体がまだ生きている場合だけに限る。
+  # 従来は job の status だけを見ていたため、run が completed（失敗を含む）で終わった後も
+  # jobs API が返す status の取りこぼし・遅延で sending に数えられることがあり、
+  # 予備 run が「別 run が配信中」と誤認して skip → 当日未配信のまま success で終わっていた
+  # （実測 2026-09-11 run 34601706112 が failure なのに 34602683209 が sending=1 を見て skip）。
+  # 失敗・完了した run は配信しないので、待たせる理由がない。
+  if [ "$RST" != "completed" ]; then
+    case "$JOB_STATUS" in
+      queued|in_progress|waiting|pending|requested)
+        SENDING=$((SENDING + 1))
+        ;;
+    esac
+  fi
 
   # 未完了 run のうち、まだ配信できていないもの（本命 or 予備が進行中）を経路別に数える
   if [ "$RST" != "completed" ] && [ "$JOB_CONCLUSION" != "success" ]; then

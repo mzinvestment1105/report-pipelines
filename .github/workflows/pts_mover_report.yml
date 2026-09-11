@@ -308,11 +308,11 @@ jobs:
           timeout_minutes: "30"
           claude_env: |
             CLAUDE_CODE_EFFORT_LEVEL: high
-            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 64000
+            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 128000
         env:
           TARGET_DATE: ${{ steps.date.outputs.value }}
           PRIVATE_REPO_ROOT: private-repo
-          CLAUDE_CODE_MAX_OUTPUT_TOKENS: 64000
+          CLAUDE_CODE_MAX_OUTPUT_TOKENS: 128000
 
       # PM 2026-09-05 承認: 枠切れ（Spending cap reached）だけは待機しても同一 run 内では回復しない。
       # 実測（2026-09-04 run 33870602080 / 33875016222）では gen1 の枠切れ後、60 / 180 秒の待機では
@@ -354,11 +354,11 @@ jobs:
           timeout_minutes: "30"
           claude_env: |
             CLAUDE_CODE_EFFORT_LEVEL: high
-            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 64000
+            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 128000
         env:
           TARGET_DATE: ${{ steps.date.outputs.value }}
           PRIVATE_REPO_ROOT: private-repo
-          CLAUDE_CODE_MAX_OUTPUT_TOKENS: 64000
+          CLAUDE_CODE_MAX_OUTPUT_TOKENS: 128000
 
       - name: Detect spending cap (attempt 2)
         id: cap2
@@ -395,11 +395,11 @@ jobs:
           timeout_minutes: "30"
           claude_env: |
             CLAUDE_CODE_EFFORT_LEVEL: high
-            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 64000
+            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 128000
         env:
           TARGET_DATE: ${{ steps.date.outputs.value }}
           PRIVATE_REPO_ROOT: private-repo
-          CLAUDE_CODE_MAX_OUTPUT_TOKENS: 64000
+          CLAUDE_CODE_MAX_OUTPUT_TOKENS: 128000
 
       # ================================================================
       # 枠切れ（Spending cap）からの自動復旧（2026-09-07 追加）
@@ -458,11 +458,11 @@ jobs:
           timeout_minutes: "30"
           claude_env: |
             CLAUDE_CODE_EFFORT_LEVEL: high
-            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 64000
+            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 128000
         env:
           TARGET_DATE: ${{ steps.date.outputs.value }}
           PRIVATE_REPO_ROOT: private-repo
-          CLAUDE_CODE_MAX_OUTPUT_TOKENS: 64000
+          CLAUDE_CODE_MAX_OUTPUT_TOKENS: 128000
 
       - name: Detect spending cap (復旧 1 回目)
         id: reccap1
@@ -495,11 +495,11 @@ jobs:
           timeout_minutes: "30"
           claude_env: |
             CLAUDE_CODE_EFFORT_LEVEL: high
-            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 64000
+            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 128000
         env:
           TARGET_DATE: ${{ steps.date.outputs.value }}
           PRIVATE_REPO_ROOT: private-repo
-          CLAUDE_CODE_MAX_OUTPUT_TOKENS: 64000
+          CLAUDE_CODE_MAX_OUTPUT_TOKENS: 128000
 
       - name: Verify generated PTS mover report (成否の一元判定)
         # 上の 3 ステップは全て continue-on-error のため、ジョブの成否はここだけで決まる。

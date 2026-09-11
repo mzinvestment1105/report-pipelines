@@ -71,15 +71,7 @@ from make_mover_report import (
 from theme_radar import (
     build_desc_lookup,
     build_material_lookup,
-    build_own_theme_lookup,
-    build_sustain_context,
-    compute_theme_heat_v2,
     detect_night,
-    load_earnings_flags,
-    load_rank_history,
-    load_theme_map,
-    _load_history as _tr_load_history,
-    render_heat_section,
     render_internal_flags,
     render_reason_material,
     render_today_candidates,
@@ -664,9 +656,10 @@ def main() -> None:
             if _rs:
                 reason_by_code.setdefault(normalize_code_4(_r["Code"]), _rs)
 
-    # === テーマ2部（値上がりセクションの前に置く）===
-    # 当日部 = 当夜の PTS 上昇銘柄。熱量部 = 昼の動意蓄積10営業日をそのまま使う
-    # （当夜の PTS を昼の蓄積へ合算しない）。誌面構成は昼の動意レポートと同一。
+    # === テーマ部（値上がりセクションの前に置く）===
+    # 当夜の PTS 上昇銘柄のみを扱う。`## 直近2週間の熱いテーマ` は 2026-09-11 PM 承認で
+    # 廃止した（昼の動意蓄積のみを読むため夜間の新規情報が無く、同日 18 時の動意
+    # レポートの再掲になっていた）。昼の動意レポート側の同セクションは維持する。
     # テーマ表の鮮度警告は内部フラグへ回し、誌面には出さない（内部情報の誌面漏出を防ぐ）。
     try:
         pts_risers = []
@@ -690,8 +683,6 @@ def main() -> None:
                     "market": _MARKET_MAP.get(str(r.get("MarketRaw", "")).strip(), r.get("MarketRaw")),
                 })
         night = detect_night(pts_risers)
-        # 熱量は昼の蓄積のみ（当夜分を重ねない）
-        heat = compute_theme_heat_v2(codes_today=None, trade_date=str(target))
         _material_today = lambda code: _pts_reason_material_for(
             code, disc_ctx, tdnet_data, yahoo_data, reason_by_code
         )
@@ -717,40 +708,7 @@ def main() -> None:
             pct_key="pts_pct",
             heading="## 本夜の動意母集団（材料一覧・Claude がここからテーマを括る）",
         )
-        # 持続文脈（2026-09-07 PM 承認）: テーマ見出しの直後へ「点灯の持続・
-        # ランキング推移・構成銘柄の業績トレンド」を機械で添え、誌面の駆動要因を
-        # 材料から書けるようにする。入力は全て追跡済み parquet で GHA でも読める。
-        # 取れなければ 0 行（＝従来と同一の raw）になり、誌面へは影響しない。
-        _sustain = None
-        try:
-            _s_hist = _tr_load_history(None)
-            _s_c2t, _s_size, _s_stale, _s_exc = load_theme_map()
-            _s_rank = load_rank_history()
-            _s_fin = load_earnings_flags(str(target))
-
-            def _sustain(_row):
-                return build_sustain_context(
-                    _row, hist=_s_hist, code_to_themes=_s_c2t,
-                    rank_hist=_s_rank, fin_flags=_s_fin, end=str(target),
-                )
-            print(
-                "持続文脈: ランキング{}日分・業績フラグ{}件".format(
-                    len(_s_rank), len(_s_fin))
-            )
-        except Exception as _e:
-            print(f"  [WARN] 持続文脈の準備: {_e}")
-            _sustain = None
-        # 熱量表は熱量降順。当夜1位テーマは必ず含める（night を渡す）。
-        # own_theme_lookup: 過去に Claude が材料から作った自前テーマ名を優先表示する（改修4）。
-        lines += render_heat_section(
-            heat,
-            today_result=night,
-            desc_lookup=_desc,
-            material_lookup=_material,
-            own_theme_lookup=build_own_theme_lookup(trade_date=str(target)),
-            sustain_ctx=_sustain,
-        )
-        lines += render_reason_material(night, heat, _material)
+        lines += render_reason_material(night, None, _material)
         internal_flags += render_internal_flags(night)
     except Exception as e:
         # テーマレーダーの失敗で本体レポートを止めない（配信絶対の原則）

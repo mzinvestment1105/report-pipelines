@@ -246,7 +246,7 @@ jobs:
           timeout_minutes: "20"
           claude_env: |
             CLAUDE_CODE_EFFORT_LEVEL: high
-            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 128000
         env:
           TARGET_DATE: ${{ steps.date.outputs.value }}
           PRIVATE_REPO_ROOT: private-repo
@@ -282,7 +282,7 @@ jobs:
           timeout_minutes: "20"
           claude_env: |
             CLAUDE_CODE_EFFORT_LEVEL: high
-            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 128000
         env:
           TARGET_DATE: ${{ steps.date.outputs.value }}
           PRIVATE_REPO_ROOT: private-repo
@@ -316,7 +316,7 @@ jobs:
           timeout_minutes: "20"
           claude_env: |
             CLAUDE_CODE_EFFORT_LEVEL: high
-            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 128000
         env:
           TARGET_DATE: ${{ steps.date.outputs.value }}
           PRIVATE_REPO_ROOT: private-repo

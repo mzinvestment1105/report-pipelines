@@ -118,11 +118,16 @@ read_stats() {
 read_stats
 
 # ---------- 3) 本命 run の走行中は完了を待つ ----------
+WAIT_EXPIRED=false
 if [ "$EVENT" = "schedule" ]; then
   DEADLINE=$(( $(date +%s) + WAIT_MINUTES * 60 ))
   while [ "$DELIVERED" -eq 0 ] && { [ "$SENDING" -gt 0 ] || [ "$DISPATCH_PENDING" -gt 0 ]; }; do
     if [ "$(date +%s)" -ge "$DEADLINE" ]; then
       echo "本命 run の完了待ちが ${WAIT_MINUTES} 分を超えたため待機を打ち切り、${LANE_LABEL}で配信します（配信絶対の原則）。"
+      # 2026-09-12 修正: 待機を打ち切った事実をフラグに残す。
+      # 従来はここで break した直後、下の判定が同じ sending>0 を見て
+      # 「別 run が配信中」で skip し、打ち切りの意味が消えていた（実測 run 34602683209）。
+      WAIT_EXPIRED=true
       break
     fi
     echo "本命 run が走行中（sending=${SENDING} dispatch_pending=${DISPATCH_PENDING}）。60 秒後に再確認します。"
@@ -155,10 +160,19 @@ elif [ "$DELIVERED" -gt 0 ]; then
   echo "skip 理由: 本日はすでに ${SEND_JOB} が成功済み（${DELIVERED} 件）＝配信が完了しているため。"
   echo "proceed=false" >> "$GITHUB_OUTPUT"
   echo "reason=skip (already delivered today: ${SEND_JOB} success=${DELIVERED})" >> "$GITHUB_OUTPUT"
-elif [ "$SENDING" -gt 0 ]; then
+elif [ "$SENDING" -gt 0 ] && [ "$WAIT_EXPIRED" != "true" ]; then
   echo "skip 理由: 別 run が今まさに配信中（sending=${SENDING}）のため。"
   echo "proceed=false" >> "$GITHUB_OUTPUT"
   echo "reason=skip (another run is delivering: sending=${SENDING})" >> "$GITHUB_OUTPUT"
+elif [ "$SENDING" -gt 0 ]; then
+  # 2026-09-12 追加: 待機上限まで待っても配信が完了しなかった場合。
+  # 「配信中」に見えても実際には配信できていない（失敗直前・ハング・遅延）ため、
+  # ここで skip すると当日未配信のまま run が success で終わり誰も気づけない（false green）。
+  # 配信絶対の原則に従い、待ちきった側が自分で配信する。
+  # 二重配信は build-and-send ジョブ単位の concurrency（cancel-in-progress: false）が防ぐ。
+  echo "待機上限（${WAIT_MINUTES} 分）まで待っても配信が完了しなかったため、sending=${SENDING} でも ${LANE_LABEL}で配信します（配信絶対の原則）。"
+  echo "proceed=true" >> "$GITHUB_OUTPUT"
+  echo "reason=recovery (wait expired while sending=${SENDING} failed=${FAILED})" >> "$GITHUB_OUTPUT"
 elif [ "$EVENT" = "schedule" ] && [ "$EFFECTIVE_FAILED" -ge 2 ]; then
   echo "skip 理由: 本日すでに ${EFFECTIVE_FAILED} 回（枠切れ由来を除く）配信に失敗しており、cron の自動リトライ上限（2 回）に達したため。"
   echo "proceed=false" >> "$GITHUB_OUTPUT"

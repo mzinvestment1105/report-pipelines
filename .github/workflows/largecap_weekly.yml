@@ -264,13 +264,13 @@ jobs:
           timeout_minutes: "50"
           claude_env: |
             CLAUDE_CODE_EFFORT_LEVEL: high
-            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 128000
         env:
           TARGET_DATE: ${{ steps.date.outputs.value }}
           PRIVATE_REPO_ROOT: private-repo
           JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
           EDINETDB_API_KEYS: ${{ secrets.EDINETDB_API_KEYS }}
-          CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+          CLAUDE_CODE_MAX_OUTPUT_TOKENS: 128000
 
       # PM 2026-09-05 承認: 枠切れ（Spending cap reached）は待機しても同一 run 内では回復しない。
       # 実測（2026-09-04 の夜間PTS動意 run）では枠切れ後の再試行が 1.5 秒で即時拒否されるだけで、
@@ -311,13 +311,13 @@ jobs:
           timeout_minutes: "30"
           claude_env: |
             CLAUDE_CODE_EFFORT_LEVEL: high
-            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 128000
         env:
           TARGET_DATE: ${{ steps.date.outputs.value }}
           PRIVATE_REPO_ROOT: private-repo
           JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
           EDINETDB_API_KEYS: ${{ secrets.EDINETDB_API_KEYS }}
-          CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+          CLAUDE_CODE_MAX_OUTPUT_TOKENS: 128000
 
       - name: Detect spending cap (attempt 2)
         id: cap2
@@ -354,13 +354,13 @@ jobs:
           timeout_minutes: "30"
           claude_env: |
             CLAUDE_CODE_EFFORT_LEVEL: high
-            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 128000
         env:
           TARGET_DATE: ${{ steps.date.outputs.value }}
           PRIVATE_REPO_ROOT: private-repo
           JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
           EDINETDB_API_KEYS: ${{ secrets.EDINETDB_API_KEYS }}
-          CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+          CLAUDE_CODE_MAX_OUTPUT_TOKENS: 128000
 
       - name: Verify generated largecap weekly report (成否の一元判定)
         # 上の 3 ステップは全て continue-on-error のため、ジョブの成否はここだけで決まる。
