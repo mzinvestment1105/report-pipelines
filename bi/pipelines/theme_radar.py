@@ -2605,6 +2605,327 @@ def render_today_roster(
     ]
     return lines
 
+# --------------------------------------------------------------------------
+# 週次テーマの母集団（2026-09-12 PM 承認・動意週次へ「今週のテーマ」を新設）
+# --------------------------------------------------------------------------
+def build_week_roster_records(
+    week_dates: list[str],
+    week_codes: list[str] | None = None,
+    extra_codes: list[str] | None = None,
+    weekly_return_lookup=None,
+    weekly_turnover_lookup=None,
+    mcap_lookup=None,
+    name_lookup=None,
+    market_lookup=None,
+    history_path: Path | str | None = None,
+) -> list[dict]:
+    """対象週（月〜金）の日次動意母集団を和集合して週次ロスターのレコードを返す。
+
+    日次の `## 本日の動意母集団` は make_mover_report が当日の母集団（extract_radar_universe）
+    から組んで render_today_roster へ渡すが、週次はその 5 日分が既に
+    movers_top100_daily.parquet（append_movers_history が日次で積む蓄積）に入っている。
+    ここではその蓄積を週の窓で読み、**1 銘柄 1 行**へ畳んで返す。
+
+    騰落率・売買代金は日次値ではなく**週の値**（sector_stock_weekly.parquet の
+    Return_W01 / AvgDailyValue5d×5）で置き換える。取れない銘柄は日次の累積で埋めず
+    欠損のままにする（推計禁止・§0）。
+
+    Args:
+        week_dates: 対象週の営業日（`YYYY-MM-DD` の昇順）。点灯日数の算出にだけ使う。
+        week_codes: 週間の値で選んだ母集団のコード列（呼び出し側が組む。省略時は
+            日次蓄積の和集合へ落ちる）。
+        weekly_return_lookup: code -> 週間騰落率（%）。
+        weekly_turnover_lookup: code -> 週間売買代金（円）。
+        mcap_lookup: code -> 時価総額（億円）。
+        name_lookup / market_lookup: code -> 銘柄名 / 市場名（蓄積側が空のときの補完）。
+
+    Returns:
+        [{"code","name","return_pct","turnover","market","mcap_oku","_lit_days"}] のリスト。
+    """
+    # 母集団は「週間の値」で決める（週次の動意は日次の母集団の和集合では取りこぼす）。
+    # 日次蓄積 movers_top100_daily は (a) その日の radar 母集団（売買代金5億・時価総額100億・
+    # 上昇）に入った銘柄しか無く (b) _load_history が上昇日だけへ絞るため、週を通して
+    # 大きく動いた銘柄でも日次の母集団へ入らなかった銘柄は落ちる（9/11 実測: 週間 +51.1%
+    # の フィーチャ(4052)・-25.6% の ティアフォー(593A)・-42.3% の ステムリム(4599) が
+    # いずれも和集合に不在）。そこで週間騰落率・週間売買代金を持つ銘柄を一次の母集団とし、
+    # 日次蓄積は「週内に何日動意母集団へ載ったか（点灯日数）」の付与にだけ使う。
+    keep = {str(d) for d in (week_dates or [])}
+
+    lit_days: dict[str, int] = {}
+    hist_name: dict[str, str] = {}
+    hist_market: dict[str, str] = {}
+    hist = _load_history(history_path)
+    if not hist.empty:
+        if keep:
+            hist = hist[hist["date"].isin(keep)]
+        for code, grp in hist.groupby("code", sort=False):
+            c = str(code).strip()
+            if not c:
+                continue
+            lit_days[c] = int(grp["date"].nunique())
+            if "name" in grp.columns:
+                for n in grp["name"]:
+                    if str(n or "").strip():
+                        hist_name[c] = str(n).strip()
+            if "market" in grp.columns:
+                for m in grp["market"]:
+                    if str(m or "").strip():
+                        hist_market[c] = str(m).strip()
+
+    codes = list(week_codes or [])
+    if not codes:
+        # 週間の値が取れない場合のみ、従来どおり日次蓄積の和集合へ落とす。
+        codes = sorted(lit_days)
+    # 母集団外の救済（日次の `（母集団外・材料あり）` と同じ趣旨・2026-09-03 PM 承認の週版）。
+    # 時価総額・売買代金のフィルタで主母集団から落ちても、週次誌面本体に載る銘柄は
+    # テーマの起点になり得る（9/11 実測: 週間 +51.1% の フィーチャ(4052)・+20.7% の
+    # ZenmuTech(338A) はいずれも時価総額100億円未満で機械的に脱落していた）。
+    out_of_radar = {str(c).strip() for c in (extra_codes or []) if str(c).strip()}
+    known = set(codes)
+    codes = codes + sorted(c for c in out_of_radar if c not in known)
+    if not codes:
+        return []
+
+    def _call(fn, code):
+        if fn is None:
+            return None
+        try:
+            return fn(code)
+        except Exception:
+            return None
+
+    out: list[dict] = []
+    for code in codes:
+        code = str(code).strip()
+        if not code:
+            continue
+        name = hist_name.get(code) or str(_call(name_lookup, code) or "").strip()
+        market = hist_market.get(code) or str(_call(market_lookup, code) or "").strip()
+
+        ret = _call(weekly_return_lookup, code)
+        turn = _call(weekly_turnover_lookup, code)
+        mcap = _call(mcap_lookup, code)
+        try:
+            if ret is not None and float(ret) != float(ret):  # NaN
+                ret = None
+        except (TypeError, ValueError):
+            ret = None
+        try:
+            if turn is not None and float(turn) != float(turn):
+                turn = None
+        except (TypeError, ValueError):
+            turn = None
+
+        out.append({
+            "code": code,
+            "name": name,
+            "return_pct": ret,
+            "turnover": turn,
+            "market": market,
+            "mcap_oku": mcap,
+            # 週内で日次の動意母集団に載った日数（0〜5）。継続性のヒントとして表示する。
+            "_lit_days": int(lit_days.get(code, 0)),
+            "_out_of_radar": code in out_of_radar,
+        })
+    return out
+
+
+def build_week_material_lookup(
+    week_dates: list[str],
+    context_path: Path | str | None = None,
+    max_items_per_day: int = 2,
+):
+    """対象週の各営業日に蓄積された材料を**日付付きで全日分**返す callable を組む。
+
+    日次の build_material_lookup は「当日材料が無ければ直近の1日分を遡る」設計だが、
+    週次テーマは「その週のどの日にどんな材料が出たか」を束ねる必要があるため、
+    週内の全日分を `{M/D}: ...` の形で古い順に連結して返す。
+
+    Returns:
+        code -> list[str] の callable。材料が1件も無ければ空リスト。
+    """
+    ctx = _load_stock_context(context_path)
+    per_code: dict[str, list[str]] = {}
+    if not ctx.empty and "materials" in ctx.columns:
+        keep = {str(d) for d in (week_dates or [])}
+        sub = ctx[ctx["date"].isin(keep)] if keep else ctx
+        sub = sub[sub["materials"].astype(str).str.strip() != ""]
+        sub = sub.sort_values("date")
+        for code, date, mats in zip(sub["code"], sub["date"], sub["materials"]):
+            items = [m.strip() for m in str(mats).split("\n") if m.strip()]
+            if not items:
+                continue
+            label = _short_date(str(date))
+            per_code.setdefault(str(code), []).extend(
+                f"{label}: {it}" for it in items[:max_items_per_day]
+            )
+
+    def _lookup(code) -> list:
+        c = str(code or "").strip()
+        if not c:
+            return []
+        return per_code.get(c) or per_code.get(c[:4]) or []
+
+    return _lookup
+
+
+def build_week_desc_lookup(
+    week_dates: list[str],
+    context_path: Path | str | None = None,
+):
+    """対象週に蓄積された「何の会社」の原文を返す callable（無ければ業種名へ落とす）。"""
+    ctx = _load_stock_context(context_path)
+    per_code: dict[str, str] = {}
+    if not ctx.empty and "desc" in ctx.columns:
+        keep = {str(d) for d in (week_dates or [])}
+        sub = ctx[ctx["date"].isin(keep)] if keep else ctx
+        sub = sub[sub["desc"].astype(str).str.strip() != ""]
+        sub = sub.sort_values("date")
+        for code, desc in zip(sub["code"], sub["desc"]):
+            per_code[str(code)] = str(desc).strip()  # 後勝ち＝週内の最新日
+    sectors = _load_sector_names()
+
+    def _lookup(code) -> str:
+        c = str(code or "").strip()
+        if not c:
+            return ""
+        return (
+            per_code.get(c)
+            or per_code.get(c[:4])
+            or sectors.get(c)
+            or sectors.get(c[:4])
+            or ""
+        )
+
+    return _lookup
+
+
+def render_week_roster(
+    universe_records: list[dict],
+    material_lookup=None,
+    desc_lookup=None,
+    week_label: str = "",
+    theme_master_path: Path | str | None = None,
+    max_material_items: int = 4,
+    max_rows: int = 160,
+) -> list[str]:
+    """週次の母集団1行表を返す（動意日次 render_today_roster の週版・PM 2026-09-12 承認）。
+
+    日次と**同一の列構成**（コード・銘柄名・何の会社・時価総額・騰落率・売買代金・
+    所属タグ・材料）で並べ、騰落率＝週間騰落率・売買代金＝週間売買代金にする。
+    Claude は日次の `## 本日のテーマ` と同じ手順でここからテーマを括る。
+
+    Args:
+        universe_records: build_week_roster_records の戻り値。
+        week_label: `9/7〜9/11` のような週の表示ラベル（見出し直下の注記に使う）。
+        max_rows: 誌面ではなく raw の肥大防止の上限（週間売買代金の大きい順に採る）。
+    """
+    heading = "## 今週の動意母集団（材料一覧・Claude がここからテーマを括る）"
+    lines = [heading, ""]
+    recs = [r for r in (universe_records or []) if str(r.get("code") or "").strip()]
+    if not recs:
+        lines += ["今週の母集団なし", ""]
+        return lines
+
+    def _turn(r) -> float:
+        try:
+            return float(r.get("turnover") or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    recs = sorted(recs, key=lambda r: -_turn(r))
+    if max_rows and len(recs) > max_rows:
+        recs = recs[:max_rows]
+
+    code_to_themes, _size, _stale, _exc = load_theme_map(theme_master_path)
+
+    lines += [
+        "> **これは機械が出した母集団であり、テーマではありません**。"
+        f"対象週（{week_label}）の 5 営業日に動意母集団へ載った銘柄の和集合を、"
+        "**週間騰落率・週間売買代金**へ置き換えて 1 銘柄 1 行で並べたものです。"
+        "下の全銘柄の `材料` 欄を読み、**同じ出来事・同じ材料で動いた銘柄を2社以上束ねて"
+        "テーマ名を付けて**ください（テーマ名は材料に即して自由に命名して構いません）。"
+        f"誌面の `## 今週のテーマ` は**{MAX_ROWS_TODAY}〜{MAX_ROWS_TODAY_MAX}テーマ**を"
+        "目標とし、束ねられなければ少ない件数で確定します（水増し禁止）。判定手順は prompts 側。",
+        "",
+        "> **`所属タグ` 列はヒントに過ぎません**。同じタグが複数行に出ていれば"
+        "「同じ括りの銘柄に資金が入った可能性を材料で確かめる」きっかけとして使い、"
+        "**タグが付いていることだけを掲載根拠にしないでください**。"
+        "タグに無いテーマ名を材料から作って構いません。",
+        "",
+        "> **材料欄の読み方**。`{M/D}: ` は**対象週のその営業日**にその銘柄が動意 raw へ"
+        "載ったときの記述（一次情報）です。同じ銘柄に複数日分が並ぶ場合は、"
+        "その週を通して材料が続いていたことを示します。誌面の理由文で個別の出来事へ"
+        "触れるときは `9/8に` のように日付を必ず明示してください。"
+        "`開示・報道なし（値動きのみ）` の銘柄は**テーマにも単独材料にも載せません**。",
+        "",
+        "> **`点灯` 列**は、その銘柄が対象週の 5 営業日のうち何日、動意母集団に載ったかです。"
+        "日数が多いほどその週を通して資金が入り続けたことを示します（テーマの駆動要因を"
+        "書く材料に使って構いませんが、値動きだけを根拠にテーマへ入れてはいけません）。",
+        "",
+        "> **1銘柄は1テーマにだけ帰属させます**。材料が実際に指している出来事の"
+        "テーマ1つへ入れ、同じ銘柄を複数テーマの主導銘柄として重複掲載しないでください。",
+        "",
+        "> **所属タグ列に `（母集団外・材料あり）` と付いた銘柄**は、時価総額・売買代金の"
+        "機械フィルタでは主母集団に入らなかったものの、週次誌面本体（値上がり／値下がり／"
+        "売買代金の各 Top）には掲載されており材料テキストが確認できる銘柄です。"
+        "テーマの起点・構成銘柄として通常どおり掲載して構いません。",
+        "",
+        "| コード | 銘柄名 | 何の会社 | 時価総額 | 週間騰落率 | 週間売買代金 | 点灯 | 所属タグ | 材料 |",
+        "|---|---|---|---|---|---|---|---|---|",
+    ]
+
+    for r in recs:
+        code = str(r.get("code") or "").strip()
+        name = str(r.get("name") or "").strip()
+        try:
+            pct = f"{float(r.get('return_pct')):+.1f}%"
+        except (TypeError, ValueError):
+            pct = ""
+        t = _turn(r)
+        turn_s = f"{t / 1e8:.1f}億円" if t > 0 else ""
+        mcap_s = _mcap_str(r)
+        try:
+            lit = f"{int(r.get('_lit_days'))}/5日"
+        except (TypeError, ValueError):
+            lit = ""
+
+        desc = ""
+        if desc_lookup is not None:
+            try:
+                desc = clean_business_desc(desc_lookup(code) or "")
+            except Exception:
+                desc = ""
+
+        items: list = []
+        if material_lookup is not None:
+            try:
+                items = [str(m).strip() for m in (material_lookup(code) or []) if str(m).strip()]
+            except Exception:
+                items = []
+        if items:
+            mat = " ／ ".join(items[:max_material_items])
+        else:
+            # 空欄禁止。取れなかった事実を明示する（§25 の銘柄除外禁止）。
+            mat = "開示・報道なし（値動きのみ）"
+
+        tags = _tag_names_for(code, code_to_themes)
+        if r.get("_out_of_radar"):
+            tags = (tags + " " if tags else "") + "（母集団外・材料あり）"
+
+        cells = [code, name, desc, mcap_s, pct, turn_s, lit, tags, mat]
+        cells = [str(c).replace("|", "／").replace("\n", " ").strip() for c in cells]
+        lines.append("| " + " | ".join(cells) + " |")
+
+    lines.append("")
+    lines += [
+        "> **単独材料**: 上の一覧で材料が明確（大型受注・提携・上場承認・大型開示等）"
+        "でありながら同じ出来事で動いた銘柄が2社に満たない銘柄は、"
+        "誌面の `## 単独材料（テーマ未満・観察）` へ最大5行で載せてください"
+        "（材料が `開示・報道なし（値動きのみ）` の銘柄は載せません）。",
+        "",
+    ]
+    return lines
 
 # --------------------------------------------------------------------------
 # 自前括りテーマの蓄積（2026-09-02 PM 承認の改修4）

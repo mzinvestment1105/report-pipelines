@@ -74,6 +74,10 @@ from theme_radar import (
     render_reason_material,
     render_today_candidates,
     render_today_roster,
+    render_week_roster,
+    build_week_roster_records,
+    build_week_material_lookup,
+    build_week_desc_lookup,
     select_early_candidates,
     set_mcap_lookup,
 )
@@ -1856,6 +1860,127 @@ def fetch_valuation_block(code4: str, close: float) -> str:
 # Step 7: レポート全体組み立て
 # ---------------------------------------------------------------------------
 
+# 週次テーマ用の母集団セクション（2026-09-12 PM 承認・動意週次の `## 今週のテーマ`）。
+# 動意日次の `## 本日の動意母集団` と同じ列構成・同じ材料テキストを、対象週（月〜金）の
+# 和集合＋週間の値で組む。日次 raw には出力しない（--weekly-roster 指定時のみ）。
+WEEKLY_PARQUET_PATH = OUTPUTS_DIR / "sector_stock_weekly.parquet"
+# 母集団外の救済枠（週版）。週間騰落率の絶対値がこの値以上で、週間売買代金が
+# この金額以上の銘柄を、時価総額フィルタで落ちていても最大 WEEK_RESCUE_MAX 件まで足す。
+WEEK_RESCUE_MIN_ABS_RETURN = 15.0   # %
+WEEK_RESCUE_MIN_TURNOVER_YEN = 5e8  # 5億円（日次の母集団と同じ売買代金の足切り）
+WEEK_RESCUE_MAX = 40
+
+
+def resolve_week_dates(friday: date) -> list[str]:
+    """対象日（金曜）を含む週の月〜金を `YYYY-MM-DD` の昇順で返す。
+
+    祝日で市場が閉じた日は動意蓄積に行が無いため、和集合側で自然に落ちる
+    （ここでカレンダー判定はしない＝祝日辞書への依存を作らない）。
+    """
+    monday = friday - timedelta(days=friday.weekday())
+    return [(monday + timedelta(days=i)).isoformat() for i in range(5)]
+
+
+def build_weekly_roster_section(friday: date) -> list[str]:
+    """`## 今週の動意母集団` の行リストを返す（週次 workflow 専用）。"""
+    week_dates = resolve_week_dates(friday)
+    label = f"{week_dates[0][5:].replace('-', '/')}〜{week_dates[-1][5:].replace('-', '/')}"
+
+    ret_map: dict[str, float] = {}
+    turn_map: dict[str, float] = {}
+    mcap_map: dict[str, float] = {}
+    name_map: dict[str, str] = {}
+    market_map: dict[str, str] = {}
+    if WEEKLY_PARQUET_PATH.exists():
+        wk = pd.read_parquet(WEEKLY_PARQUET_PATH)
+        for _, r in wk.iterrows():
+            c = normalize_code_4(r.get("Code"))
+            if not c:
+                continue
+            v = r.get("Return_W01")
+            if pd.notna(v):
+                # Return_W01 は小数（0.5108 = +51.1%）。誌面・raw は % 表記のため 100 倍する。
+                ret_map[c] = float(v) * 100
+            v = r.get("AvgDailyValue5d")
+            if pd.notna(v):
+                # 週間売買代金 = 5営業日平均売買代金 × 5（prompts/mover-weekly.md と同一定義）
+                turn_map[c] = float(v) * 5
+            # 時価総額は**対象日（金曜）EOD** で判定する（_cr §31）。parquet の MarketCap 列は
+            # 週初（Close）基準で算出されており、動意週次の誌面が使う金曜終値基準と食い違う
+            # （9/11 実測: 4052 は MarketCap=50.6億円 だが誌面は 65億円＝金曜終値基準）。
+            # 発行済株数 × Close_W01（＝対象週金曜の終値）で組み直す。株数が取れない銘柄は
+            # 欠損のままにする（MarketCap で代用しない・推計禁止・§0）。
+            shares = r.get(
+                "NumberOfIssuedAndOutstandingSharesAtTheEndOfFiscalYearIncludingTreasuryStock"
+            )
+            close_fri = r.get("Close_W01")
+            if pd.notna(shares) and pd.notna(close_fri):
+                mcap_map[c] = float(shares) * float(close_fri) / 1e8  # 円 → 億円
+            v = r.get("CompanyName")
+            if isinstance(v, str) and v.strip():
+                name_map[c] = v.strip()
+            v = r.get("MarketCodeName")
+            if isinstance(v, str) and v.strip():
+                market_map[c] = v.strip()
+        print(f"  週次母集団: 週間ランキング parquet {len(ret_map)}銘柄")
+    else:
+        print(f"  [WARN] 週次母集団: {WEEKLY_PARQUET_PATH} が無く週間の値を付けられません")
+
+    # 週の母集団は**日次と同一のロジック**で決める（_cr §38）。日次は
+    # extract_radar_universe（売買代金5億円以上 × 時価総額100億円以上 × 上昇、
+    # グロース／スタンダードは全件・プライムは log10(1+売買代金[億円])×騰落率 の上位50件）
+    # を当日値へ当てている。週次は同じ関数へ**週の値**を渡す（DailyReturn=週間騰落率・
+    # Turnover=週間売買代金・MarketCapOku=金曜EOD時価総額）。関数を共有することで、
+    # 日次と週次でテーマの母集団定義が食い違うことを構造的に防ぐ。
+    week_uni = pd.DataFrame([
+        {
+            "Code": c,
+            "CompanyName": name_map.get(c, ""),
+            "MarketCodeName": market_map.get(c, ""),
+            "DailyReturn": ret_map[c],
+            "Turnover": turn_map.get(c),
+            "MarketCapOku": mcap_map.get(c),
+        }
+        for c in ret_map
+    ])
+    radar_week = extract_radar_universe(week_uni)
+    week_codes = [str(c) for c in radar_week["Code"]] if not radar_week.empty else []
+    print(f"  週次母集団: extract_radar_universe（週の値）で {len(week_codes)}銘柄")
+
+    # 母集団外の救済（2026-09-03 PM 承認の日次ルールの週版）。時価総額100億円・
+    # 売買代金5億円のフィルタで落ちても、週次誌面本体（値上がり／値下がり／売買代金の
+    # 各 Top）へ載る銘柄はテーマの起点になり得るため、週間騰落率の絶対値が大きい銘柄を
+    # 救済枠として足す。所属タグ列に `（母集団外・材料あり）` の目印が付く。
+    known = set(week_codes)
+    extra_codes = [
+        c for c, _v in sorted(
+            ((c, abs(v)) for c, v in ret_map.items()
+             if c not in known and abs(v) >= WEEK_RESCUE_MIN_ABS_RETURN
+             and turn_map.get(c, 0) >= WEEK_RESCUE_MIN_TURNOVER_YEN),
+            key=lambda kv: -kv[1],
+        )[:WEEK_RESCUE_MAX]
+    ]
+    print(f"  週次母集団: 母集団外の救済 {len(extra_codes)}銘柄")
+
+    records = build_week_roster_records(
+        week_dates,
+        week_codes=week_codes,
+        extra_codes=extra_codes,
+        weekly_return_lookup=ret_map.get,
+        weekly_turnover_lookup=turn_map.get,
+        mcap_lookup=mcap_map.get,
+        name_lookup=name_map.get,
+        market_lookup=market_map.get,
+    )
+    print(f"  週次母集団: {week_dates[0]}〜{week_dates[-1]} の和集合 {len(records)}銘柄")
+    return render_week_roster(
+        records,
+        material_lookup=build_week_material_lookup(week_dates),
+        desc_lookup=build_week_desc_lookup(week_dates),
+        week_label=label,
+    )
+
+
 def build_report(
     full_df: pd.DataFrame,
     detail_df: pd.DataFrame,
@@ -1870,6 +1995,7 @@ def build_report(
     hist_df: pd.DataFrame | None = None,
     quality_note: str = "",
     radar_df: pd.DataFrame | None = None,
+    weekly_roster: bool = False,
 ) -> str:
     lines = [
         f"# 動意銘柄レポート 生データ ({today.strftime('%Y-%m-%d')})",
@@ -2042,6 +2168,19 @@ def build_report(
         # 材料未取得の銘柄は候補にすら載らなかった（9/2 の当日テーマは1件）。
         # 新形式は母集団を全件並べ、テーマの括りと命名を Claude が材料から行う（_cr §38）。
         lines += render_today_roster(_roster_records, _material, desc_lookup=_desc)
+        # 週次テーマ（2026-09-12 PM 承認）: 動意週次の誌面へ日次と同一構成の
+        # `## 今週のテーマ` を出すため、対象週（月〜金）の日次母集団を和集合した
+        # `## 今週の動意母集団` を当日ロスターの直後へ 1 回だけ足す。
+        # 日次 raw には一切影響しない（--weekly-roster 指定時のみ出力）。
+        # 週の値（週間騰落率・週間売買代金・時価総額）は sector_stock_weekly.parquet の
+        # Return_W01 / AvgDailyValue5d×5 / MarketCap を使う（週次 workflow が本 step の
+        # 直前に生成済み）。取れない銘柄は欠損のままにする（推計禁止・§0）。
+        if weekly_roster:
+            try:
+                lines += build_weekly_roster_section(today)
+            except Exception as _e:
+                # 配信絶対の原則（_cr §36）: 週次母集団が組めなくても raw 本体は止めない。
+                print(f"  [WARN] 週次母集団（今週のテーマ用）: {_e}")
         # 初動候補テーマ（v16 / 2026-09-03）: 当日の統合テーマ行から「複数銘柄が同時に
         # 点灯し、かつ実弾（売買代金）が入っている」ものだけを機械条件で拾う欄。
         # 誌面位置は `## 本日のテーマ` の直後・`## 直近2週間の熱いテーマ` の前。
@@ -2324,6 +2463,9 @@ def main() -> None:
     parser.add_argument("--date-gate", action="store_true",
                         help="対象日ゲート（注記モード・GHA 用）: 対象日 EOD 未着でも生成を続行し、"
                              "品質注記を raw 冒頭と {対象日}_quality_flags.txt に出力する（中止しない）")
+    parser.add_argument("--weekly-roster", action="store_true",
+                        help="対象週（月〜金）の動意母集団を和集合した `## 今週の動意母集団` を raw へ追加する"
+                             "（動意週次の `## 今週のテーマ` 用・週次 workflow 専用。日次 raw には出さない）")
     parser.add_argument("--probe-date-only", action="store_true",
                         help="対象日 EOD の着信確認のみ行い exit 0/3 を返す（workflow の待機リトライ用・生成しない）")
     args = parser.parse_args()
@@ -2481,6 +2623,7 @@ def main() -> None:
         hist_df=hist_df,
         quality_note=quality_note,
         radar_df=radar_df,
+        weekly_roster=args.weekly_roster,
     )
 
     # 検証時に本番 raw を上書きしないための逃がし口。未設定なら従来どおり market/daily/。

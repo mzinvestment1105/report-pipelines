@@ -616,7 +616,11 @@ jobs:
           EDINETDB_API_KEYS: ${{ secrets.EDINETDB_API_KEYS }}
           PYTHONIOENCODING: utf-8
         run: |
-          python make_mover_report.py --date ${{ steps.date.outputs.value }} --no-pdf --date-gate
+          # --weekly-roster（2026-09-12 PM 承認）: 対象週（月〜金）の動意母集団を和集合した
+          # `## 今週の動意母集団` を raw へ追加する。動意週次の誌面冒頭に置く
+          # `## 今週のテーマ`（動意日次の `## 本日のテーマ` と同一構成・_cr §38）の材料一覧であり、
+          # 直前の step が生成した sector_stock_weekly.parquet の週間値を使う。
+          python make_mover_report.py --date ${{ steps.date.outputs.value }} --no-pdf --date-gate --weekly-roster
 
       - name: Append 立花証券 e支店 API context to movers raw
         working-directory: ./private-repo/bi/pipelines
