@@ -362,6 +362,8 @@ def _check_reaction_format(md: str) -> list[str]:
 #   2. 「株価の反応」への 4 本値の混入（error）
 #   3. 同義反復の禁止例（warning・語句ベースのため誤検知を避け warning から導入）
 #   4. 1 件あたりの分量超過（warning）
+#   5. §8 需給テーブルの ⑩ 信用規制 行の書式（基準日つきの状態表記・error）
+#   6. ⑩ 信用規制 行と「規制の見通し」の存在（error / 旧日付は warning）
 # 既存の _check_reaction_format() とは独立した関数として実装し、既存検査には触れない。
 
 # 節の開始は「株価が反応した上位N件」の見出し。終了は次の同レベル以上の見出し。
@@ -1497,23 +1499,74 @@ _DIRECTION_ONLY = re.compile(
 )
 
 
-def check_demand_table_numbers(md: str) -> tuple[list[str], str]:
+# ⑩ 信用規制 行の「現状」セルの書式。基準日（M/D）を先頭に置き、種別または状態が続く。
+# 「9/3 日々公表」「9/8 増担保」「9/8 日々公表・増担保」「9/11 指定なし」「9/11 取得不能」。
+# 日付を必須にするのは、規制の有無は基準日が無いと意味を成さないためである（_common_rules §44）。
+_MARGIN_REG_STATUS = re.compile(
+    r"^\s*\d{1,2}/\d{1,2}\s*"
+    r"(日々公表|増担保|指定なし|取得不能)"
+    r"(\s*[・/／]\s*(日々公表|増担保|指定なし|取得不能))*"
+)
+
+# ⑩ 行と「規制の見通し」を error として強制する開始日。これより前の日付のレポートは
+# 既に送信済みであり、再送・ダイジェスト生成のたびに落とすと運用が止まるため warning に留める。
+MARGIN_REG_REQUIRED_FROM = "2026-09-13"
+
+
+def _report_date_from_name(name: str) -> str | None:
+    """レポートのファイル名（YYYY-MM-DD.md）から日付文字列を取り出す。
+
+    取り出せない場合は None を返し、呼び出し側は「日付不明」として
+    ⑩ 行・規制の見通しの欠落を warning 扱いにする（既存誌面を壊さない）。
+    """
+    m = re.match(r"^(\d{4}-\d{2}-\d{2})\.md$", str(name).strip())
+    return m.group(1) if m else None
+
+
+def _report_date_from_md(md: str) -> str | None:
+    """誌面の見出し行（# 593A ○○ Deep Dive レポート（2026-09-10））から日付を取り出す。
+
+    送信スクリプトはファイル名を gate へ渡さないため、ファイル名から日付が
+    取れない呼び出しでもこの経路で新旧を判定できるようにする。
+    """
+    for line in md.split("\n", 40)[:40]:
+        if not line.startswith("# "):
+            continue
+        m = re.search(r"(\d{4}-\d{2}-\d{2})", line)
+        if m:
+            return m.group(1)
+    return None
+
+
+def check_demand_table_numbers(
+    md: str, report_date: str | None = None
+) -> tuple[list[str], list[str], str]:
     """§8 需給テーブルの各行の「現状」セルが数値を含むかを検査する。
 
     - 「現状」セルに数字が 1 文字も無い行を error とする。
     - 方向語・評価語だけで構成された行を error とする。
     - 軸名に「トレンド」を含む行は起点 → 終点の形式（→ / ->）を必須とする。
+    - 軸名が「⑩」で始まる行（信用規制）は数値・方向語の一般検査ではなく、
+      「M/D 日々公表 / 増担保 / 指定なし / 取得不能」の書式を必須とする
+      （状態語そのものが結論であり、数値を持たない行だからである）。
+    - ⑩ 行そのものの欠落と、「規制の見通し」の欠落を検査する。
+      report_date が MARGIN_REG_REQUIRED_FROM 以降なら error、それより前・
+      不明なら warning とする（送信済みレポートの再送を壊さないため）。
 
-    返り値: (errors, info メッセージ)
+    返り値: (errors, warnings, info メッセージ)
     """
     errors: list[str] = []
+    warnings: list[str] = []
     checked = 0
+    found_table = False
+    has_margin_row = False
     for line, header, rows in _tables_with_lines(md):
         head = [h.strip() for h in header]
         if not head or head[0] != "軸":
             continue
         if "現状" not in head:
             continue
+        found_table = True
         i_cur = head.index("現状")
         for row in rows:
             if len(row) <= i_cur:
@@ -1521,6 +1574,18 @@ def check_demand_table_numbers(md: str) -> tuple[list[str], str]:
             axis = row[0].strip()
             cur = re.sub(r"\*\*|__|`", "", row[i_cur]).strip()
             checked += 1
+            if axis.startswith("⑩"):
+                # 信用規制の行。状態語そのものが結論であり数値を持たないため、
+                # 一般の数値・方向語の検査を当てず、基準日つきの状態表記を必須とする。
+                has_margin_row = True
+                if not _MARGIN_REG_STATUS.match(cur):
+                    errors.append(
+                        f"[需給テーブル] L{line} 台「{axis}」の現状セルの書式が不正です"
+                        f"（記載:「{cur}」） → 対処: 基準日を先頭に置き"
+                        "「9/3 日々公表」「9/8 増担保」「9/11 指定なし」「9/11 取得不能」"
+                        "のいずれかで書く（_common_rules §44）"
+                    )
+                continue
             if not re.search(r"\d", cur):
                 errors.append(
                     f"[需給テーブル] L{line} 台「{axis}」の現状セルに数値がありません"
@@ -1538,8 +1603,30 @@ def check_demand_table_numbers(md: str) -> tuple[list[str], str]:
                     f"（記載:「{cur}」・書式: ○○○,○○○株 → ○○○,○○○株（±○.○%））"
                 )
     if not checked:
-        return [], "[需給テーブル] §8 の統合テーブルが見つからず検査スキップ"
-    return errors, f"[需給テーブル] {checked} 行を検査（違反 {len(errors)} 件）"
+        return [], [], "[需給テーブル] §8 の統合テーブルが見つからず検査スキップ"
+
+    # ⑩ 信用規制 行そのものの欠落と、「規制の見通し」の欠落。
+    # 規制の有無は需給の読みを反転させうるため、行の省略を認めない（_common_rules §44）。
+    strict = bool(report_date) and report_date >= MARGIN_REG_REQUIRED_FROM
+    sink = errors if strict else warnings
+    if found_table and not has_margin_row:
+        sink.append(
+            "[需給テーブル] §8 需給テーブルに ⑩ 信用規制 行がありません"
+            " → 対処: 生データの「### 信用取引規制（日々公表・増担保）」節から"
+            "「M/D 日々公表」「M/D 増担保」「M/D 指定なし」「M/D 取得不能」の行を 1 行足す"
+        )
+    if found_table and "規制の見通し" not in md:
+        sink.append(
+            "[需給テーブル] §8 に「規制の見通し」の記載がありません"
+            " → 対処: ⑩ の直後に 2〜3 行で、指定または解除の基準までの距離を"
+            "実数と基準値の対比で書く（基準値の出典は dev/reference/jpx_margin_regulation_criteria.md）"
+        )
+    note = (
+        f"[需給テーブル] {checked} 行を検査（違反 {len(errors)} 件・⑩ 信用規制行 "
+        + ("あり" if has_margin_row else "なし")
+        + "）"
+    )
+    return errors, warnings, note
 
 
 
@@ -2892,7 +2979,9 @@ def check_skeleton(md: str) -> tuple[list[str], list[str], list[str]]:
     return errors, warnings, info
 
 
-def run_gate(md: str, code: str) -> tuple[list[str], list[str], list[str]]:
+def run_gate(
+    md: str, code: str, report_date: str | None = None
+) -> tuple[list[str], list[str], list[str]]:
     """(errors, warnings, info) を返す。errors が空なら送信可。"""
     errors: list[str] = []
     warnings: list[str] = []
@@ -3087,9 +3176,15 @@ def run_gate(md: str, code: str) -> tuple[list[str], list[str], list[str]]:
 
     # 16. §8 需給テーブルの数値必須（errors・PM 2026-09-07）
     #     「現状」列が方向語だけで数値を欠く行を不合格にする。
+    #     加えて ⑩ 信用規制 行の書式・同行の存在・「規制の見通し」の存在を検査する
+    #     （errors・PM 2026-09-12・_common_rules §44）。⑩ と見通しの欠落は
+    #     MARGIN_REG_REQUIRED_FROM 以降のレポートのみ error、それ以前は warning。
     #     §8 の統合テーブルが無い誌面ではスキップする（後方互換）。
-    dt_errs, dt_note = check_demand_table_numbers(md)
+    dt_errs, dt_warns, dt_note = check_demand_table_numbers(
+        md, report_date or _report_date_from_md(md)
+    )
     errors.extend(dt_errs)
+    warnings.extend(dt_warns)
     if dt_note:
         info.append(dt_note)
 
@@ -3132,7 +3227,9 @@ def main() -> int:
         return 1
 
     md_text = md_path.read_text(encoding="utf-8")
-    errors, warnings, info = run_gate(md_text, args.code)
+    # ⑩ 信用規制 行・規制の見通しの必須化は、ファイル名の日付で新旧を切り分ける。
+    report_date = _report_date_from_name(md_path.name) or args.date
+    errors, warnings, info = run_gate(md_text, args.code, report_date)
 
     # 5 分版（結論行のみ）を印字する（PM 2026-09-08）。PM は誌面全文を読む前に
     # ここだけを読んで筋が通っているかを確認し、送信の可否を判断する。

@@ -120,6 +120,14 @@ REACTION_JQ_INDEX_CODES = {
 SHORT_SALE_SCAN_BACK_DAYS = 21   # 対象日より前（直前の残高＝増減の比較対象を取るため）
 SHORT_SALE_SCAN_FWD_DAYS  = 6    # 対象日より後（対象日の CalcDate 分が公表されるまで）
 
+# 信用取引規制（/markets/margin-alert）の走査期間。現在の指定が「いつ始まったか」を
+# 連続区間の先頭として取るため、基準日から十分さかのぼる（90 日）。
+MARGIN_ALERT_SCAN_BACK_DAYS = 90
+# 信用規制の取得がレート上限（429）で落ちた時の再試行回数と初回待機秒数。
+# 2 秒 → 4 秒 → 8 秒 と倍にしながら最大 3 回呼ぶ（= 再試行は 2 回）。
+MARGIN_ALERT_RETRIES = 3
+MARGIN_ALERT_BACKOFF_BASE_SEC = 2.0
+
 # 取得経路の記録（provenance）。値は "EDINET DB" / "EDINET公式API(有報)" / "取得不可"
 PROV_DB      = "EDINET DB"
 PROV_EDINET  = "EDINET公式API(有報)"
@@ -659,6 +667,95 @@ def build_supply_demand_axes(code4: str) -> dict:
     out["axes"]["trend_judge"] = direction
 
     return out
+
+
+def _fmt_margin_alert(ma: dict | None) -> list[str]:
+    """信用取引規制（日々公表・増担保）セクションを組み立てる。
+
+    §8 需給分析で規制の有無を必ず明示するため、**取得できなかった場合もセクションを
+    省略しない**。取得失敗を「指定なし」と書くと需給の読みを誤らせるため、判定は
+    「指定中／指定なし／取得不能」の3値を厳密に出し分ける。
+    """
+    lines = ["### 信用取引規制（日々公表・増担保）", ""]
+
+    if not ma:
+        lines += ["- **判定**: 取得不能（未実行）", ""]
+        return lines
+
+    status = ma.get("fetch_status") or "error:不明"
+    tgt = ma.get("target_date")
+    tgt_s = tgt.isoformat() if tgt else "N/A"
+
+    if status.startswith("error"):
+        # 取得失敗を「指定なし」と書かない（黙った補完の禁止）。
+        lines += [
+            f"- **判定**: 取得不能（{status}）",
+            f"- **根拠**: J-Quants v2 /markets/margin-alert（基準日 {tgt_s}）の取得に失敗",
+            "- ※ 規制の有無は確認できていない。規制なしと解釈しないこと。",
+            "",
+        ]
+        return lines
+
+    if status == "empty" or not ma.get("designated"):
+        lines += [
+            "- **判定**: 指定なし（増担保規制・日々公表銘柄のいずれにも該当しない）",
+            f"- **根拠**: J-Quants v2 /markets/margin-alert・基準日 {tgt_s}／"
+            f"{ma.get('basis') or 'N/A'}",
+        ]
+        if status == "empty":
+            lines += ["- 走査期間に本銘柄の公表行なし（規制・注意喚起の対象外）", ""]
+            return lines
+        lines.append(f"- 走査期間の公表行数: {ma.get('history_days', 0)} 行")
+    else:
+        kinds = "・".join(ma.get("kinds") or []) or "区分不明"
+        since = ma.get("since")
+        lines += [
+            f"- **判定**: 指定中（{kinds}）",
+            f"- **根拠**: J-Quants v2 /markets/margin-alert・基準日 {tgt_s}／"
+            f"{ma.get('basis') or 'N/A'}",
+            f"- **直近の指定日（連続区間の先頭）**: "
+            f"{since.isoformat() if since else '特定できず'}",
+            f"- 走査期間の公表行数: {ma.get('history_days', 0)} 行",
+        ]
+
+    row = ma.get("latest_row") or {}
+    if row:
+        def g(k, unit="", fmt="{:,.0f}"):
+            v = row.get(k)
+            if v is None or (isinstance(v, float) and v != v):
+                return "N/A"
+            try:
+                return f"{fmt.format(float(v))}{unit}"
+            except (TypeError, ValueError):
+                return str(v)
+
+        lines += [
+            "",
+            f"直近公表行（PubDate={row.get('PubDate', 'N/A')} / "
+            f"AppDate={row.get('AppDate', 'N/A')} / "
+            f"TSEMrgnRegCls={row.get('TSEMrgnRegCls', 'N/A')}）",
+            "",
+            "| 項目 | 実数 |",
+            "|------|------|",
+            f"| 信用買残（LongOut） | {g('LongOut', '株')} |",
+            f"| 信用買残 前日比（LongOutChg） | {g('LongOutChg', '株', '{:+,.0f}')} |",
+            f"| 信用買残 対売買単位比率（LongOutRatio） | {g('LongOutRatio', '', '{:,.4f}')} |",
+            f"| 信用売残（ShrtOut） | {g('ShrtOut', '株')} |",
+            f"| 信用売残 前日比（ShrtOutChg） | {g('ShrtOutChg', '株', '{:+,.0f}')} |",
+            f"| 信用売残 対売買単位比率（ShrtOutRatio） | {g('ShrtOutRatio', '', '{:,.4f}')} |",
+            # SLRatio は 2026-09-11 に全銘柄 1 日分で突合し
+            # 「ShrtOut ÷ LongOut × 100（％）」であることを実測確認した。
+            # CLAUDE.md §3-D により「信用倍率」の語は使わない。
+            f"| 信用売残÷信用買残（SLRatio） | {g('SLRatio', '%', '{:,.1f}')} |",
+        ]
+        pr = row.get("PubReason")
+        if isinstance(pr, dict):
+            on = [k for k, v in pr.items() if str(v) == "1"]
+            lines.append(
+                f"| 公表理由フラグ（PubReason=1 の項目） | {', '.join(on) if on else 'なし'} |"
+            )
+    lines.append("")
+    return lines
 
 
 def _fmt_supply_demand_axes(sd: dict | None) -> list[str]:
@@ -3684,6 +3781,203 @@ def _fetch_jq_index_closes(days: list) -> dict:
     return out
 
 
+# 信用取引規制（日々公表・増担保）の判定に使う区分コード。
+# J-Quants v2 /markets/margin-alert の TSEMrgnRegCls と PubReason フラグの
+# 対応は 2026-09-11 に実データ（全銘柄 1 日分 271 行）で突合して確認した:
+#   "001" … PubReason.RestrictedByJSF / PrecautionByJSF のみ = 日証金（JSF）の
+#            貸株注意喚起・申込制限。東証の規制ではないため「指定なし」扱い。
+#   "002" … PubReason.DailyPublication="1" = 東証の「日々公表銘柄」。
+#   "003" … PubReason.Restricted="1"       = 東証の「増担保規制（委託保証金率引上げ）」。
+#   "101" … PubReason.UnclearOrSecOnAlert="1" = 不明確・監理銘柄。
+MARGIN_ALERT_CLS_DAILY_PUB = "002"
+MARGIN_ALERT_CLS_RESTRICTED = "003"
+MARGIN_ALERT_CLS_LABELS = {
+    "001": "日証金の注意喚起・申込制限（東証規制ではない）",
+    "002": "日々公表銘柄",
+    "003": "増担保規制（委託保証金率引上げ）",
+    "101": "不明確・監理銘柄",
+}
+
+
+def fetch_margin_alert(code: str, target_date) -> dict:
+    """J-Quants v2 /markets/margin-alert から、信用取引規制の指定状況を取得する。
+
+    ■ エンドポイントのパス（実装で確認済み・2026-09-12）
+      導入済み jquantsapi の `enums.py` が `MKT_MARGIN_ALERT = "/markets/margin-alert"`
+      を定義し、`apis/v2/markets.py` の MktMarginAlertApiV2 が実際にこのパスを叩く。
+      v1 の同一機能は `/markets/daily_margin_interest` であり、v2 で改称された
+      （ライブラリ内では path_old として併記されている）。本関数は v2 クライアント
+      （jquantsapi.ClientV2）を使うため、パスは `/markets/margin-alert` である。
+
+    §8 需給分析で「増担保規制中か／日々公表銘柄か」を明示するために使う。
+    この判定を誤ると、規制で買いが細っている銘柄を「需給良好」と読み違えるため、
+    エンドポイント自身の意味づけだけから判定し、推測での補完を一切行わない。
+
+    ■ designated の導出根拠（PM 報告用に明記する）
+      本エンドポイントは「日々公表信用取引残高」であり、**規制対象・注意喚起対象の
+      銘柄しか行を返さない**（非対象銘柄は列すら無い空 DataFrame が返る。7203・6758
+      で実測確認済み）。したがって「行があるか否か」だけで判定すると、日証金の
+      貸株注意喚起にすぎない銘柄まで「規制中」と誤判定する。実際 7256 は毎営業日
+      行が返るが TSEMrgnRegCls="001"（日証金の貸株注意喚起のみ）であり、東証の
+      増担保規制でも日々公表銘柄でもない。
+      そのため designated は **行の存在ではなく PubReason の該当フラグ**から導く:
+        designated = (PubReason.Restricted == "1") or (PubReason.DailyPublication == "1")
+      TSEMrgnRegCls（"002"/"003"）は同じ内容の区分コードで、実データ上 PubReason と
+      完全に一致した。PubReason を主、TSEMrgnRegCls を従（フラグ欠損時の予備）とする。
+
+    Args:
+        code: 銘柄コード（4桁・5桁どちらでも可。API はどちらも受け付ける）。
+        target_date: 判定の基準日（date）。この日以前で最新の公表日の行を採用する。
+    Returns:
+        {
+          "designated": bool,          # 東証の増担保規制 or 日々公表に該当するか
+          "since": date | None,        # 現在の指定が始まった公表日（連続区間の先頭）
+          "latest_row": dict | None,   # 採用した行（生の列名のまま）
+          "history_days": int,         # 走査期間に返ってきた行数
+          "fetch_status": "ok" | "empty" | "error:<msg>",
+          "basis": str,                # designated をどう導いたか
+          "kinds": list[str],          # 該当した規制の種類（日本語ラベル）
+          "target_date": date | None,
+        }
+    """
+    out: dict = {
+        "designated": False, "since": None, "latest_row": None,
+        "history_days": 0, "fetch_status": "empty", "basis": "",
+        "kinds": [], "target_date": target_date,
+    }
+
+    api_key = os.environ.get("JQUANTS_API_KEY", "").strip()
+    if not api_key:
+        out["fetch_status"] = "error:JQUANTS_API_KEY 未設定"
+        return out
+    if target_date is None:
+        out["fetch_status"] = "error:基準日が未確定"
+        return out
+
+    try:
+        import jquantsapi
+        client = jquantsapi.ClientV2(api_key=api_key)
+    except Exception as e:
+        print(f"  → 取得失敗: J-Quants クライアント生成（信用規制）: {e}", file=sys.stderr)
+        out["fetch_status"] = f"error:クライアント生成 {e}"
+        return out
+
+    # 指定開始日（連続区間の先頭）を取るため、基準日から十分さかのぼって走査する。
+    frm = target_date - timedelta(days=MARGIN_ALERT_SCAN_BACK_DAYS)
+    # レート上限（429 Too Many Requests）は J-Quants 側で頻繁に起きる。ここで諦めると
+    # §8 の ⑩ 信用規制 行が「取得不能」になり、規制の有無を誌面で語れなくなるため、
+    # 指数バックオフ（2 秒 → 4 秒 → 8 秒）で 3 回まで待って取り直す。
+    # 429 以外の例外は仕様上の失敗であり、再試行せず即座に fetch_status へ倒す。
+    df = None
+    last_err: Exception | None = None
+    for attempt in range(MARGIN_ALERT_RETRIES):
+        try:
+            df = client.get_mkt_margin_alert(
+                code=str(code).strip(),
+                from_yyyymmdd=frm.strftime("%Y%m%d"),
+                to_yyyymmdd=target_date.strftime("%Y%m%d"),
+            )
+            last_err = None
+            break
+        except Exception as e:  # noqa: BLE001 — 例外種別はライブラリ依存のため文字列で判定する
+            last_err = e
+            is_rate_limited = "429" in str(e) or "too many requests" in str(e).lower()
+            if not is_rate_limited or attempt == MARGIN_ALERT_RETRIES - 1:
+                break
+            wait = MARGIN_ALERT_BACKOFF_BASE_SEC * (2 ** attempt)
+            print(
+                f"  → J-Quants 信用規制 {code}: レート上限のため {wait:.0f} 秒待って再試行"
+                f"（{attempt + 1}/{MARGIN_ALERT_RETRIES - 1} 回目）",
+                file=sys.stderr,
+            )
+            time.sleep(wait)
+    if last_err is not None:
+        print(f"  → 取得失敗: J-Quants 信用規制 {code}: {last_err}", file=sys.stderr)
+        out["fetch_status"] = f"error:{last_err}"
+        return out
+
+    # 非対象銘柄は「列すら無い空 DataFrame」が返るため、列アクセス前に長さで判定する。
+    if df is None or len(df) == 0:
+        # 行が無い = このエンドポイントの母集団（規制・注意喚起対象）に入っていない。
+        out["fetch_status"] = "empty"
+        out["basis"] = "absent_from_margin_alert_list（規制・注意喚起いずれの対象でもない）"
+        return out
+
+    def _to_date(s):
+        try:
+            return datetime.strptime(str(s)[:10], "%Y-%m-%d").date()
+        except (TypeError, ValueError):
+            return None
+
+    rows: list[dict] = []
+    for r in df.to_dict("records"):
+        d = _to_date(r.get("PubDate"))
+        if d is None or d > target_date:
+            continue
+        rows.append({"_pubdate": d, **r})
+    rows.sort(key=lambda x: x["_pubdate"])
+    out["history_days"] = len(rows)
+    if not rows:
+        out["fetch_status"] = "empty"
+        out["basis"] = "absent_from_margin_alert_list（基準日以前の公表行が無い）"
+        return out
+
+    def _flags(r) -> dict:
+        pr = r.get("PubReason")
+        return pr if isinstance(pr, dict) else {}
+
+    def _is_designated(r) -> bool:
+        """東証の規制（増担保 or 日々公表）に該当するか。PubReason を主・区分を従とする。"""
+        fl = _flags(r)
+        if fl:
+            return fl.get("Restricted") == "1" or fl.get("DailyPublication") == "1"
+        # PubReason が取れない場合のみ区分コードで代替する（推定はしない）。
+        return str(r.get("TSEMrgnRegCls") or "") in (
+            MARGIN_ALERT_CLS_DAILY_PUB, MARGIN_ALERT_CLS_RESTRICTED
+        )
+
+    latest = rows[-1]
+    out["fetch_status"] = "ok"
+    out["latest_row"] = {k: v for k, v in latest.items() if k != "_pubdate"}
+    out["designated"] = _is_designated(latest)
+
+    fl = _flags(latest)
+    kinds: list[str] = []
+    if fl.get("Restricted") == "1":
+        kinds.append("増担保規制（委託保証金率引上げ）")
+    if fl.get("DailyPublication") == "1":
+        kinds.append("日々公表銘柄")
+    if not kinds and out["designated"]:
+        lbl = MARGIN_ALERT_CLS_LABELS.get(str(latest.get("TSEMrgnRegCls") or ""))
+        if lbl:
+            kinds.append(lbl)
+    out["kinds"] = kinds
+
+    if out["designated"]:
+        # 実際に立っているフラグだけを根拠として書く（立っていない条件を根拠に含めない）。
+        fired = [k for k in ("Restricted", "DailyPublication") if fl.get(k) == "1"]
+        out["basis"] = (
+            (" / ".join(f"PubReason.{k}=1" for k in fired) if fired
+             else f"TSEMrgnRegCls={latest.get('TSEMrgnRegCls')!r}")
+            + f"（TSEMrgnRegCls={latest.get('TSEMrgnRegCls')!r}）"
+        )
+        # 現在の指定が続いている連続区間の先頭を探す（間に非該当日があればそこで切る）。
+        since = latest["_pubdate"]
+        for r in reversed(rows[:-1]):
+            if _is_designated(r):
+                since = r["_pubdate"]
+            else:
+                break
+        out["since"] = since
+    else:
+        cls = str(latest.get("TSEMrgnRegCls") or "")
+        out["basis"] = (
+            "PubReason に Restricted/DailyPublication が立っていない"
+            f"（TSEMrgnRegCls={cls!r}: {MARGIN_ALERT_CLS_LABELS.get(cls, '区分不明')}）"
+        )
+    return out
+
+
 def _fetch_jq_short_sale_daily(code4: str, days: list, shares_out=None) -> dict:
     """J-Quants /markets/short-sale-report から、対象銘柄の機関空売り残の日次増減を取得する。
 
@@ -4295,6 +4589,7 @@ def build_data_markdown(
     sd_axes: dict | None = None,
     guidance: dict | None = None,
     reaction_ctx: dict | None = None,
+    margin_alert: dict | None = None,
 ) -> str:
     company_name = (
         company_data.get("companyName")
@@ -4460,8 +4755,10 @@ def build_data_markdown(
 
     lines += ["", "---", ""]
 
-    # 需給3軸（誌面のゲート項目）
+    # 需給3軸（誌面のゲート項目）＋ 信用取引規制（日々公表・増担保）。
+    # 規制セクションは取得失敗時も必ず出す（§8 需給分析で規制の有無を必ず明示するため）。
     sd_lines = _fmt_supply_demand_axes(sd_axes)
+    sd_lines += _fmt_margin_alert(margin_alert)
     if sd_lines:
         lines += sd_lines
         lines += ["---", ""]
@@ -4797,6 +5094,29 @@ def main() -> None:
           f"  需給3軸: {'算出済' if sd_axes.get('available') else '未収録'}"
           f"  過去レポート: {len([s for s in past_research.split('---') if s.strip()])} 件")
 
+    # 7-1) 信用取引規制（日々公表・増担保）。§8 需給分析で規制の有無を必ず明示する。
+    #      基準日は株価データの最終営業日（無ければ当日）。
+    _ma_target = None
+    if price_stats and price_stats.get("last_date"):
+        try:
+            _ma_target = datetime.strptime(
+                str(price_stats["last_date"])[:10], "%Y-%m-%d"
+            ).date()
+        except (TypeError, ValueError):
+            _ma_target = None
+    if _ma_target is None:
+        _ma_target = date.today()
+    print(f"[9/9] 信用取引規制（日々公表・増担保）を確認中（基準日 {_ma_target}）...")
+    margin_alert = fetch_margin_alert(code, _ma_target)
+    provenance["margin_alert"] = (
+        f"J-Quants /markets/margin-alert（{margin_alert.get('fetch_status')}）"
+    )
+    if margin_alert.get("fetch_status") == "ok" and margin_alert.get("designated"):
+        print("  → ⚠️ 指定中: " + "・".join(margin_alert.get("kinds") or []))
+    else:
+        print(f"  → 判定: {margin_alert.get('fetch_status')} / "
+              f"designated={margin_alert.get('designated')}")
+
     # 7-2) 反応スコア対象日の外部環境。
     #      「特定できる材料が確認できなかった」で終わらせないため、値動きの原因に
     #      なりうる事実（自社開示・国内指数・米国指数・為替・同業）を機械で揃える。
@@ -4854,6 +5174,7 @@ def main() -> None:
         sd_axes=sd_axes,
         guidance=guidance,
         reaction_ctx=reaction_ctx,
+        margin_alert=margin_alert,
     )
     out_path.write_text(md, encoding="utf-8")
     char_count = len(md)
