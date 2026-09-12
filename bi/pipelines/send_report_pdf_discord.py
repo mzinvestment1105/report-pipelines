@@ -16,7 +16,10 @@ import argparse
 import json
 import os
 import re
+import secrets
 import sys
+import time
+from urllib.parse import quote
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -40,6 +43,16 @@ from send_report_jpeg_discord import (  # noqa: E402
 
 JST = timezone(timedelta(hours=9))
 load_dotenv(Path(__file__).resolve().parent / ".env")
+
+# まとめ版 PDF（build_report_digest.py が直接 PDF を出力する）の送信設定。
+# md からのレンダリングを経ない唯一の種別のため KIND_CONFIG とは別に持ち、
+# 既存 kind の解決ロジックへ一切影響を与えない。
+# PM 2026-09-12 決定: まとめ版は個別銘柄レポート（stock）と同じチャンネルへ常に送る。
+DIGEST_CONFIG = {
+    "pdf_path": "bi/outputs/report_digest/mizuki_reports_digest_{date}.pdf",
+    "webhook_env": KIND_CONFIG["stock"]["webhook_env"],
+    "label": "個別銘柄レポート まとめ版",
+}
 
 # 送信種別 → md_to_pdf のテーマ kind（アクセント色・キッカー）
 _PDF_KIND = {
@@ -83,6 +96,93 @@ def _ensure_movers_doc_title(md_text: str, identifier: str, doc_label: str) -> s
     return label + "\n\n" + stripped
 
 
+# PDF をブラウザ内表示するための設定（Cloudflare Workers KV へ一時保管する）。
+# 30 日 = 2,592,000 秒で自動的に消える。
+_PDF_VIEW_TTL_SEC = 2592000
+_PDF_VIEW_DEFAULT_BASE = "https://mizuki-fund-scheduler-1.mzinvestment1105.workers.dev/pdf"
+
+
+def upload_pdf_for_inline_view(pdf_path: Path) -> str | None:
+    """PDF を Cloudflare KV へ置き、ブラウザ内表示できる秘密 URL を返す。
+
+    Discord の添付は PC だとダウンロードになってしまうため、クリック 1 回で
+    ブラウザに開く URL を別途用意して本文に添える。URL に含まれるランダムな
+    token を知っている人だけが開ける（ログイン不要・30 日で失効）。
+
+    失敗しても送信本体は絶対に止めない（配信絶対の原則）。
+    設定が無い・検証に通らない場合は None を返し、リンク無しで従来どおり送る。
+    """
+    try:
+        api_token = os.getenv("CLOUDFLARE_API_TOKEN")
+        account_id = os.getenv("CF_ACCOUNT_ID")
+        namespace_id = os.getenv("CF_KV_NAMESPACE_ID")
+        base_url = os.getenv("PDF_VIEW_BASE_URL", _PDF_VIEW_DEFAULT_BASE).rstrip("/")
+        if not (api_token and account_id and namespace_id and base_url):
+            print("  PDF inline link: skipped (設定が未登録のためリンク無しで送信)")
+            return None
+
+        filename = pdf_path.name
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", filename):
+            print(f"  PDF inline link: skipped (ファイル名が半角英数以外: {filename})")
+            return None
+
+        # 当て推量できないランダム文字列。Worker 側の検証は 20〜64 文字の英数字とハイフン等。
+        token = secrets.token_urlsafe(24)
+        # KV のキーは "<token>/<filename>"。REST API の URL 上では "/" を %2F にエンコードする。
+        kv_key = quote(f"{token}/{filename}", safe="")
+        put_url = (
+            f"https://api.cloudflare.com/client/v4/accounts/{account_id}"
+            f"/storage/kv/namespaces/{namespace_id}/values/{kv_key}"
+            f"?expiration_ttl={_PDF_VIEW_TTL_SEC}"
+        )
+        with pdf_path.open("rb") as f:
+            res = requests.put(
+                put_url,
+                headers={
+                    "Authorization": f"Bearer {api_token}",
+                    "Content-Type": "application/octet-stream",
+                },
+                data=f.read(),
+                timeout=60,
+            )
+        if res.status_code >= 400:
+            print(f"  PDF inline link: KV upload failed HTTP {res.status_code}（リンク無しで送信）")
+            return None
+
+        view_url = f"{base_url}/{token}/{filename}"
+
+        # KV は書き込み直後にまだ読めないことがあるため、実際に開けるまで確認する（最大 60 秒）。
+        for _ in range(12):
+            try:
+                check = requests.get(view_url, timeout=20)
+                disposition = check.headers.get("Content-Disposition", "")
+                ctype = check.headers.get("Content-Type", "")
+                if (
+                    check.status_code == 200
+                    and ctype.startswith("application/pdf")
+                    and disposition.lower().startswith("inline")
+                ):
+                    print("  PDF inline link: ready")
+                    return view_url
+            except Exception as exc:  # 検証中の通信エラーは再試行で吸収する
+                print(f"  PDF inline link: check retry ({type(exc).__name__})")
+            time.sleep(5)
+
+        print("  PDF inline link: 検証に通らなかったためリンク無しで送信")
+        return None
+    except Exception as exc:  # 何が起きても送信本体は止めない
+        print(f"  PDF inline link: skipped ({type(exc).__name__}: {exc})")
+        return None
+
+
+def _with_inline_view_link(content: str, pdf_path: Path) -> str:
+    """Discord 本文の末尾に、ブラウザ内表示リンクを 1 行だけ添える。"""
+    url = upload_pdf_for_inline_view(pdf_path)
+    if not url:
+        return content
+    return content + f"\nPC で読む（クリックでブラウザに表示・30 日間有効）: {url}"
+
+
 def _post_pdf(webhook: str, pdf_path: Path, content: str) -> bool:
     payload = {"content": content, "attachments": [{"id": 0, "filename": pdf_path.name}]}
     with pdf_path.open("rb") as f:
@@ -98,9 +198,37 @@ def _post_pdf(webhook: str, pdf_path: Path, content: str) -> bool:
     return True
 
 
+def _send_digest(args) -> int:
+    """まとめ版 PDF を個別銘柄チャンネルへそのまま添付送信する。
+
+    build_report_digest.py の出力を再生成せずに送るため、md 由来の kind と違い
+    レンダリング（render_markdown_to_pdf）も表ゲートも通さない。
+    """
+    date_str = args.date or datetime.now(JST).strftime("%Y-%m-%d")
+    pdf_path = REPO_ROOT / DIGEST_CONFIG["pdf_path"].format(date=date_str)
+    if not pdf_path.exists():
+        print(f"ERROR: digest pdf not found: {pdf_path}")
+        return 1
+
+    webhook = os.getenv(DIGEST_CONFIG["webhook_env"])
+    if not webhook and not args.skip_send:
+        # フォールバック禁止（別チャンネルへ流さない）。未設定なら止める。
+        print(f"ERROR: {DIGEST_CONFIG['webhook_env']} not set")
+        return 1
+
+    print(f"  found: {pdf_path}  size={pdf_path.stat().st_size:,} bytes")
+    if args.skip_send:
+        return 0
+
+    print(f"[1/1] sending to Discord ({DIGEST_CONFIG['webhook_env']})")
+    content = f"**{DIGEST_CONFIG['label']}** {date_str}"
+    content = _with_inline_view_link(content, pdf_path)
+    return 0 if _post_pdf(webhook, pdf_path, content) else 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--kind", choices=list(KIND_CONFIG), required=True)
+    parser.add_argument("--kind", choices=list(KIND_CONFIG) + ["digest"], required=True)
     parser.add_argument("--date", help="YYYY-MM-DD（JST・日次レポート用）")
     parser.add_argument("--month", help="YYYY-MM（月次レポート用・earnings 等）")
     parser.add_argument("--code", help="銘柄コード（stock 用）")
@@ -111,6 +239,11 @@ def main() -> int:
         help="個別銘柄レポートの送信前機械ゲートを飛ばす（緊急時のバイパス）",
     )
     args = parser.parse_args()
+
+    # まとめ版は既に PDF として存在するため、md 解決・表ゲート・レンダリングを通さず
+    # そのまま添付送信して早期 return する（既存 kind の処理経路には触れない）。
+    if args.kind == "digest":
+        return _send_digest(args)
 
     cfg = KIND_CONFIG[args.kind]
     pdf_kind = _PDF_KIND.get(args.kind, "macro")
@@ -219,7 +352,9 @@ def main() -> int:
         display_id = identifier
 
     print(f"[2/2] sending to Discord ({cfg['webhook_env']})")
-    return 0 if _post_pdf(webhook, out_path, f"**{cfg['label']}** {display_id}") else 1
+    content = f"**{cfg['label']}** {display_id}"
+    content = _with_inline_view_link(content, out_path)
+    return 0 if _post_pdf(webhook, out_path, content) else 1
 
 
 if __name__ == "__main__":

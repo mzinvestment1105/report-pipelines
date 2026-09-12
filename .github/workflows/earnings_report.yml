@@ -487,6 +487,10 @@ jobs:
         if: ${{ github.event.inputs.dry_run != 'true' }}
         working-directory: ./private-repo/bi/pipelines
         env:
+          # レポート PDF をブラウザ内表示するリンク用（Cloudflare KV へ一時保管・30 日で失効）
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
           DISCORD_WEBHOOK_EARNINGS: ${{ secrets.DISCORD_WEBHOOK_EARNINGS }}
           PYTHONIOENCODING: utf-8
         run: |
