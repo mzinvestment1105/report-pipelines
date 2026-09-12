@@ -43,6 +43,34 @@ def _fmt_mcap(v: float) -> str:
     return f"{v / 1e8:,.0f}億円"
 
 
+def _fmt_contrib(v: float) -> str:
+    """寄与額（円）→ '+1,234億円' / '-3,526億円'（符号必須＝PDF レンダラの色付け対象）。"""
+    if pd.isna(v):
+        return ""
+    return f"{v / 1e8:+,.0f}億円"
+
+
+SHARES_COL = (
+    "NumberOfIssuedAndOutstandingSharesAtTheEndOfFiscalYearIncludingTreasuryStock"
+)
+
+
+def add_contribution(ssw: pd.DataFrame) -> pd.DataFrame:
+    """週初（前週金曜終値）時価総額と、その寄与額（時価総額 x 週間騰落率）を付与する。
+
+    sector_stock_weekly.parquet の `MarketCap` は screening_master 由来で基準日が
+    週末と一致しないため、寄与額の基準には使わない。`Close_Latest`（対象週末の
+    分割調整後終値）と発行済株式数から週末時価総額を作り、`Return_W01` で割り戻して
+    週初時価総額 `MarketCapStart` を得る。寄与額 = MarketCapStart x Return_W01 は
+    「その銘柄が当週に増減させた時価総額（円）」そのものになる。
+    """
+    out = ssw.copy()
+    cap_end = out[SHARES_COL] * out["Close_Latest"]
+    out["MarketCapStart"] = cap_end / (1 + out["Return_W01"])
+    out["Contribution"] = out["MarketCapStart"] * out["Return_W01"]
+    return out
+
+
 def _arrows(returns: list[float]) -> str:
     """W08→W01（古→新）の順で ▲（>0）/▼（≤0）。"""
     out = []
@@ -71,6 +99,7 @@ def load_data():
     sm = pd.read_parquet(OUT_DIR / "screening_master.parquet")
     valid = set(sm["Code"].astype(str))
     ssw = ssw[ssw["Code"].astype(str).isin(valid)].copy()  # ETF/REIT 除外（個別株のみ）
+    ssw = add_contribution(ssw)
     return sw, ssw
 
 
@@ -96,12 +125,22 @@ def high52_ratio(ssw_sec: pd.DataFrame) -> tuple[int, int, float]:
 
 
 def stock_table(ssw_sec: pd.DataFrame, top: bool) -> list[str]:
-    s = ssw_sec.dropna(subset=["Return_W01"]).sort_values("Return_W01", ascending=not top)
-    s = s.head(5)
-    rows = ["| 順位 | コード | 銘柄 | 週間 | 時価総額 |", "|:--:|:--:|:--|--:|--:|"]
+    """主役銘柄表。並びは「時価総額 x 週間騰落率の寄与順」（騰落率単独ではない）。
+
+    強いセクター（top=True）は寄与プラス上位5、弱いセクター（top=False）は寄与
+    マイナス下位5。寄与額・週初時価総額のいずれかが欠損する行は対象から落とす。
+    """
+    s = ssw_sec.dropna(subset=["Contribution", "MarketCapStart"])
+    s = s[s["Contribution"] > 0] if top else s[s["Contribution"] < 0]
+    s = s.sort_values("Contribution", ascending=not top).head(5)
+    rows = [
+        "| 順位 | コード | 銘柄 | 週間 | 時価総額 | 寄与 |",
+        "|:--:|:--:|:--|--:|--:|--:|",
+    ]
     for i, (_, r) in enumerate(s.iterrows(), 1):
         rows.append(
-            f"| {i} | {r['Code']} | {r['CompanyName']} | {_fmt_pct(r['Return_W01'])} | {_fmt_mcap(r['MarketCap'])} |"
+            f"| {i} | {r['Code']} | {r['CompanyName']} | {_fmt_pct(r['Return_W01'])} "
+            f"| {_fmt_mcap(r['MarketCapStart'])} | {_fmt_contrib(r['Contribution'])} |"
         )
     return rows
 
@@ -138,6 +177,10 @@ def sector_block(name: str, swrow: pd.Series, ssw_sec: pd.DataFrame, strong: boo
         )
         out.append(metrics)
 
+    out.append("")
+    out.append(
+        "**主役銘柄**（時価総額×週間騰落率の寄与順・時価総額は週初終値ベース）"
+    )
     out.append("")
     out.extend(stock_table(ssw_sec, top=strong))
     out.append("")
