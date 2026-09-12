@@ -2,7 +2,7 @@
 
 PM 2026-06-28: セクターは週末のみ・データ駆動の新フォーマットへ刷新。Deep Research（GHA 失敗の主因）を
 撤廃し、本スクリプトが sector_weekly / sector_stock_weekly / screening_master の3 parquet から
-「強弱ランキング・8週トレンド帯・資金フロー・52週高値圏・主役Top5/下落主役Bottom5・資金の流れ」を
+「強弱ランキング・8週トレンド帯・売買代金増減・52週高値圏・主役Top5/下落主役Bottom5・売買代金の動き」を
 表組み中心の markdown として出力する。色付け（上昇緑/下落赤）・表装飾は lib/md_to_pdf 側で付与。
 
 出力フォーマットは scratchpad の承認サンプルに準拠。3M/1Y は集計歪みのため出力しない。
@@ -57,10 +57,11 @@ def _arrows(returns: list[float]) -> str:
 
 
 def _flow_label(ratio: float) -> str:
+    """売買代金の前週比（最新5営業日 ÷ その直前5営業日 - 1）のラベル。"""
     if ratio > 0.10:
-        return "流入継続"
+        return "増加"
     if ratio < -0.10:
-        return "流出"
+        return "減少"
     return "横ばい"
 
 
@@ -74,8 +75,13 @@ def load_data():
 
 
 def sector_fund_flow(ssw_sec: pd.DataFrame) -> float | None:
-    a = ssw_sec["ValAvg5d_BlkSeq01"].sum(min_count=1)
-    b = ssw_sec["ValAvg5d_BlkSeq04"].sum(min_count=1)
+    """売買代金の前週比。最新5営業日の売買代金合計 ÷ その直前5営業日の合計 - 1。
+
+    ValAvg5d_BlkSeqNN は make_screening_master_v2.py の `blk = n - seq`（n=VOLUME_BLOCK_WEEKS、既定8）
+    で作られるため、**BlkSeq08 が最新5営業日・BlkSeq01 が最古（35〜39営業日前）** の向きになる。
+    """
+    a = ssw_sec["ValAvg5d_BlkSeq08"].sum(min_count=1)  # 最新5営業日
+    b = ssw_sec["ValAvg5d_BlkSeq07"].sum(min_count=1)  # その直前5営業日
     if pd.isna(a) or pd.isna(b) or b == 0:
         return None
     return a / b - 1
@@ -116,7 +122,7 @@ def sector_block(name: str, swrow: pd.Series, ssw_sec: pd.DataFrame, strong: boo
 
     if anomalous:
         metrics = (
-            f"**8週トレンド** {arrows}　｜　**資金フロー** {flow_str}　｜　"
+            f"**8週トレンド** {arrows}　｜　**売買代金増減** {flow_str}　｜　"
             f"**52週高値圏** {n}銘柄中{m}（{p:.1f}%）"
         )
         out.append(metrics)
@@ -127,7 +133,7 @@ def sector_block(name: str, swrow: pd.Series, ssw_sec: pd.DataFrame, strong: boo
         )
     else:
         metrics = (
-            f"**8週トレンド** {arrows}（累計 {cum:+.1f}%）　｜　**資金フロー** {flow_str}　｜　"
+            f"**8週トレンド** {arrows}（累計 {cum:+.1f}%）　｜　**売買代金増減** {flow_str}　｜　"
             f"**52週高値圏** {n}銘柄中{m}（{p:.1f}%）"
         )
         out.append(metrics)
@@ -151,7 +157,7 @@ def build(date: str | None, out_path: Path | None) -> Path:
     def ssw_of(sec):
         return ssw[ssw["Sector17CodeName"] == sec]
 
-    # 資金の流れ（全業種・対象個別株ベース）
+    # 売買代金の前週比（全業種・対象個別株ベース）
     flows = []
     for _, r in ranked.iterrows():
         f = sector_fund_flow(ssw_of(r["Sector17CodeName"]))
@@ -176,7 +182,7 @@ def build(date: str | None, out_path: Path | None) -> Path:
     L.append(
         f"> **今日の注目** ── {len(ranked)}業種中、週間プラスは{n_pos}業種（{pos_str}）。"
         f"最強は{top1} {_fmt_pct(top1w)}、最弱は{bot1} {_fmt_pct(bot1w)}。"
-        f"資金は4週前比で{infl_lead} など広く流入継続、流出は{outfl_lead}。"
+        f"売買代金は前週比で{infl_lead} など増加、減少は{outfl_lead}。"
         f"「その他」業種は構成1銘柄のため強弱から除外。"
     )
     L.append("")
@@ -198,11 +204,11 @@ def build(date: str | None, out_path: Path | None) -> Path:
     L.append("")
     for _, r in weak.iterrows():
         L.extend(sector_block(r["Sector17CodeName"], r, ssw_of(r["Sector17CodeName"]), strong=False))
-    L.append("## 資金の流れ（4週前比）")
+    L.append("## 売買代金の動き（前週比）")
     L.append("")
-    L.append("**🔥 流入継続**　" + "、".join(f"{s} {v * 100:+.1f}%" for s, v in inflow))
+    L.append("**🔥 増加**　" + "、".join(f"{s} {v * 100:+.1f}%" for s, v in inflow))
     L.append("")
-    L.append("**🧊 流出**　" + ("、".join(f"{s} {v * 100:+.1f}%" for s, v in outflow) or "なし"))
+    L.append("**🧊 減少**　" + ("、".join(f"{s} {v * 100:+.1f}%" for s, v in outflow) or "なし"))
     L.append("")
 
     md = "\n".join(L)
