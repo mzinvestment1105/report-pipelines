@@ -120,6 +120,21 @@ REACTION_JQ_INDEX_CODES = {
 SHORT_SALE_SCAN_BACK_DAYS = 21   # 対象日より前（直前の残高＝増減の比較対象を取るため）
 SHORT_SALE_SCAN_FWD_DAYS  = 6    # 対象日より後（対象日の CalcDate 分が公表されるまで）
 
+# 週次信用残（/markets/margin-interest）のライブ取得期間と比較軸。screening_master は
+# MARGIN_INTEREST_LOOKBACK_WEEKS=8 で 8 週分しか持たないため、長期スパンの需給改善／悪化が
+# 誌面に出なかった。PM 2026-09-13 指示: 固定期間（26 週前比）に意味を持たせず、
+#   (a) 今と同じくらいの株価水準だった過去時点との比較（同じ株価で需給がどれだけ軽くなったか）
+#   (b) 同水準の過去が無い銘柄（7256 のような大幅下落銘柄）でも効く長期トレンド
+#       ＝ 52 週ピーク比 + 13/26/52 週前比
+# の 2 本を出す。短期の 6 週前比は従来どおり残す。
+MARGIN_INTEREST_TREND_WEEKS      = (6,)            # 短期の増減（従来互換の基本行）
+MARGIN_INTEREST_LONGTERM_WEEKS   = (13, 26, 52)    # 長期トレンド行に並べる複数期間
+MARGIN_INTEREST_FETCH_WEEKS      = 53              # ライブ取得の遡及週数（52 週 + 1）
+MARGIN_INTEREST_FETCH_PAD_DAYS   = 28              # 週末・祝日ズレ＋直近週の公表遅れ分の余白（暦日）
+MARGIN_SAMELEVEL_LOOKBACK_WEEKS  = 52              # 同水準株価時点を探す遡及範囲（週）
+MARGIN_SAMELEVEL_PRICE_TOL_PCT   = 10.0            # 「同水準」と見なす終値の許容差（±%）
+MARGIN_SAMELEVEL_MIN_GAP_WEEKS   = 4               # 直近この週数より前の週のみ基準週の候補にする
+
 # 信用取引規制（/markets/margin-alert）の走査期間。現在の指定が「いつ始まったか」を
 # 連続区間の先頭として取るため、基準日から十分さかのぼる（90 日）。
 MARGIN_ALERT_SCAN_BACK_DAYS = 90
@@ -569,10 +584,498 @@ def _sm_row(code4: str):
         return None
 
 
-def build_supply_demand_axes(code4: str) -> dict:
+def fetch_margin_interest_series(code4: str, as_of: date | None = None) -> dict:
+    """J-Quants v2 /markets/margin-interest から対象銘柄の週次信用残の時系列をライブ取得する。
+
+    screening_master.parquet は MARGIN_INTEREST_LOOKBACK_WEEKS=8 の週次スナップショットしか
+    持たず、6 週前比しか計算できない。同水準株価時点比と長期トレンド（52 週ピーク比・
+    13/26/52 週前比）を誌面に出すため、ここで銘柄コード + 期間指定のライブ取得を行う
+    （MARGIN_INTEREST_FETCH_WEEKS=53 週 + 余白。1 銘柄 1 コールで期間だけ広げる。PM 2026-09-13 指示）。
+
+    返却行のキー（v2 の実名）:
+        Code, Date, IssType, LongVol（信用買残）, ShrtVol（信用売残）,
+        LongStdVol/LongNegVol（制度／一般の内訳）, ShrtStdVol/ShrtNegVol
+
+    IssType（1=制度信用銘柄, 2=貸借銘柄 等）が複数返る日は制度側（小さい番号）を優先し
+    1 日 1 行に畳む（market_overlays.fetch_weekly_margin_overlay と同じ方針）。
+
+    Args:
+        code4: 銘柄コード（4桁 or 485A のような英数字混在）。
+        as_of: 基準日（この日以前の公表週までを対象にする）。省略時は当日。
+    Returns:
+        {"status": "ok"|"error:...", "rows": [{"date": date, "long": float, "short": float}, ...昇順],
+         "note": str}
+        取得失敗時は rows=[] と status に理由を入れる（黙った補完をしないため）。
+    """
+    out: dict = {"status": "error:未実行", "rows": [], "note": ""}
+    if as_of is None:
+        as_of = date.today()
+
+    api_key = os.environ.get("JQUANTS_API_KEY", "").strip()
+    if not api_key:
+        out["status"] = "error:JQUANTS_API_KEY 未設定"
+        return out
+
+    try:
+        import jquantsapi
+        from jq_client_utils import fetch_paginated_v2
+        client = jquantsapi.ClientV2(api_key=api_key)
+    except Exception as e:
+        out["status"] = f"error:クライアント生成失敗（{type(e).__name__}）"
+        print(f"  → 取得失敗: J-Quants クライアント生成（週次信用残）: {e}", file=sys.stderr)
+        return out
+
+    date_from = as_of - timedelta(
+        days=MARGIN_INTEREST_FETCH_WEEKS * 7 + MARGIN_INTEREST_FETCH_PAD_DAYS)
+    code_q = str(code4).strip()
+    try:
+        rows = fetch_paginated_v2(
+            client, "/markets/margin-interest",
+            params={"code": code_q,
+                    "from": date_from.isoformat(),
+                    "to": as_of.isoformat()},
+            sleep_seconds=0.6,
+        )
+    except Exception as e:
+        out["status"] = f"error:API エラー（{type(e).__name__}）"
+        print(f"  → 取得失敗: J-Quants 週次信用残 {code_q}: {e}", file=sys.stderr)
+        return out
+
+    if not rows:
+        out["status"] = "error:該当データ0件（信用取引銘柄でない可能性）"
+        return out
+
+    def _to_f(v):
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    # 日付ごとに IssType 昇順で 1 行に畳む（制度信用銘柄=1 を優先）。
+    best: dict = {}
+    for r in rows:
+        ds = str(r.get("Date") or "")[:10]
+        try:
+            d = date.fromisoformat(ds)
+        except ValueError:
+            continue
+        if d > as_of:
+            continue
+        try:
+            it = int(r.get("IssType")) if r.get("IssType") is not None else 99
+        except (TypeError, ValueError):
+            it = 99
+        cur = best.get(d)
+        if cur is None or it < cur[0]:
+            best[d] = (it, r)
+
+    series = []
+    for d in sorted(best):
+        r = best[d][1]
+        series.append({
+            "date":  d,
+            "long":  _to_f(r.get("LongVol")),
+            "short": _to_f(r.get("ShrtVol")),
+        })
+    if not series:
+        out["status"] = f"error:基準日 {as_of} 以前の公表週が0件"
+        return out
+
+    out["status"] = "ok"
+    out["rows"] = series
+    out["note"] = (f"J-Quants v2 /markets/margin-interest（code={code_q}・"
+                   f"{date_from.isoformat()}〜{as_of.isoformat()}・{len(series)} 週）")
+    return out
+
+
+def fetch_short_position_series(code4: str, as_of: date | None = None) -> dict:
+    """J-Quants v2 /markets/short-sale-report から機関空売り残（合計）の時系列を取得する。
+
+    空売り残高報告制度（発行済株式総数の 0.5% 以上で報告義務）の開示を、対象銘柄の
+    全履歴から取得して CalcDate（残高が動いた日）ごとに機関横断で合計する。
+
+    **注意（実機確認 2026-09-13）**: このエンドポイントは `code` 指定は効くが
+    `from` / `to` は無視され全履歴が返る（215A で 1,014 行 / 2024-08〜）。そのため
+    期間絞りはクライアント側で行う。1 銘柄 1 コールで済むためコストは小さい。
+
+    Args:
+        code4: 銘柄コード。
+        as_of: 基準日（この日以前の CalcDate までを対象にする）。省略時は当日。
+    Returns:
+        {"status": "ok"|"error:...", "rows": [{"date": date, "shares": float, "ratio": float}, ...昇順],
+         "note": str}
+    """
+    out: dict = {"status": "error:未実行", "rows": [], "note": ""}
+    if as_of is None:
+        as_of = date.today()
+
+    api_key = os.environ.get("JQUANTS_API_KEY", "").strip()
+    if not api_key:
+        out["status"] = "error:JQUANTS_API_KEY 未設定"
+        return out
+    try:
+        import jquantsapi
+        from jq_client_utils import fetch_paginated_v2
+        client = jquantsapi.ClientV2(api_key=api_key)
+    except Exception as e:
+        out["status"] = f"error:クライアント生成失敗（{type(e).__name__}）"
+        print(f"  → 取得失敗: J-Quants クライアント生成（機関空売り残）: {e}", file=sys.stderr)
+        return out
+
+    code_q = str(code4).strip()
+    try:
+        rows = fetch_paginated_v2(
+            client, "/markets/short-sale-report",
+            params={"code": code_q}, sleep_seconds=0.6,
+        )
+    except Exception as e:
+        out["status"] = f"error:API エラー（{type(e).__name__}）"
+        print(f"  → 取得失敗: J-Quants 機関空売り残 {code_q}: {e}", file=sys.stderr)
+        return out
+
+    if not rows:
+        out["status"] = "error:該当データ0件（報告義務水準0.5%に達した機関が無い）"
+        return out
+
+    def _to_f(v):
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    # CalcDate × 機関 で最後の1行を採り、日ごとに機関横断で合計する。
+    by_day: dict = {}
+    for r in rows:
+        try:
+            d = date.fromisoformat(str(r.get("CalcDate") or "")[:10])
+        except ValueError:
+            continue
+        if d > as_of:
+            continue
+        inst = str(r.get("SSName") or r.get("DICName") or "").strip()
+        by_day.setdefault(d, {})[inst] = r
+
+    series = []
+    for d in sorted(by_day):
+        sh = [_to_f(x.get("ShrtPosShares")) for x in by_day[d].values()]
+        rt = [_to_f(x.get("ShrtPosToSO")) for x in by_day[d].values()]
+        sh = [x for x in sh if x is not None]
+        rt = [x for x in rt if x is not None]
+        series.append({
+            "date":   d,
+            "shares": sum(sh) if sh else None,
+            "ratio":  sum(rt) if rt else None,
+        })
+    if not series:
+        out["status"] = f"error:基準日 {as_of} 以前の報告が0件"
+        return out
+
+    out["status"] = "ok"
+    out["rows"] = series
+    out["note"] = (f"J-Quants v2 /markets/short-sale-report（code={code_q}・"
+                   f"CalcDate {series[0]['date']}〜{series[-1]['date']}・{len(series)} 日）")
+    return out
+
+
+def _pick_margin_week(series: list, target: date):
+    """時系列（昇順）から「target 以前で最も近い基準日」の1行を返す（無ければ None）。"""
+    cand = [x for x in series if x["date"] <= target]
+    return cand[-1] if cand else None
+
+
+def _weekly_close_lookup(price_df):
+    """日足 DataFrame から「任意の日付以前で最も近い営業日の終値」を引く関数を返す。
+
+    信用残の基準日は毎週金曜だが金曜が休場のこともあるため、「その日以前で最も近い
+    営業日の終値」を当てる。価格は fetch_price_history（yfinance・auto_adjust=False）の
+    Close で分割調整済み・配当未調整（`_cr` §4 系: 株価時系列は分割調整後を使う）。
+
+    Args:
+        price_df: fetch_price_history が返す DataFrame（DatetimeIndex・Close 列）。None 可。
+    Returns:
+        callable(date) -> (営業日, 終値) または None。price_df が使えなければ None。
+    """
+    if price_df is None or getattr(price_df, "empty", True):
+        return None
+    if "Close" not in getattr(price_df, "columns", []):
+        return None
+    pairs = []
+    try:
+        for idx, val in price_df["Close"].items():
+            try:
+                d = idx.date()
+            except AttributeError:
+                continue
+            try:
+                c = float(val)
+            except (TypeError, ValueError):
+                continue
+            if c > 0:
+                pairs.append((d, c))
+        pairs.sort()
+    except Exception as e:
+        print(f"  → 取得失敗: 週次終値の索引作成: {e}", file=sys.stderr)
+        return None
+    if not pairs:
+        return None
+
+    def _lookup(target: date):
+        cand = [x for x in pairs if x[0] <= target]
+        return cand[-1] if cand else (None, None)
+
+    return _lookup
+
+
+def _find_same_level_week(series: list, latest: dict, close_lookup):
+    """「直近と同じくらいの株価水準だった過去の週」を1つ選ぶ。
+
+    PM 2026-09-13 指示: 固定の週数（26 週前等）に意味はないので、
+    「今と同じ株価だった時点で需給がどれだけ重かったか」を比較軸にする。
+
+    選定ルール:
+      - 候補は直近公表週から MARGIN_SAMELEVEL_LOOKBACK_WEEKS 週以内、かつ
+        直近 MARGIN_SAMELEVEL_MIN_GAP_WEEKS 週より前の週（直近の揺れを基準にしない）。
+      - 各候補週の基準日以前で最も近い営業日の終値を引き、直近終値との差が
+        ±MARGIN_SAMELEVEL_PRICE_TOL_PCT% 以内なら「同水準」と判定する。
+      - 該当が複数あれば最も新しい週を採る。
+      - 該当が無ければ株価差が最小の週（最接近週）を参考として返す。
+
+    Returns:
+        {"status": "ok"|"nearest_only"|"error:...", "base": 週の行 or None,
+         "base_close": float or None, "latest_close": float or None,
+         "price_diff_pct": float or None, "nearest": {...} or None}
+        price_diff_pct は「直近終値が基準週の終値より何%高い／低いか」。
+    """
+    out: dict = {"status": "error:未実行", "base": None, "base_close": None,
+                 "latest_close": None, "price_diff_pct": None, "nearest": None}
+    if close_lookup is None:
+        out["status"] = "error:株価時系列を取得できず（同水準株価の判定不能）"
+        return out
+    if not series or not latest:
+        out["status"] = "error:週次残高が0件"
+        return out
+
+    lt_date = latest.get("date")
+    _, lt_close = close_lookup(lt_date)
+    if not lt_close:
+        out["status"] = f"error:直近基準日 {lt_date} 以前の終値が取れず"
+        return out
+    out["latest_close"] = lt_close
+
+    oldest = lt_date - timedelta(days=MARGIN_SAMELEVEL_LOOKBACK_WEEKS * 7)
+    newest = lt_date - timedelta(days=MARGIN_SAMELEVEL_MIN_GAP_WEEKS * 7)
+    cands = []
+    for row in series:
+        d = row.get("date")
+        if d is None or d < oldest or d > newest:
+            continue
+        _, c = close_lookup(d)
+        if not c:
+            continue
+        cands.append((row, c, (lt_close - c) / c * 100.0))
+    if not cands:
+        out["status"] = (f"error:{MARGIN_SAMELEVEL_LOOKBACK_WEEKS}週内に"
+                         "終値を引ける公表週が無い")
+        return out
+
+    nearest = min(cands, key=lambda x: (abs(x[2]), -x[0]["date"].toordinal()))
+    out["nearest"] = {"base": nearest[0], "base_close": nearest[1],
+                      "price_diff_pct": nearest[2]}
+
+    within = [x for x in cands if abs(x[2]) <= MARGIN_SAMELEVEL_PRICE_TOL_PCT]
+    if within:
+        pick = max(within, key=lambda x: x[0]["date"])
+        out["status"] = "ok"
+        out["base"], out["base_close"], out["price_diff_pct"] = pick[0], pick[1], pick[2]
+    else:
+        out["status"] = "nearest_only"
+    return out
+
+
+def _margin_pct_change(base, end):
+    """(end - base) / base * 100 を返す（算出不能なら None）。"""
+    if base is None or end is None:
+        return None
+    try:
+        base = float(base)
+        end = float(end)
+    except (TypeError, ValueError):
+        return None
+    if base == 0:
+        return None
+    return (end - base) / base * 100.0
+
+
+def _judge_margin(chg, kind: str = "long"):
+    """増減率から需給の判定文を返す（算出不能なら None）。"""
+    if chg is None:
+        return None
+    if abs(chg) < 1:
+        return "横ばい"
+    if kind == "short_pos":
+        return "減少（買い戻し進行）" if chg < 0 else "増加（売り圧力増）"
+    return "減少（良い兆候）" if chg < 0 else "増加（悪化）"
+
+
+def _build_longterm_block(series: list, latest: dict, value_key: str) -> dict:
+    """長期トレンド（52週ピーク→直近の減少率 + 13/26/52週前比）を1行分にまとめる。
+
+    固定期間（26 週等）に意味を持たせず「どこまで減ったか」を見るための行。
+    株価が大きく下がって同水準の過去が無い銘柄（7256 のような例）でも成立する。
+    取得範囲より前を要求された期間は base=None とし、誌面では「-」で出す。
+
+    Returns:
+        {"peak": 行 or None, "peak_pct": float or None,
+         "offsets": {13: {"base": 行 or None, "pct": float or None}, ...}}
+    """
+    out: dict = {"peak": None, "peak_pct": None, "offsets": {}}
+    if not series or not latest:
+        return out
+    lt_date = latest.get("date")
+    oldest = lt_date - timedelta(days=MARGIN_SAMELEVEL_LOOKBACK_WEEKS * 7)
+    window = [r for r in series
+              if r.get("date") is not None and oldest <= r["date"] <= lt_date
+              and r.get(value_key) is not None]
+    if window:
+        peak = max(window, key=lambda r: (r[value_key], r["date"].toordinal()))
+        out["peak"] = peak
+        out["peak_pct"] = _margin_pct_change(peak.get(value_key), latest.get(value_key))
+    first = series[0]["date"]
+    for wk in MARGIN_INTEREST_LONGTERM_WEEKS:
+        want = lt_date - timedelta(days=wk * 7)
+        base = _pick_margin_week(series, want)
+        # 取得範囲の先頭より前を要求された場合（上場が浅い等）は基準週なしとして扱う。
+        if base is not None and first > want + timedelta(days=10):
+            base = None
+        out["offsets"][wk] = {
+            "base": base,
+            "pct": _margin_pct_change((base or {}).get(value_key), latest.get(value_key)),
+        }
+    return out
+
+
+def build_margin_trend_rows(code4: str, as_of: date | None = None,
+                            price_df=None) -> dict:
+    """信用残・機関空売り残の比較軸を3種類（短期・同水準株価時点・長期）で組み立てる。
+
+    PM 2026-09-13 指示により固定の「26 週前比」を単独の柱にせず、次の3段にした。
+      1. 6週前→直近（従来の短期）
+      2. 同水準株価時点→直近: 過去 52 週の週次残高のうち、直近終値との差が ±10% 以内で
+         かつ直近 4 週より前の最も新しい週を基準週とする。該当が無ければ最接近週を
+         参考として併記する（「同じ株価で需給がどれだけ軽くなったか」を見る軸）。
+      3. 長期トレンド: 52 週ピーク→直近の減少率 + 13/26/52 週前比（「どこまで減ったか」を
+         複数期間で見る軸。同水準の過去が無い下落銘柄でも成立する）。
+
+    取得できなかった場合は黙って screening_master へ退避せず、status に理由を残して
+    誌面に「取得できず（理由）」を出させる（黙った補完の禁止）。
+
+    Args:
+        code4: 銘柄コード。
+        as_of: 基準日（この日以前の公表週まで）。
+        price_df: fetch_price_history の DataFrame（同水準株価の判定に使う）。None なら
+                  同水準判定は「株価時系列を取得できず」として行を出す。
+    """
+    res = fetch_margin_interest_series(code4, as_of=as_of)
+    out: dict = {
+        "status": res["status"],
+        "source_note": res.get("note", ""),
+        "latest": None,
+        "weeks": {},          # {6: {...}} 短期の増減
+        "same_level": None,   # 同水準株価時点比（信用買残・信用売残）
+        "longterm": {},       # {"long": {...}, "short": {...}} 長期トレンド
+    }
+    close_lookup = _weekly_close_lookup(price_df)
+    series = res.get("rows") or []
+    if res["status"] != "ok" or not series:
+        out["same_level"] = {"status": res["status"]}
+        return out
+
+    latest = series[-1]
+    out["latest"] = latest
+    out["fetch_first_week"] = series[0]["date"]
+    out["fetch_weeks"] = len(series)
+
+    # 1) 短期（6週前比）
+    for wk in MARGIN_INTEREST_TREND_WEEKS:
+        base = _pick_margin_week(series, latest["date"] - timedelta(days=wk * 7))
+        entry: dict = {"weeks": wk, "base": base}
+        if base is None:
+            entry["note"] = f"{wk}週前の公表週が取得範囲に無い"
+            out["weeks"][wk] = entry
+            continue
+        for key in ("long", "short"):
+            chg = _margin_pct_change(base.get(key), latest.get(key))
+            entry[f"{key}_pct"] = chg
+            entry[f"{key}_judge"] = _judge_margin(chg)
+        out["weeks"][wk] = entry
+
+    # 2) 同水準株価時点比
+    sl = _find_same_level_week(series, latest, close_lookup)
+    if sl.get("status") in ("ok", "nearest_only"):
+        pick = sl.get("base") or (sl.get("nearest") or {}).get("base")
+        for key in ("long", "short"):
+            sl[f"{key}_pct"] = _margin_pct_change((pick or {}).get(key), latest.get(key))
+            sl[f"{key}_judge"] = _judge_margin(sl[f"{key}_pct"])
+    out["same_level"] = sl
+
+    # 3) 長期トレンド（52週ピーク比 + 13/26/52週前比）
+    out["longterm"] = {
+        "long":  _build_longterm_block(series, latest, "long"),
+        "short": _build_longterm_block(series, latest, "short"),
+    }
+
+    # 機関空売り残（空売り残高報告制度・合計）を同じ3軸で併記する。
+    sp = fetch_short_position_series(code4, as_of=as_of)
+    out["short_pos_status"] = sp["status"]
+    out["short_pos_note"]   = sp.get("note", "")
+    out["short_pos_latest"] = None
+    out["short_pos_weeks"]  = {}
+    out["short_pos_same_level"] = {"status": sp["status"]}
+    out["short_pos_longterm"]   = {}
+    sp_series = sp.get("rows") or []
+    if sp["status"] == "ok" and sp_series:
+        sp_latest = sp_series[-1]
+        out["short_pos_latest"] = sp_latest
+        out["short_pos_first"]  = sp_series[0]["date"]
+        for wk in MARGIN_INTEREST_TREND_WEEKS:
+            base = _pick_margin_week(sp_series,
+                                     sp_latest["date"] - timedelta(days=wk * 7))
+            e: dict = {"weeks": wk, "base": base}
+            if base is None:
+                e["note"] = f"{wk}週前以前の報告が取得範囲に無い"
+            else:
+                chg = _margin_pct_change(base.get("shares"), sp_latest.get("shares"))
+                e["shares_pct"] = chg
+                e["judge"] = _judge_margin(chg, "short_pos")
+            out["short_pos_weeks"][wk] = e
+
+        sl2 = _find_same_level_week(sp_series, sp_latest, close_lookup)
+        if sl2.get("status") in ("ok", "nearest_only"):
+            pick2 = sl2.get("base") or (sl2.get("nearest") or {}).get("base")
+            sl2["shares_pct"] = _margin_pct_change((pick2 or {}).get("shares"),
+                                            sp_latest.get("shares"))
+            sl2["judge"] = _judge_margin(sl2["shares_pct"], "short_pos")
+        out["short_pos_same_level"] = sl2
+        out["short_pos_longterm"] = _build_longterm_block(sp_series, sp_latest, "shares")
+    return out
+
+
+def build_supply_demand_axes(code4: str, as_of: date | None = None,
+                             price_df=None) -> dict:
     """需給3軸（発行済比率・解消日数・トレンド）と誌面参照列を実数で返す。
 
     列が欠損している場合は推定せず None のまま残す。
+
+    ③トレンドは screening_master ベースの「6週前→直近」（互換のため維持）に加え、
+    J-Quants /markets/margin-interest のライブ取得による「6週前比」「同水準株価時点比」
+    「長期トレンド（52週ピーク比・13/26/52週前比）」を `axes["margin_trend"]` に入れる
+    （PM 2026-09-13 指示。screening_master は 8 週分しか持たず長期スパンの需給改善が
+    誌面に出ず、かつ固定の 26 週前比には意味がないため比較軸を組み替えた）。
+
+    Args:
+        code4: 銘柄コード。
+        as_of: 基準日（この日以前の公表週まで）。
+        price_df: fetch_price_history の日足 DataFrame。同水準株価時点の判定に使う。
     """
     import pandas as pd
 
@@ -666,6 +1169,10 @@ def build_supply_demand_axes(code4: str) -> dict:
     out["axes"]["trend_pct"]   = chg
     out["axes"]["trend_judge"] = direction
 
+    # ③-2 / ③-3 のトレンド（J-Quants ライブ取得。6週前比・同水準株価時点比・長期トレンド）
+    out["axes"]["margin_trend"] = build_margin_trend_rows(
+        code4, as_of=as_of, price_df=price_df)
+
     return out
 
 
@@ -758,6 +1265,255 @@ def _fmt_margin_alert(ma: dict | None) -> list[str]:
     return lines
 
 
+def _shares_fmt(v, shares_out):
+    """株数を「N,NNN株（発行済比 X.XX%）」形式にする（None は N/A）。"""
+    if v is None:
+        return "N/A"
+    base = f"{v:,.0f}株"
+    if shares_out:
+        base += f"（発行済比 {v / shares_out * 100:.2f}%）"
+    return base
+
+
+def _pct_fmt(v):
+    return f"{v:+.1f}%" if v is not None else "N/A"
+
+
+def _price_fmt(v):
+    return f"{v:,.1f}円" if v is not None else "N/A"
+
+
+def _fmt_same_level_row(sl: dict | None, shares_out, value_key: str,
+                        pct_key: str, judge_key: str) -> list[str]:
+    """同水準株価時点比の行（1〜2行）を組み立てる。
+
+    status=="ok" なら基準週の1行。"nearest_only" なら「該当なし」を明記した上で
+    最接近週での比較を参考として併記する（PM 2026-09-13 指示）。
+    取得不能なら理由を明示して「増減を解釈しないこと（未確認）」を残す。
+    """
+    lines = []
+    st = (sl or {}).get("status") or "error:未実行"
+    if st not in ("ok", "nearest_only"):
+        lines.append(f"| 同水準株価時点比 | 取得できず（{st}） | - | - | - | 取得不能 |")
+        return lines
+
+    lt_close = sl.get("latest_close")
+    if st == "ok":
+        b = sl.get("base")
+        lines.append(
+            f"| 同水準株価時点比 | {b['date'].isoformat()}"
+            f"（当時 {_price_fmt(sl.get('base_close'))}"
+            f"・直近 {_price_fmt(lt_close)}・株価差 {_pct_fmt(sl.get('price_diff_pct'))}） "
+            f"| {_shares_fmt(b.get(value_key), shares_out)} "
+            f"| {_shares_fmt(sl.get('_latest_val'), shares_out)} "
+            f"| {_pct_fmt(sl.get(pct_key))} | {sl.get(judge_key) or 'N/A'} |"
+        )
+        return lines
+
+    nb = (sl.get("nearest") or {}).get("base")
+    nb_close = (sl.get("nearest") or {}).get("base_close")
+    nb_diff = (sl.get("nearest") or {}).get("price_diff_pct")
+    nb_date = nb["date"].isoformat() if nb else "N/A"
+    lines.append(
+        f"| 同水準株価時点比 | 該当なし"
+        f"（{MARGIN_SAMELEVEL_LOOKBACK_WEEKS}週内に株価差 ±{MARGIN_SAMELEVEL_PRICE_TOL_PCT:.0f}% の週なし"
+        f"・最接近は {nb_date} の {_price_fmt(nb_close)}＝差 {_pct_fmt(nb_diff)}） "
+        f"| {_shares_fmt((nb or {}).get(value_key), shares_out)} "
+        f"| {_shares_fmt(sl.get('_latest_val'), shares_out)} "
+        f"| {_pct_fmt(sl.get(pct_key))}（参考） | {sl.get(judge_key) or 'N/A'}（参考） |"
+    )
+    return lines
+
+
+def _fmt_longterm_row(lt: dict | None, shares_out, label: str) -> str:
+    """長期トレンド行（52週ピーク→直近 + 13/26/52週前比）を1行にする。"""
+    lt = lt or {}
+    peak = lt.get("peak")
+    if peak is None:
+        peak_txt = "ピーク算出不能"
+    else:
+        peak_txt = (f"{peak['date'].isoformat()} の "
+                    f"{_shares_fmt(lt.get('_peak_val'), shares_out)} → 直近 "
+                    f"{_pct_fmt(lt.get('peak_pct'))}")
+    offs = lt.get("offsets") or {}
+    parts = []
+    for wk in MARGIN_INTEREST_LONGTERM_WEEKS:
+        e = offs.get(wk) or {}
+        if e.get("base") is None or e.get("pct") is None:
+            parts.append(f"{wk}週前比 -")
+        else:
+            parts.append(f"{wk}週前比 {_pct_fmt(e['pct'])}"
+                         f"（{e['base']['date'].isoformat()}）")
+    return f"| {label} | {peak_txt} | " + " / ".join(parts) + " |"
+
+
+def _fmt_margin_trend(mt: dict | None, shares_out) -> list[str]:
+    """信用残トレンド（6週前比・同水準株価時点比・長期トレンド）のセクションを組み立てる。
+
+    PM 2026-09-13 指示により固定の「26 週前比」を柱にせず、
+    (1) 6週前比 (2) 同水準株価時点比 (3) 長期トレンド（52週ピーク比 + 13/26/52週前比）
+    の3段にする。ライブ取得に失敗した場合も行を省略せず「取得できず（理由）」を明示する
+    （黙った補完の禁止。screening_master は 8 週しか持たず長期スパンが誌面から消えるため）。
+    """
+    lines = [
+        "### ③-2 信用残トレンド（6週前比・同水準株価時点比・長期トレンド）",
+        "",
+        "| 比較 | 基準日（株価情報） | 基準日の信用買残 | 直近の信用買残 | 増減率 | 判定 |",
+        "|------|--------------------|------------------|----------------|--------|------|",
+    ]
+
+    if not mt or mt.get("status") != "ok":
+        reason = (mt or {}).get("status") or "error:未実行"
+        lines.append(f"| 6週前比 | 取得できず（{reason}） | - | - | - | 取得不能 |")
+        lines.append(f"| 同水準株価時点比 | 取得できず（{reason}） | - | - | - | 取得不能 |")
+        lines += [
+            "",
+            f"- **根拠**: J-Quants v2 /markets/margin-interest のライブ取得に失敗（{reason}）。",
+            "- ※ 需給が改善／悪化したと解釈しないこと（未確認）。",
+            "",
+        ]
+        lines += _fmt_short_pos_trend(mt or {}, shares_out)
+        return lines
+
+    latest = mt.get("latest") or {}
+    lt_date = latest.get("date").isoformat() if latest.get("date") else "N/A"
+    lt_long = _shares_fmt(latest.get("long"), shares_out)
+
+    # (1) 6週前比
+    for wk in MARGIN_INTEREST_TREND_WEEKS:
+        e = (mt.get("weeks") or {}).get(wk)
+        if not e or e.get("base") is None:
+            note = (e or {}).get("note") or "基準週なし"
+            lines.append(f"| {wk}週前比 | 取得できず（{note}） | - | {lt_long} | - | 取得不能 |")
+            continue
+        b = e["base"]
+        lines.append(
+            f"| {wk}週前比 | {b['date'].isoformat()} "
+            f"| {_shares_fmt(b.get('long'), shares_out)} | {lt_long} "
+            f"| {_pct_fmt(e.get('long_pct'))} | {e.get('long_judge') or 'N/A'} |"
+        )
+
+    # (2) 同水準株価時点比
+    sl = dict(mt.get("same_level") or {})
+    sl["_latest_val"] = latest.get("long")
+    lines += _fmt_same_level_row(sl, shares_out, "long", "long_pct", "long_judge")
+
+    # 信用売残側の同期間比較（参考列を独立の小表にせず箇条書きで添える）
+    sl_short_pct = (mt.get("same_level") or {}).get("short_pct")
+    wk6 = (mt.get("weeks") or {}).get(6) or {}
+
+    lines += [
+        "",
+        f"- **直近基準日**: {lt_date}（信用残は毎週金曜時点の公表）。"
+        f" 直近の信用売残: {_shares_fmt(latest.get('short'), shares_out)}。",
+        f"- **信用売残の増減率**: 6週前比 {_pct_fmt(wk6.get('short_pct'))} / "
+        f"同水準株価時点比 {_pct_fmt(sl_short_pct)}。",
+        "",
+        "#### ③-2-b 信用残の長期トレンド（52週ピーク→直近・13/26/52週前比）",
+        "",
+        "| 対象 | 52週ピーク→直近 | 期間別の増減率 |",
+        "|------|------------------|----------------|",
+    ]
+    for key, label in (("long", "信用買残"), ("short", "信用売残")):
+        blk = dict((mt.get("longterm") or {}).get(key) or {})
+        peak = blk.get("peak")
+        blk["_peak_val"] = (peak or {}).get(key)
+        lines.append(_fmt_longterm_row(blk, shares_out, label))
+
+    lines += [
+        "",
+        f"- **根拠**: {mt.get('source_note') or 'J-Quants v2 /markets/margin-interest'}。"
+        f" 取得期間は {mt.get('fetch_first_week')} 〜 {lt_date}（{mt.get('fetch_weeks')} 週）。",
+        "- **基準週の選び方**: 6週前比は「直近公表週の 6 週前の暦日以前で最も近い公表週」。"
+        f" 同水準株価時点比は「直近 {MARGIN_SAMELEVEL_LOOKBACK_WEEKS} 週内で、直近終値との差が"
+        f" ±{MARGIN_SAMELEVEL_PRICE_TOL_PCT:.0f}% 以内かつ直近 {MARGIN_SAMELEVEL_MIN_GAP_WEEKS} 週より前の"
+        " 最も新しい公表週」。該当が無い場合は株価が最も近い週を参考として併記する。"
+        " 終値は yfinance 日足（分割調整済み・配当未調整）の、基準日以前で最も近い営業日。",
+        "- **長期トレンド**: 過去 52 週の残高ピークからの減少率と 13/26/52 週前比。"
+        " 固定期間の恣意性を避け「どこまで減ったか」を複数期間で示す（取得範囲外は「-」）。",
+        "- ※ 信用買残の減少＝需給改善（上値のしこり解消）、増加＝悪化。"
+        " screening_master は 8 週分のみ保持するため、6 週超のスパンは本表（ライブ取得）が唯一の根拠。",
+        "",
+    ]
+    lines += _fmt_short_pos_trend(mt, shares_out)
+    return lines
+
+
+def _fmt_short_pos_trend(mt: dict, shares_out) -> list[str]:
+    """機関空売り残（空売り残高報告制度・機関合計）の3段トレンドを組み立てる。
+
+    信用残と同じく (1) 6週前比 (2) 同水準株価時点比 (3) 長期トレンド（52週ピーク比 +
+    13/26/52週前比）を出す。取得失敗時も行を省略せず理由を明示する（黙った補完の禁止）。
+    """
+    lines = [
+        "### ③-3 機関空売り残トレンド（6週前比・同水準株価時点比・長期トレンド）",
+        "",
+        "| 比較 | 基準日（株価情報） | 基準日の機関空売り残 | 直近の機関空売り残 | 増減率 | 判定 |",
+        "|------|--------------------|----------------------|--------------------|--------|------|",
+    ]
+
+    status = (mt or {}).get("short_pos_status") or "error:未実行"
+    if status != "ok":
+        lines.append(f"| 6週前比 | 取得できず（{status}） | - | - | - | 取得不能 |")
+        lines.append(f"| 同水準株価時点比 | 取得できず（{status}） | - | - | - | 取得不能 |")
+        lines += [
+            "",
+            "- **根拠**: J-Quants v2 /markets/short-sale-report のライブ取得に失敗または"
+            f"該当なし（{status}）。",
+            "- ※ 機関空売りが増えた／減ったと解釈しないこと（未確認）。"
+            " 報告義務は発行済株式総数の 0.5% 以上であり、0件は「報告水準に達した機関が無い」を意味する。",
+            "",
+        ]
+        return lines
+
+    latest = mt.get("short_pos_latest") or {}
+    lt_date = latest.get("date").isoformat() if latest.get("date") else "N/A"
+    lt_sh = _shares_fmt(latest.get("shares"), shares_out)
+
+    for wk in MARGIN_INTEREST_TREND_WEEKS:
+        e = (mt.get("short_pos_weeks") or {}).get(wk)
+        if not e or e.get("base") is None:
+            note = (e or {}).get("note") or "基準日なし"
+            lines.append(f"| {wk}週前比 | 取得できず（{note}） | - | {lt_sh} | - | 取得不能 |")
+            continue
+        b = e["base"]
+        lines.append(
+            f"| {wk}週前比 | {b['date'].isoformat()} "
+            f"| {_shares_fmt(b.get('shares'), shares_out)} | {lt_sh} "
+            f"| {_pct_fmt(e.get('shares_pct'))} | {e.get('judge') or 'N/A'} |"
+        )
+
+    sl = dict(mt.get("short_pos_same_level") or {})
+    sl["_latest_val"] = latest.get("shares")
+    lines += _fmt_same_level_row(sl, shares_out, "shares", "shares_pct", "judge")
+
+    lines += [
+        "",
+        "#### ③-3-b 機関空売り残の長期トレンド（52週ピーク→直近・13/26/52週前比）",
+        "",
+        "| 対象 | 52週ピーク→直近 | 期間別の増減率 |",
+        "|------|------------------|----------------|",
+    ]
+    blk = dict(mt.get("short_pos_longterm") or {})
+    peak = blk.get("peak")
+    blk["_peak_val"] = (peak or {}).get("shares")
+    lines.append(_fmt_longterm_row(blk, shares_out, "機関空売り残"))
+
+    lines += [
+        "",
+        f"- **根拠**: {mt.get('short_pos_note') or 'J-Quants v2 /markets/short-sale-report'}。"
+        " 基準日は CalcDate（残高が実際に動いた日）ベースで、報告義務のある機関"
+        "（発行済の 0.5% 以上）の合計。",
+        "- **基準日の選び方**: 6週前比は「直近報告日の 6 週前の暦日以前で最も近い報告日」。"
+        f" 同水準株価時点比は「直近 {MARGIN_SAMELEVEL_LOOKBACK_WEEKS} 週内で、直近終値との差が"
+        f" ±{MARGIN_SAMELEVEL_PRICE_TOL_PCT:.0f}% 以内かつ直近 {MARGIN_SAMELEVEL_MIN_GAP_WEEKS} 週より前の"
+        " 最も新しい報告日」。該当が無い場合は株価が最も近い報告日を参考として併記する。",
+        "- ※ 当エンドポイントは `from`/`to` が効かず全履歴が返るため、期間絞りはクライアント側で実施。",
+        "",
+    ]
+    return lines
+
+
 def _fmt_supply_demand_axes(sd: dict | None) -> list[str]:
     """需給3軸セクションを組み立てる。取得できない項目は N/A のまま残す。"""
     if not sd:
@@ -790,12 +1546,17 @@ def _fmt_supply_demand_axes(sd: dict | None) -> list[str]:
          f"| {f_num(ax.get('unwind_days'), '日', '{:.2f}')} "
          f"| {ax.get('unwind_days_judge') or 'N/A'} "
          f"| 1日未満=軽い / 1〜5日=普通 / 5〜10日=重い / 10日以上=非常に重い |"),
-        (f"| ③ トレンド（6週前→直近の信用買残） "
+        (f"| ③ トレンド（6週前→直近の信用買残・screening_master） "
          f"| {f_num(ax.get('trend_start'), '株')} → {f_num(ax.get('trend_end'), '株')}"
          f"（{f_num(ax.get('trend_pct'), '%', '{:+.1f}')}） "
          f"| {ax.get('trend_judge') or 'N/A'} "
          f"| 減少=良い兆候 |"),
         "",
+    ]
+
+    lines += _fmt_margin_trend(ax.get("margin_trend"), shares_out)
+
+    lines += [
         "### 需給・流動性の実数（対発行済%併記）",
         "",
         "| 項目 | 実数 | 対発行済株式総数 |",
@@ -5083,19 +5844,7 @@ def main() -> None:
               f"  {price_stats['first_date']} 〜 {price_stats['last_date']}")
 
     # 7) 需給・セクター・マクロ・過去レポート（ローカルファイル）
-    print("[9/9] 需給・セクター・マクロ・過去レポートを読み込み中...")
-    supply_demand  = load_supply_demand(code)
-    sd_axes        = build_supply_demand_axes(code)
-    sector_name    = supply_demand.get("sector", "")
-    sector_context = load_sector_context(sector_name)
-    macro_context  = load_macro_context()
-    past_research  = load_past_research(code)
-    print(f"  → セクター: {sector_name or '不明'}"
-          f"  需給3軸: {'算出済' if sd_axes.get('available') else '未収録'}"
-          f"  過去レポート: {len([s for s in past_research.split('---') if s.strip()])} 件")
-
-    # 7-1) 信用取引規制（日々公表・増担保）。§8 需給分析で規制の有無を必ず明示する。
-    #      基準日は株価データの最終営業日（無ければ当日）。
+    # 基準日は株価データの最終営業日（無ければ当日）。信用残トレンド・信用規制で共用する。
     _ma_target = None
     if price_stats and price_stats.get("last_date"):
         try:
@@ -5106,6 +5855,24 @@ def main() -> None:
             _ma_target = None
     if _ma_target is None:
         _ma_target = date.today()
+
+    print("[9/9] 需給・セクター・マクロ・過去レポートを読み込み中...")
+    supply_demand  = load_supply_demand(code)
+    sd_axes        = build_supply_demand_axes(code, as_of=_ma_target,
+                                              price_df=price_df)
+    _mt = (sd_axes.get("axes") or {}).get("margin_trend") or {}
+    print("  → 信用残トレンド（ライブ取得・6週前比/同水準株価時点比/長期）: "
+          f"{_mt.get('status')} / 同水準={(_mt.get('same_level') or {}).get('status')}")
+    sector_name    = supply_demand.get("sector", "")
+    sector_context = load_sector_context(sector_name)
+    macro_context  = load_macro_context()
+    past_research  = load_past_research(code)
+    print(f"  → セクター: {sector_name or '不明'}"
+          f"  需給3軸: {'算出済' if sd_axes.get('available') else '未収録'}"
+          f"  過去レポート: {len([s for s in past_research.split('---') if s.strip()])} 件")
+
+    # 7-1) 信用取引規制（日々公表・増担保）。§8 需給分析で規制の有無を必ず明示する。
+    #      基準日 _ma_target は 7) で株価データの最終営業日から算出済み。
     print(f"[9/9] 信用取引規制（日々公表・増担保）を確認中（基準日 {_ma_target}）...")
     margin_alert = fetch_margin_alert(code, _ma_target)
     provenance["margin_alert"] = (
