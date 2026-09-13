@@ -142,6 +142,11 @@ MARGIN_ALERT_SCAN_BACK_DAYS = 90
 # 2 秒 → 4 秒 → 8 秒 と倍にしながら最大 3 回呼ぶ（= 再試行は 2 回）。
 MARGIN_ALERT_RETRIES = 3
 MARGIN_ALERT_BACKOFF_BASE_SEC = 2.0
+# ③-1 日々公表信用残の日次推移で並べる営業日数と、増減率を測る営業日オフセット。
+DAILY_MARGIN_TABLE_DAYS   = 15
+DAILY_MARGIN_CHG_OFFSETS  = (5, 10)
+# ③-3 機関別増減の小表に並べる営業日数（変化があった CalcDate のみ数える）。
+SHORT_POS_BY_INST_DAYS    = 10
 
 # 取得経路の記録（provenance）。値は "EDINET DB" / "EDINET公式API(有報)" / "取得不可"
 PROV_DB      = "EDINET DB"
@@ -1170,8 +1175,18 @@ def build_supply_demand_axes(code4: str, as_of: date | None = None,
     out["axes"]["trend_judge"] = direction
 
     # ③-2 / ③-3 のトレンド（J-Quants ライブ取得。6週前比・同水準株価時点比・長期トレンド）
-    out["axes"]["margin_trend"] = build_margin_trend_rows(
-        code4, as_of=as_of, price_df=price_df)
+    _mt = build_margin_trend_rows(code4, as_of=as_of, price_df=price_df)
+
+    # ③-1 日々公表信用残の日次推移（J-Quants ライブ取得）。週次だけでは直近 1 週間の
+    # 増減が誌面から消えるため必ず取る（2026-09-12 の 7256 誤判定の是正）。
+    out["axes"]["daily_margin"] = fetch_daily_margin_series(
+        code4, as_of or date.today(), shares_out=shares_out)
+
+    # ③-3-c 機関別の増減（どの機関がいつ何株動かしたか）。
+    _mt["short_pos_by_inst"] = fetch_short_pos_by_institution(
+        code4, as_of or date.today(), shares_out=shares_out)
+
+    out["axes"]["margin_trend"] = _mt
 
     return out
 
@@ -1204,15 +1219,31 @@ def _fmt_margin_alert(ma: dict | None) -> list[str]:
         return lines
 
     if status == "empty" or not ma.get("designated"):
+        # 「東証の増担保規制・日々公表の指定なし」でも、日次残高が公表されている
+        # （= 本エンドポイントに毎営業日行が返る）ことは別の事実である。
+        # 2026-09-12 の 7256 深掘りは両者を混同し「指定なし／規制なし」の 1 行だけを
+        # 出したため、日次で信用買残が減っている事実が誌面から消えた。
         lines += [
-            "- **判定**: 指定なし（増担保規制・日々公表銘柄のいずれにも該当しない）",
+            "- **判定**: 東証の指定なし（増担保規制・日々公表銘柄のいずれにも該当しない）",
             f"- **根拠**: J-Quants v2 /markets/margin-alert・基準日 {tgt_s}／"
             f"{ma.get('basis') or 'N/A'}",
         ]
         if status == "empty":
-            lines += ["- 走査期間に本銘柄の公表行なし（規制・注意喚起の対象外）", ""]
+            lines += [
+                "- 走査期間に本銘柄の公表行なし（規制・注意喚起の対象外・日次残高の公表なし）",
+                "",
+            ]
             return lines
         lines.append(f"- 走査期間の公表行数: {ma.get('history_days', 0)} 行")
+        # 行が返っている＝日次の信用残高が公表されている銘柄。東証の指定有無とは別事実。
+        cls = str((ma.get("latest_row") or {}).get("TSEMrgnRegCls") or "")
+        lines += [
+            f"- **日次残高の公表**: あり（本エンドポイントに毎営業日行が返る"
+            f"・区分 TSEMrgnRegCls={cls!r}: "
+            f"{MARGIN_ALERT_CLS_LABELS.get(cls, '区分不明')}）",
+            "- 日次の信用買残・売残の推移は \u2462-1 を見ること"
+            "（東証の指定がないことを「日次残高が無い」と読み替えないこと）。",
+        ]
     else:
         kinds = "・".join(ma.get("kinds") or []) or "区分不明"
         since = ma.get("since")
@@ -1347,6 +1378,143 @@ def _fmt_longterm_row(lt: dict | None, shares_out, label: str) -> str:
     return f"| {label} | {peak_txt} | " + " / ".join(parts) + " |"
 
 
+def _fmt_daily_margin(dm: dict | None, shares_out) -> list[str]:
+    """③-1 日々公表信用残の日次推移（直近 15 営業日）を組み立てる。
+
+    週次信用残（金曜時点・公表は翌週）しか見ないと直近 1 週間の増減が誌面から消え、
+    「需給が改善している／悪化している」を 1 週間古い前提で語ることになる
+    （2026-09-12 発行の 7256 深掘りで実際に起きた）。そのため日々公表銘柄については
+    日次の残高・前日比・発行済比を必ず並べる。
+    取得できなかった場合も行を省略せず理由を明示する（黙った補完の禁止）。
+    """
+    lines = ["### \u2462-1 日々公表信用残の日次推移", ""]
+
+    status = (dm or {}).get("status") or "error:未実行"
+    if status == "empty":
+        lines += [
+            "- 日々公表対象外（週次のみ）。"
+            "J-Quants v2 /markets/margin-alert に本銘柄の行が無く、日次の信用残は公表されていない。",
+            "- 日次の増減は確認できない。週次信用残（\u2462-2）で読むこと。",
+            "",
+        ]
+        return lines
+    if status != "ok":
+        lines += [
+            f"- **取得できず（{status}）**: J-Quants v2 /markets/margin-alert の取得に失敗。",
+            "- ※ 日次の信用残が増えた／減ったと解釈しないこと（未確認）。",
+            "",
+        ]
+        return lines
+
+    rows = dm.get("rows") or []
+    tail = rows[-DAILY_MARGIN_TABLE_DAYS:]
+
+    def _sh(v):
+        return f"{v:,.0f}" if v is not None else "N/A"
+
+    def _chg(v):
+        return f"{v:+,.0f}" if v is not None else "N/A"
+
+    def _pc(v):
+        return f"{v:.2f}%" if v is not None else "N/A"
+
+    lines += [
+        "| 適用日 | 信用買残 | 買残 前日比 | 買残 発行済比 | 信用売残 | 売残 前日比 | 売残 発行済比 |",
+        "|--------|----------|-------------|---------------|----------|-------------|---------------|",
+    ]
+    for r in reversed(tail):  # 新しい順
+        lines.append(
+            f"| {r['date'].isoformat()} | {_sh(r['long'])} | {_chg(r['long_chg'])} | "
+            f"{_pc(r['long_pct'])} | {_sh(r['short'])} | {_chg(r['short_chg'])} | "
+            f"{_pc(r['short_pct'])} |"
+        )
+    lines.append("")
+
+    # 期間の累計増減と 5/10 営業日増減率。
+    lines += [
+        "| 比較 | 基準日 | 基準日の信用買残 | 直近の信用買残 | 買残 増減率 | 売残 増減率 |",
+        "|------|--------|------------------|----------------|-------------|-------------|",
+    ]
+    latest = tail[-1]
+    cum = dm.get("cum") or {}
+    tbl_first = tail[0]
+
+    def _pct_s(v):
+        return f"{v:+.1f}%" if v is not None else "N/A"
+
+    # 表に出した期間の初日→最終日（誌面の表と数字が合う形にする）。
+    tb_long_pct = (((latest["long"] - tbl_first["long"]) / tbl_first["long"] * 100.0)
+                   if (tbl_first.get("long") and latest.get("long") is not None) else None)
+    tb_short_pct = (((latest["short"] - tbl_first["short"]) / tbl_first["short"] * 100.0)
+                    if (tbl_first.get("short") and latest.get("short") is not None) else None)
+    lines.append(
+        f"| 表の期間 累計（{len(tail)} 営業日） | {tbl_first['date'].isoformat()} | "
+        f"{_sh(tbl_first['long'])} | {_sh(latest['long'])} | {_pct_s(tb_long_pct)} | "
+        f"{_pct_s(tb_short_pct)} |"
+    )
+    for off in DAILY_MARGIN_CHG_OFFSETS:
+        e = (dm.get("chg") or {}).get(off)
+        if not e:
+            lines.append(f"| {off} 営業日前比 | 取得できず（遡及行不足） | - | - | - | - |")
+            continue
+        lines.append(
+            f"| {off} 営業日前比 | {e['base_date'].isoformat()} | {_sh(e.get('long_base'))} | "
+            f"{_sh(latest['long'])} | {_pct_s(e.get('long_pct'))} | {_pct_s(e.get('short_pct'))} |"
+        )
+    lines.append("")
+
+    ldiff = cum.get("long_diff")
+    judge = ("信用買残は減少（需給の重さが軽くなる方向）" if (ldiff is not None and ldiff < 0)
+             else "信用買残は増加（需給の重さが増す方向）" if (ldiff is not None and ldiff > 0)
+             else "信用買残の増減は算出できず")
+    lines += [
+        f"- **判定**: {judge}"
+        + (f"（取得期間 {cum.get('from')}\u2192{cum.get('to')} で "
+           f"{ldiff:+,.0f}株・{_pct_s(cum.get('long_pct'))}）" if ldiff is not None else ""),
+        f"- **根拠**: {dm.get('note') or 'N/A'}。"
+        "日付は AppDate（適用日 = 残高が立っていた営業日）で並べている"
+        "（PubDate は翌営業日の公表日であり、これで並べると 1 営業日ずれる）。",
+        "",
+    ]
+    return lines
+
+
+def _fmt_short_pos_by_inst(sp: dict | None, shares_out) -> list[str]:
+    """\u2462-3 の小表: 直近の機関別空売り残の増減（報告のあった日のみ・新しい順）。
+
+    機関合計だけでは「どの機関がいつ何株減らしたか」が消える。空売り残高報告制度は
+    残高が変化した時だけ行が出るため、行のある CalcDate がその機関の残高が動いた日
+    そのものであり、買い戻しの主体と規模をここで特定できる。
+    """
+    lines = [f"#### \u2462-3-c 直近 {SHORT_POS_BY_INST_DAYS} 営業日の機関別増減（報告のあった日のみ）", ""]
+
+    status = (sp or {}).get("status") or "error:未実行"
+    if status != "ok":
+        lines += [
+            f"- 取得できず（{status}）。",
+            "- ※ 機関が買い戻した／売り増したと解釈しないこと（未確認）。"
+            " 報告義務は発行済株式総数の 0.5% 以上であり、0件は「報告水準に達した機関が無い」を意味する。",
+            "",
+        ]
+        return lines
+
+    rows = sp.get("rows") or []
+    lines += [
+        "| 計算日 | 機関名 | 残高株数 | 発行済比 | 前回報告比 |",
+        "|--------|--------|----------|----------|------------|",
+    ]
+    for r in rows:
+        sh = f"{r['shares']:,.0f}" if r.get("shares") is not None else "N/A"
+        pc = f"{r['pct']:.2f}%" if r.get("pct") is not None else "N/A"
+        if r.get("diff") is not None:
+            df_s = f"{r['diff']:+,.0f}"
+        else:
+            df_s = "新規報告（前回なし）" if r.get("is_first") else "N/A"
+        lines.append(f"| {r['date'].isoformat()} | {r['inst']} | {sh} | {pc} | {df_s} |")
+    lines += ["", f"- **根拠**: {sp.get('note') or 'N/A'}。", ""]
+    return lines
+
+
 def _fmt_margin_trend(mt: dict | None, shares_out) -> list[str]:
     """信用残トレンド（6週前比・同水準株価時点比・長期トレンド）のセクションを組み立てる。
 
@@ -1436,6 +1604,7 @@ def _fmt_margin_trend(mt: dict | None, shares_out) -> list[str]:
         "",
     ]
     lines += _fmt_short_pos_trend(mt, shares_out)
+    lines += _fmt_short_pos_by_inst(mt.get("short_pos_by_inst"), shares_out)
     return lines
 
 
@@ -1554,6 +1723,9 @@ def _fmt_supply_demand_axes(sd: dict | None) -> list[str]:
         "",
     ]
 
+    # ③-1 日次（日々公表銘柄のみ実数が出る） → ③-2 週次トレンド の順に並べる。
+    # 直近 1 週間の増減は日次しか持っていないため、週次より前に置く。
+    lines += _fmt_daily_margin(ax.get("daily_margin"), shares_out)
     lines += _fmt_margin_trend(ax.get("margin_trend"), shares_out)
 
     lines += [
@@ -4739,6 +4911,270 @@ def fetch_margin_alert(code: str, target_date) -> dict:
     return out
 
 
+def fetch_daily_margin_series(code: str, target_date, shares_out=None,
+                              scan_back_days: int = 120) -> dict:
+    """J-Quants v2 /markets/margin-alert から「日々公表信用取引残高」の日次時系列を返す。
+
+    ■ 取得元を J-Quants に決めた根拠（2026-09-13 実測）
+      PM が参照する karauri.net の 7256 日次表（8/28〜9/10 の信用買残・売残）と、
+      本エンドポイントの `AppDate`（適用日 = 残高が実際に立っていた営業日）で並べた
+      LongOut / ShrtOut を全 10 日付・買残売残とも突合し、**全件一致**を確認した。
+      よって karauri.net のスクレイピングは不要であり、取得元は J-Quants 一本とする。
+
+    ■ 日付列の取り違えに注意（2026-09-12 の誤判定の原因）
+      本エンドポイントは 1 行に 2 つの日付を持つ:
+        - `AppDate` … 適用日。その残高がいつ時点のものかを表す。karauri.net の表の
+                      日付列はこれに一致する。J-Quants 週次信用残（金曜時点）の
+                      基準日ともこれで揃う（7256 の 9/4 は週次 3,073,600 株と一致）。
+        - `PubDate` … 公表日。AppDate の翌営業日になる。
+      日次推移は必ず `AppDate` で並べる。`PubDate` で並べると全行が 1 営業日ずれ、
+      「直近の減少」を 1 日古い値で語ることになる。
+
+    ■ 母集団（行が返る銘柄）
+      本エンドポイントは日々公表銘柄・増担保規制銘柄・日証金の貸株注意喚起銘柄に
+      限って行を返す。非対象銘柄は列すら無い空 DataFrame になる（215A・7203 で実測）。
+      したがって「行が毎営業日返る」こと自体が「日次残高が公表されている銘柄」の
+      証拠であり、これを `daily_published=True` として扱う。PubReason の
+      DailyPublication フラグは東証が制度として指定した日々公表銘柄だけに立つ狭い
+      意味のフラグであり、日次残高が取れるか否かの判定には使えない。
+
+    Args:
+        code: 銘柄コード（4桁・5桁いずれでも可）。
+        target_date: 基準日（この日以前の AppDate までを対象にする）。
+        shares_out: 発行済株式総数（発行済比%の算出に使う。無ければ None のまま）。
+        scan_back_days: 遡及する暦日数。
+
+    Returns:
+        {
+          "status": "ok"|"empty"|"error:<msg>",
+          "daily_published": bool,      # 日次残高が公表されている銘柄か
+          "rows": [{"date": date(AppDate), "pub_date": date, "long": float,
+                    "long_chg": float, "short": float, "short_chg": float,
+                    "long_pct": float|None, "short_pct": float|None}, ...昇順],
+          "chg": {5: {...}, 10: {...}},  # 営業日オフセットごとの増減
+          "cum": {...},                  # 期間の累計増減（初日→最終日）
+          "note": str,
+        }
+    """
+    out: dict = {
+        "status": "error:未実行", "daily_published": False, "rows": [],
+        "chg": {}, "cum": {}, "note": "",
+    }
+    api_key = os.environ.get("JQUANTS_API_KEY", "").strip()
+    if not api_key:
+        out["status"] = "error:JQUANTS_API_KEY 未設定"
+        return out
+    if target_date is None:
+        out["status"] = "error:基準日が未確定"
+        return out
+
+    try:
+        import jquantsapi
+        client = jquantsapi.ClientV2(api_key=api_key)
+    except Exception as e:  # noqa: BLE001
+        print(f"  → 取得失敗: J-Quants クライアント生成（日次信用残）: {e}", file=sys.stderr)
+        out["status"] = f"error:クライアント生成 {e}"
+        return out
+
+    frm = target_date - timedelta(days=scan_back_days)
+    df = None
+    last_err: Exception | None = None
+    for attempt in range(MARGIN_ALERT_RETRIES):
+        try:
+            df = client.get_mkt_margin_alert(
+                code=str(code).strip(),
+                from_yyyymmdd=frm.strftime("%Y%m%d"),
+                to_yyyymmdd=target_date.strftime("%Y%m%d"),
+            )
+            last_err = None
+            break
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            is_rate = "429" in str(e) or "too many requests" in str(e).lower()
+            if not is_rate or attempt == MARGIN_ALERT_RETRIES - 1:
+                break
+            time.sleep(MARGIN_ALERT_BACKOFF_BASE_SEC * (2 ** attempt))
+    if last_err is not None:
+        print(f"  → 取得失敗: J-Quants 日次信用残 {code}: {last_err}", file=sys.stderr)
+        out["status"] = f"error:{last_err}"
+        return out
+
+    if df is None or len(df) == 0:
+        out["status"] = "empty"
+        out["note"] = "日々公表対象外（本エンドポイントに行が無い＝日次残高の公表なし）"
+        return out
+
+    def _to_date(s):
+        try:
+            return datetime.strptime(str(s)[:10], "%Y-%m-%d").date()
+        except (TypeError, ValueError):
+            return None
+
+    def _f(v):
+        try:
+            if v is None:
+                return None
+            v = float(v)
+            return None if v != v else v
+        except (TypeError, ValueError):
+            return None
+
+    # AppDate（適用日）で一意化する。同一 AppDate が重複したら PubDate の新しい行を採る。
+    by_app: dict = {}
+    for r in df.to_dict("records"):
+        ad = _to_date(r.get("AppDate"))
+        if ad is None or ad > target_date:
+            continue
+        pdt = _to_date(r.get("PubDate"))
+        prev = by_app.get(ad)
+        if prev is not None and pdt is not None and prev[0] is not None and pdt <= prev[0]:
+            continue
+        by_app[ad] = (pdt, r)
+
+    rows: list[dict] = []
+    for ad in sorted(by_app):
+        pdt, r = by_app[ad]
+        lo, sh = _f(r.get("LongOut")), _f(r.get("ShrtOut"))
+        rows.append({
+            "date": ad, "pub_date": pdt,
+            "long": lo, "long_chg": _f(r.get("LongOutChg")),
+            "short": sh, "short_chg": _f(r.get("ShrtOutChg")),
+            "long_pct":  (lo / shares_out * 100.0) if (lo is not None and shares_out) else None,
+            "short_pct": (sh / shares_out * 100.0) if (sh is not None and shares_out) else None,
+            "reg_cls": str(r.get("TSEMrgnRegCls") or ""),
+        })
+    if not rows:
+        out["status"] = "empty"
+        out["note"] = f"基準日 {target_date} 以前の適用日（AppDate）の行が0件"
+        return out
+
+    out["status"] = "ok"
+    out["daily_published"] = True
+    out["rows"] = rows
+
+    latest = rows[-1]
+    # 営業日オフセット比（公表営業日ベース。暦日ではなく行数で数える）。
+    for off in DAILY_MARGIN_CHG_OFFSETS:
+        if len(rows) > off:
+            base = rows[-1 - off]
+            ent: dict = {"base_date": base["date"]}
+            for key in ("long", "short"):
+                b, l = base.get(key), latest.get(key)
+                ent[f"{key}_base"] = b
+                ent[f"{key}_pct"] = ((l - b) / b * 100.0) if (b and l is not None) else None
+                ent[f"{key}_diff"] = (l - b) if (b is not None and l is not None) else None
+            out["chg"][off] = ent
+
+    first = rows[0]
+    cum: dict = {"from": first["date"], "to": latest["date"]}
+    for key in ("long", "short"):
+        b, l = first.get(key), latest.get(key)
+        cum[f"{key}_from"] = b
+        cum[f"{key}_to"] = l
+        cum[f"{key}_diff"] = (l - b) if (b is not None and l is not None) else None
+        cum[f"{key}_pct"] = ((l - b) / b * 100.0) if (b and l is not None) else None
+    out["cum"] = cum
+    out["note"] = (f"J-Quants v2 /markets/margin-alert（code={str(code).strip()}・"
+                   f"適用日 AppDate {rows[0]['date']}〜{latest['date']}・{len(rows)} 営業日）")
+    return out
+
+
+def fetch_short_pos_by_institution(code4: str, as_of, shares_out=None,
+                                   max_days: int = SHORT_POS_BY_INST_DAYS) -> dict:
+    """機関空売り残の「機関別・日別の増減」を、変化があった行だけ新しい順に返す。
+
+    /markets/short-sale-report は「残高が変化して報告された時だけ」行が出る制度開示
+    （発行済株式総数の 0.5% 以上に報告義務）であり、行が出た CalcDate がその機関の
+    残高が動いた日である。機関合計（③-3 本体）では「どの機関がいつ何株動かしたか」が
+    消えるため、ここで機関別の生の増減を残す。PrevRptRatio（前回報告比率）ではなく、
+    同一機関の直前の報告行との株数差を自前で取る（比率だけでは株数が出ないため）。
+
+    Args:
+        code4: 銘柄コード。
+        as_of: 基準日（この日以前の CalcDate まで）。
+        shares_out: 発行済株式総数（発行済比%に使う。無ければ ShrtPosToSO を使う）。
+        max_days: 並べる CalcDate の最大数（新しい順）。
+    Returns:
+        {"status": "ok"|"error:...", "rows": [{"date","inst","shares","pct","diff"}...新しい順],
+         "note": str}
+    """
+    out: dict = {"status": "error:未実行", "rows": [], "note": ""}
+    if as_of is None:
+        as_of = date.today()
+
+    api_key = os.environ.get("JQUANTS_API_KEY", "").strip()
+    if not api_key:
+        out["status"] = "error:JQUANTS_API_KEY 未設定"
+        return out
+    try:
+        import jquantsapi
+        from jq_client_utils import fetch_paginated_v2
+        client = jquantsapi.ClientV2(api_key=api_key)
+        raw = fetch_paginated_v2(client, "/markets/short-sale-report",
+                                 params={"code": str(code4).strip()}, sleep_seconds=0.6)
+    except Exception as e:  # noqa: BLE001
+        out["status"] = f"error:API エラー（{type(e).__name__}）"
+        print(f"  → 取得失敗: J-Quants 機関別空売り残 {code4}: {e}", file=sys.stderr)
+        return out
+
+    if not raw:
+        out["status"] = "error:該当データ0件（報告義務水準0.5%に達した機関が無い）"
+        return out
+
+    def _f(v):
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    # 機関ごとに CalcDate 昇順に並べ、直前の報告行との株数差を取る。
+    per_inst: dict = {}
+    for r in raw:
+        try:
+            d = date.fromisoformat(str(r.get("CalcDate") or "")[:10])
+        except ValueError:
+            continue
+        if d > as_of:
+            continue
+        inst = str(r.get("SSName") or r.get("DICName") or "").strip() or "機関名不明"
+        per_inst.setdefault(inst, {})[d] = r
+
+    flat: list[dict] = []
+    for inst, by_d in per_inst.items():
+        ds = sorted(by_d)
+        for i, d in enumerate(ds):
+            r = by_d[d]
+            sh = _f(r.get("ShrtPosShares"))
+            prev = _f(by_d[ds[i - 1]].get("ShrtPosShares")) if i > 0 else None
+            ratio = _f(r.get("ShrtPosToSO"))
+            if sh is not None and shares_out:
+                pct = sh / shares_out * 100.0
+            elif ratio is not None:
+                pct = ratio * 100.0
+            else:
+                pct = None
+            flat.append({
+                "date": d, "inst": inst, "shares": sh, "pct": pct,
+                "diff": (sh - prev) if (sh is not None and prev is not None) else None,
+                "is_first": i == 0,
+            })
+
+    if not flat:
+        out["status"] = f"error:基準日 {as_of} 以前の報告が0件"
+        return out
+
+    # 新しい順に並べ、直近 max_days 分の CalcDate に絞る（行が出た日＝変化があった日）。
+    uniq_days = sorted({x["date"] for x in flat}, reverse=True)[:max_days]
+    keep = set(uniq_days)
+    rows = [x for x in flat if x["date"] in keep]
+    rows.sort(key=lambda x: (x["date"], x["inst"]), reverse=True)
+    out["status"] = "ok"
+    out["rows"] = rows
+    out["note"] = (f"J-Quants v2 /markets/short-sale-report（code={str(code4).strip()}・"
+                   f"CalcDate {uniq_days[-1]}〜{uniq_days[0]}・報告のあった {len(uniq_days)} 日）")
+    return out
+
+
 def _fetch_jq_short_sale_daily(code4: str, days: list, shares_out=None) -> dict:
     """J-Quants /markets/short-sale-report から、対象銘柄の機関空売り残の日次増減を取得する。
 
@@ -5863,6 +6299,13 @@ def main() -> None:
     _mt = (sd_axes.get("axes") or {}).get("margin_trend") or {}
     print("  → 信用残トレンド（ライブ取得・6週前比/同水準株価時点比/長期）: "
           f"{_mt.get('status')} / 同水準={(_mt.get('same_level') or {}).get('status')}")
+    _dm = (sd_axes.get("axes") or {}).get("daily_margin") or {}
+    print("  → 日々公表信用残（日次・③-1）: "
+          f"{_dm.get('status')} / 日次公表={_dm.get('daily_published')} / "
+          f"{len(_dm.get('rows') or [])} 営業日")
+    _spi = (_mt.get("short_pos_by_inst") or {})
+    print(f"  → 機関別空売り残（③-3-c）: {_spi.get('status')} / "
+          f"{len(_spi.get('rows') or [])} 行")
     sector_name    = supply_demand.get("sector", "")
     sector_context = load_sector_context(sector_name)
     macro_context  = load_macro_context()
