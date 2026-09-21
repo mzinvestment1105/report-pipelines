@@ -6,14 +6,24 @@ PM 2026-08-29 確定（「parquet の数値が出ていなかったら回らな�
 「データが揃っている前提での配信絶対」であり、対象日データ未着時は本ゲートが優先する。
 
 処理:
+  0. 対象日が非営業日（土日・祝日）なら、待たずに即 exit 5（休場スキップ）。
   1. bi/outputs/price_history/{YYYY}.parquet の Date 最大値を読み、対象日以上なら即 exit 0。
   2. 未着なら JQuants から対象日分を取得して parquet へ反映（--topup 指定時）。
   3. それでも未着なら --retries / --interval-seconds に従って 1〜2 を繰り返す。
   4. 最終的に未着なら exit 4（呼び出し側の workflow が generate 以降を止める）。
 
+2026-09-21 追加（休場判定）: 本ゲートは「市場が休場でデータが存在し得ない日」と
+「パイプライン障害でデータが届かない日」を区別せず、前者でも最大約60分ポーリングしたうえで
+exit 4（failure）となり 🚨 の異常アラートを上げていた。2026-09-21 敬老の日の週次レポートが
+この経路で失敗し、さらに 09-22 国民の休日・09-23 秋分の日と 5 連休が続くため、
+同じ誤アラートが休場日ごとに再発する状態だった。対象日が非営業日なら待機も補完もせず
+exit 5 で静かに抜ける（呼び出し側は正常終了扱いにしてレポートを発行しない）。
+営業日判定は jpholiday（bi/pipelines/requirements.txt に既存・他6本のパイプラインで使用中）。
+
 exit code:
   0 = 対象日のデータあり（続行可）
-  4 = リトライ上限まで待っても対象日のデータが未着（生成中止）
+  4 = リトライ上限まで待っても対象日のデータが未着（生成中止・異常）
+  5 = 対象日が非営業日（土日・祝日）のため休場スキップ（正常・アラート不要）
   1 = 判定自体が失敗（parquet 不在・読込不可等のインフラ失敗）
 """
 from __future__ import annotations
@@ -35,6 +45,23 @@ PIPELINES_DIR = Path(__file__).resolve().parents[1]
 EXIT_OK = 0
 EXIT_INFRA = 1
 EXIT_MISSING = 4
+EXIT_MARKET_CLOSED = 5
+
+
+def is_trading_day(d: date) -> bool:
+    """東証の営業日なら True（土日・日本の祝日は False）。
+
+    jpholiday が import できない環境では「判定不能＝営業日扱い」とし、従来どおり
+    データ待機の経路へ倒す（休場スキップの誤発動でレポートを落とさないため）。
+    """
+    if d.weekday() >= 5:
+        return False
+    try:
+        import jpholiday
+    except ImportError:
+        print("[WARN] jpholiday が import できないため休場判定をスキップします（営業日として扱います）")
+        return True
+    return not jpholiday.is_holiday(d)
 
 
 def latest_price_date(target_year: int) -> date | None:
@@ -90,6 +117,16 @@ def main() -> int:
     except ValueError:
         print(f"[ERROR] --expect-date の形式が不正です: {args.expect_date}")
         return EXIT_INFRA
+
+    if not is_trading_day(expect):
+        try:
+            import jpholiday
+            reason = jpholiday.is_holiday_name(expect) or "土日"
+        except ImportError:
+            reason = "土日"
+        print(f"[SKIP] 対象日 {expect.isoformat()} は非営業日です（{reason}）。"
+              f"市場が休場のため価格データは存在せず、待機・補完・生成を行いません。")
+        return EXIT_MARKET_CLOSED
 
     if not PRICE_HISTORY_DIR.exists():
         print(f"[ERROR] price_history ディレクトリが存在しません: {PRICE_HISTORY_DIR}")

@@ -52,12 +52,21 @@ RESERVED_MINKABU_PATHS = {"popular_ranking", "rise_ranking", "new", ""}
 # 落ちた実績があるため、リトライ（指数バックオフ）+ UA ローテーションを追加。
 # 同日追記: 実際に観測されたブロックは 405 だった（当初のリトライ対象 403/429/5xx に
 # 含まれず即 give-up していた）ため 405 を追加し、待機列も (2,5,15,40) へ延長。
-_RETRY_WAITS = (2, 5, 15, 40)
+# 2026-09-21: 上記の対策後も 2026-09-16 17:43 JST の run で 3 ソース全滅（株探 405・
+# みんかぶ 403）が再発した。旧待機列の合計は約 62 秒で、IP 単位のブロックが解除される
+# 前に試行を使い切っていた。待機列を (5,15,45,120,300) へ延ばし合計を約 8 分へ拡大する
+# （ジョブ枠 30 分に対し 3 ソース最悪 24 分で収まる範囲）。
+_RETRY_WAITS = (5, 15, 45, 120, 300)
 _RETRY_STATUSES = (403, 405, 429, 500, 502, 503, 504)
+# 待機列を 6 試行へ延ばしたため、UA も 6 種へ拡張して試行ごとに別の UA を当てる
+# （3 種のままだと 4 回目以降が 1〜3 回目と同じ UA の再提示になり、UA 起因のブロックを抜けられない）。
 _UA_POOL = (
     HEADERS.get("User-Agent", "Mozilla/5.0"),
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
 )
 
 

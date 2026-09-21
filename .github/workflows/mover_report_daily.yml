@@ -18,11 +18,14 @@ name: 動意銘柄レポート日次
   schedule:
     - cron: '45 8 * * 1-5'
 
-# PM 2026-08-26 確定: 旧 4 並列（prime/standard/growth_a/growth_b）を 1 実行へ統合。
+# 2026-09-21 確定: 市場別 3 レッグ（growth / standard / prime）構成。
 # setup-raw ジョブが raw データ生成 + artifact upload。
-# generate-market ジョブが market=all の 1 実行で全 3 市場を 1 ファイルへ生成。
-# merge-and-send ジョブが単一ファイルを配置 + Discord 送信 + commit。
-# 並び順はグロース → スタンダード → プライム（prompts/mover-report.md が制御）。
+# generate-market ジョブが市場ごとに独立 invocation で 1 市場ずつ生成する
+#   （出力上限 32,000 トークンを市場ごとに丸ごと使えるようにするため。2026-09-16 に
+#    market=all の 1 実行で 3 試行すべてが上限到達し全社未配信となった事故の再発防止）。
+# merge-and-send ジョブが生成できた市場を固定順で結合 + Discord 送信 + commit。
+#   1 市場が落ちても残りの市場で配信し、欠落は誌面の品質注記と ⚠ 通知で明示する。
+# 並び順はグロース → スタンダード → プライム（merge-and-send の結合順が制御）。
 
 # PM 2026-06-06 修正: target_date による group 分裂を防ぐため固定 group へ変更。
 concurrency:
@@ -310,21 +313,18 @@ jobs:
   generate-market:
     needs: setup-raw
     runs-on: ubuntu-latest
-    # PM 2026-08-26: 4 並列を 1 実行へ統合し、1 ジョブが 3 市場 40 銘柄を書くため各試行の枠を拡張
-    # （gen1 45→60 分・gen2/gen3 30→45 分）。
-    # 最悪ケース = 前段 10 分 + 1 回目 60 分 + 待機 1 分 + 2 回目 45 分 + 待機 3 分 + 3 回目 45 分
-    #            + 検証/artifact 2 分 = 166 分 → 余裕を見て 175 分。
-    timeout-minutes: 175
+    # 2026-09-21 改定: 1 市場 1 レッグへ戻したため各試行の枠を縮小（gen1 60→40 分・gen2 45→30 分）。
+    # 最悪ケース = 前段 10 分 + 1 回目 40 分 + 待機 1 分 + 2 回目 30 分 + 検証/artifact 2 分
+    #            = 83 分 → 余裕を見て 90 分。
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        # PM 2026-08-26 確定: 固定プロンプト121KB×4重複を解消するため1実行へ統合。
-        # 並び順はグロース→スタンダード→プライム（prompts/mover-report.md が制御）。
-        # 旧構成 [prime, standard, growth_a, growth_b] の4分割は「出力32Kトークン上限」が根拠だったが、
-        # 2026-07-07 に CLAUDE_CODE_MAX_OUTPUT_TOKENS を 64000 へ引き上げ済みで根拠が消滅した
-        # （実績出力は4セクション合計で枠の約1/3）。matrix 構造自体は参照箇所の書き換えを
-        # 最小にするため残し、値だけを [all] の1値に畳む。
-        market: [all]
+        # 出力トークン上限は 32,000（現行 GHA アクションが固定する Claude Code CLI 1.0.88 の実効上限）。
+        # 市場別レッグに分けることで各市場が 32,000 の枠を丸ごと使える（1 実行 3 市場だと 1 枠を分け合う）。
+        # 2026-09-21 復帰: 2026-09-16 に 3 試行すべてが出力上限到達で落ち全社未配信となった事故を受けて。
+        # 並び順はグロース→スタンダード→プライム（merge-and-send の結合順が制御）。
+        market: [growth, standard, prime]
     steps:
       - name: Checkout report-pipelines
         uses: actions/checkout@v4
@@ -386,11 +386,32 @@ jobs:
           mkdir -p market/daily
           SRC=/tmp/movers-raw/${TARGET_DATE}_movers_raw.md
           DST=market/daily/${TARGET_DATE}_movers_raw.md
-          # PM 2026-08-26 確定: 統合後は全市場を1実行が担当するため raw は無加工で全量を渡す
-          # （旧 case 文による市場別スライス〈standard / growth へ担当市場の節のみ渡す〉は統合により不要）。
-          # raw ヘッダ（タイトル・価格比較・「対象日市場概況」ブロック）も全量に含まれるため、
-          # 「本日の地合い」の引用元と対象日検証のアンカーはそのまま届く。
-          cp "$SRC" "$DST"
+          # PM 2026-06-13 確定 / 2026-09-21 復帰: standard / growth レッグには担当市場の節のみ渡し、
+          # 担当外市場（プライム/スタンダード ~1,960 行）の無駄読み・同一 offset 再読込ループを構造的に防ぐ。
+          # prime は Section 9 が全市場横断のため全 raw を保持する。
+          # PM 2026-07-12 確定: standard / growth にも raw ヘッダ（タイトル・価格比較・
+          # 「対象日市場概況」ブロック＝「## Layer 1」より前の全行）を前置する。
+          # 「本日の地合い」の引用元と対象日検証のアンカーを全レッグへ届けるため
+          # （2026-07-09 日付品質事故の再発防止）。
+          case "$TARGET_MARKET" in
+            growth)
+              awk '/^## Layer 1/{exit} {print}' "$SRC" > "$DST"
+              awk '/^## グロース/{f=1} f' "$SRC" >> "$DST"
+              ;;
+            standard)
+              awk '/^## Layer 1/{exit} {print}' "$SRC" > "$DST"
+              awk '/^## スタンダード/{f=1} /^## グロース/{f=0} f' "$SRC" >> "$DST"
+              ;;
+            *)
+              cp "$SRC" "$DST"
+              ;;
+          esac
+          # 抽出失敗（見出し不一致等）の保険: 極端に短ければ全 raw にフォールバック
+          # （閾値 40: ヘッダ前置分 ~20 行があっても市場節の抽出失敗を検知できる値・PM 2026-07-12）
+          if [ "$(wc -l < "$DST")" -lt 40 ]; then
+            echo "Sliced raw too short for market=$TARGET_MARKET; falling back to full raw"
+            cp "$SRC" "$DST"
+          fi
           echo "Placed $DST for market=$TARGET_MARKET ($(wc -l < "$DST") lines / source $(wc -l < "$SRC") lines)"
 
       - name: 既存日次レポートファイル群を削除（前回不良ファイル読込スキップ防止）
@@ -420,8 +441,10 @@ jobs:
           model: claude-opus-5
           prompt_file: report-pipelines/prompts/mover-report.md
           allowed_tools: "Read,Write,Edit,Bash,Grep,Glob,WebSearch,WebFetch"
-          timeout_minutes: "60"
-          # PM 2026-07-07: 32001 出力トークン上限で市場セクションが途中終了する事故の予防で 64000 へ。
+          timeout_minutes: "40"
+          # 出力トークン上限 32,000 は現行 GHA アクションが固定する Claude Code CLI 1.0.88 の実効上限
+          # （これを超える値を書いても CLI が 32,000 へ丸めるため無効・_cr §49）。上限は暴走応答の保険であり
+          # 通常の誌面が到達してはならない。市場別レッグ化で 1 市場あたりの誌面量を枠内へ収める設計。
           claude_env: |
             CLAUDE_CODE_EFFORT_LEVEL: high
             CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
@@ -468,49 +491,7 @@ jobs:
           model: claude-opus-5
           prompt_file: report-pipelines/prompts/mover-report.md
           allowed_tools: "Read,Write,Edit,Bash,Grep,Glob,WebSearch,WebFetch"
-          timeout_minutes: "45"
-          claude_env: |
-            CLAUDE_CODE_EFFORT_LEVEL: high
-            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
-        env:
-          TARGET_DATE: ${{ needs.setup-raw.outputs.target_date }}
-          TARGET_MARKET: ${{ matrix.market }}
-          PRIVATE_REPO_ROOT: private-repo
-          CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
-
-      - name: Detect spending cap (attempt 2)
-        id: cap2
-        if: steps.gen2.outcome == 'failure'
-        env:
-          EXECUTION_FILE: ${{ steps.gen2.outputs.execution_file }}
-          ATTEMPT: '2'
-        run: bash report-pipelines/.github/scripts/detect_spending_cap.sh
-
-      - name: Wait before retry 3 (Claude overloaded 等の一時エラー)
-        if: steps.gen2.outcome == 'failure' && steps.cap2.outputs.capped != 'true'
-        env:
-          TARGET_DATE: ${{ needs.setup-raw.outputs.target_date }}
-          TARGET_MARKET: ${{ matrix.market }}
-        run: |
-          F="private-repo/market/daily/movers/${TARGET_DATE}_${TARGET_MARKET}.md"
-          if [ -f "$F" ]; then
-            mv "$F" "/tmp/${TARGET_DATE}_${TARGET_MARKET}.attempt2.partial.md"
-            echo "2 回目の不完全な出力を /tmp へ退避しました（再試行が白紙から書き直せるようにするため）"
-          fi
-          echo "2 回目も失敗しました。180 秒待機して最終再試行します"
-          sleep 180
-
-      - name: Generate ${{ matrix.market }} market section via Claude Code (retry 3)
-        id: gen3
-        if: steps.gen2.outcome == 'failure' && steps.cap2.outputs.capped != 'true'
-        continue-on-error: true
-        uses: anthropics/claude-code-base-action@beta
-        with:
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          model: claude-opus-5
-          prompt_file: report-pipelines/prompts/mover-report.md
-          allowed_tools: "Read,Write,Edit,Bash,Grep,Glob,WebSearch,WebFetch"
-          timeout_minutes: "45"
+          timeout_minutes: "30"
           claude_env: |
             CLAUDE_CODE_EFFORT_LEVEL: high
             CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
@@ -521,7 +502,7 @@ jobs:
           CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
 
       - name: Verify generated market section (成否の一元判定)
-        # 上の 3 ステップは全て continue-on-error のため、ジョブの成否はここだけで決まる。
+        # 上の 2 ステップ（gen1 / gen2）は全て continue-on-error のため、ジョブの成否はここだけで決まる。
         # 「どの試行で成功したか」に依存せず成果物の実在で判定するので、リトライ成功を失敗扱いする
         # / 失敗を成功扱いする判定崩れが起きない。
         env:
@@ -529,9 +510,9 @@ jobs:
           TARGET_MARKET: ${{ matrix.market }}
         run: |
           F="private-repo/market/daily/movers/${TARGET_DATE}_${TARGET_MARKET}.md"
-          echo "attempt outcomes: gen1=${{ steps.gen1.outcome }} gen2=${{ steps.gen2.outcome }} gen3=${{ steps.gen3.outcome }}"
+          echo "attempt outcomes: gen1=${{ steps.gen1.outcome }} gen2=${{ steps.gen2.outcome }}"
           if [ ! -s "$F" ]; then
-            echo "::error::${TARGET_MARKET} 市場セクションが 3 回の試行で生成されませんでした: $F"
+            echo "::error::${TARGET_MARKET} 市場セクションが 2 回の試行で生成されませんでした: $F"
             exit 1
           fi
           echo "生成成功: $F ($(wc -l < "$F") lines)"
@@ -542,7 +523,9 @@ jobs:
           name: mover-daily-${{ matrix.market }}-${{ needs.setup-raw.outputs.target_date }}
           path: private-repo/market/daily/movers/${{ needs.setup-raw.outputs.target_date }}_${{ matrix.market }}.md
           retention-days: 7
-          if-no-files-found: error
+          # 2026-09-21: 市場別レッグ化により 1 市場が落ちても他市場で配信する。
+          # 欠落は merge-and-send の missing_markets で検知し品質注記へ載せるため、ここでは落とさない。
+          if-no-files-found: warn
 
       - name: Discord 通知（❌ 市場別失敗）
         if: failure() || cancelled()
@@ -557,6 +540,10 @@ jobs:
 
   merge-and-send:
     needs: [setup-raw, generate-market]
+    # 2026-09-21 改定: 市場別レッグ化に伴い、generate-market のいずれかが失敗しても
+    # 生成できた市場だけで配信する（旧: needs の暗黙 success 依存で 1 市場の失敗が全社未配信を招いた）。
+    # 元データ（setup-raw）が無い場合だけは配信不能なので従来どおり起動しない。
+    if: always() && needs.setup-raw.result == 'success'
     runs-on: ubuntu-latest
     # PM 2026-07-01: フォント/Playwright の apt 導入が遅い日（実測14分）に 15 分枠だと
     # ゲート到達前にジョブ timeout でキャンセルされ未送信になる。余裕を持って 30 分へ。
@@ -650,31 +637,41 @@ jobs:
           merge-multiple: true
 
       - name: Place market file as {date}.md
+        id: place
         working-directory: ./private-repo
         env:
           TARGET_DATE: ${{ needs.setup-raw.outputs.target_date }}
         run: |
           MOVERS_DIR="market/daily/movers"
           mkdir -p "$MOVERS_DIR"
-          rm -f "${MOVERS_DIR}/${TARGET_DATE}.md"
-          # PM 2026-08-26 確定: 4 並列統合により artifact は単一（{date}_all.md）。
-          # 旧 4 ファイル cat 結合は不要になり、そのまま cp する。
-          # ファイル内の市場並び順はグロース → スタンダード → プライム
-          # （prompts/mover-report.md が制御）。PM 2026-09-02 確定で送信は
-          # 1 メッセージ・1 PDF（movers_{date}.pdf）へ統一した。send_report_pdf_discord.py は
-          # ファイル全体をそのまま 1 本の PDF にし、市場タイトル行は本文中の区切り帯になる。
-          # PM 2026-09-02 確定: 同一内容の md を _all.md と {date}.md の 2 本 commit する
-          # 二重出力を廃止し、private repo へ配置するのは {date}.md の 1 本だけにする。
-          # （artifact 側のファイル名 {date}_all.md は generate-market の verify/retry が
-          #   その名前で成否判定しているため据え置く。）
-          SRC="/tmp/market-artifacts/${TARGET_DATE}_all.md"
           OUTPUT="${MOVERS_DIR}/${TARGET_DATE}.md"
-          if [ ! -f "$SRC" ]; then
-            echo "ERROR: artifact not found: $SRC"
+          rm -f "$OUTPUT"
+          # 2026-09-21 改定: 市場別レッグへ戻したため、市場ごとの artifact を固定順で結合する。
+          # 並び順はグロース → スタンダード → プライム（この結合順が誌面の市場順を決める）。
+          # 生成に失敗した市場は欠落したまま結合し、欠落名を missing_markets として下流へ渡す
+          # （注記挿入 step が誌面へ ⚠ を載せる）。1 市場も無い場合だけ配信不能として exit 1。
+          # PM 2026-09-02 確定: 送信は 1 メッセージ・1 PDF（movers_{date}.pdf）で、
+          # send_report_pdf_discord.py はファイル全体をそのまま 1 本の PDF にする。
+          FOUND=""
+          MISSING=""
+          for m in growth standard prime; do
+            SRC="/tmp/market-artifacts/${TARGET_DATE}_${m}.md"
+            if [ -s "$SRC" ]; then
+              if [ -n "$FOUND" ]; then printf '\n' >> "$OUTPUT"; fi
+              cat "$SRC" >> "$OUTPUT"
+              FOUND="${FOUND}${FOUND:+ }${m}"
+              echo "Appended ${m} ($(wc -l < "$SRC") lines)"
+            else
+              MISSING="${MISSING}${MISSING:+ }${m}"
+              echo "::warning::${m} 市場のセクションが生成されていません（artifact 欠落）: $SRC"
+            fi
+          done
+          if [ -z "$FOUND" ]; then
+            echo "::error::全 3 市場のセクションが 1 つも生成されていないため配信できません"
             exit 1
           fi
-          cp "$SRC" "$OUTPUT"
-          echo "Placed $OUTPUT ($(wc -l < "$OUTPUT") lines)"
+          echo "missing_markets=${MISSING}" >> $GITHUB_OUTPUT
+          echo "Placed $OUTPUT ($(wc -l < "$OUTPUT") lines / markets: ${FOUND} / missing: ${MISSING:-なし})"
 
       - name: Download movers raw artifact (品質フラグ取得用)
         # PM 2026-07-12（絶対配信原則）: setup-raw が出力した {date}_quality_flags.txt（対象日 EOD
@@ -727,9 +724,29 @@ jobs:
             DETAIL=$(grep '^  - ' /tmp/gate.log | head -5 | sed 's/^  - //' | awk 'NR>1{printf "・"} {printf "%s", $0} END{print ""}')
             NOTE="${NOTE}${NOTE:+ ／ }機械検査で不合格項目あり（${DETAIL}）"
           fi
+          # 2026-09-21 追加: 市場別レッグ化により一部市場が欠落したまま配信しうる。欠落は誌面で明示する。
+          MISSING="${{ steps.place.outputs.missing_markets }}"
+          if [ -n "$MISSING" ]; then
+            NAMES=""
+            for m in $MISSING; do
+              case "$m" in
+                growth)   JP="グロース" ;;
+                standard) JP="スタンダード" ;;
+                prime)    JP="プライム" ;;
+                *)        JP="$m" ;;
+              esac
+              NAMES="${NAMES}${NAMES:+・}${JP}"
+            done
+            NOTE="${NOTE}${NOTE:+ ／ }⚠ ${NAMES} セクションは生成上限到達により本号未掲載"
+          fi
           if [ -n "$NOTE" ]; then
             F=market/daily/movers/${TARGET_DATE}.md
-            awk -v note="> ⚠️ **品質注記**: ${NOTE}" '{print} /^# 動意銘柄レポート /{print ""; print note}' "$F" > "${F}.tmp" && mv "${F}.tmp" "$F"
+            # 2026-09-21 修正: 日次の誌面タイトルは「# グロース市場」等の市場名行であり、
+            # 旧アンカー /^# 動意銘柄レポート / は一度も一致せず注記が挿入されていなかった。
+            # 市場名タイトルの【最初の 1 件】の直後にだけ挿入する（誌面冒頭に 1 回）。
+            awk -v note="> ⚠️ **品質注記**: ${NOTE}" \
+              '{print} !done && /^# (グロース|スタンダード|プライム)市場$/{print ""; print note; done=1}' \
+              "$F" > "${F}.tmp" && mv "${F}.tmp" "$F"
             echo "annotated=true" >> $GITHUB_OUTPUT
             echo "note=${NOTE}" >> $GITHUB_OUTPUT
             echo "品質注記を挿入: ${NOTE}"
@@ -776,6 +793,18 @@ jobs:
         run: |
           bash ../report-pipelines/bi/pipelines/ops/ci_commit_push.sh \
             -m "data: mover report ${TARGET_DATE}" market/daily market/archive
+
+      - name: Discord 通知（⚠️ 一部市場が欠けたまま配信）
+        # 2026-09-21 追加: 市場別レッグのいずれかが生成できなくても、完成した市場だけで配信する。
+        if: steps.place.outputs.missing_markets != '' && steps.send.outcome == 'success'
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
+          state: partial
+          label: 動意銘柄レポート 一部市場が欠けたまま配信
+          date: ${{ needs.setup-raw.outputs.target_date }}
+          meaning: 日次レポートは配信済みですが、${{ steps.place.outputs.missing_markets }} 市場のセクションが 2 回の試行で生成できず本号に含まれていません（誌面冒頭に ⚠ 注記あり）。それ以外の市場は通常どおりの内容です。
+          action_required: 欠けた市場が必要な場合のみ、手動 dispatch（force_rerun=true）で再実行
 
       - name: Discord 通知（⚠️ 配信済み・品質注記あり）
         # PM 2026-07-12（絶対配信原則）: 品質問題があってもレポートは配信済み。何が注記されたかを PM へ通知。

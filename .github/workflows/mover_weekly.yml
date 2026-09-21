@@ -50,10 +50,13 @@ name: 動意銘柄レポート週次
     - cron: '0 10 * * 0'
     - cron: '0 21 * * 0'
 
-# PM 2026-08-26 確定: 旧 4 並列（prime/standard/growth_a/growth_b）を 1 実行へ統合。
-# generate-market ジョブが market=all の 1 実行で全 3 市場を 1 ファイルへ生成し、
-# merge-and-send ジョブが単一ファイルを配置して Discord 送信する。
-# 並び順はグロース → スタンダード → プライム（prompts/mover-weekly.md が制御）。
+# 2026-09-21 確定: 市場別 3 レッグ（growth / standard / prime）構成。
+# generate-market ジョブが市場ごとに独立 invocation で 1 市場ずつ生成し、
+#   （出力上限 32,000 トークンを市場ごとに丸ごと使えるようにするため）
+# merge-and-send ジョブが生成できた市場を固定順で結合して Discord 送信する。
+#   1 市場が落ちても残りの市場で配信し、欠落は誌面の品質注記と ⚠ 通知で明示する。
+# 並び順はグロース → スタンダード → プライム（merge-and-send の結合順が制御）。
+# 週次のテーマ 2 部構成は growth レッグが自ファイル冒頭に書くため、結合後は誌面先頭に来る。
 
 # 2026-08-05: workflow 単位の concurrency は廃止（予備 run が JST 22:53 まで待機している間に
 # 本命 Worker の workflow_dispatch が pending へ回されるのを避けるため）。
@@ -152,11 +155,22 @@ jobs:
           LANE_LABEL: ${{ steps.lane.outputs.label }}
         run: bash .github/scripts/standby_guard.sh
 
-      - name: 対象日を「対象週の金曜」へ正規化（土曜レーン対応）
+      - name: 対象日を「対象週の金曜」へ正規化（土日月レーン対応）
         # PM 2026-08-29 追加: standby_guard.sh の TARGET_DATE は実行日（JST）であり、
-        # 予備レーンを土曜へ移した結果そのままでは土曜日付になる。週次動意の対象日は常に
-        # 「対象週の金曜」なので、土曜なら 1 日前・日曜なら 2 日前へ寄せる（月〜金はそのまま）。
+        # 予備レーンを土曜以降へ移した結果そのままでは土日月の日付になる。週次動意の対象日は
+        # 常に「対象週の金曜」なので、JST カレンダー曜日だけから金曜へ寄せる。
         # workflow_dispatch で target_date を明示した場合はその値を尊重する。
+        #
+        # 2026-09-21 修正（run 35543762739 の誤動作）: 旧実装の case は 6(土)/7(日) だけを扱い、
+        # 2026-08-29 に追加した第5レーン（月曜 JST 07:00・retry5）の 1(月) が `*)` へ落ちて
+        # 実行日そのまま = 月曜日付が対象日になっていた。実ログ:
+        #   「実行日 2026-09-21 (dow=1) → 対象日（対象週の金曜）= 2026-09-21」
+        # 結果、既に配信済みの 2026-09-18 週ではなく月曜（かつ祝日）を対象週として重複チェック
+        # を行い、未配信と誤判定して無用な生成を起票した。
+        # 対策: 金=0 / 土=-1 / 日=-2 / 月=-3 を JST 曜日だけから決め、それ以外の曜日（火〜木）は
+        # 週次レーンとして想定外なので明示 error で落とす（黙って誤日付を下流へ流さない）。
+        # レーン判定（起床時刻・受付窓）は対象日の算出に一切関与しない＝cron の遅延着火が
+        # 何時間ずれても対象日は曜日だけで決まる。
         id: normalize
         env:
           RAW_DATE: ${{ steps.check.outputs.target_date }}
@@ -167,13 +181,27 @@ jobs:
             VALUE="$INPUT_DATE"
             echo "手動指定の対象日をそのまま使用します: $VALUE"
           else
-            DOW=$(date -u -d "$RAW_DATE" +%u)   # 1=月 … 6=土 7=日
+            # RAW_DATE は standby_guard.sh が出す実行日（JST）。空なら JST の当日を使う。
+            BASE="${RAW_DATE:-$(TZ=Asia/Tokyo date +%Y-%m-%d)}"
+            DOW=$(date -u -d "$BASE" +%u)   # 1=月 … 5=金 6=土 7=日
             case "$DOW" in
-              6) VALUE=$(date -u -d "$RAW_DATE -1 day" +%Y-%m-%d) ;;
-              7) VALUE=$(date -u -d "$RAW_DATE -2 day" +%Y-%m-%d) ;;
-              *) VALUE="$RAW_DATE" ;;
+              5) OFFSET=0 ;;   # 金曜（本命 Worker 経路）
+              6) OFFSET=1 ;;   # 土曜（retry1 / retry2）
+              7) OFFSET=2 ;;   # 日曜（retry3 / retry4）
+              1) OFFSET=3 ;;   # 月曜（retry5・最終レーン）
+              *)
+                echo "::error::週次動意の対象日を決められません: 実行日 $BASE は dow=$DOW（火〜木）で、金〜月のいずれのレーンにも該当しません"
+                exit 1
+                ;;
             esac
-            echo "実行日 $RAW_DATE (dow=$DOW) → 対象日（対象週の金曜）= $VALUE"
+            VALUE=$(date -u -d "$BASE -${OFFSET} day" +%Y-%m-%d)
+            echo "実行日 $BASE (dow=$DOW) → 対象日（対象週の金曜・-${OFFSET}日）= $VALUE"
+            # 念のため算出結果が金曜であることを検証する（曜日計算の取り違え検知）
+            VDOW=$(date -u -d "$VALUE" +%u)
+            if [ "$VDOW" != "5" ]; then
+              echo "::error::正規化の結果 $VALUE が金曜ではありません (dow=$VDOW)。対象日の算出ロジックに不整合があります"
+              exit 1
+            fi
           fi
           echo "value=$VALUE"
           echo "target_date=$VALUE" >> "$GITHUB_OUTPUT"
@@ -297,8 +325,15 @@ jobs:
     # always() で常に評価し、内部で配信有無を再判定してから通知するため、
     # 「途中レーンで配信できた週」に誤ってエスカレーションが飛ぶことはない。
     # ===================================================================================
+    #
+    # 2026-09-21 改定（市場別 3 レッグ復帰 + 休場スキップ）:
+    #   - 対象日が休場（price-gate exit 5 → market_closed=true）なら何も通知しない（無言 skip）。
+    #     「回らなかった」のではなく「回す対象がそもそも無い」ためエスカレーションは誤報になる。
+    #   - merge-and-send が success で、一部市場が欠けた（missing_markets 非空）場合は
+    #     merge-and-send 側が ⚠ 通知を出す。ここは 🚨 を出さない（配信自体は成立しているため）。
+    #   - 3 市場すべてが落ちて merge-and-send が配信できなかった場合のみ 🚨 を出す。
     needs: [guard, price-gate, setup-raw, generate-market, merge-and-send]
-    if: always() && github.event_name == 'schedule' && needs.guard.outputs.lane_id == 'retry5'
+    if: always() && github.event_name == 'schedule' && needs.guard.outputs.lane_id == 'retry5' && needs.price-gate.outputs.market_closed != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -354,7 +389,7 @@ jobs:
           elif [ "$SETUP" = "failure" ]; then
             R="元データ（movers raw / 週間ランキング parquet）の生成に失敗しました"
           elif [ "$GEN" = "failure" ]; then
-            R="市場セクションの生成（Claude 実行）が 3 回の試行で完了しませんでした"
+            R="市場セクションの生成（Claude 実行）が 2 回の試行で完了しませんでした"
           elif [ "$SEND" = "failure" ]; then
             R="統合または Discord 送信が失敗しました"
           else
@@ -400,6 +435,9 @@ jobs:
     timeout-minutes: 90
     outputs:
       target_date: ${{ needs.guard.outputs.target_date }}
+      # 2026-09-21 追加: check_price_history_date.py の exit 5（対象日が非営業日＝休場）を
+      # 下流へ伝える。true なら setup-raw 以降を起動せず、escalate も無言で降りる。
+      market_closed: ${{ steps.gate.outputs.market_closed }}
     steps:
       - name: Checkout report-pipelines
         uses: actions/checkout@v4
@@ -452,13 +490,26 @@ jobs:
           # ただし --topup（make_price_history_master.py daily による JQuants 直接取得）は
           # 毎回・毎リトライで必ず試す。price_history.yml の着地を待たず自力で取りに行けるのが
           # 最短経路であり、多くの場合ここで揃って当該レーン内で配信まで到達する。
+          # 2026-09-21 改定: 終了コードを明示的に受けて 4 系統へ分岐する。
+          #   0 = 対象日のデータ着荷済み                        → 生成へ進む
+          #   5 = 対象日が非営業日（土日・jpholiday の祝日）    → 休場。生成せず正常終了（無言 skip）
+          #   4 = 営業日だがリトライ後も未着                    → ⛔ 通知して停止（従来どおり）
+          #   1 = 判定そのもののインフラ失敗                    → ❌ 通知して停止
           python bi/pipelines/ops/check_price_history_date.py             --expect-date ${{ needs.guard.outputs.target_date }}             --retries 3 --interval-seconds 600 --topup
           ec=$?
+          set -e
           echo "exit_code=$ec" >> $GITHUB_OUTPUT
           if [ "$ec" -eq 0 ]; then
+            echo "market_closed=false" >> $GITHUB_OUTPUT
             echo "価格データ着荷を確認しました。生成へ進みます。"
             exit 0
           fi
+          if [ "$ec" -eq 5 ]; then
+            echo "market_closed=true" >> $GITHUB_OUTPUT
+            echo "::notice::対象日 ${{ needs.guard.outputs.target_date }} は休場（非営業日）のため週次レポートを生成しません"
+            exit 0
+          fi
+          echo "market_closed=false" >> $GITHUB_OUTPUT
           if [ "$ec" -eq 4 ]; then
             echo "::error::対象日 ${{ needs.guard.outputs.target_date }} の価格データが price_history に未着のため、週次動意レポートの生成・配信を見送ります"
           else
@@ -493,7 +544,10 @@ jobs:
 
   setup-raw:
     needs: [guard, price-gate]
-    if: needs.guard.outputs.proceed == 'true'
+    # 2026-09-21 追加: price-gate が「対象日は休場（非営業日）」と判定した場合は
+    # 生成系を一切起動しない（exit 5 → market_closed=true）。price-gate は正常終了するため
+    # needs の success だけでは止まらず、ここで明示的に降りる必要がある。
+    if: needs.guard.outputs.proceed == 'true' && needs.price-gate.outputs.market_closed != 'true'
     # PM 2026-05-30 確定: 週次 workflow にも raw 生成 step を追加。日次 workflow と同様、
     # 週次実行時に make_mover_report.py で当週分の raw を新規生成し artifact 共有する。
     # これ以前は raw 生成 step がなく、private リポに commit 済の最新 raw（2026-05-22）を
@@ -677,20 +731,18 @@ jobs:
   generate-market:
     needs: setup-raw
     runs-on: ubuntu-latest
-    # PM 2026-08-26: 4 並列を 1 実行へ統合し、1 ジョブが 3 市場 40 銘柄を書くため各試行の枠を拡張
-    # （gen1 45→60 分・gen2/gen3 30→45 分）。
-    # 最悪ケース = 前段（clone/setup/fonts/playwright/parquet 配布）12 分 + 1 回目 60 分 + 待機 1 分
-    #            + 2 回目 45 分 + 待機 3 分 + 3 回目 45 分 + 検証/artifact 3 分 = 169 分 → 180 分。
-    timeout-minutes: 180
+    # 2026-09-21 改定: 1 市場 1 レッグへ戻したため各試行の枠を縮小（gen1 60→40 分・gen2 45→30 分）。
+    # 最悪ケース = 前段（clone/setup/fonts/playwright/parquet 配布）12 分 + 1 回目 40 分 + 待機 1 分
+    #            + 2 回目 30 分 + 検証/artifact 3 分 = 86 分 → 90 分。
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        # PM 2026-08-26 確定: 固定プロンプト121KB×4重複を解消するため1実行へ統合。
-        # 並び順はグロース→スタンダード→プライム（prompts/mover-weekly.md が制御）。
-        # 旧構成 [prime, standard, growth_a, growth_b] の4分割は「出力32Kトークン上限」が根拠だったが、
-        # 2026-07-07 に CLAUDE_CODE_MAX_OUTPUT_TOKENS を 64000 へ引き上げ済みで根拠が消滅した。
-        # matrix 構造自体は参照箇所の書き換えを最小にするため残し、値だけを [all] の1値に畳む。
-        market: [all]
+        # 出力トークン上限は 32,000（現行 GHA アクションが固定する Claude Code CLI 1.0.88 の実効上限）。
+        # 市場別レッグに分けることで各市場が 32,000 の枠を丸ごと使える（1 実行 3 市場だと 1 枠を分け合う）。
+        # 2026-09-21 復帰: 2026-09-16 に 3 試行すべてが出力上限到達で落ち全社未配信となった事故を受けて。
+        # 並び順はグロース→スタンダード→プライム（merge-and-send の結合順が制御）。
+        market: [growth, standard, prime]
     steps:
       - name: Checkout report-pipelines
         uses: actions/checkout@v4
@@ -801,9 +853,25 @@ jobs:
           mkdir -p market/daily
           SRC=/tmp/movers-raw/${TARGET_DATE}_movers_raw.md
           DST=market/daily/${TARGET_DATE}_movers_raw.md
-          # PM 2026-08-26 確定: 統合後は全市場を1実行が担当するため raw は無加工で全量を渡す
-          # （旧 case 文による市場別スライスは統合により不要）。
-          cp "$SRC" "$DST"
+          # PM 2026-06-13 確定 / 2026-09-21 復帰: standard / growth レッグには担当市場の節のみ渡し、
+          # 担当外市場の無駄読み・同一 offset 再読込ループを構造的に防ぐ（トークン・コスト削減）。
+          # prime は Section 9 が全市場横断のため全 raw を保持する。
+          case "$TARGET_MARKET" in
+            growth)
+              awk '/^## グロース/{f=1} f' "$SRC" > "$DST"
+              ;;
+            standard)
+              awk '/^## スタンダード/{f=1} /^## グロース/{f=0} f' "$SRC" > "$DST"
+              ;;
+            *)
+              cp "$SRC" "$DST"
+              ;;
+          esac
+          # 抽出失敗（見出し不一致等）の保険: 極端に短ければ全 raw にフォールバック
+          if [ "$(wc -l < "$DST")" -lt 40 ]; then
+            echo "Sliced raw too short for market=$TARGET_MARKET; falling back to full raw"
+            cp "$SRC" "$DST"
+          fi
           echo "Placed $DST for market=$TARGET_MARKET ($(wc -l < "$DST") lines / source $(wc -l < "$SRC") lines)"
 
       - name: Check screening_master parquet existence (no update・PM 2026-05-23 確定)
@@ -844,7 +912,7 @@ jobs:
       # PM 2026-08-19 承認（動意日次 mover_report_daily.yml からの横展開）: Anthropic 側の過負荷応答
       # （API Error: 529 overloaded_error）を初回 API 呼び出しで受けて即 exit 1 する事故の恒久対策。
       # 第三者製の新規 action を足さず、continue-on-error + outcome 判定の再試行ステップだけで構成する。
-      # 529 は即時再試行が無意味なため待機を指数的に伸ばす（60 秒 → 180 秒）。3 ステップとも
+      # 529 は即時再試行が無意味なため 60 秒待機してから 1 度だけ再試行する。2 ステップとも
       # continue-on-error のため、成否は最後の Verify ステップ 1 箇所（成果物ファイルが非空か）で決まる。
       - name: Generate ${{ matrix.market }} market section via Claude Code (Opus 5 + effort high)
         id: gen1
@@ -855,8 +923,10 @@ jobs:
           model: claude-opus-5
           prompt_file: report-pipelines/prompts/mover-weekly.md
           allowed_tools: "Read,Write,Edit,Bash,Grep,Glob,WebSearch,WebFetch"
-          timeout_minutes: "60"
-          # PM 2026-07-07: 32001 出力トークン上限で市場セクションが途中終了する事故の予防で 64000 へ。
+          timeout_minutes: "40"
+          # 出力トークン上限 32,000 は現行 GHA アクションが固定する Claude Code CLI 1.0.88 の実効上限
+          # （これを超える値を書いても CLI が 32,000 へ丸めるため無効・_cr §49）。上限は暴走応答の保険であり
+          # 通常の誌面が到達してはならない。市場別レッグ化で 1 市場あたりの誌面量を枠内へ収める設計。
           claude_env: |
             CLAUDE_CODE_EFFORT_LEVEL: high
             CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
@@ -904,51 +974,7 @@ jobs:
           model: claude-opus-5
           prompt_file: report-pipelines/prompts/mover-weekly.md
           allowed_tools: "Read,Write,Edit,Bash,Grep,Glob,WebSearch,WebFetch"
-          timeout_minutes: "45"
-          claude_env: |
-            CLAUDE_CODE_EFFORT_LEVEL: high
-            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
-        env:
-          TARGET_DATE: ${{ needs.setup-raw.outputs.target_date }}
-          TARGET_MARKET: ${{ matrix.market }}
-          PRIVATE_REPO_ROOT: private-repo
-          JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
-          CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
-
-      - name: Detect spending cap (attempt 2)
-        id: cap2
-        if: success() && steps.gen2.outcome == 'failure'
-        env:
-          EXECUTION_FILE: ${{ steps.gen2.outputs.execution_file }}
-          ATTEMPT: '2'
-        run: bash report-pipelines/.github/scripts/detect_spending_cap.sh
-
-      - name: Wait before retry 3 (Claude overloaded 等の一時エラー)
-        if: success() && steps.gen2.outcome == 'failure' && steps.cap2.outputs.capped != 'true'
-        env:
-          TARGET_DATE: ${{ needs.setup-raw.outputs.target_date }}
-          TARGET_MARKET: ${{ matrix.market }}
-        run: |
-          F="private-repo/market/daily/movers/${TARGET_DATE}_weekly_${TARGET_MARKET}.md"
-          # 途中まで書かれた不完全ファイルは退避（削除しない）。再試行が白紙から書き直せるようにする。
-          if [ -f "$F" ]; then
-            mv "$F" "/tmp/${TARGET_DATE}_weekly_${TARGET_MARKET}.attempt2.partial.md"
-            echo "2 回目の不完全な出力を /tmp へ退避しました（再試行が白紙から書き直せるようにするため）"
-          fi
-          echo "2 回目も失敗しました。180 秒待機して最終再試行します"
-          sleep 180
-
-      - name: Generate ${{ matrix.market }} market section via Claude Code (retry 3)
-        id: gen3
-        if: success() && steps.gen2.outcome == 'failure' && steps.cap2.outputs.capped != 'true'
-        continue-on-error: true
-        uses: anthropics/claude-code-base-action@beta
-        with:
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          model: claude-opus-5
-          prompt_file: report-pipelines/prompts/mover-weekly.md
-          allowed_tools: "Read,Write,Edit,Bash,Grep,Glob,WebSearch,WebFetch"
-          timeout_minutes: "45"
+          timeout_minutes: "30"
           claude_env: |
             CLAUDE_CODE_EFFORT_LEVEL: high
             CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
@@ -960,7 +986,7 @@ jobs:
           CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
 
       - name: Verify generated weekly market section (成否の一元判定)
-        # 上の 3 ステップは全て continue-on-error のため、ジョブの成否はここだけで決まる。
+        # 上の 2 ステップ（gen1 / gen2）は全て continue-on-error のため、ジョブの成否はここだけで決まる。
         # 「どの試行で成功したか」に依存せず成果物の実在で判定するので、リトライ成功を失敗扱いする
         # / 失敗を成功扱いする判定崩れが起きない。
         env:
@@ -968,9 +994,9 @@ jobs:
           TARGET_MARKET: ${{ matrix.market }}
         run: |
           F="private-repo/market/daily/movers/${TARGET_DATE}_weekly_${TARGET_MARKET}.md"
-          echo "attempt outcomes: gen1=${{ steps.gen1.outcome }} gen2=${{ steps.gen2.outcome }} gen3=${{ steps.gen3.outcome }}"
+          echo "attempt outcomes: gen1=${{ steps.gen1.outcome }} gen2=${{ steps.gen2.outcome }}"
           if [ ! -s "$F" ]; then
-            echo "::error::${TARGET_MARKET} 市場セクション（週次）が 3 回の試行で生成されませんでした: $F"
+            echo "::error::${TARGET_MARKET} 市場セクション（週次）が 2 回の試行で生成されませんでした: $F"
             exit 1
           fi
           echo "生成成功: $F ($(wc -l < "$F") lines)"
@@ -981,7 +1007,9 @@ jobs:
           name: mover-weekly-${{ matrix.market }}-${{ needs.setup-raw.outputs.target_date }}
           path: private-repo/market/daily/movers/${{ needs.setup-raw.outputs.target_date }}_weekly_${{ matrix.market }}.md
           retention-days: 7
-          if-no-files-found: error
+          # 2026-09-21: 市場別レッグ化により 1 市場が落ちても他市場で配信する。
+          # 欠落は merge-and-send の missing_markets で検知し品質注記へ載せるため、ここでは落とさない。
+          if-no-files-found: warn
 
       - name: Discord 通知（❌ 市場別失敗）
         if: failure() || cancelled()
@@ -995,7 +1023,11 @@ jobs:
           action_required: run ログ確認 → 手動 dispatch（force_rerun=true）で再実行。ログに「Spending cap reached」がある場合は Claude 利用枠切れ＝リセット時刻以降に force_rerun=true
 
   merge-and-send:
-    needs: [setup-raw, generate-market]
+    needs: [setup-raw, generate-market, price-gate]
+    # 2026-09-21 改定: 市場別レッグ化に伴い、generate-market のいずれかが失敗しても
+    # 生成できた市場だけで配信する（旧: needs の暗黙 success 依存で 1 市場の失敗が全社未配信を招いた）。
+    # 元データ（setup-raw）が無い場合と、対象日が休場（price-gate exit 5）の場合は起動しない。
+    if: always() && needs.setup-raw.result == 'success' && needs.price-gate.outputs.market_closed != 'true'
     runs-on: ubuntu-latest
     # PM 2026-08-19: フォント導入の堅牢化でステップ枠 8 分を確保したため、旧 15 分枠では
     # フォント（最大 8 分）+ Playwright（実測 6 分）+ 統合/送信/commit で溢れる。日次の
@@ -1087,29 +1119,43 @@ jobs:
           merge-multiple: true
 
       - name: Place market file as {date}_weekly.md
+        id: place
         working-directory: ./private-repo
         env:
           TARGET_DATE: ${{ needs.setup-raw.outputs.target_date }}
         run: |
           MOVERS_DIR="market/daily/movers"
           mkdir -p "$MOVERS_DIR"
-          # 既存統合ファイルを削除
-          rm -f "${MOVERS_DIR}/${TARGET_DATE}_weekly.md"
-          # PM 2026-08-26 確定: 4 並列統合により artifact は単一（{date}_weekly_all.md）。
-          # 旧 4 ファイル cat 結合は不要になり、そのまま cp する。
-          # ファイル内の市場並び順はグロース → スタンダード → プライム
-          # （prompts/mover-weekly.md が制御）。PM 2026-09-02 確定で send_report_pdf_discord.py
-          # （--kind movers_weekly）は分割せず 1 本の PDF にし、
-          # ファイル内の出現順のまま送るため、送信は無改修で透過する。
-          SRC="/tmp/market-artifacts/${TARGET_DATE}_weekly_all.md"
           DST="${MOVERS_DIR}/${TARGET_DATE}_weekly_all.md"
-          if [ ! -f "$SRC" ]; then
-            echo "ERROR: artifact not found: $SRC"
+          OUTPUT="${MOVERS_DIR}/${TARGET_DATE}_weekly.md"
+          rm -f "$DST" "$OUTPUT"
+          # 2026-09-21 改定: 市場別レッグへ戻したため、市場ごとの artifact を固定順で結合する。
+          # 並び順はグロース → スタンダード → プライム（この結合順が誌面の市場順を決める）。
+          # 週次のテーマ 2 部構成（## 今週のテーマ / ## 単独材料）は growth レッグが自分のファイル
+          # 冒頭に書くため、結合後は誌面の先頭に来る（prompts/mover-weekly.md が制御）。
+          # 生成に失敗した市場は欠落したまま結合し、欠落名を missing_markets として下流へ渡す。
+          # PM 2026-09-02 確定: send_report_pdf_discord.py（--kind movers_weekly）は分割せず
+          # 1 本の PDF にし、ファイル内の出現順のまま送るため送信は無改修で透過する。
+          FOUND=""
+          MISSING=""
+          for m in growth standard prime; do
+            SRC="/tmp/market-artifacts/${TARGET_DATE}_weekly_${m}.md"
+            if [ -s "$SRC" ]; then
+              if [ -n "$FOUND" ]; then printf '\n' >> "$DST"; fi
+              cat "$SRC" >> "$DST"
+              FOUND="${FOUND}${FOUND:+ }${m}"
+              echo "Appended ${m} ($(wc -l < "$SRC") lines)"
+            else
+              MISSING="${MISSING}${MISSING:+ }${m}"
+              echo "::warning::${m} 市場のセクションが生成されていません（artifact 欠落）: $SRC"
+            fi
+          done
+          if [ -z "$FOUND" ]; then
+            echo "::error::全 3 市場のセクションが 1 つも生成されていないため配信できません"
             exit 1
           fi
-          cp "$SRC" "$DST"
-          echo "Placed $DST ($(wc -l < "$DST") lines)"
-          OUTPUT="${MOVERS_DIR}/${TARGET_DATE}_weekly.md"
+          echo "missing_markets=${MISSING}" >> $GITHUB_OUTPUT
+          echo "Placed $DST ($(wc -l < "$DST") lines / markets: ${FOUND} / missing: ${MISSING:-なし})"
           cp "$DST" "$OUTPUT"
           echo "Placed $OUTPUT ($(wc -l < "$OUTPUT") lines)"
 
@@ -1171,6 +1217,21 @@ jobs:
             # paste -d はマルチバイト区切りをバイト分割するため awk で連結（・区切り）
             DETAIL=$(grep '^  - ' /tmp/gate.log | head -5 | sed 's/^  - //' | awk 'NR>1{printf "・"} {printf "%s", $0} END{print ""}')
             NOTE="${NOTE}${NOTE:+ ／ }機械検査で不合格項目あり（${DETAIL}）"
+          fi
+          # 2026-09-21 追加: 市場別レッグ化により一部市場が欠落したまま配信しうる。欠落は誌面で明示する。
+          MISSING="${{ steps.place.outputs.missing_markets }}"
+          if [ -n "$MISSING" ]; then
+            NAMES=""
+            for m in $MISSING; do
+              case "$m" in
+                growth)   JP="グロース" ;;
+                standard) JP="スタンダード" ;;
+                prime)    JP="プライム" ;;
+                *)        JP="$m" ;;
+              esac
+              NAMES="${NAMES}${NAMES:+・}${JP}"
+            done
+            NOTE="${NOTE}${NOTE:+ ／ }⚠ ${NAMES} セクションは生成上限到達により本号未掲載"
           fi
           if [ -n "$NOTE" ]; then
             F=market/daily/movers/${TARGET_DATE}_weekly.md
@@ -1248,6 +1309,19 @@ jobs:
         run: |
           bash ../report-pipelines/bi/pipelines/ops/ci_commit_push.sh \
             -m "data: mover weekly ${TARGET_DATE}" market/daily market/archive
+
+      - name: Discord 通知（⚠️ 一部市場が欠けたまま配信）
+        # 2026-09-21 追加: 市場別レッグのいずれかが生成できなくても、完成した市場だけで配信する。
+        # 「配信自体は成立している」ため 🚨 ではなく ⚠️ とし、escalate の 🚨 とは役割を分ける。
+        if: steps.place.outputs.missing_markets != '' && steps.send.outcome == 'success'
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
+          state: partial
+          label: 動意銘柄レポート週次 一部市場が欠けたまま配信
+          date: ${{ needs.setup-raw.outputs.target_date }}
+          meaning: 週次レポートは配信済みですが、${{ steps.place.outputs.missing_markets }} 市場のセクションが 2 回の試行で生成できず本号に含まれていません（誌面冒頭に ⚠ 注記あり）。それ以外の市場は通常どおりの内容です。
+          action_required: 欠けた市場が必要な場合のみ、手動 dispatch（force_rerun=true）で再実行
 
       - name: Discord 通知（⚠️ 配信済み・品質注記あり）
         # PM 2026-07-12（絶対配信原則）: 品質問題があってもレポートは配信済み。何が注記されたかを PM へ通知。
