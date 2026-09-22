@@ -38,6 +38,7 @@ import argparse
 import io
 import os
 import re
+import sys
 import time
 from datetime import date, datetime, time as dtime, timedelta
 from pathlib import Path
@@ -79,6 +80,18 @@ from theme_radar import (
 )
 
 BASE_DIR = Path(__file__).parent
+
+# 営業日判定は ops/check_price_history_date.py の is_trading_day を正本として再利用する
+# （祝日判定ロジックを二重実装しないため。同関数は jpholiday を使い、import 不可の環境では
+#  「判定不能＝営業日扱い」へ倒す）。ops/ は本ファイルと同階層のサブディレクトリ。
+sys.path.insert(0, str(BASE_DIR / "ops"))
+from check_price_history_date import is_trading_day  # noqa: E402
+
+# 終了コード（呼び出し側 workflow の分岐用・ops/check_price_history_date.py と揃える）
+#   0 = 正常（raw 生成完了）
+#   1 = 異常（Python 例外・インフラ失敗）
+#   5 = 生成中止だが正常扱い（非営業日／カブラボの更新が対象日より古い＝焼き直し防止）
+EXIT_SKIP = 5
 
 # ---------------------------------------------------------------------------
 # 抽出パラメータ（当日終値比のみ）
@@ -215,6 +228,17 @@ def _kaburabo_direction(table: pd.DataFrame, parsed: pd.DataFrame) -> str:
         return "up"
     s = pd.to_numeric(parsed.get("DiffPct"), errors="coerce").dropna()
     return "down" if (not s.empty and s.median() < 0) else "up"
+
+
+def _kaburabo_snapshot_date(updated: str) -> date | None:
+    """カブラボの「2026/09/21 18:01 更新」形式から日付を取り出す。解釈できなければ None。"""
+    m = re.search(r"(20\d\d)/(\d\d)/(\d\d)", updated or "")
+    if not m:
+        return None
+    try:
+        return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    except ValueError:
+        return None
 
 
 def scrape_kaburabo() -> tuple[pd.DataFrame, pd.DataFrame, str]:
@@ -487,6 +511,20 @@ def main() -> None:
         target = now.date() - timedelta(days=1) if now.time() < dtime(7, 0) else now.date()
     print(f"対象取引日: {target}")
 
+    # === 非営業日ガード（2026-09-22 追加）===
+    # 2026-09-21〜23 の 3 連休で、Japannext PTS は「祝日及び、東証休日を除く」運用のため
+    # 夜間 PTS の当日データが存在しない。それでも本スクリプトがカブラボの前夜スナップショットを
+    # 掴んで当日分として生成し、09-22 に 09-21 18:01 更新の内容が再配信された。
+    # 発火層（Cloudflare Worker の dayType "tradingday"）と二重の保険として、ここでも止める。
+    if not is_trading_day(target):
+        try:
+            import jpholiday
+            reason = jpholiday.is_holiday_name(target) or "土日"
+        except ImportError:
+            reason = "土日"
+        print(f"[SKIP] 対象取引日 {target} は非営業日（{reason}・PTS 休業）のため生成を中止します")
+        sys.exit(EXIT_SKIP)
+
     # 階層1: 誌面へ転記する品質注記（raw 冒頭の ⚠️ 行 + {date}_pts_quality_flags.txt）。
     #   顧客提出水準の定型文のみ。例外文字列・URL・HTTPステータス・取得元名を入れてはならない
     #   （内部フラグが誌面へ漏出した 2026-08-17/18 の再発防止）。
@@ -498,6 +536,18 @@ def main() -> None:
     try:
         up_raw, down_kb, kb_updated = scrape_kaburabo()
         print(f"カブラボ: 値上がり {len(up_raw)} 件 / 値下がり {len(down_kb)} 件（{kb_updated}）")
+        # === 鮮度ガード（2026-09-22 追加）===
+        # カブラボのページは休場日に前営業日のスナップショットを掲示し続ける。更新日が対象日より
+        # 古ければ、その内容は当日の夜間 PTS ではなく前夜の焼き直しなので生成しない。
+        # 更新時刻を取れなかった場合は警告のみで続行する（パーサの仕様変化で配信を止めないため）。
+        snap_date = _kaburabo_snapshot_date(kb_updated)
+        if snap_date is None:
+            print(f"[WARN] カブラボの更新時刻を解釈できませんでした（'{kb_updated}'）。"
+                  f"鮮度判定をスキップして続行します")
+        elif snap_date < target:
+            print(f"[STALE] カブラボの更新時刻 {kb_updated} が対象取引日 {target} より古いため"
+                  f"生成を中止します（前夜分の焼き直し防止）")
+            sys.exit(EXIT_SKIP)
     except SourceError as e:
         up_raw, down_kb, kb_updated = pd.DataFrame(), pd.DataFrame(), ""
         quality_notes.append("値上がりランキングを取得できず、本日は掲載銘柄が通常より少なくなっています。")

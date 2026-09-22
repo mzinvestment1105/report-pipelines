@@ -271,19 +271,45 @@ jobs:
         run: pip install -r report-pipelines/bi/pipelines/requirements.txt
 
       - name: Generate PTS movers raw (v5 カブラボの当日終値比・動意と同一材料プロセス)
+        id: raw
         # 値動きデータ＝カブラボ（値上がり表・値下がり表）の当日終値比。材料はTDNet/EDINET/みんかぶ/
         # Yahoo掲示板/需給で動意と同一。取得失敗は誌面用の {date}_pts_quality_flags.txt（階層1のみ）と
         # 内部追跡用の {date}_pts_internal_flags.txt（誌面へ出さない）に分けて出力し配信は止めない（絶対配信）。
-        # 本 step の失敗（exit 非0）はインフラ失敗のみ。
+        #
+        # 2026-09-22 改定: 終了コードを明示的に受けて 3 系統へ分岐する（mover_weekly.yml の
+        # price-gate と同じ規約）。
+        #   0 = raw 生成完了                                    → 生成へ進む
+        #   5 = 対象日が非営業日、またはカブラボの更新日が対象日より古い（前夜スナップショットの
+        #       焼き直し）                                      → 静かにスキップ。以降の step を全て
+        #                                                          skip し job は success で終える
+        #       （Discord 送信なし・❌/🚨 通知なし・リトライなし）
+        #   その他 = インフラ失敗                                → 従来どおり job failure
         working-directory: ./private-repo/bi/pipelines
         env:
           JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
           EDINETDB_API_KEYS: ${{ secrets.EDINETDB_API_KEYS }}
           PYTHONIOENCODING: utf-8
         run: |
+          set +e
           python make_pts_mover_report.py --date ${{ steps.date.outputs.value }}
+          ec=$?
+          set -e
+          echo "exit_code=$ec" >> $GITHUB_OUTPUT
+          if [ "$ec" -eq 0 ]; then
+            echo "skipped=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          if [ "$ec" -eq 5 ]; then
+            echo "skipped=true" >> $GITHUB_OUTPUT
+            echo "::notice::対象取引日 ${{ steps.date.outputs.value }} は非営業日、またはカブラボの更新が対象日より古いため夜間PTS動意レポートを生成しません（無言スキップ）"
+            exit 0
+          fi
+          echo "skipped=false" >> $GITHUB_OUTPUT
+          echo "::error::PTS raw 生成が失敗しました (exit=$ec)"
+          exit $ec
 
       - name: 出力ディレクトリ作成 + 既存レポートファイル削除（前回不良ファイル読込スキップ防止）
+        if: steps.raw.outputs.skipped != 'true'
         working-directory: ./private-repo
         env:
           TARGET_DATE: ${{ steps.date.outputs.value }}
@@ -297,6 +323,7 @@ jobs:
       # 529 は即時再試行が無意味なため待機を指数的に伸ばす（60 秒 → 180 秒）。3 ステップとも
       # continue-on-error のため、成否は最後の Verify ステップ 1 箇所（成果物ファイルが非空か）で決まる。
       - name: Generate report via Claude Code (Opus 5 + effort high)
+        if: steps.raw.outputs.skipped != 'true'
         id: gen1
         continue-on-error: true
         uses: anthropics/claude-code-base-action@beta
@@ -321,14 +348,14 @@ jobs:
       # 食い潰し、枠が戻ってからの自動復旧経路を自分で塞ぐ。よって枠切れ時は後続 gen を打ち切る。
       - name: Detect spending cap (attempt 1)
         id: cap1
-        if: success() && steps.gen1.outcome == 'failure'
+        if: steps.raw.outputs.skipped != 'true' && (success() && steps.gen1.outcome == 'failure')
         env:
           EXECUTION_FILE: ${{ steps.gen1.outputs.execution_file }}
           ATTEMPT: '1'
         run: bash report-pipelines/.github/scripts/detect_spending_cap.sh
 
       - name: Wait before retry 2 (Claude overloaded 等の一時エラー)
-        if: success() && steps.gen1.outcome == 'failure' && steps.cap1.outputs.capped != 'true'
+        if: steps.raw.outputs.skipped != 'true' && (success() && steps.gen1.outcome == 'failure' && steps.cap1.outputs.capped != 'true')
         env:
           TARGET_DATE: ${{ steps.date.outputs.value }}
         run: |
@@ -343,7 +370,7 @@ jobs:
 
       - name: Generate report via Claude Code (retry 2)
         id: gen2
-        if: success() && steps.gen1.outcome == 'failure' && steps.cap1.outputs.capped != 'true'
+        if: steps.raw.outputs.skipped != 'true' && (success() && steps.gen1.outcome == 'failure' && steps.cap1.outputs.capped != 'true')
         continue-on-error: true
         uses: anthropics/claude-code-base-action@beta
         with:
@@ -362,14 +389,14 @@ jobs:
 
       - name: Detect spending cap (attempt 2)
         id: cap2
-        if: success() && steps.gen2.outcome == 'failure'
+        if: steps.raw.outputs.skipped != 'true' && (success() && steps.gen2.outcome == 'failure')
         env:
           EXECUTION_FILE: ${{ steps.gen2.outputs.execution_file }}
           ATTEMPT: '2'
         run: bash report-pipelines/.github/scripts/detect_spending_cap.sh
 
       - name: Wait before retry 3 (Claude overloaded 等の一時エラー)
-        if: success() && steps.gen2.outcome == 'failure' && steps.cap2.outputs.capped != 'true'
+        if: steps.raw.outputs.skipped != 'true' && (success() && steps.gen2.outcome == 'failure' && steps.cap2.outputs.capped != 'true')
         env:
           TARGET_DATE: ${{ steps.date.outputs.value }}
         run: |
@@ -384,7 +411,7 @@ jobs:
 
       - name: Generate report via Claude Code (retry 3)
         id: gen3
-        if: success() && steps.gen2.outcome == 'failure' && steps.cap2.outputs.capped != 'true'
+        if: steps.raw.outputs.skipped != 'true' && (success() && steps.gen2.outcome == 'failure' && steps.cap2.outputs.capped != 'true')
         continue-on-error: true
         uses: anthropics/claude-code-base-action@beta
         with:
@@ -415,7 +442,7 @@ jobs:
       #   リセット文字列からは「分」だけを起床時刻の微調整に使う。
       - name: 枠切れマーカーを記録（guard の retry_cap 切り分け用）
         id: capmark
-        if: steps.cap1.outputs.capped == 'true' || steps.cap2.outputs.capped == 'true'
+        if: steps.raw.outputs.skipped != 'true' && (steps.cap1.outputs.capped == 'true' || steps.cap2.outputs.capped == 'true')
         env:
           TARGET_DATE: ${{ steps.date.outputs.value }}
         run: |
@@ -428,7 +455,7 @@ jobs:
           echo "枠切れマーカーを作成しました（後続 run の guard が retry_cap から除外するために使います）"
 
       - name: 枠切れマーカーをアーティファクトへ退避
-        if: steps.capmark.outcome == 'success'
+        if: steps.raw.outputs.skipped != 'true' && (steps.capmark.outcome == 'success')
         uses: actions/upload-artifact@v4
         with:
           name: spending-cap-${{ steps.date.outputs.value }}-${{ github.run_id }}
@@ -438,7 +465,7 @@ jobs:
       # ---- 復旧 1 回目 ----
       - name: 枠リセット待機（復旧 1 回目）
         id: wait1
-        if: steps.cap1.outputs.capped == 'true' || steps.cap2.outputs.capped == 'true'
+        if: steps.raw.outputs.skipped != 'true' && (steps.cap1.outputs.capped == 'true' || steps.cap2.outputs.capped == 'true')
         env:
           ATTEMPT: '1'
           RESETS_MINUTE: ${{ steps.cap1.outputs.resets_minute || steps.cap2.outputs.resets_minute }}
@@ -447,7 +474,7 @@ jobs:
 
       - name: Generate report via Claude Code (復旧 1 回目)
         id: rec1
-        if: steps.wait1.outputs.should_retry == 'true'
+        if: steps.raw.outputs.skipped != 'true' && (steps.wait1.outputs.should_retry == 'true')
         continue-on-error: true
         uses: anthropics/claude-code-base-action@beta
         with:
@@ -466,7 +493,7 @@ jobs:
 
       - name: Detect spending cap (復旧 1 回目)
         id: reccap1
-        if: steps.rec1.outcome == 'failure'
+        if: steps.raw.outputs.skipped != 'true' && (steps.rec1.outcome == 'failure')
         env:
           EXECUTION_FILE: ${{ steps.rec1.outputs.execution_file }}
           ATTEMPT: 'recovery-1'
@@ -475,7 +502,7 @@ jobs:
       # ---- 復旧 2 回目（1 回目でも枠が戻っていなかった場合のみ） ----
       - name: 枠リセット待機（復旧 2 回目）
         id: wait2
-        if: steps.reccap1.outputs.capped == 'true'
+        if: steps.raw.outputs.skipped != 'true' && (steps.reccap1.outputs.capped == 'true')
         env:
           ATTEMPT: '2'
           RESETS_MINUTE: ${{ steps.reccap1.outputs.resets_minute }}
@@ -484,7 +511,7 @@ jobs:
 
       - name: Generate report via Claude Code (復旧 2 回目)
         id: rec2
-        if: steps.wait2.outputs.should_retry == 'true'
+        if: steps.raw.outputs.skipped != 'true' && (steps.wait2.outputs.should_retry == 'true')
         continue-on-error: true
         uses: anthropics/claude-code-base-action@beta
         with:
@@ -502,6 +529,7 @@ jobs:
           CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
 
       - name: Verify generated PTS mover report (成否の一元判定)
+        if: steps.raw.outputs.skipped != 'true'
         # 上の 3 ステップは全て continue-on-error のため、ジョブの成否はここだけで決まる。
         # 「どの試行で成功したか」に依存せず成果物の実在で判定するので、リトライ成功を失敗扱いする
         # / 失敗を成功扱いする判定崩れが起きない。
@@ -521,6 +549,7 @@ jobs:
           echo "生成成功: $F ($(wc -l < "$F") lines)"
 
       - name: 品質注記の機械挿入（フラグ検知時のみ・タイトル直後）
+        if: steps.raw.outputs.skipped != 'true'
         # 絶対配信原則: make_pts_mover_report.py が出力する {date}_pts_quality_flags.txt（誌面用・階層1のみ）を
         # レポート冒頭（# 夜間PTS動意レポート …）直後へ挿入。Claude 側の注記と重複しても機械挿入を正とする。
         #
@@ -555,6 +584,7 @@ jobs:
           fi
 
       - name: Install Japanese fonts (Noto Sans CJK JP)
+        if: steps.raw.outputs.skipped != 'true'
         # PM 2026-08-19 承認（動意日次 mover_report_daily.yml からの横展開）: `sudo apt-get update -qq`
         # が出力ゼロのまま数十分ハングし、ジョブ枠に到達して配信ごと落ちる事故（GitHub 側の一時事象）の
         # 恒久対策。①ステップ単位 timeout ②各コマンドを timeout コマンドで打ち切り ③待機つき 3 回リトライ。
@@ -590,10 +620,12 @@ jobs:
           exit 0
 
       - name: Install Playwright Chromium
+        if: steps.raw.outputs.skipped != 'true'
         run: |
           playwright install chromium --with-deps
 
       - name: 相互参照ゲート（警告のみ・配信は止めない）
+        if: steps.raw.outputs.skipped != 'true'
         # PM 2026-09-05 指示（_common_rules.md §40）: 誌面で他セクション・他順位・他銘柄行を
         # 指し示す表記（「〜を参照」「前述」「上記の」「同上」「再掲」等）を全レポート種別で禁止する。
         # 重複銘柄も各セクションで「何の会社」「なぜ動いた」を独立して書き切る。
@@ -607,6 +639,7 @@ jobs:
           python bi/pipelines/lib/crossref_check.py --file market/daily/pts_movers/${{ steps.date.outputs.value }}.md || true
 
       - name: Send Discord (単一 JPEG/PDF・分割なし)
+        if: steps.raw.outputs.skipped != 'true'
         id: send
         working-directory: ./private-repo/bi/pipelines
         env:
@@ -620,6 +653,7 @@ jobs:
           python send_report_pdf_discord.py --kind pts_movers --date ${{ steps.date.outputs.value }}
 
       - name: Rotate report archives (5 件超過分を archive/ へ退避)
+        if: steps.raw.outputs.skipped != 'true'
         working-directory: ./private-repo
         env:
           PYTHONIOENCODING: utf-8
@@ -633,6 +667,7 @@ jobs:
         # market/daily だけだったため「移動元の削除」だけが commit され、移動先が push されず、
         # 2026-08-19 以降の過去号がリポから消えていた（実測: market/archive/macro の最新が 8/18）。
       - name: Commit and push to private repo
+        if: steps.raw.outputs.skipped != 'true'
         working-directory: ./private-repo
         env:
           TARGET_DATE: ${{ steps.date.outputs.value }}
@@ -641,7 +676,7 @@ jobs:
             -m "data: pts mover report ${TARGET_DATE}" market/daily market/archive
 
       - name: Discord 通知（⚠️ 配信済み・品質注記あり）
-        if: steps.annotate.outputs.annotated == 'true' && steps.send.outcome == 'success'
+        if: steps.raw.outputs.skipped != 'true' && (steps.annotate.outputs.annotated == 'true' && steps.send.outcome == 'success')
         uses: ./report-pipelines/.github/actions/notify-discord
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
@@ -652,7 +687,7 @@ jobs:
           action_required: レポート冒頭の品質注記を確認
 
       - name: Discord 通知（⚠️ 配信済み・後処理のみ失敗）
-        if: (failure() || cancelled()) && steps.send.outcome == 'success'
+        if: steps.raw.outputs.skipped != 'true' && ((failure() || cancelled()) && steps.send.outcome == 'success')
         uses: ./report-pipelines/.github/actions/notify-discord
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
@@ -667,7 +702,7 @@ jobs:
       # 誤読されるため通知を分ける。ただし予備 cron は JST 21:08 / 21:25 発火のため、リセットが
       # それより後なら自動では戻らない。実測に基づき「自動復旧する」と断定はしない。
       - name: Discord 通知（⏱ Claude 利用枠切れ）
-        if: (failure() || cancelled()) && steps.send.outcome != 'success' && (steps.cap1.outputs.capped == 'true' || steps.cap2.outputs.capped == 'true')
+        if: steps.raw.outputs.skipped != 'true' && ((failure() || cancelled()) && steps.send.outcome != 'success' && (steps.cap1.outputs.capped == 'true' || steps.cap2.outputs.capped == 'true'))
         uses: ./report-pipelines/.github/actions/notify-discord
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
@@ -678,7 +713,7 @@ jobs:
           action_required: 不要（リセット後の予備タイマーで届けば復旧完了）。予備タイマーより後のリセットだった場合のみ、リセット時刻以降に手動 dispatch（force_rerun=true）
 
       - name: Discord 通知（❌ 生成/送信失敗）
-        if: (failure() || cancelled()) && steps.send.outcome != 'success' && steps.cap1.outputs.capped != 'true' && steps.cap2.outputs.capped != 'true'
+        if: steps.raw.outputs.skipped != 'true' && ((failure() || cancelled()) && steps.send.outcome != 'success' && steps.cap1.outputs.capped != 'true' && steps.cap2.outputs.capped != 'true')
         uses: ./report-pipelines/.github/actions/notify-discord
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
