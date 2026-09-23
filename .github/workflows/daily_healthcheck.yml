@@ -143,14 +143,54 @@ jobs:
           else
             echo "alert=false" >> $GITHUB_OUTPUT
           fi
-          MEANING=""
+          # 内部向けの内訳（未起動／失敗のまま未復旧の 2 値）はログ用 detail にだけ残す。
+          DETAIL=""
           if [ -n "$NORUN" ]; then
-            MEANING="未起動（run ゼロ＝Worker と GHA cron の両方が不発）: ${NORUN}。"
+            DETAIL="未起動（run ゼロ＝Worker と GHA cron の両方が不発）: ${NORUN}。"
           fi
           if [ -n "$FAILED" ]; then
-            MEANING="${MEANING}未配信（run はあるが配信ジョブが成功していない＝失敗または skip のまま）: ${FAILED}。"
+            DETAIL="${DETAIL}未配信（run はあるが配信ジョブが成功していない＝失敗または skip のまま）: ${FAILED}。"
           fi
-          echo "meaning=${MEANING}" >> $GITHUB_OUTPUT
+          echo "detail=${DETAIL}" >> $GITHUB_OUTPUT
+          # 2026-09-23（PM 判断・運用通知の平易化）: PM 向けの本文は和名のレポート名だけで書く。
+          # 当日以外の日付で判定した項目（前日の更新・前夜の PTS 等）は「（M/D分）」を添える。
+          TODAY_JST="${{ steps.scope.outputs.today_jst }}"
+          NAMES=""
+          NAMES_PLAIN=""
+          for entry in "${ENTRIES[@]}"; do
+            entry=$(echo "$entry" | tr -d ' ')
+            wf="${entry%%=*}"
+            rest="${entry#*=}"
+            since="${rest%%=*}"
+            case " ${NORUN} ${FAILED} " in
+              *" ${wf} "*) ;;
+              *) continue ;;
+            esac
+            case "$wf" in
+              macro_report_daily.yml)        JP="マクロ朝刊" ;;
+              macro_report_evening.yml)      JP="マクロ夕刊" ;;
+              mover_report_daily.yml)        JP="動意レポート" ;;
+              mover_weekly.yml)              JP="動意レポート週次" ;;
+              pts_mover_report.yml)          JP="夜間PTS動意レポート" ;;
+              theme_report_daily.yml)        JP="テーマ動意" ;;
+              sector_report_weekly_full.yml) JP="セクター週次" ;;
+              largecap_weekly.yml)           JP="大型株週次" ;;
+              screening_master.yml)          JP="スクリーニング更新" ;;
+              price_history.yml)             JP="株価データ更新" ;;
+              financial_history.yml)         JP="財務データ更新" ;;
+              *)                             JP="${wf%.yml}" ;;
+            esac
+            SD="${since:0:10}"
+            if [ "$SD" != "$TODAY_JST" ]; then
+              LABEL_ONE="${JP}（$((10#${SD:5:2}))/$((10#${SD:8:2}))分）"
+            else
+              LABEL_ONE="${JP}"
+            fi
+            NAMES="${NAMES}${NAMES:+・}${LABEL_ONE}"
+            NAMES_PLAIN="${NAMES_PLAIN}${NAMES_PLAIN:+・}${JP}"
+          done
+          echo "meaning=${NAMES}が予定の時刻を過ぎても届いていません。" >> $GITHUB_OUTPUT
+          echo "names=${NAMES_PLAIN}" >> $GITHUB_OUTPUT
 
       - name: Discord 通知（🚨 未発行検知）
         if: steps.check.outputs.alert == 'true'
@@ -158,10 +198,11 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_URL }}
           state: alert
-          label: Healthcheck 未発行検知（${{ steps.scope.outputs.label }}）
+          label: '健全性チェック'
           date: ${{ steps.scope.outputs.today_jst }}
-          meaning: ${{ steps.check.outputs.meaning }}
-          action_required: 未起動レーンは手動 dispatch で発行（続く場合は Cloudflare Worker / cron を点検）。未復旧レーンは各レーンの❌通知の対応手順に従う
+          meaning: '${{ steps.check.outputs.meaning }}'
+          action_required: '次回 Claude Code で「${{ steps.check.outputs.names }}を復旧して」とお伝えください'
+          detail: '${{ steps.scope.outputs.label }}｜${{ steps.check.outputs.detail }}'
 
       - name: Healthy heartbeat (when all OK)
         if: steps.check.outputs.alert == 'false'
@@ -175,6 +216,7 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_URL }}
           state: failed
-          label: Healthcheck 自体が失敗
-          meaning: 無音検知の見張り役（healthcheck）自体がエラーになりました。このままだと各レーンの未発行を検知できません。
-          action_required: run ログ確認 → 手動 dispatch で再実行
+          label: '健全性チェック'
+          meaning: '内部エラーで点検ができませんでした。未配信があっても気づけない状態です。'
+          action_required: '次回 Claude Code で「健全性チェックを復旧して」とお伝えください'
+          detail: 'Healthcheck 自体が失敗｜無音検知の見張り役（healthcheck）自体がエラーになりました。このままだと各レーンの未発行を検知できません。'

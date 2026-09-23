@@ -205,10 +205,11 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_SNS || secrets.DISCORD_WEBHOOK_URL }}
           state: alert
-          label: SNS デイリーデータ同期 X 取得 0 件
+          label: 'SNS データ同期'
           date: ${{ steps.date.outputs.value }}
-          meaning: 'X プロフィール取得の件数が 0 でした（0 件の対象: ${{ steps.profile_gate.outputs.empty }}）。スクリプトは正常終了しているため、バーナー垢の cookie 失効によるサイレント失敗が疑われます。当日のフォロワー増減・churn は信用できません。'
-          action_required: X バーナー垢へ再ログインして auth_token / ct0 を取り直し Secrets（X_BURNER_AUTH_TOKEN・X_BURNER_CT0）を更新 → 手動 dispatch で再実行
+          meaning: 'X のフォロワー数などが取れませんでした（ログイン切れの疑い）。本日のフォロワー増減は正しくありません。'
+          action_required: '次回 Claude Code で「X のログインを更新して」とお伝えください'
+          detail: 'SNS デイリーデータ同期 X 取得 0 件｜X プロフィール取得の件数が 0 でした（0 件の対象: ${{ steps.profile_gate.outputs.empty }}）。スクリプトは正常終了しているため、バーナー垢の cookie 失効によるサイレント失敗が疑われます。当日のフォロワー増減・churn は信用できません。'
 
       - name: 2/4 前日比 churn 算出
         id: churn

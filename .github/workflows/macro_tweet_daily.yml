@@ -130,9 +130,10 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_SNS || secrets.DISCORD_WEBHOOK_URL }}
           state: timer
-          label: マクロ市況ツイート 予備タイマー起動
-          meaning: '本日のツイート案がまだ生成できていないため、GHA 側の予備タイマーが救援起動しました（本日: 成功 ${{ steps.check.outputs.done_ok }} 件・失敗 ${{ steps.check.outputs.done_fail }} 件・実行中 ${{ steps.check.outputs.active }} 件）。'
-          action_required: 不要（このあとツイート案が届けば復旧完了。届かない場合のみ run ログを確認）
+          label: '市況ツイート'
+          meaning: '通常の時刻に届かなかったため、予備の仕組みで作り直しています。このあとツイート案が届きます。'
+          action_required: '不要'
+          detail: 'マクロ市況ツイート 予備タイマー起動｜本日のツイート案がまだ生成できていないため、GHA 側の予備タイマーが救援起動しました（本日: 成功 ${{ steps.check.outputs.done_ok }} 件・失敗 ${{ steps.check.outputs.done_fail }} 件・実行中 ${{ steps.check.outputs.active }} 件）。'
 
       - name: Discord 通知（🚨 自動リトライ停止）
         if: contains(steps.check.outputs.reason, 'retry_cap')
@@ -140,9 +141,10 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_SNS || secrets.DISCORD_WEBHOOK_URL }}
           state: alert
-          label: マクロ市況ツイート 自動リトライ停止
-          meaning: 対象日に 3 回以上失敗したため自動再実行を停止しました（暴走防止の上限）。ツイート案は未生成です。
-          action_required: run ログ確認 → 原因解消後に手動 dispatch（force_rerun=true）で再実行
+          label: '市況ツイート'
+          meaning: '本日のツイート案を自動では作れませんでした（再試行の上限）。'
+          action_required: '次回 Claude Code で「市況ツイートを復旧して」とお伝えください'
+          detail: 'マクロ市況ツイート 自動リトライ停止｜対象日に 3 回以上失敗したため自動再実行を停止しました（暴走防止の上限）。ツイート案は未生成です。'
 
       - name: Discord 通知（guard 失敗）
         if: failure() || cancelled()
@@ -150,9 +152,10 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_SNS || secrets.DISCORD_WEBHOOK_URL }}
           state: failed
-          label: マクロ市況ツイート guard 失敗
-          meaning: 実行前チェック（当日重複判定）自体がエラーになり、生成ジョブが起動していません。
-          action_required: run ログ確認 → 手動 dispatch で再実行
+          label: '市況ツイート'
+          meaning: '内部エラーで作成を開始できませんでした。'
+          action_required: '次回 Claude Code で「市況ツイートを復旧して」とお伝えください'
+          detail: 'マクロ市況ツイート guard 失敗｜実行前チェック（当日重複判定）自体がエラーになり、生成ジョブが起動していません。'
 
   generate:
     needs: guard
@@ -399,10 +402,11 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_SNS || secrets.DISCORD_WEBHOOK_URL }}
           state: partial
-          label: マクロ市況ツイート 後処理のみ失敗
+          label: '市況ツイート'
           date: ${{ steps.date.outputs.value }}
-          meaning: ツイート案は Discord へ配信済みです。配信後の commit だけが失敗しました。
-          action_required: 不要（差分は次回 run が回収）
+          meaning: '配信は完了しています。保存処理だけ失敗しましたが内容に影響はありません。'
+          action_required: '不要'
+          detail: 'マクロ市況ツイート 後処理のみ失敗｜ツイート案は Discord へ配信済みです。配信後の commit だけが失敗しました。'
 
       - name: Discord 通知（❌ 失敗）
         if: (failure() || cancelled()) && steps.send.outcome != 'success'
@@ -410,7 +414,8 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_SNS || secrets.DISCORD_WEBHOOK_URL }}
           state: failed
-          label: マクロ市況ツイート 失敗
+          label: '市況ツイート'
           date: ${{ steps.date.outputs.value }}
-          meaning: 生成または送信が完了せず、本日のツイート案は未配信です。
-          action_required: run ログ確認 → 手動 dispatch（force_rerun=true）で再実行。ログに「Spending cap reached」がある場合は Claude 利用枠切れ＝リセット時刻以降に force_rerun=true
+          meaning: '内部エラーで本日のツイート案を作れませんでした。'
+          action_required: '次回 Claude Code で「市況ツイートを復旧して」とお伝えください'
+          detail: 'マクロ市況ツイート 失敗｜生成または送信が完了せず、本日のツイート案は未配信です。'

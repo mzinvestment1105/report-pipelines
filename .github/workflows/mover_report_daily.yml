@@ -131,11 +131,12 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
           state: timer
-          label: 動意銘柄レポート 予備タイマー起動
+          label: '動意レポート'
           # 2026-08-19 修正: 旧文面は「Worker 発火が届かなかった」と断定していたが、Worker が正常着弾し
           # その run が失敗した場合も同じ通知が出る。guard が実際に把握している当日実績のみを述べる。
-          meaning: '本日の生成がまだ成功していないため、GHA 側の予備タイマーが救援起動しました（本日: 成功 ${{ steps.check.outputs.done_ok }} 件・失敗 ${{ steps.check.outputs.done_fail }} 件・実行中 ${{ steps.check.outputs.active }} 件）。レポートはこのあと通常どおり届きます。'
-          action_required: 不要（このあとレポートが届けば復旧完了。届かない場合のみ run ログを確認）
+          meaning: '通常の時刻に届かなかったため、予備の仕組みで作り直しています。このあと届きます。'
+          action_required: '不要'
+          detail: '動意銘柄レポート 予備タイマー起動｜本日の生成がまだ成功していないため、GHA 側の予備タイマーが救援起動しました（本日: 成功 ${{ steps.check.outputs.done_ok }} 件・失敗 ${{ steps.check.outputs.done_fail }} 件・実行中 ${{ steps.check.outputs.active }} 件）。レポートはこのあと通常どおり届きます。'
 
       - name: Discord 通知（🚨 自動リトライ停止）
         if: contains(steps.check.outputs.reason, 'retry_cap')
@@ -143,9 +144,10 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
           state: alert
-          label: 動意銘柄レポート 自動リトライ停止
-          meaning: 当日 2 回以上失敗したため cron の自動再実行を停止しました。本日未配信です。
-          action_required: run ログ確認 → 原因解消後に手動 dispatch（force_rerun=true）で再実行
+          label: '動意レポート'
+          meaning: '本日分を自動では作れませんでした（再試行の上限）。'
+          action_required: '次回 Claude Code で「動意レポートを復旧して」とお伝えください'
+          detail: '動意銘柄レポート 自動リトライ停止｜当日 2 回以上失敗したため cron の自動再実行を停止しました。本日未配信です。'
 
       - name: Discord 通知（guard 失敗）
         if: failure() || cancelled()
@@ -153,9 +155,10 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS || secrets.DISCORD_WEBHOOK_URL }}
           state: failed
-          label: 動意銘柄レポート guard 失敗
-          meaning: 実行前チェック（当日重複判定）自体がエラーになり、生成ジョブが起動していません。
-          action_required: run ログ確認 → 手動 dispatch で再実行
+          label: '動意レポート'
+          meaning: '内部エラーで作成を開始できませんでした。'
+          action_required: '次回 Claude Code で「動意レポートを復旧して」とお伝えください'
+          detail: '動意銘柄レポート guard 失敗｜実行前チェック（当日重複判定）自体がエラーになり、生成ジョブが起動していません。'
 
   setup-raw:
     needs: guard
@@ -322,10 +325,11 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
           state: failed
-          label: 動意銘柄レポート 失敗（raw 生成）
+          label: '動意レポート'
           date: ${{ steps.date.outputs.value }}
-          meaning: 動意銘柄の元データ（raw）生成が失敗し、後続の市場別生成が始まらないため本日未配信です。
-          action_required: run ログ確認 → 手動 dispatch（force_rerun=true）で再実行
+          meaning: '内部エラーで本日分を作れませんでした。'
+          action_required: '次回 Claude Code で「動意レポートを復旧して」とお伝えください'
+          detail: '動意銘柄レポート 失敗（raw 生成）｜動意銘柄の元データ（raw）生成が失敗し、後続の市場別生成が始まらないため本日未配信です。'
 
   generate-market:
     needs: setup-raw
@@ -550,10 +554,11 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
           state: failed
-          label: 動意銘柄レポート 失敗（${{ matrix.market }} 市場の生成）
+          label: '動意レポート'
           date: ${{ needs.setup-raw.outputs.target_date }}
-          meaning: ${{ matrix.market }} 市場セクションの生成が失敗し、統合レポートが組めないため本日未配信です。
-          action_required: run ログ確認 → 手動 dispatch（force_rerun=true）で再実行。ログに「Spending cap reached」がある場合は Claude 利用枠切れ＝リセット時刻以降に force_rerun=true
+          meaning: '${{ matrix.market == ''growth'' && ''グロース'' || matrix.market == ''standard'' && ''スタンダード'' || ''プライム'' }}の部分を作れませんでした。他の市場の部分だけで配信を試みます。'
+          action_required: '不要'
+          detail: '動意銘柄レポート 失敗（${{ matrix.market }} 市場の生成）｜${{ matrix.market }} 市場セクションの生成が失敗し、統合レポートが組めないため本日未配信です。'
 
   merge-and-send:
     needs: [setup-raw, generate-market]
@@ -688,6 +693,13 @@ jobs:
             exit 1
           fi
           echo "missing_markets=${MISSING}" >> $GITHUB_OUTPUT
+          # 2026-09-23: PM 向け通知に載せる市場名は和名にする（growth → グロース 等）
+          MISSING_JA=""
+          for m in $MISSING; do
+            case "$m" in growth) JA="グロース" ;; standard) JA="スタンダード" ;; prime) JA="プライム" ;; *) JA="$m" ;; esac
+            MISSING_JA="${MISSING_JA}${MISSING_JA:+・}${JA}"
+          done
+          echo "missing_markets_ja=${MISSING_JA}" >> $GITHUB_OUTPUT
           echo "Placed $OUTPUT ($(wc -l < "$OUTPUT") lines / markets: ${FOUND} / missing: ${MISSING:-なし})"
 
       - name: Download movers raw artifact (品質フラグ取得用)
@@ -818,10 +830,11 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
           state: partial
-          label: 動意銘柄レポート 一部市場が欠けたまま配信
+          label: '動意レポート'
           date: ${{ needs.setup-raw.outputs.target_date }}
-          meaning: 日次レポートは配信済みですが、${{ steps.place.outputs.missing_markets }} 市場のセクションが 2 回の試行で生成できず本号に含まれていません（誌面冒頭に ⚠ 注記あり）。それ以外の市場は通常どおりの内容です。
-          action_required: 欠けた市場が必要な場合のみ、手動 dispatch（force_rerun=true）で再実行
+          meaning: '配信しました。${{ steps.place.outputs.missing_markets_ja }}の部分だけ作れなかったため、その部分は載っていません。'
+          action_required: '不要'
+          detail: '動意銘柄レポート 一部市場が欠けたまま配信｜日次レポートは配信済みですが、${{ steps.place.outputs.missing_markets }} 市場のセクションが 2 回の試行で生成できず本号に含まれていません（誌面冒頭に ⚠ 注記あり）。それ以外の市場は通常どおりの内容です。'
 
       - name: Discord 通知（⚠️ 配信済み・品質注記あり）
         # PM 2026-07-12（絶対配信原則）: 品質問題があってもレポートは配信済み。何が注記されたかを PM へ通知。
@@ -830,10 +843,11 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
           state: partial
-          label: 動意銘柄レポート 配信済み（品質注記あり）
+          label: '動意レポート'
           date: ${{ needs.setup-raw.outputs.target_date }}
-          meaning: レポートは配信済みです。品質注記（${{ steps.annotate.outputs.note }}）を各市場の冒頭に付けています。
-          action_required: レポート冒頭の品質注記を確認（数値を使う前に注記のデータ日付を参照）
+          meaning: '配信しました。一部に注意点があるため、誌面の冒頭に注記があります。'
+          action_required: '不要'
+          detail: '動意銘柄レポート 配信済み（品質注記あり）｜レポートは配信済みです。品質注記（${{ steps.annotate.outputs.note }}）を各市場の冒頭に付けています。'
 
       - name: Discord 通知（⚠️ 配信済み・後処理のみ失敗）
         if: (failure() || cancelled()) && steps.send.outcome == 'success'
@@ -841,10 +855,11 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
           state: partial
-          label: 動意銘柄レポート 後処理のみ失敗
+          label: '動意レポート'
           date: ${{ needs.setup-raw.outputs.target_date }}
-          meaning: レポート本体は配信済みです。配信後のアーカイブ整理または commit だけが失敗しました。
-          action_required: 不要（差分は次回 run が回収）
+          meaning: '配信は完了しています。保存処理だけ失敗しましたが誌面に影響はありません。'
+          action_required: '不要'
+          detail: '動意銘柄レポート 後処理のみ失敗｜レポート本体は配信済みです。配信後のアーカイブ整理または commit だけが失敗しました。'
 
       - name: Discord 通知（❌ merge/送信失敗）
         if: (failure() || cancelled()) && steps.send.outcome != 'success'
@@ -852,7 +867,8 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
           state: failed
-          label: 動意銘柄レポート 失敗（統合/送信）
+          label: '動意レポート'
           date: ${{ needs.setup-raw.outputs.target_date }}
-          meaning: 市場別セクションの統合または Discord 送信が失敗し、本日未配信です。
-          action_required: run ログ確認 → 手動 dispatch（force_rerun=true）で再実行
+          meaning: '内部エラーで本日分を作れませんでした。'
+          action_required: '次回 Claude Code で「動意レポートを復旧して」とお伝えください'
+          detail: '動意銘柄レポート 失敗（統合/送信）｜市場別セクションの統合または Discord 送信が失敗し、本日未配信です。'

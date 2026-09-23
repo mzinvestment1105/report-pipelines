@@ -97,12 +97,13 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
           state: timer
-          label: 夜間PTS動意レポート 予備タイマー起動
+          label: '夜間PTS動意レポート'
           date: ${{ steps.check.outputs.target_date }}
           # 2026-08-19 修正: 旧文面は「Worker 発火が届かなかった」と断定していたが、Worker が正常着弾し
           # その run が失敗した場合も同じ通知が出る。guard が実際に把握している当日実績のみを述べる。
-          meaning: '本日の生成がまだ成功していないため、GHA 側の予備タイマーが救援起動しました（本日: 成功 ${{ steps.stats.outputs.done_ok }} 件・失敗 ${{ steps.stats.outputs.done_fail }} 件・実行中 ${{ steps.stats.outputs.active }} 件）。レポートはこのあと通常どおり届きます。'
-          action_required: 不要（このあとレポートが届けば復旧完了。届かない場合のみ run ログを確認）
+          meaning: '通常の時刻に届かなかったため、予備の仕組みで作り直しています。このあと届きます。'
+          action_required: '不要'
+          detail: '夜間PTS動意レポート 予備タイマー起動｜本日の生成がまだ成功していないため、GHA 側の予備タイマーが救援起動しました（本日: 成功 ${{ steps.stats.outputs.done_ok }} 件・失敗 ${{ steps.stats.outputs.done_fail }} 件・実行中 ${{ steps.stats.outputs.active }} 件）。レポートはこのあと通常どおり届きます。'
 
       - name: Discord 通知（🚨 自動リトライ停止）
         if: contains(steps.check.outputs.reason, 'retry_cap')
@@ -110,9 +111,10 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
           state: alert
-          label: 夜間PTS動意レポート 自動リトライ停止
-          meaning: 当日 2 回以上失敗したため cron の自動再実行を停止しました。本日未配信です。
-          action_required: run ログ確認 → 原因解消後に手動 dispatch（force_rerun=true）で再実行
+          label: '夜間PTS動意レポート'
+          meaning: '本日分を自動では作れませんでした（再試行の上限）。'
+          action_required: '次回 Claude Code で「夜間PTS動意レポートを復旧して」とお伝えください'
+          detail: '夜間PTS動意レポート 自動リトライ停止｜当日 2 回以上失敗したため cron の自動再実行を停止しました。本日未配信です。'
 
       # 2026-09-07 追加: guard が「実行しない」と判定した経路のうち、当日未配信のまま終わる
       # 理由（cap_retry_limit / 想定外時間帯）は従来どこにも通知が出ず、PM から見て
@@ -124,21 +126,23 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
           state: alert
-          label: 夜間PTS動意レポート 未発行（枠切れ再試行の上限）
+          label: '夜間PTS動意レポート'
           date: ${{ steps.check.outputs.target_date }}
-          meaning: 'Claude の利用枠切れによる失敗が本日の再試行上限に達したため、これ以上の自動再実行を止めました。本日は未配信です（判定: ${{ steps.check.outputs.reason }}）。'
-          action_required: 枠のリセット後に手動 dispatch（force_rerun=true）で再実行
+          meaning: '本日分を自動では作れませんでした（Claude の利用枠切れ）。'
+          action_required: '次回 Claude Code で「夜間PTS動意レポートを復旧して」とお伝えください'
+          detail: '夜間PTS動意レポート 未発行（枠切れ再試行の上限）｜Claude の利用枠切れによる失敗が本日の再試行上限に達したため、これ以上の自動再実行を止めました。本日は未配信です（判定: ${{ steps.check.outputs.reason }}）。'
 
       - name: Discord 通知（🚨 想定外の時間帯で中止）
         if: contains(steps.check.outputs.reason, 'outside window')
         uses: ./.github/actions/notify-discord
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
-          state: alert
-          label: 夜間PTS動意レポート 未発行（発行時間帯を外れた）
+          state: '${{ steps.check.outputs.window_side == ''early'' && ''timer'' || ''alert'' }}'
+          label: '夜間PTS動意レポート'
           date: ${{ steps.check.outputs.target_date }}
-          meaning: 'cron の着火が想定の発行時間帯（12:00〜23:30 JST）を外れたため、日付ズレ配信を避けて中止しました。本日は未配信です（判定: ${{ steps.check.outputs.reason }}）。'
-          action_required: 当日中に読む必要があれば手動 dispatch（force_rerun=true）で再実行
+          meaning: '${{ steps.check.outputs.window_side == ''early'' && ''予備の起動が深夜にずれましたが、本日分は通常の時刻に作ります。'' || ''本日分を作れませんでした（起動が遅すぎました）。'' }}'
+          action_required: '${{ steps.check.outputs.window_side == ''early'' && ''不要'' || ''次回 Claude Code で「夜間PTS動意レポートを再送して」とお伝えください'' }}'
+          detail: '夜間PTS動意レポート 未発行（発行時間帯を外れた）｜cron の着火が想定の発行時間帯（12:00〜23:30 JST）を外れたため、日付ズレ配信を避けて中止しました。本日は未配信です（判定: ${{ steps.check.outputs.reason }}）。'
 
       - name: Discord 通知（guard 失敗）
         if: failure() || cancelled()
@@ -146,9 +150,10 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS || secrets.DISCORD_WEBHOOK_URL }}
           state: failed
-          label: 夜間PTS動意レポート guard 失敗
-          meaning: 実行前チェック（当日配信済み判定）自体がエラーになり、生成ジョブが起動していません。
-          action_required: run ログ確認 → 手動 dispatch（force_rerun=true）で再実行
+          label: '夜間PTS動意レポート'
+          meaning: '内部エラーで作成を開始できませんでした。'
+          action_required: '次回 Claude Code で「夜間PTS動意レポートを復旧して」とお伝えください'
+          detail: '夜間PTS動意レポート guard 失敗｜実行前チェック（当日配信済み判定）自体がエラーになり、生成ジョブが起動していません。'
 
   # 2026-09-07 追加: guard が未配信のまま終わった日の理由を Private 側へ 1 行残す。
   # Discord 通知は流れて消えるため、後から「あの日なぜ届かなかったか」を辿れる追記型の台帳を持つ。
@@ -686,10 +691,11 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
           state: partial
-          label: 夜間PTS動意レポート 配信済み（品質注記あり）
+          label: '夜間PTS動意レポート'
           date: ${{ steps.date.outputs.value }}
-          meaning: レポートは配信済みです。品質注記（${{ steps.annotate.outputs.note }}）を冒頭に付けています。
-          action_required: レポート冒頭の品質注記を確認
+          meaning: '配信しました。一部に注意点があるため、誌面の冒頭に注記があります。'
+          action_required: '不要'
+          detail: '夜間PTS動意レポート 配信済み（品質注記あり）｜レポートは配信済みです。品質注記（${{ steps.annotate.outputs.note }}）を冒頭に付けています。'
 
       - name: Discord 通知（⚠️ 配信済み・後処理のみ失敗）
         if: steps.raw.outputs.skipped != 'true' && ((failure() || cancelled()) && steps.send.outcome == 'success')
@@ -697,10 +703,11 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
           state: partial
-          label: 夜間PTS動意レポート 後処理のみ失敗
+          label: '夜間PTS動意レポート'
           date: ${{ steps.date.outputs.value }}
-          meaning: レポート本体は配信済みです。配信後のアーカイブ整理または commit だけが失敗しました。
-          action_required: 不要（差分は次回 run が回収）
+          meaning: '配信は完了しています。保存処理だけ失敗しましたが誌面に影響はありません。'
+          action_required: '不要'
+          detail: '夜間PTS動意レポート 後処理のみ失敗｜レポート本体は配信済みです。配信後のアーカイブ整理または commit だけが失敗しました。'
 
       # PM 2026-09-05 承認: 枠切れは「壊れた」のではなく「今は打てないだけ」で、PM の対応内容が
       # 真の失敗とは別物（原因調査ではなくリセット待ち）。同じ ❌ 文面に混ぜると恒久的な障害と
@@ -712,10 +719,11 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
           state: timer
-          label: 夜間PTS動意レポート 生成見送り（Claude 利用枠切れ）
+          label: '夜間PTS動意レポート'
           date: ${{ steps.date.outputs.value }}
-          meaning: 'Claude の利用枠が上限に達したため生成できませんでした${{ steps.cap1.outputs.resets != '''' && format(''（枠のリセット {0}）'', steps.cap1.outputs.resets) || (steps.cap2.outputs.resets != '''' && format(''（枠のリセット {0}）'', steps.cap2.outputs.resets) || '''') }}。設備やデータの障害ではなく、枠が戻れば同じ手順で生成できます。無駄打ちを避けるため同一 run 内の再試行は打ち切っています。'
-          action_required: 不要（リセット後の予備タイマーで届けば復旧完了）。予備タイマーより後のリセットだった場合のみ、リセット時刻以降に手動 dispatch（force_rerun=true）
+          meaning: 'Claude の利用枠が切れたため、枠が戻り次第、予備の仕組みで作り直します。'
+          action_required: '不要'
+          detail: '夜間PTS動意レポート 生成見送り（Claude 利用枠切れ）｜Claude の利用枠が上限に達したため生成できませんでした${{ steps.cap1.outputs.resets != '''' && format(''（枠のリセット {0}）'', steps.cap1.outputs.resets) || (steps.cap2.outputs.resets != '''' && format(''（枠のリセット {0}）'', steps.cap2.outputs.resets) || '''') }}。設備やデータの障害ではなく、枠が戻れば同じ手順で生成できます。無駄打ちを避けるため同一 run 内の再試行は打ち切っています。'
 
       - name: Discord 通知（❌ 生成/送信失敗）
         if: steps.raw.outputs.skipped != 'true' && ((failure() || cancelled()) && steps.send.outcome != 'success' && steps.cap1.outputs.capped != 'true' && steps.cap2.outputs.capped != 'true')
@@ -723,7 +731,8 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
           state: failed
-          label: 夜間PTS動意レポート 失敗（生成/送信）
+          label: '夜間PTS動意レポート'
           date: ${{ steps.date.outputs.value }}
-          meaning: raw 生成・Claude 生成・Discord 送信のいずれかが失敗し、本日未配信です。
-          action_required: run ログ確認 → 手動 dispatch（force_rerun=true）で再実行
+          meaning: '内部エラーで本日分を作れませんでした。'
+          action_required: '次回 Claude Code で「夜間PTS動意レポートを復旧して」とお伝えください'
+          detail: '夜間PTS動意レポート 失敗（生成/送信）｜raw 生成・Claude 生成・Discord 送信のいずれかが失敗し、本日未配信です。'

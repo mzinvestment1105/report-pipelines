@@ -102,11 +102,12 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_MACRO }}
           state: timer
-          label: マクロレポート夕刊 予備タイマー起動
+          label: 'マクロ夕刊'
           # 2026-08-19 修正: 旧文面は「Worker 発火が届かなかった」と断定していたが、Worker が正常着弾し
           # その run が失敗した場合も同じ通知が出る。guard が実際に把握している当日実績のみを述べる。
-          meaning: '本日の生成がまだ成功していないため、GHA 側の予備タイマーが救援起動しました（本日: 成功 ${{ steps.check.outputs.done_ok }} 件・失敗 ${{ steps.check.outputs.done_fail }} 件・実行中 ${{ steps.check.outputs.active }} 件）。レポートはこのあと通常どおり届きます。'
-          action_required: 不要（このあとレポートが届けば復旧完了。届かない場合のみ run ログを確認）
+          meaning: '通常の時刻に届かなかったため、予備の仕組みで作り直しています。このあと届きます。'
+          action_required: '不要'
+          detail: 'マクロレポート夕刊 予備タイマー起動｜''本日の生成がまだ成功していないため、GHA 側の予備タイマーが救援起動しました（本日: 成功 ${{ steps.check.outputs.done_ok }} 件・失敗 ${{ steps.check.outputs.done_fail }} 件・実行中 ${{ steps.check.outputs.active }} 件）。レポートはこのあと通常どおり届きます。'''
 
       - name: Discord 通知（🚨 自動リトライ停止）
         if: contains(steps.check.outputs.reason, 'retry_cap')
@@ -114,9 +115,10 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_MACRO }}
           state: alert
-          label: マクロレポート夕刊 自動リトライ停止
-          meaning: 当日 2 回以上失敗したため cron の自動再実行を停止しました。本日未配信です。
-          action_required: run ログ確認 → 原因解消後に手動 dispatch（force_rerun=true）で再実行
+          label: 'マクロ夕刊'
+          meaning: '本日分を自動では作れませんでした（再試行の上限）。'
+          action_required: '次回 Claude Code で「マクロ夕刊を復旧して」とお伝えください'
+          detail: 'マクロレポート夕刊 自動リトライ停止｜当日 2 回以上失敗したため cron の自動再実行を停止しました。本日未配信です。'
 
       - name: Discord 通知（guard 失敗）
         if: failure() || cancelled()
@@ -124,9 +126,10 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_MACRO || secrets.DISCORD_WEBHOOK_URL }}
           state: failed
-          label: マクロレポート夕刊 guard 失敗
-          meaning: 実行前チェック（当日重複判定）自体がエラーになり、生成ジョブが起動していません。
-          action_required: run ログ確認 → 手動 dispatch で再実行
+          label: 'マクロ夕刊'
+          meaning: '内部エラーで作成を開始できませんでした。'
+          action_required: '次回 Claude Code で「マクロ夕刊を復旧して」とお伝えください'
+          detail: 'マクロレポート夕刊 guard 失敗｜実行前チェック（当日重複判定）自体がエラーになり、生成ジョブが起動していません。'
 
   generate:
     needs: guard
@@ -292,10 +295,11 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_MACRO }}
           state: none
-          label: マクロレポート夕刊 発行なし
+          label: 'マクロ夕刊'
           date: ${{ steps.date.outputs.value }}
-          meaning: 前回以降の新着記事がなかったため、本日の夕刊は発行しません（正常動作）。
-          action_required: 不要
+          meaning: '本日は新しい材料がなく発行しません。'
+          action_required: '不要'
+          detail: 'マクロレポート夕刊 発行なし｜前回以降の新着記事がなかったため、本日の夕刊は発行しません（正常動作）。'
 
       # 2026-07-07 構造矛盾解消: 従来は skip 通知後も生成・送信 step が続行していた
       # （後続 step に exit_code != '2' の条件が無かった）。以降の全 step に条件を付与。
@@ -498,10 +502,11 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_MACRO }}
           state: partial
-          label: マクロレポート夕刊 後処理のみ失敗
+          label: 'マクロ夕刊'
           date: ${{ steps.date.outputs.value }}
-          meaning: レポート本体は配信済みです。配信後のアーカイブ整理または commit だけが失敗しました。
-          action_required: 不要（差分は次回 run が回収）
+          meaning: '配信は完了しています。保存処理だけ失敗しましたが誌面に影響はありません。'
+          action_required: '不要'
+          detail: 'マクロレポート夕刊 後処理のみ失敗｜レポート本体は配信済みです。配信後のアーカイブ整理または commit だけが失敗しました。'
 
       - name: Discord 通知（❌ 失敗）
         if: (failure() || cancelled()) && steps.send.outcome != 'success'
@@ -509,7 +514,8 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_MACRO }}
           state: failed
-          label: マクロレポート夕刊 失敗
+          label: 'マクロ夕刊'
           date: ${{ steps.date.outputs.value }}
-          meaning: 生成または送信が完了せず、本日未配信です。
-          action_required: run ログ確認 → 手動 dispatch（force_rerun=true）で再実行。ログに「Spending cap reached」がある場合は Claude 利用枠切れ＝リセット時刻以降に force_rerun=true
+          meaning: '内部エラーで本日分を作れませんでした。'
+          action_required: '次回 Claude Code で「マクロ夕刊を復旧して」とお伝えください'
+          detail: 'マクロレポート夕刊 失敗｜生成または送信が完了せず、本日未配信です。'

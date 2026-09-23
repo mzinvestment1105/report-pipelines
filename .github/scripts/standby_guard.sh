@@ -12,7 +12,9 @@
 # 動作:
 #   1) schedule 起動なら WAKE_JST（JST HH:MM）まで sleep する。
 #      ただし着火が想定外時間帯（WINDOW_START_JST 未満 / WINDOW_END_JST 超過）なら日付ズレ配信を
-#      避けて skip する。
+#      避けて skip する。2026-09-23 から、この時間帯判定の前に「本日すでに配信済みか」を見て、
+#      配信済みなら通知なしで降りる（配信済みの日に「未配信」と通知する誤報の防止）。
+#      時間帯外で降りる場合は window_side=early（受付開始前）/ late（受付終了後）も出力する。
 #   2) 起床後、本命 run が走行中なら最大 WAIT_MINUTES 分だけその完了を待つ（本命に配信を譲る）。
 #   3) 配信ジョブ単位（check_delivery.sh）で本日の配信可否を判定し、$GITHUB_OUTPUT へ
 #      proceed / reason / target_date を書く。
@@ -115,7 +117,31 @@ if [ "$EVENT" = "schedule" ]; then
   NOW=$(jst_min)
 
   if [ "$NOW" -gt "$W_END" ] || [ "$NOW" -lt "$W_START" ]; then
-    echo "skip 理由: cron が想定外の時間帯（$(jst_hhmm) JST / 許容 ${WINDOW_START_JST}〜${WINDOW_END_JST}）に着火したため。日付ズレ配信を避けて中止します。"
+    # 2026-09-23 修正（PM 判断・運用通知の平易化）: 「本日すでに配信済みか」を時間帯判定より先に見る。
+    # 従来は時間帯判定が先だったため、21:00 に配信済みの日でも予備 cron が 23:30 以降に遅延着火すると
+    # 「未配信」の 🚨 が出ていた（配信済みの日に未配信と通知する誤報）。
+    # 取得に失敗した場合は 0 件扱いにして従来どおり時間帯判定へ進む（guard 自体は落とさない）。
+    OW_DELIVERED=0
+    if OW_STATS=$(bash "$(dirname "$0")/check_delivery.sh" "$WF_FILE" "$SEND_JOB" "$MY_RUN_ID"); then
+      OW_DELIVERED=$(echo "$OW_STATS" | jq -r '.delivered // 0' 2>/dev/null || echo 0)
+    else
+      echo "配信状況の取得に失敗しました（時間帯判定は続行します）" >&2
+    fi
+    case "$OW_DELIVERED" in (''|*[!0-9]*) OW_DELIVERED=0 ;; esac
+    if [ "$OW_DELIVERED" -gt 0 ]; then
+      echo "skip 理由: 想定外の時間帯（$(jst_hhmm) JST）の着火ですが、本日はすでに ${SEND_JOB} が成功済み（${OW_DELIVERED} 件）＝配信が完了しているため。通知は出しません。"
+      echo "proceed=false" >> "$GITHUB_OUTPUT"
+      echo "reason=skip (already delivered today: ${SEND_JOB} success=${OW_DELIVERED})" >> "$GITHUB_OUTPUT"
+      exit 0
+    fi
+    # window_side: early = 受付開始前（深夜〜午前。その日の本番はまだこれから）/ late = 受付終了後（その日はもう作れない）
+    if [ "$NOW" -lt "$W_START" ]; then
+      echo "window_side=early" >> "$GITHUB_OUTPUT"
+      echo "skip 理由: cron が受付開始前（$(jst_hhmm) JST / 許容 ${WINDOW_START_JST}〜${WINDOW_END_JST}）に着火したため。本日分は通常の時刻に作るため、ここでは中止します。"
+    else
+      echo "window_side=late" >> "$GITHUB_OUTPUT"
+      echo "skip 理由: cron が受付終了後（$(jst_hhmm) JST / 許容 ${WINDOW_START_JST}〜${WINDOW_END_JST}）に着火したため。日付ズレ配信を避けて中止します。"
+    fi
     echo "proceed=false" >> "$GITHUB_OUTPUT"
     echo "reason=skip (cron outside window: $(jst_hhmm) JST)" >> "$GITHUB_OUTPUT"
     exit 0

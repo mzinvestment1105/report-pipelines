@@ -72,9 +72,10 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_URL }}
           state: alert
-          label: 業績履歴ETL 自動リトライ停止
-          meaning: 当日 2 回以上失敗したため cron の自動再実行を停止しました。業績データは前回値のまま更新されていません。
-          action_required: run ログ確認 → 原因解消後に手動 dispatch（mode=daily）で再実行
+          label: '財務データ更新'
+          meaning: '本日の更新を自動では完了できませんでした（再試行の上限）。データは前回のままです。'
+          action_required: '次回 Claude Code で「財務データ更新を復旧して」とお伝えください'
+          detail: '業績履歴ETL 自動リトライ停止｜当日 2 回以上失敗したため cron の自動再実行を停止しました。業績データは前回値のまま更新されていません。'
 
       - name: Discord 通知（guard 失敗）
         if: failure() || cancelled()
@@ -82,9 +83,10 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_URL }}
           state: failed
-          label: 業績履歴ETL guard 失敗
-          meaning: 実行前チェック（当日重複判定）自体がエラーになり、更新ジョブが起動していません。
-          action_required: run ログ確認 → 手動 dispatch（mode=daily）で再実行
+          label: '財務データ更新'
+          meaning: '内部エラーで更新を開始できませんでした。データは前回のままです。'
+          action_required: '次回 Claude Code で「財務データ更新を復旧して」とお伝えください'
+          detail: '業績履歴ETL guard 失敗｜実行前チェック（当日重複判定）自体がエラーになり、更新ジョブが起動していません。'
 
   update:
     needs: guard
@@ -163,9 +165,10 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_URL }}
           state: done
-          label: 業績履歴ETL 完了（${{ steps.mode.outputs.mode }}）
-          meaning: 全銘柄の業績履歴 parquet を最新開示分まで更新しました。
-          action_required: 不要
+          label: '財務データ更新'
+          meaning: '更新が完了しました。'
+          action_required: '不要'
+          detail: '業績履歴ETL 完了（${{ steps.mode.outputs.mode }}）｜全銘柄の業績履歴 parquet を最新開示分まで更新しました。'
 
       - name: Discord 通知（❌ 失敗）
         # cancelled() を含める: job timeout 超過は conclusion=cancelled になり
@@ -175,6 +178,7 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_URL }}
           state: failed
-          label: 業績履歴ETL 失敗（${{ steps.mode.outputs.mode }}）
-          meaning: 日次更新が完了せず（エラーまたは制限時間超過）、業績データは前回値のまま更新されていません。
-          action_required: run ログ確認 → 手動 dispatch（mode=daily）で再実行
+          label: '財務データ更新'
+          meaning: '更新が完了しませんでした。データは前回のままです。'
+          action_required: '次回 Claude Code で「財務データ更新を復旧して」とお伝えください'
+          detail: '業績履歴ETL 失敗（${{ steps.mode.outputs.mode }}）｜日次更新が完了せず（エラーまたは制限時間超過）、業績データは前回値のまま更新されていません。'

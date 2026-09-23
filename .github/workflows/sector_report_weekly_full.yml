@@ -69,10 +69,11 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_SECTOR }}
           state: timer
-          label: セクター週次レポート 予備タイマー起動
+          label: 'セクター週次'
           date: ${{ steps.check.outputs.target_date }}
-          meaning: 定時の Cloudflare Worker 発火（金曜 21 時）が届かなかったため、GHA 側の予備タイマーが代わりに生成を開始しました。レポートはこのあと通常どおり届きます。
-          action_required: 不要（毎週続く場合のみ Worker 点検）
+          meaning: '通常の時刻に届かなかったため、予備の仕組みで作り直しています。このあと届きます。'
+          action_required: '不要'
+          detail: 'セクター週次レポート 予備タイマー起動｜定時の Cloudflare Worker 発火（金曜 21 時）が届かなかったため、GHA 側の予備タイマーが代わりに生成を開始しました。レポートはこのあと通常どおり届きます。'
 
       - name: Discord 通知（🚨 自動リトライ停止）
         if: contains(steps.check.outputs.reason, 'retry_cap')
@@ -80,9 +81,10 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_SECTOR }}
           state: alert
-          label: セクター週次レポート 自動リトライ停止
-          meaning: 当日 2 回以上失敗したため cron の自動再実行を停止しました。今週分は未配信です。
-          action_required: run ログ確認 → 原因解消後に手動 dispatch（force_rerun=true）で再実行
+          label: 'セクター週次'
+          meaning: '今週分を自動では作れませんでした（再試行の上限）。'
+          action_required: '次回 Claude Code で「セクター週次を復旧して」とお伝えください'
+          detail: 'セクター週次レポート 自動リトライ停止｜当日 2 回以上失敗したため cron の自動再実行を停止しました。今週分は未配信です。'
 
       - name: Discord 通知（guard 失敗）
         if: failure() || cancelled()
@@ -90,9 +92,10 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_SECTOR || secrets.DISCORD_WEBHOOK_URL }}
           state: failed
-          label: セクター週次レポート guard 失敗
-          meaning: 実行前チェック（当日重複判定）自体がエラーになり、生成ジョブが起動していません。
-          action_required: run ログ確認 → 手動 dispatch で再実行
+          label: 'セクター週次'
+          meaning: '内部エラーで作成を開始できませんでした。'
+          action_required: '次回 Claude Code で「セクター週次を復旧して」とお伝えください'
+          detail: 'セクター週次レポート guard 失敗｜実行前チェック（当日重複判定）自体がエラーになり、生成ジョブが起動していません。'
 
   generate:
     needs: guard
@@ -465,10 +468,11 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_SECTOR }}
           state: partial
-          label: セクター週次レポート 配信済み（品質注記あり）
+          label: 'セクター週次'
           date: ${{ steps.date.outputs.value }}
-          meaning: レポートは配信済みです。品質注記（${{ steps.annotate.outputs.note }}）を冒頭に付けています。
-          action_required: レポート冒頭の品質注記を確認（数値を使う前に注記のデータ日付・週の窓を参照）
+          meaning: '配信しました。一部のデータが最新でないため、誌面の冒頭に注記があります。'
+          action_required: '不要'
+          detail: 'セクター週次レポート 配信済み（品質注記あり）｜レポートは配信済みです。品質注記（${{ steps.annotate.outputs.note }}）を冒頭に付けています。'
 
       - name: Commit and push to private repo
         # PM 2026-06-28: 生成 step が失敗しても再生成済 parquet を必ずコミットする（データ凍結防止）。
@@ -488,10 +492,11 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_SECTOR }}
           state: partial
-          label: セクター週次レポート 後処理のみ失敗
+          label: 'セクター週次'
           date: ${{ steps.date.outputs.value }}
-          meaning: レポート本体は配信済みです。配信後の commit だけが失敗しました。
-          action_required: 不要（差分は次回 run が回収）
+          meaning: '配信は完了しています。保存処理だけ失敗しましたが誌面に影響はありません。'
+          action_required: '不要'
+          detail: 'セクター週次レポート 後処理のみ失敗｜レポート本体は配信済みです。配信後の commit だけが失敗しました。'
 
       - name: Discord 通知（❌ 失敗）
         if: (failure() || cancelled()) && steps.send.outcome != 'success'
@@ -499,7 +504,8 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_SECTOR }}
           state: failed
-          label: セクター週次レポート 失敗
+          label: 'セクター週次'
           date: ${{ steps.date.outputs.value }}
-          meaning: 生成または送信が完了せず、今週分は未配信です（集計 parquet は可能な範囲で commit 済み）。
-          action_required: run ログ確認 → 手動 dispatch（force_rerun=true）で再実行
+          meaning: '内部エラーで今週分を作れませんでした。'
+          action_required: '次回 Claude Code で「セクター週次を復旧して」とお伝えください'
+          detail: 'セクター週次レポート 失敗｜生成または送信が完了せず、今週分は未配信です（集計 parquet は可能な範囲で commit 済み）。'

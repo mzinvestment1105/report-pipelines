@@ -115,9 +115,10 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_THEME }}
           state: alert
-          label: テーマランキング蓄積 自動リトライ停止
-          meaning: 当日 2 回以上失敗したため cron の自動再実行を停止しました。本日分の theme_momentum.parquet が未蓄積です。
-          action_required: run ログ確認 → 原因解消後に手動 dispatch で再実行
+          label: 'テーマ動意'
+          meaning: '本日のテーマデータを自動では集められませんでした（再試行の上限）。レポートの配信には影響ありません。'
+          action_required: '次回 Claude Code で「テーマ動意を復旧して」とお伝えください'
+          detail: 'テーマランキング蓄積 自動リトライ停止｜当日 2 回以上失敗したため cron の自動再実行を停止しました。本日分の theme_momentum.parquet が未蓄積です。'
 
       - name: Discord 通知（guard 失敗）
         if: failure() || cancelled()
@@ -125,9 +126,10 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_THEME || secrets.DISCORD_WEBHOOK_URL }}
           state: failed
-          label: テーマランキング蓄積 guard 失敗
-          meaning: 実行前チェック（当日重複判定）自体がエラーになり、蓄積ジョブが起動していません。
-          action_required: run ログ確認 → 手動 dispatch で再実行
+          label: 'テーマ動意'
+          meaning: '内部エラーでテーマデータの収集を開始できませんでした。レポートの配信には影響ありません。'
+          action_required: '次回 Claude Code で「テーマ動意を復旧して」とお伝えください'
+          detail: 'テーマランキング蓄積 guard 失敗｜実行前チェック（当日重複判定）自体がエラーになり、蓄積ジョブが起動していません。'
 
   generate:
     # job 名は check_delivery.sh の判定キー（guard が "generate" を参照）のため変更しない。
@@ -224,10 +226,11 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_THEME }}
           state: failed
-          label: テーマランキング蓄積 失敗（取得ブロック）
+          label: 'テーマ動意'
           date: ${{ steps.date.outputs.value }}
-          meaning: テーマランキングの取得元（株探/みんかぶ）が GHA の接続を拒否し（IP ブロック起因・リトライ済み）、本日分が未蓄積です。誌面配信は 2026-09-02 に廃止済のため配信影響はありません。
-          action_required: ローカルで bi/pipelines/fetch_theme_momentum.py を実行してリカバリ（GHA の再実行は同じ IP 帯で失敗しやすい）
+          meaning: 'テーマ情報の取得元に接続を断られ、本日のテーマデータを集められませんでした。レポートの配信には影響ありません。'
+          action_required: '次回 Claude Code で「テーマ動意を復旧して」とお伝えください'
+          detail: 'テーマランキング蓄積 失敗（取得ブロック）｜テーマランキングの取得元（株探/みんかぶ）が GHA の接続を拒否し（IP ブロック起因・リトライ済み）、本日分が未蓄積です。誌面配信は 2026-09-02 に廃止済のため配信影響はありません。'
 
       - name: Discord 通知（❌ 失敗）
         if: (failure() || cancelled()) && steps.fetch_raw.outcome != 'failure'
@@ -235,7 +238,8 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_THEME }}
           state: failed
-          label: テーマランキング蓄積 失敗
+          label: 'テーマ動意'
           date: ${{ steps.date.outputs.value }}
-          meaning: theme_momentum.parquet の蓄積または commit が完了しませんでした。誌面配信は 2026-09-02 に廃止済のため配信影響はありません。
-          action_required: run ログ確認 → 手動 dispatch で再実行
+          meaning: '本日のテーマデータの保存が完了しませんでした。レポートの配信には影響ありません。'
+          action_required: '次回 Claude Code で「テーマ動意を復旧して」とお伝えください'
+          detail: 'テーマランキング蓄積 失敗｜theme_momentum.parquet の蓄積または commit が完了しませんでした。誌面配信は 2026-09-02 に廃止済のため配信影響はありません。'

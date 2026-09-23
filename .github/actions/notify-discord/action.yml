@@ -1,10 +1,12 @@
 name: notify-discord
 description: >
-  Discord 通知の標準文法（2026-07-07 確定・4行定型）で送信する composite action。
-  形式: 「[絵文字] [label]（M/D）/ [何が起きたか1行] / 対応: [PMがやること] / [run直リンク(失敗系のみ)]」。
-  絵文字語彙は7種に固定: ✅done(ETL完了のみ) ⏱timer(予備タイマー起動・対応不要) ⏭none(発行なし・正常)
-  ⛔blocked(品質ゲートで送信中止) ⚠️partial(配信済み・後処理のみ失敗) ❌failed(失敗・復旧手順つき)
-  🚨alert(自動リトライ停止/未発行検知・PM対応必須)。
+  Discord 通知の標準文法（2026-07-07 確定・2026-09-23 平易化）で送信する composite action。
+  形式: 「[絵文字] [レポート名]（M/D） — [状況を平易な1文]」＋2行目「対応: [PMがやること]」の最大2行。
+  絵文字語彙は7種に固定: ✅done(ETL完了のみ) ⏱timer(遅れて届く・対応不要) ⏭none(発行なし・正常)
+  ⛔blocked(本日は見送り) ⚠️partial(配信済み・注意点あり) ❌failed(内部エラー)
+  🚨alert(未配信・PMへの連絡が必要)。
+  2026-09-23（PM 判断・案3）: GitHub の実行リンクは本文に載せない（大きなプレビューカードになり PM が
+  使えないため）。実行リンクと内部の理由（detail）はジョブログの ::notice にだけ出す。
   通知はベストエフォート（webhook 未設定・送信失敗でも job を落とさない）。
 
 inputs:
@@ -15,18 +17,22 @@ inputs:
     description: "状態キー: done | timer | none | blocked | partial | failed | alert"
     required: true
   label:
-    description: "1行目本文: レポート/ETL 名 + 状態（例: 動意銘柄レポート 送信中止）"
+    description: "PM が知っている和名のレポート名だけ（例: 動意レポート）。状態や内部用語は書かない"
     required: true
   date:
     description: "対象日。YYYY-MM-DD なら M/D へ変換・M/D 等はそのまま・空なら当日 JST"
     required: false
     default: ""
   meaning:
-    description: "2行目: 何が起きたか 1 行（PM が読んで分かる言葉で）"
+    description: "1行目の本文: 何が起きたかを平易な日本語の1文で（内部用語・英語の仕組み名は書かない）"
     required: true
   action_required:
-    description: "3行目: PM がやること（不要なら「不要」）"
+    description: "2行目「対応: 」の中身。不要なら「不要」、必要なら「次回 Claude Code で「{名}を復旧して」とお伝えください」の一言"
     required: true
+  detail:
+    description: "内部の理由・件数など（Discord には送らず、ジョブログの ::notice にだけ出す）"
+    required: false
+    default: ""
 
 runs:
   using: composite
@@ -40,6 +46,7 @@ runs:
         DATE_IN: ${{ inputs.date }}
         MEANING: ${{ inputs.meaning }}
         ACTION_REQ: ${{ inputs.action_required }}
+        DETAIL: ${{ inputs.detail }}
         RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
       run: |
         if [ -z "$WEBHOOK" ]; then
@@ -70,13 +77,19 @@ runs:
           MD="$((10#$(TZ=Asia/Tokyo date +%m)))/$((10#$(TZ=Asia/Tokyo date +%d)))"
         fi
 
-        MSG="${EMOJI} ${LABEL}（${MD}）"$'\n'"${MEANING}"$'\n'"対応: ${ACTION_REQ}"
-        # run 直リンクは失敗系（blocked/partial/failed/alert）のみ付ける
-        case "$STATE" in
-          blocked|partial|failed|alert)
-            MSG="${MSG}"$'\n'"${RUN_URL}"
-            ;;
-        esac
+        # 2026-09-23: 本文は最大2行（1行目=状況・2行目=対応）。実行リンクと内部の理由はログにだけ出す。
+        NL=$'\n'
+        MSG="${EMOJI} ${LABEL}（${MD}） — ${MEANING}"
+        if [ -n "$ACTION_REQ" ]; then
+          MSG="${MSG}${NL}対応: ${ACTION_REQ}"
+        fi
+        # ログ用のワークフローコマンドは % と改行をエスケープする（本文が途中で切れないように）
+        esc() { local v="$1"; v="${v//%/%25}"; v="${v//$'\r'/%0D}"; v="${v//$'\n'/%0A}"; printf '%s' "$v"; }
+        echo "::notice title=Discord 通知（${STATE}）::$(esc "$MSG")"
+        echo "::notice title=この実行のログ::${RUN_URL}"
+        if [ -n "$DETAIL" ]; then
+          echo "::notice title=通知の内部情報::$(esc "$DETAIL")"
+        fi
 
         jq -n --arg content "$MSG" '{content: $content}' \
           | curl -s -X POST "$WEBHOOK" -H "Content-Type: application/json" -d @- \

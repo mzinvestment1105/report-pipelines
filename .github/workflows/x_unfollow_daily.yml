@@ -115,9 +115,10 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_SNS || secrets.DISCORD_WEBHOOK_URL }}
           state: alert
-          label: X リムーブ候補 日次 自動リトライ停止
-          meaning: 当日 2 回以上失敗したため cron の自動再実行を停止しました。本日のリムーブ候補レポートは未発行です。
-          action_required: run ログ確認 → 原因解消後に手動 dispatch（force_rerun=true）で再実行
+          label: 'X リムーブ候補'
+          meaning: '本日分を自動では作れませんでした（再試行の上限）。'
+          action_required: '次回 Claude Code で「X リムーブ候補を復旧して」とお伝えください'
+          detail: 'X リムーブ候補 日次 自動リトライ停止｜当日 2 回以上失敗したため cron の自動再実行を停止しました。本日のリムーブ候補レポートは未発行です。'
 
       - name: Discord 通知（guard 失敗）
         if: failure() || cancelled()
@@ -125,9 +126,10 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_SNS || secrets.DISCORD_WEBHOOK_URL }}
           state: failed
-          label: X リムーブ候補 日次 guard 失敗
-          meaning: 実行前チェック（当日重複判定）自体がエラーになり、生成ジョブが起動していません。
-          action_required: run ログ確認 → 手動 dispatch で再実行
+          label: 'X リムーブ候補'
+          meaning: '内部エラーで作成を開始できませんでした。'
+          action_required: '次回 Claude Code で「X リムーブ候補を復旧して」とお伝えください'
+          detail: 'X リムーブ候補 日次 guard 失敗｜実行前チェック（当日重複判定）自体がエラーになり、生成ジョブが起動していません。'
 
   generate:
     needs: guard
@@ -411,10 +413,11 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_SNS || secrets.DISCORD_WEBHOOK_URL }}
           state: partial
-          label: X リムーブ候補 日次 後処理のみ失敗
+          label: 'X リムーブ候補'
           date: ${{ steps.date.outputs.value }}
-          meaning: リムーブ候補レポートは Discord へ配信済みです。配信後の commit だけが失敗しました。
-          action_required: 不要（差分は次回 run が回収）
+          meaning: '配信は完了しています。保存処理だけ失敗しましたが内容に影響はありません。'
+          action_required: '不要'
+          detail: 'X リムーブ候補 日次 後処理のみ失敗｜リムーブ候補レポートは Discord へ配信済みです。配信後の commit だけが失敗しました。'
 
       - name: Discord 通知（❌ 失敗）
         if: (failure() || cancelled()) && steps.send.outcome != 'success'
@@ -422,10 +425,11 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_SNS || secrets.DISCORD_WEBHOOK_URL }}
           state: failed
-          label: X リムーブ候補 日次 失敗
+          label: 'X リムーブ候補'
           date: ${{ steps.date.outputs.value }}
-          meaning: 生成または送信が完了せず、本日のリムーブ候補レポートは未配信です。
-          action_required: run ログ確認 → 手動 dispatch（force_rerun=true）で再実行
+          meaning: '内部エラーで本日分を作れませんでした。'
+          action_required: '次回 Claude Code で「X リムーブ候補を復旧して」とお伝えください'
+          detail: 'X リムーブ候補 日次 失敗｜生成または送信が完了せず、本日のリムーブ候補レポートは未配信です。'
 
       - name: 成否サマリ（bool のみ）
         if: always()

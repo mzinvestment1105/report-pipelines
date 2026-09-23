@@ -92,9 +92,10 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_SNS || secrets.DISCORD_WEBHOOK_URL }}
           state: alert
-          label: D ラボレーンツイート 自動リトライ停止
-          meaning: 対象日に 3 回以上失敗したため自動再実行を停止しました。ツイート案は未生成です。
-          action_required: run ログ確認 → 原因解消後に手動 dispatch（force_rerun=true）で再実行
+          label: 'D-Labツイート'
+          meaning: '本日のツイート案を自動では作れませんでした（再試行の上限）。'
+          action_required: '次回 Claude Code で「D-Labツイートを復旧して」とお伝えください'
+          detail: 'D ラボレーンツイート 自動リトライ停止｜対象日に 3 回以上失敗したため自動再実行を停止しました。ツイート案は未生成です。'
 
       - name: Discord 通知（guard 失敗）
         if: failure() || cancelled()
@@ -102,9 +103,10 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_SNS || secrets.DISCORD_WEBHOOK_URL }}
           state: failed
-          label: D ラボレーンツイート guard 失敗
-          meaning: 実行前チェック自体がエラーになり、生成ジョブが起動していません。
-          action_required: run ログ確認 → 手動 dispatch で再実行
+          label: 'D-Labツイート'
+          meaning: '内部エラーで作成を開始できませんでした。'
+          action_required: '次回 Claude Code で「D-Labツイートを復旧して」とお伝えください'
+          detail: 'D ラボレーンツイート guard 失敗｜実行前チェック自体がエラーになり、生成ジョブが起動していません。'
 
   generate:
     needs: guard
@@ -441,10 +443,11 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_SNS || secrets.DISCORD_WEBHOOK_URL }}
           state: partial
-          label: D ラボレーンツイート 後処理のみ失敗
+          label: 'D-Labツイート'
           date: ${{ steps.date.outputs.value }}
-          meaning: ツイート案は Discord へ配信済みです。配信後の記録または commit だけが失敗しました。
-          action_required: 不要（差分は次回 run が回収。ただし同じ論点が翌日再選定される可能性あり）
+          meaning: '配信は完了しています。記録の保存だけ失敗したため、明日同じ話題が選ばれることがあります。'
+          action_required: '不要'
+          detail: 'D ラボレーンツイート 後処理のみ失敗｜ツイート案は Discord へ配信済みです。配信後の記録または commit だけが失敗しました。'
 
       - name: Discord 通知（❌ 失敗）
         if: (failure() || cancelled()) && steps.send.outcome != 'success'
@@ -452,7 +455,8 @@ jobs:
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_SNS || secrets.DISCORD_WEBHOOK_URL }}
           state: failed
-          label: D ラボレーンツイート 失敗
+          label: 'D-Labツイート'
           date: ${{ steps.date.outputs.value }}
-          meaning: 生成または送信が完了せず、本日の D ラボレーンツイート案は未配信です。
-          action_required: run ログ確認 → 手動 dispatch（force_rerun=true）で再実行
+          meaning: '内部エラーで本日のツイート案を作れませんでした。'
+          action_required: '次回 Claude Code で「D-Labツイートを復旧して」とお伝えください'
+          detail: 'D ラボレーンツイート 失敗｜生成または送信が完了せず、本日の D ラボレーンツイート案は未配信です。'
