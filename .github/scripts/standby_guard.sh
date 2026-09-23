@@ -35,6 +35,9 @@
 #   DISPATCH_OVERRIDES: "true" なら workflow_dispatch は配信済みでも実行する（朝刊系の既存仕様用）
 #   CAP_AWARE_RETRY   : "true" で枠切れ由来の失敗を retry_cap から除外する（2026-09-07 追加・既定 false）
 #   CAP_RETRY_LIMIT   : 枠切れ由来の失敗を許容する上限（既定 3）。これを超えたら cron を止める。
+#   REQUIRE_TRADINGDAY: "1" で対象日が日本市場の非営業日（土日・祝日・東証年末年始）なら
+#                       Discord 通知なしで proceed=false / reason=skip (market closed: ...) を返す
+#                       （2026-09-23 追加・既定 off。判定は is_tradingday.sh + jp_holidays.txt）。
 #
 # 【2026-09-07 追加・CAP_AWARE_RETRY の背景】
 #   従来の retry_cap は「当日 2 回失敗で cron の自動リトライ停止」だが、
@@ -81,6 +84,27 @@ if [ "$EVENT" = "workflow_dispatch" ] && [ "${FORCE_RERUN:-}" = "true" ]; then
   echo "proceed=true" >> "$GITHUB_OUTPUT"
   echo "reason=force_rerun (manual guard bypass)" >> "$GITHUB_OUTPUT"
   exit 0
+fi
+
+# ---------- 0) 営業日ガード（REQUIRE_TRADINGDAY=1 のときのみ・2026-09-23 追加） ----------
+# 既定は未設定（off）でこのブロックは丸ごと素通りするため、この env を渡さない workflow
+# （mover_weekly / sector_report_weekly_full 等、土日月に金曜分を出すレーン）の挙動は一切変わらない。
+# 休場日は予備タイマーの待機・通知より前に降りる（⏱/🚨 通知は reason に反応しないため鳴らない）。
+if [ "${REQUIRE_TRADINGDAY:-}" = "1" ]; then
+  TD_RC=0
+  TD_LINE=$(bash "$(dirname "$0")/is_tradingday.sh" "$TARGET_DATE") || TD_RC=$?
+  if [ "$TD_RC" -eq 1 ]; then
+    TD_REASON="${TD_LINE##*reason=}"
+    echo "skip 理由: 対象日 ${TARGET_DATE} は日本市場の休場日（${TD_REASON}）のため。Discord 通知は出しません。"
+    echo "::notice title=${WF_FILE} skipped::market closed (${TD_REASON}) - no report, no Discord notification"
+    echo "proceed=false" >> "$GITHUB_OUTPUT"
+    echo "reason=skip (market closed: ${TD_REASON})" >> "$GITHUB_OUTPUT"
+    exit 0
+  elif [ "$TD_RC" -ne 0 ]; then
+    echo "is_tradingday.sh failed (rc=${TD_RC}); 営業日判定を省いて通常の判定を続けます" >&2
+  else
+    echo "営業日判定: ${TD_LINE}"
+  fi
 fi
 
 # ---------- 1) 予備タイマー: 起床時刻まで待機 ----------

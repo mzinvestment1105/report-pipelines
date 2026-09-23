@@ -44,6 +44,24 @@ jobs:
           DOW_JST=$(TZ=Asia/Tokyo date +%u)   # 1=月 ... 7=日
           TODAY_JST=$(TZ=Asia/Tokyo date +%Y-%m-%d)
           YESTERDAY_JST=$(TZ=Asia/Tokyo date -d 'yesterday' +%Y-%m-%d)
+          echo "today_jst=${TODAY_JST}" >> $GITHUB_OUTPUT
+          echo "hour_jst=${HOUR_JST}" >> $GITHUB_OUTPUT
+
+          # 2026-09-23 追加: 日本市場レーン（screening / 動意日次 / PTS / テーマ）は、判定対象日が
+          # 非営業日（土日・祝日・東証年末年始＝jp_holidays.txt）なら点検対象から外す（誤 🚨 防止）。
+          # マクロ朝刊・夕刊は祝日も発行するため従来どおり点検する。判定スクリプトが異常終了した
+          # 場合（rc=2）は営業日扱い＝従来どおり点検する（見張りを緩めない側に倒す）。
+          jp_open() { bash .github/scripts/is_tradingday.sh "$1" >/dev/null; [ $? -ne 1 ]; }
+
+          # 2026-09-23 追加: 朝の点検は 07:00 JST 以降のみ。夕方 cron が深夜まで遅延着火した場合や
+          # 深夜の手動実行が「朝スコープ」に入り、06:23 発行前のマクロ朝刊を未発行と誤検知するのを防ぐ。
+          if [ $((10#$HOUR_JST)) -lt 7 ]; then
+            echo "scope=none" >> $GITHUB_OUTPUT
+            echo "workflows=" >> $GITHUB_OUTPUT
+            echo "label=点検なし（07:00 JST 前）" >> $GITHUB_OUTPUT
+            echo "::notice title=daily_healthcheck skipped::${HOUR_JST}h JST is before 07:00 - morning check not run"
+            exit 0
+          fi
           if [ "$HOUR_JST" -lt 12 ]; then
             # 朝スコープ: 当日朝刊 + 前日夕方 ETL 2 本（前日日付で判定）
             # position_check は PM 2026-07-09 でレーン抹消のため監視対象外
@@ -55,8 +73,15 @@ jobs:
             fi
             echo "scope=morning" >> $GITHUB_OUTPUT
             # pts_mover_report は平日 21:00 JST 発火のため前日日付で判定（月曜朝は前週金曜分＝SM_DATE と同ロジック）
-            echo "workflows=macro_report_daily.yml=${TODAY_JST}=generate,screening_master.yml=${SM_DATE}=update,financial_history.yml=${YESTERDAY_JST}=update,price_history.yml=${YESTERDAY_JST}=update,pts_mover_report.yml=${SM_DATE}=build-and-send" >> $GITHUB_OUTPUT
-            echo "label=朝刊 + 前日 ETL 3 本 + 前夜PTS" >> $GITHUB_OUTPUT
+            WFS="macro_report_daily.yml=${TODAY_JST}=generate,financial_history.yml=${YESTERDAY_JST}=update,price_history.yml=${YESTERDAY_JST}=update"
+            if jp_open "$SM_DATE"; then
+              WFS="${WFS},screening_master.yml=${SM_DATE}=update,pts_mover_report.yml=${SM_DATE}=build-and-send"
+              echo "label=朝刊 + 前日 ETL 3 本 + 前夜PTS" >> $GITHUB_OUTPUT
+            else
+              echo "::notice title=daily_healthcheck::${SM_DATE} is a market holiday - screening_master / pts_mover_report not checked"
+              echo "label=朝刊 + 前日 ETL 2 本（${SM_DATE} は休場のため screening/PTS は点検対象外）" >> $GITHUB_OUTPUT
+            fi
+            echo "workflows=${WFS}" >> $GITHUB_OUTPUT
           elif [ "$DOW_JST" -eq 5 ] && [ "$HOUR_JST" -ge 22 ]; then
             # 金曜夜スコープ: 金曜 21:00 JST 発火の週次 3 本を同日（金曜）日付で判定
             echo "scope=friday_weekly" >> $GITHUB_OUTPUT
@@ -66,14 +91,20 @@ jobs:
             # 夕方スコープ: 夕方 3 レポート（当日 12:00 JST 以降で判定）
             # sector_report_daily（PM 2026-07-08）・position_check（PM 2026-07-09）はレーン抹消のため監視対象外
             echo "scope=evening" >> $GITHUB_OUTPUT
-            echo "workflows=mover_report_daily.yml=${TODAY_JST}=merge-and-send,macro_report_evening.yml=${TODAY_JST}=generate,theme_report_daily.yml=${TODAY_JST}=generate" >> $GITHUB_OUTPUT
-            echo "label=夕方 3 本" >> $GITHUB_OUTPUT
+            if jp_open "$TODAY_JST"; then
+              echo "workflows=mover_report_daily.yml=${TODAY_JST}=merge-and-send,macro_report_evening.yml=${TODAY_JST}=generate,theme_report_daily.yml=${TODAY_JST}=generate" >> $GITHUB_OUTPUT
+              echo "label=夕方 3 本" >> $GITHUB_OUTPUT
+            else
+              echo "::notice title=daily_healthcheck::${TODAY_JST} is a market holiday - mover_report_daily / theme_report_daily not checked"
+              echo "workflows=macro_report_evening.yml=${TODAY_JST}=generate" >> $GITHUB_OUTPUT
+              echo "label=夕刊のみ（${TODAY_JST} は休場のため動意・テーマは点検対象外）" >> $GITHUB_OUTPUT
+            fi
           fi
-          echo "today_jst=${TODAY_JST}" >> $GITHUB_OUTPUT
-          echo "hour_jst=${HOUR_JST}" >> $GITHUB_OUTPUT
 
       - name: Check today's report success
         id: check
+        # 2026-09-23: 07:00 JST 前（scope=none）は点検しない（🚨 も heartbeat も出さない）。
+        if: steps.scope.outputs.scope != 'none'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |

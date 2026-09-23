@@ -48,6 +48,23 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # 2026-09-23: 祝日・休場ガード（Cloudflare Worker と同じ判定・cron フォールバックにも効かせる）。
+          # 対象日（target_date 指定時はその日・空なら JST 当日）が非営業日なら Discord 通知なしで静かに skip。
+          # 後続の 🚨 通知は reason に 'retry_cap' を含む時のみ発火するため、この reason では鳴らない。
+          CHECK_DATE="${{ github.event.inputs.target_date }}"
+          if TD_LINE=$(bash .github/scripts/is_tradingday.sh ${CHECK_DATE}); then
+            echo "${TD_LINE}"
+          else
+            TD_RC=$?
+            if [ "$TD_RC" -eq 1 ]; then
+              TD_REASON="${TD_LINE##*reason=}"
+              echo "proceed=false" >> $GITHUB_OUTPUT
+              echo "reason=skip (market closed: ${TD_REASON})" >> $GITHUB_OUTPUT
+              echo "::notice title=theme_report_daily skipped::market closed (${TD_REASON}) - no collection, no Discord notification"
+              exit 0
+            fi
+            echo "is_tradingday.sh failed (rc=${TD_RC}); continuing with the normal guard" >&2
+          fi
           TODAY_JST=$(TZ=Asia/Tokyo date +%Y-%m-%d)
           MY_RUN_ID=${{ github.run_id }}
           EVENT="${{ github.event_name }}"

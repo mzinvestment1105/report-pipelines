@@ -68,6 +68,11 @@ jobs:
           # 枠が戻ってからの自動復旧経路を自分で塞ぐ（実測: run 33875929742 が retry_cap で skip）。
           CAP_AWARE_RETRY: 'true'
           CAP_RETRY_LIMIT: '3'
+          # 2026-09-23 追加: 祝日・休場ガード（Cloudflare Worker と同じ判定を cron 予備経路にも効かせる）。
+          # 対象日が非営業日なら standby_guard.sh が待機前に proceed=false / reason=skip (market closed: ...) で降りる。
+          # ⏱ 予備タイマー・🚨 各通知はこの reason では発火しない（record-skip は Private の skip_log へ 1 行残すのみ）。
+          # standby_guard.sh 側は既定 off のため、mover_weekly / sector_report_weekly_full は無影響。
+          REQUIRE_TRADINGDAY: '1'
         run: bash .github/scripts/standby_guard.sh
 
       # 2026-08-19: 予備タイマー通知の文面へ実測値を埋めるためだけの補助ステップ。

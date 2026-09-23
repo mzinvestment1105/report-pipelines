@@ -19,15 +19,47 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
-      proceed: ${{ steps.check.outputs.proceed }}
-      reason: ${{ steps.check.outputs.reason }}
+      # 2026-09-23: 休場日は check を走らせず tradingday 側の proceed=false / reason を返す。
+      proceed: ${{ steps.check.outputs.proceed || steps.tradingday.outputs.proceed }}
+      reason: ${{ steps.check.outputs.reason || steps.tradingday.outputs.reason }}
     steps:
       # 通知 composite action（.github/actions/notify-discord）を使うため checkout が必要
       - name: Checkout report-pipelines (通知 action 用)
         uses: actions/checkout@v4
 
+      # 2026-09-23: 祝日・休場ガード（Cloudflare Worker と同じ判定）。cron フォールバック（17:15 JST）が
+      # 祝日にも ETL を回して ✅ を送る問題への対処。非営業日は以降の step / update ジョブを全て止め、
+      # Discord 通知なしで静かに skip する（::notice のみ）。
+      # workflow_dispatch は対象外: Worker の発火は Worker 側で祝日ブロック済みで、本 workflow には
+      # force_rerun 等の入力が無いため、PM の手動再実行（例: 金曜失敗分の土曜リカバリ）を塞がない。
+      - name: 営業日判定（祝日・休場ガード）
+        id: tradingday
+        run: |
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "open=true" >> $GITHUB_OUTPUT
+            echo "event=${{ github.event_name }}: 休場判定は Worker 側で実施済みのため通す"
+            exit 0
+          fi
+          if TD_LINE=$(bash .github/scripts/is_tradingday.sh); then
+            echo "${TD_LINE}"
+            echo "open=true" >> $GITHUB_OUTPUT
+          else
+            TD_RC=$?
+            if [ "$TD_RC" -eq 1 ]; then
+              TD_REASON="${TD_LINE##*reason=}"
+              echo "open=false" >> $GITHUB_OUTPUT
+              echo "proceed=false" >> $GITHUB_OUTPUT
+              echo "reason=skip (market closed: ${TD_REASON})" >> $GITHUB_OUTPUT
+              echo "::notice title=screening_master skipped::market closed (${TD_REASON}) - no ETL, no Discord notification"
+            else
+              echo "is_tradingday.sh failed (rc=${TD_RC}); continuing with the normal guard" >&2
+              echo "open=true" >> $GITHUB_OUTPUT
+            fi
+          fi
+
       - name: Check today's runs
         id: check
+        if: steps.tradingday.outputs.open == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
