@@ -50,6 +50,7 @@ from dotenv import load_dotenv
 from jq_client_utils import normalize_code_4
 from make_mover_report import (
     build_supply_block,
+    fetch_concrete_description,
     fetch_ohlc_history,
     fetch_tdnet_batch,
     fetch_yahoo_batch,
@@ -739,14 +740,19 @@ def main() -> None:
         # 当夜部は候補リスト（最大15件・主導銘柄ごとに材料テキスト付き）。
         # テーマ名の付け直し・共通材料の判定・行の絞り込みは Claude が行う（_cr §38）。
         # PTS は当夜騰落率で並ぶため pct_key を pts_pct にする。
-        # 「何の会社」欄の素材。出典は EDINET DB の事業概要（yahoo_data の description）。
+        # 「何の会社」欄の素材。出典は EDINET DB の事業概要／法人プロフィール、業種名だけの銘柄は
+        # 株探「概要」→ Yahoo「特色」（yahoo_data の description・make_mover_report.fetch_company_description）。
         _desc_today = lambda code: (
             (yahoo_data.get(normalize_code_4(code), {}) or {}).get("description", "")
         )
-        # フォールバック連鎖つき lookup（当夜 → 直近10営業日の昼蓄積 → 業種名）。
+        # フォールバック連鎖つき lookup（当夜 → 直近10営業日の昼蓄積 → 株探「概要」→ Yahoo「特色」 → 業種名）。
+        # --fast は重い取得を省くモードのため株探・Yahoo 特色も呼ばない。
         # 夜間 PTS は昼の蓄積 parquet を読むだけで、当夜分の書き込みはしない
         # （昼の動意レポートが同日分を既に保存しているため上書きしない）。
-        _desc = build_desc_lookup(primary=_desc_today, trade_date=str(target))
+        _desc = build_desc_lookup(
+            primary=_desc_today, trade_date=str(target),
+            fallback=None if args.fast else fetch_concrete_description,
+        )
         _material = build_material_lookup(primary=_material_today, trade_date=str(target))
         # 当夜部は母集団全銘柄の1行表（2026-09-02 PM 承認の改修1・2＝材料起点への転換）。
         # 昼の動意レポートと同じ手順に揃える（辞書タグ起点の候補15件を廃止し、

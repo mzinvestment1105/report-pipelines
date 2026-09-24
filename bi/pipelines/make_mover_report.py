@@ -261,6 +261,48 @@ def fetch_daily_all(client, target_date: date) -> pd.DataFrame:
     return df
 
 
+def supplement_master_with_eq_master(
+    client, master_df: pd.DataFrame, as_of: date
+) -> tuple[pd.DataFrame, set[str]]:
+    """screening_master 未登録の 3 市場銘柄を JQuants /equities/master で補完する。
+
+    返り値: (補完後の master_df, 3 市場外（ETF・REIT・TOKYO PRO MARKET 等）のコード集合)。
+    取得に失敗した場合は master_df をそのまま返し、従来の推定（末尾 A=グロース）で続行する。
+    """
+    universe = {MARKET_PRIME, MARKET_STANDARD, MARKET_GROWTH}
+    try:
+        rows = fetch_paginated_v2(
+            client, "/equities/master",
+            params={"date": as_of.strftime("%Y-%m-%d")}, sleep_seconds=1.0,
+        )
+    except Exception as e:  # noqa: BLE001 — 補完は付加処理。失敗しても生成は止めない
+        print(f"[WARN] /equities/master 取得失敗・未登録銘柄は従来の推定で続行: {e}")
+        return master_df, set()
+    eq = pd.DataFrame(rows)
+    if eq.empty or not {"Code", "MktNm"}.issubset(eq.columns):
+        print(f"[WARN] /equities/master が空または列不足（{list(eq.columns)}）・従来の推定で続行")
+        return master_df, set()
+    eq["Code"] = eq["Code"].map(normalize_code_4).astype(str)
+    eq = eq.drop_duplicates("Code", keep="last")
+    in_universe = eq["MktNm"].isin(universe)
+    non_universe = set(eq.loc[~in_universe, "Code"])
+    known = set(master_df["Code"].astype(str))
+    add = eq[in_universe & ~eq["Code"].isin(known)].rename(columns={
+        "CoName": "CompanyName", "MktNm": "MarketCodeName", "S17Nm": "Sector17CodeName",
+    })
+    add = add[[c for c in ("Code", "CompanyName", "MarketCodeName", "Sector17CodeName")
+               if c in add.columns]]
+    if not add.empty:
+        master_df = pd.concat([master_df, add], ignore_index=True)
+        print(
+            f"  /equities/master 補完: 未登録 {len(add)} 銘柄を追加 "
+            + ", ".join(f"{c} {n}({m})" for c, n, m in zip(
+                add["Code"], add.get("CompanyName", add["Code"]), add["MarketCodeName"]))
+        )
+    print(f"  /equities/master: 3市場外 {len(non_universe)} コードを価格表から除外（ETF/REIT 等）")
+    return master_df, non_universe
+
+
 def fetch_ohlc_history(
     client,
     target_codes: set[str],
@@ -686,6 +728,11 @@ def build_full_table(
             # 銘柄名に ETF/REIT 系キーワード
             | company_name_str.str.contains(etf_reit_keywords_full, na=False, regex=True)
         )
+        # 銘柄マスター（3 市場の個別株のみ）に載っている銘柄は ETF/REIT ではない。
+        # 名前のキーワード判定は未登録コードだけに当てる（「リート」がアクリート・
+        # 旭コンクリート工業・日本コンクリート工業に、「インバース」がリファインバース
+        # グループに一致し、個別株 4 銘柄が常に除外されていた・2026-09-24 実測）。
+        is_etf_reit = is_etf_reit & ~df["Code"].isin(set(meta["Code"]))
         excluded_count = int(is_etf_reit.sum())
         if excluded_count:
             print(
@@ -1216,7 +1263,8 @@ def fetch_yahoo_batch(codes: list[str]) -> dict[str, dict]:
     for i, code in enumerate(codes, 1):
         code4 = normalize_code_4(code)
         print(f"  news/bbs [{i}/{total}] {code4}")
-        description = fetch_company_description(edinet_client, code4) if edinet_client else ""
+        # EDINET クライアントが無い場合も株探「概要」までは試す（fetch_company_description 内で分岐）
+        description = fetch_company_description(edinet_client, code4)
         result[code4] = {
             # GHA の IP からは 403 のため Yahoo へ一本化。2026-08-19 実測（fetch_minkabu_news は復帰用に残置）。
             "news":        fetch_yahoo_news(code4),
@@ -1224,44 +1272,250 @@ def fetch_yahoo_batch(codes: list[str]) -> dict[str, dict]:
             "description": description,
         }
         time.sleep(REQUEST_SLEEP)
+    for _label, _st in (("株探 概要", kabutan_gaiyo_stats()), ("Yahoo 特色", yahoo_profile_stats())):
+        if _st["requests"] or _st["blocked"]:
+            print(
+                f"  {_label}: 対象{_st['codes']}銘柄・HTTP要求{_st['requests']}回・取得{_st['hits']}件"
+                + ("・途中で遮断を検知し以降停止" if _st["blocked"] else "")
+            )
     return result
 
 
-def fetch_company_description(client: EdinetDBClient, code4: str) -> str:
-    """EDINET DB API から事業内容を取得する。
+# ---------------------------------------------------------------------------
+# 株探「概要」（「何の会社」の具体化・2026-09-23 PM 承認）
+# ---------------------------------------------------------------------------
+# EDINET DB の事業概要・法人プロフィールが取れず業種名（「情報・通信業」等）だけ、または空に
+# なる銘柄が 9/18 の蓄積実測で 231 銘柄中 155（業種名のみ 53・空 102）あった。株探の銘柄
+# ページには「概要」行（例: 4075「AI組込ソフトの開発・提供。…」）があるため、業種名へ落とす
+# 直前にここを挟む。取れなければ None を返し、従来のフォールバックへそのまま戻る（fail-open）。
+# 株探は GHA のクラウド IP から 403/405（WAF 拒否）が返る実績がある（make_pts_mover_report・
+# fetch_theme_momentum）。遮断を検知したら以降の呼び出しを止め、リトライで raw 生成を伸ばさない。
+_KABUTAN_STOCK_URL = "https://kabutan.jp/stock/?code={code}"
+_KABUTAN_GAIYO_TIMEOUT = 10          # 1リクエストのタイムアウト（秒）
+_KABUTAN_GAIYO_RETRIES = 2           # 初回に加えて最大2回リトライ
+_KABUTAN_GAIYO_BACKOFF = 1.0         # リトライ待機の基準秒（1秒→2秒）
+_KABUTAN_GAIYO_MIN_INTERVAL = 0.5    # 株探へのリクエスト間隔の下限（秒）
+_KABUTAN_GAIYO_BLOCK_STATUS = {403, 405}  # リトライ後もこれなら遮断とみなし以降停止
+_KABUTAN_GAIYO_MAX_CONSEC_FAIL = 3   # 429/5xx/通信例外が銘柄をまたいで連続したら以降停止
+_KABUTAN_GAIYO_HEADERS = {
+    # br（brotli）は復号ライブラリ依存のため要求しない
+    "User-Agent": _BROWSER_HEADERS["User-Agent"],
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+    "Referer": "https://kabutan.jp/",
+}
+# Yahoo!ファイナンス 企業情報ページ「特色」（2026-09-24 追加）。株探が GHA から拒否される日でも、
+# 同じ runner から Yahoo のニュース・掲示板は取得できている（raw に Yahoo ニュースが載る）ため、
+# 株探の次の具体的な事業説明の取得元として挟む。
+_YAHOO_PROFILE_URL = "https://finance.yahoo.co.jp/quote/{code}.T/profile"
+_YAHOO_PROFILE_HEADERS = dict(_KABUTAN_GAIYO_HEADERS, Referer="https://finance.yahoo.co.jp/")
+
+
+def _new_desc_source(name: str, headers: dict) -> dict:
+    """事業説明ページ取得元ごとの実行中状態（辞書キャッシュ・遮断フラグ・統計）。ディスクには書かない。"""
+    return {"name": name, "headers": headers, "cache": {}, "session": None,
+            "last": 0.0, "blocked": False, "consec_fail": 0, "requests": 0, "hits": 0}
+
+
+_KABUTAN_SRC = _new_desc_source("株探 概要", _KABUTAN_GAIYO_HEADERS)
+_YAHOO_PROFILE_SRC = _new_desc_source("Yahoo 特色", _YAHOO_PROFILE_HEADERS)
+
+
+def _kabutan_retryable(status: int) -> bool:
+    return status in (403, 405, 429) or 500 <= status <= 599
+
+
+def _fetch_desc_page(src: dict, code, url_tmpl: str, parse) -> str | None:
+    """事業説明ページを取得して parse(html) の結果を返す共通処理（取れなければ None・例外は外へ出さない）。
+
+    ブラウザ相当 UA・タイムアウト10秒。403/405/429/5xx は短い待機（1秒→2秒）で最大2回リトライ。
+    同じ取得元への連続アクセスは 0.5 秒以上空ける。結果は実行中の辞書にだけキャッシュする。
+    リトライ後も 403/405 なら、または 429/5xx/通信例外が銘柄をまたいで3回連続したら、
+    その取得元への以降の呼び出しを止める（遮断中のリトライで raw 生成を伸ばさない）。
+    """
+    c = normalize_code_4(code)
+    if not c:
+        return None
+    cache = src["cache"]
+    if c in cache:
+        return cache[c]
+    if src["blocked"]:
+        return None
+    result: str | None = None
+    final_status: int | None = None
+    try:
+        if src["session"] is None:
+            src["session"] = requests.Session()
+            src["session"].headers.update(src["headers"])
+        url = url_tmpl.format(code=c)
+        for attempt in range(1 + _KABUTAN_GAIYO_RETRIES):
+            if attempt:
+                time.sleep(_KABUTAN_GAIYO_BACKOFF * (2 ** (attempt - 1)))
+            wait = _KABUTAN_GAIYO_MIN_INTERVAL - (time.monotonic() - src["last"])
+            if wait > 0:
+                time.sleep(wait)
+            src["requests"] += 1
+            try:
+                r = src["session"].get(url, timeout=_KABUTAN_GAIYO_TIMEOUT)
+            except requests.RequestException:
+                final_status = None
+                continue
+            finally:
+                src["last"] = time.monotonic()
+            final_status = r.status_code
+            if r.status_code == 200:
+                if not r.encoding or r.encoding.lower() == "iso-8859-1":
+                    r.encoding = "utf-8"
+                result = parse(r.text)
+                break
+            if not _kabutan_retryable(r.status_code):
+                break  # 404 等はリトライしても変わらない
+    except Exception as e:
+        print(f"  [WARN] {c} {src['name']}の取得に失敗: {e}")
+        result = None
+    if final_status is not None and not _kabutan_retryable(final_status):
+        src["consec_fail"] = 0  # 200・404 等＝相手には届いている
+    elif final_status in _KABUTAN_GAIYO_BLOCK_STATUS:
+        src["blocked"] = True
+        print(f"  [WARN] {src['name']}: HTTP {final_status} のため以降のアクセスを停止（事業欄は次のフォールバックへ）")
+    else:
+        src["consec_fail"] += 1
+        if src["consec_fail"] >= _KABUTAN_GAIYO_MAX_CONSEC_FAIL:
+            src["blocked"] = True
+            print(f"  [WARN] {src['name']}: 失敗が{src['consec_fail']}銘柄連続したため以降のアクセスを停止")
+    if result:
+        src["hits"] += 1
+    cache[c] = result
+    return result
+
+
+def _src_stats(src: dict) -> dict:
+    return {"codes": len(src["cache"]), "requests": src["requests"],
+            "hits": src["hits"], "blocked": src["blocked"]}
+
+
+def parse_kabutan_gaiyo(html: str) -> str | None:
+    """株探の銘柄ページ HTML から「概要」行（th=概要 の隣の td）の本文を返す。"""
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(html or "", "html.parser")
+    for th in soup.find_all("th"):
+        if th.get_text(strip=True) != "概要":
+            continue
+        td = th.find_next_sibling("td")
+        if td is None:
+            continue
+        text = re.sub(r"\s+", " ", td.get_text(" ", strip=True)).strip()
+        if text:
+            return text
+    return None
+
+
+def fetch_kabutan_gaiyo(code) -> str | None:
+    """株探の銘柄ページ「概要」行を返す（取れなければ None）。仕様は _fetch_desc_page。"""
+    return _fetch_desc_page(_KABUTAN_SRC, code, _KABUTAN_STOCK_URL, parse_kabutan_gaiyo)
+
+
+def kabutan_gaiyo_stats() -> dict:
+    """株探「概要」取得の実行中統計（対象銘柄数・HTTP 要求回数・取得件数・遮断有無）。"""
+    return _src_stats(_KABUTAN_SRC)
+
+
+# RSC ペイロード内の {"title":"特色","text":"..."}（HTML 側の構造が変わった時の予備）
+_YAHOO_TOKUSHOKU_RE = re.compile(r'\\?"title\\?":\\?"特色\\?",\\?"text\\?":\\?"((?:[^"\\]|\\.)*?)\\?"')
+
+
+def _clean_yahoo_tokushoku(text: str) -> str:
+    import unicodedata
+    t = unicodedata.normalize("NFKC", str(text or ""))
+    t = re.sub(r"^\s*【特色】", "", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def parse_yahoo_tokushoku(html: str) -> str | None:
+    """Yahoo!ファイナンス企業情報ページ HTML から「特色」の本文を返す（全角英数は NFKC で半角化）。"""
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(html or "", "html.parser")
+    for h in soup.find_all(["h2", "h3", "th", "dt"]):
+        if h.get_text(strip=True) != "特色":
+            continue
+        body = h.find_next_sibling(["p", "td", "dd", "div"])
+        if body is None:
+            continue
+        text = _clean_yahoo_tokushoku(body.get_text(" ", strip=True))
+        if text:
+            return text
+    m = _YAHOO_TOKUSHOKU_RE.search(html or "")
+    if m:
+        raw = m.group(1).replace("\\\\n", " ").replace("\\n", " ").replace('\\"', '"').replace("\\", "")
+        text = _clean_yahoo_tokushoku(raw)
+        if text:
+            return text
+    return None
+
+
+def fetch_yahoo_profile(code) -> str | None:
+    """Yahoo!ファイナンス企業情報ページの「特色」を返す（取れなければ None）。仕様は _fetch_desc_page。"""
+    return _fetch_desc_page(_YAHOO_PROFILE_SRC, code, _YAHOO_PROFILE_URL, parse_yahoo_tokushoku)
+
+
+def yahoo_profile_stats() -> dict:
+    """Yahoo「特色」取得の実行中統計。"""
+    return _src_stats(_YAHOO_PROFILE_SRC)
+
+
+def fetch_concrete_description(code) -> str | None:
+    """業種名しか無い銘柄向けの具体的な事業説明（株探「概要」→ Yahoo「特色」の順）。"""
+    return fetch_kabutan_gaiyo(code) or fetch_yahoo_profile(code)
+
+
+def _same_as_industry(text: str, industry: str) -> bool:
+    """事業概要の文字列が業種名そのもの（＝具体的な事業内容ではない）かを判定する。"""
+    t = re.sub(r"\s+", "", str(text or "")).replace("･", "・")
+    i = re.sub(r"\s+", "", str(industry or "")).replace("･", "・")
+    return bool(t) and bool(i) and t == i
+
+
+def fetch_company_description(client: EdinetDBClient | None, code4: str) -> str:
+    """銘柄の事業内容（「何の会社」の素材）を一次情報から取得する。
 
     取得順（いずれも一次情報。取れなければ空文字を返し、推測で埋めない）:
       1. get_company の事業概要フィールド（現状ほぼ空）
       2. get_corporate_profile の `business_summary`
-         （国税庁法人番号サイト + gBizINFO 由来の事業概要1〜2文。2026-08-31 追加。
-          テーマ表「何の会社」欄がここで埋まる主経路）
-      3. 業種名のみ（1・2 とも取れない場合の最後の手段）
+         （国税庁法人番号サイト + gBizINFO 由来の事業概要1〜2文。2026-08-31 追加）
+      3. 株探の銘柄ページ「概要」行（1・2 が取れない／業種名と同じ場合。2026-09-23 追加）
+      4. Yahoo!ファイナンス企業情報ページ「特色」（3 も取れない場合。2026-09-24 追加。
+         株探は GHA の IP から拒否されることがあり、その日は 4 が主経路になる）
+      5. 業種名のみ（1〜4 とも取れない場合の最後の手段）
     """
+    industry = ""
     try:
-        edinet_code = client.code_to_edinet(code4)
-        if not edinet_code:
-            return ""
-        data = client.get_company(edinet_code)
-        # get_company のレスポンスから事業概要を抽出（フィールド名候補を順に試す）
-        for key in ["businessDescription", "businessSummary", "businessOverview", "description"]:
-            v = data.get(key, "")
-            if v:
-                return str(v)[:300]
-        # 法人番号があれば法人プロフィールの business_summary を試す
-        corp_no = str(data.get("corporateNumber") or "").strip()
-        if corp_no:
-            try:
-                prof = client.get_corporate_profile(corp_no)
-                summary = str(prof.get("business_summary") or "").strip()
-                if summary:
-                    return summary[:300]
-            except Exception:
-                pass
-        # フォールバック: 業種名のみ返す
-        industry = data.get("industryName") or data.get("industry", "")
-        return str(industry) if industry else ""
+        edinet_code = client.code_to_edinet(code4) if client is not None else None
+        if edinet_code:
+            data = client.get_company(edinet_code) or {}
+            industry = str(data.get("industryName") or data.get("industry", "") or "").strip()
+            # get_company のレスポンスから事業概要を抽出（フィールド名候補を順に試す）
+            for key in ["businessDescription", "businessSummary", "businessOverview", "description"]:
+                v = str(data.get(key, "") or "").strip()
+                if v and not _same_as_industry(v, industry):
+                    return v[:300]
+            # 法人番号があれば法人プロフィールの business_summary を試す
+            corp_no = str(data.get("corporateNumber") or "").strip()
+            if corp_no:
+                try:
+                    prof = client.get_corporate_profile(corp_no)
+                    summary = str(prof.get("business_summary") or "").strip()
+                    if summary and not _same_as_industry(summary, industry):
+                        return summary[:300]
+                except Exception:
+                    pass
     except Exception:
-        return ""
+        pass
+    # 業種名だけ（または空）になる銘柄に限り株探「概要」→ Yahoo「特色」を挟む（取れなければ従来どおり）
+    concrete = fetch_concrete_description(code4)
+    if concrete:
+        return concrete[:300]
+    # フォールバック: 業種名のみ返す
+    return industry
 
 
 # ---------------------------------------------------------------------------
@@ -1976,7 +2230,7 @@ def build_weekly_roster_section(friday: date) -> list[str]:
     return render_week_roster(
         records,
         material_lookup=build_week_material_lookup(week_dates),
-        desc_lookup=build_week_desc_lookup(week_dates),
+        desc_lookup=build_week_desc_lookup(week_dates, fallback=fetch_concrete_description),
         week_label=label,
     )
 
@@ -2132,8 +2386,9 @@ def build_report(
                 _radar_codes_today.add(_ec)
         except Exception as _e:
             print(f"  [WARN] roster母集団拡張: {_e}")
-        # 「何の会社」欄の素材。出典は EDINET DB の事業概要（fetch_company_description が
-        # yahoo_data[code]["description"] へ格納済み）であり、新規取得も推測もしない。
+        # 「何の会社」欄の素材。出典は EDINET DB の事業概要／法人プロフィール、それが業種名だけの
+        # 銘柄は株探「概要」→ Yahoo「特色」（いずれも fetch_company_description が yahoo_data[code]["description"]
+        # へ格納済み）であり、推測はしない。
         _desc_today = lambda code: (
             (yahoo_data.get(normalize_code_4(code), {}) or {}).get("description", "")
         )
@@ -2159,8 +2414,10 @@ def build_report(
             print(f"銘柄コンテキスト蓄積: {_ctx_path}")
         except Exception as _e:
             print(f"  [WARN] append_stock_context: {_e}")
-        # フォールバック連鎖つき lookup（当日 → 直近10営業日の蓄積 → 業種名）。
-        _desc = build_desc_lookup(primary=_desc_today, trade_date=str(today))
+        # フォールバック連鎖つき lookup（当日 → 直近10営業日の蓄積 → 株探「概要」→ Yahoo「特色」 → 業種名）。
+        _desc = build_desc_lookup(
+            primary=_desc_today, trade_date=str(today), fallback=fetch_concrete_description,
+        )
         _material = build_material_lookup(primary=_material_today, trade_date=str(today))
         # 当日部は母集団全銘柄の1行表（2026-09-02 PM 承認の改修1・2＝材料起点への転換）。
         # 旧 render_today_candidates は「みんかぶ辞書タグ単位の候補15件」であり、
@@ -2527,6 +2784,15 @@ def main() -> None:
     master_df = pd.read_parquet(SCREENING_MASTER_PATH)
     master_df["Code"] = master_df["Code"].astype(str).str[:4]
     print(f"screening_master: {len(master_df)} 銘柄")
+
+    # 2026-09-24: screening_master 未登録コード（直近 IPO・ETF）を JQuants の上場銘柄一覧で補完し、
+    # 3 市場外（ETF/REIT 等）を価格表から除く。末尾 A を一律グロースと推定していたため、
+    # ETF（200A）がグロース売買代金 Top10 に混入して誌面側で除外され 9 件になり、
+    # スタンダード上場の 627A がグロースに載った。
+    master_df, non_universe_codes = supplement_master_with_eq_master(client, master_df, today_dt)
+    if non_universe_codes:
+        today_df = today_df[~today_df["Code"].isin(non_universe_codes)].copy()
+        prev_df = prev_df[~prev_df["Code"].isin(non_universe_codes)].copy()
 
     # --- 全銘柄テーブル ---
     print("リターン計算中...")

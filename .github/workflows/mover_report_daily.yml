@@ -19,6 +19,8 @@ name: 動意銘柄レポート日次
     - cron: '45 8 * * 1-5'
 
 # 2026-09-21 確定: 市場別 3 レッグ（growth / standard / prime）構成。
+# 2026-09-24 改定: テーマ欄を独立生成枠 themes へ分離し 4 レッグ（themes / growth / standard / prime）。
+#   結合順はテーマ欄 → グロース → スタンダード → プライム、OWN_THEMES_JSON は最終行。
 # setup-raw ジョブが raw データ生成 + artifact upload。
 # generate-market ジョブが市場ごとに独立 invocation で 1 市場ずつ生成する
 #   （出力上限 32,000 トークンを市場ごとに丸ごと使えるようにするため。2026-09-16 に
@@ -345,7 +347,9 @@ jobs:
         # 市場別レッグに分けることで各市場が 32,000 の枠を丸ごと使える（1 実行 3 市場だと 1 枠を分け合う）。
         # 2026-09-21 復帰: 2026-09-16 に 3 試行すべてが出力上限到達で落ち全社未配信となった事故を受けて。
         # 並び順はグロース→スタンダード→プライム（merge-and-send の結合順が制御）。
-        market: [growth, standard, prime]
+        # 2026-09-24: テーマ欄（本日/今週のテーマ等）を独立生成枠 themes へ分離。テーマ理由文の
+        # 3 部構成化（250〜400 字）で旧担当レッグの出力が 32,000 上限へ近づくのを避けるため。
+        market: [themes, growth, standard, prime]
     steps:
       - name: Checkout report-pipelines
         uses: actions/checkout@v4
@@ -424,6 +428,7 @@ jobs:
               awk '/^## スタンダード/{f=1} /^## グロース/{f=0} f' "$SRC" >> "$DST"
               ;;
             *)
+              # themes（テーマ欄は全市場の銘柄を束ねるため）と prime は全 raw
               cp "$SRC" "$DST"
               ;;
           esac
@@ -556,7 +561,7 @@ jobs:
           state: failed
           label: '動意レポート'
           date: ${{ needs.setup-raw.outputs.target_date }}
-          meaning: '${{ matrix.market == ''growth'' && ''グロース'' || matrix.market == ''standard'' && ''スタンダード'' || ''プライム'' }}の部分を作れませんでした。他の市場の部分だけで配信を試みます。'
+          meaning: '${{ matrix.market == ''themes'' && ''テーマ欄'' || matrix.market == ''growth'' && ''グロース'' || matrix.market == ''standard'' && ''スタンダード'' || ''プライム'' }}の部分を作れませんでした。残りの部分だけで配信を試みます。'
           action_required: '不要'
           detail: '動意銘柄レポート 失敗（${{ matrix.market }} 市場の生成）｜${{ matrix.market }} 市場セクションの生成が失敗し、統合レポートが組めないため本日未配信です。'
 
@@ -676,27 +681,46 @@ jobs:
           # send_report_pdf_discord.py はファイル全体をそのまま 1 本の PDF にする。
           FOUND=""
           MISSING=""
-          for m in growth standard prime; do
+          # 2026-09-24: テーマ欄を独立生成枠（themes レッグ）へ分離。結合順はテーマ欄 → グロース →
+          # スタンダード → プライム（2026-09-21 以前の単一実行の誌面と同じ並び）。自前括りブロック
+          # （OWN_THEMES_JSON・誌面に出ない HTML コメント）は themes レッグの 1 個だけを本文から外し、
+          # 結合後の最終行へ移す（翌日の make_mover_report.py の ingest_own_themes が回収する）。
+          JSON_BLOCK="/tmp/own_themes_json.txt"
+          : > "$JSON_BLOCK"
+          for m in themes growth standard prime; do
             SRC="/tmp/market-artifacts/${TARGET_DATE}_${m}.md"
             if [ -s "$SRC" ]; then
+              if [ "$m" = "themes" ]; then
+                awk '/^<!-- OWN_THEMES_JSON/{f=1} f{print} f && /OWN_THEMES_JSON -->/{exit}' "$SRC" > "$JSON_BLOCK"
+              fi
+              # 本文から OWN_THEMES_JSON を外し、末尾の空行を落としてから結合する
+              BODY="/tmp/${TARGET_DATE}_${m}.body.md"
+              awk '/^<!-- OWN_THEMES_JSON/{f=1} !f{print} /OWN_THEMES_JSON -->/{f=0}' "$SRC" \
+                | awk '/^[[:space:]]*$/{b=b $0 "\n"; next} {printf "%s", b; b=""; print}' > "$BODY"
               if [ -n "$FOUND" ]; then printf '\n' >> "$OUTPUT"; fi
-              cat "$SRC" >> "$OUTPUT"
+              cat "$BODY" >> "$OUTPUT"
               FOUND="${FOUND}${FOUND:+ }${m}"
               echo "Appended ${m} ($(wc -l < "$SRC") lines)"
             else
               MISSING="${MISSING}${MISSING:+ }${m}"
-              echo "::warning::${m} 市場のセクションが生成されていません（artifact 欠落）: $SRC"
+              echo "::warning::${m} のセクションが生成されていません（artifact 欠落）: $SRC"
             fi
           done
           if [ -z "$FOUND" ]; then
-            echo "::error::全 3 市場のセクションが 1 つも生成されていないため配信できません"
+            echo "::error::全 4 枠（テーマ欄・3 市場）のセクションが 1 つも生成されていないため配信できません"
             exit 1
           fi
+          if [ -s "$JSON_BLOCK" ]; then
+            printf '\n' >> "$OUTPUT"
+            cat "$JSON_BLOCK" >> "$OUTPUT"
+          else
+            echo "::warning::テーマ欄の OWN_THEMES_JSON ブロックがありません（翌日の自前括りテーマ蓄積のみ欠ける・配信は継続）"
+          fi
           echo "missing_markets=${MISSING}" >> $GITHUB_OUTPUT
-          # 2026-09-23: PM 向け通知に載せる市場名は和名にする（growth → グロース 等）
+          # 2026-09-23: PM 向け通知に載せる名前は和名にする（themes → テーマ欄・growth → グロース 等）
           MISSING_JA=""
           for m in $MISSING; do
-            case "$m" in growth) JA="グロース" ;; standard) JA="スタンダード" ;; prime) JA="プライム" ;; *) JA="$m" ;; esac
+            case "$m" in themes) JA="テーマ欄" ;; growth) JA="グロース" ;; standard) JA="スタンダード" ;; prime) JA="プライム" ;; *) JA="$m" ;; esac
             MISSING_JA="${MISSING_JA}${MISSING_JA:+・}${JA}"
           done
           echo "missing_markets_ja=${MISSING_JA}" >> $GITHUB_OUTPUT
@@ -759,6 +783,7 @@ jobs:
             NAMES=""
             for m in $MISSING; do
               case "$m" in
+                themes)   JP="テーマ欄" ;;
                 growth)   JP="グロース" ;;
                 standard) JP="スタンダード" ;;
                 prime)    JP="プライム" ;;
@@ -773,9 +798,14 @@ jobs:
             # 2026-09-21 修正: 日次の誌面タイトルは「# グロース市場」等の市場名行であり、
             # 旧アンカー /^# 動意銘柄レポート / は一度も一致せず注記が挿入されていなかった。
             # 市場名タイトルの【最初の 1 件】の直後にだけ挿入する（誌面冒頭に 1 回）。
-            awk -v note="> ⚠️ **品質注記**: ${NOTE}" \
-              '{print} !done && /^# (グロース|スタンダード|プライム)市場$/{print ""; print note; done=1}' \
-              "$F" > "${F}.tmp" && mv "${F}.tmp" "$F"
+            if grep -qE '^# (グロース|スタンダード|プライム)市場$' "$F"; then
+              awk -v note="> ⚠️ **品質注記**: ${NOTE}" \
+                '{print} !done && /^# (グロース|スタンダード|プライム)市場$/{print ""; print note; done=1}' \
+                "$F" > "${F}.tmp" && mv "${F}.tmp" "$F"
+            else
+              # 2026-09-24: 市場ブロックが 1 つも無い（テーマ欄のみ）号は先頭へ注記する
+              { printf '%s\n\n' "> ⚠️ **品質注記**: ${NOTE}"; cat "$F"; } > "${F}.tmp" && mv "${F}.tmp" "$F"
+            fi
             echo "annotated=true" >> $GITHUB_OUTPUT
             echo "note=${NOTE}" >> $GITHUB_OUTPUT
             echo "品質注記を挿入: ${NOTE}"
@@ -834,7 +864,7 @@ jobs:
           date: ${{ needs.setup-raw.outputs.target_date }}
           meaning: '配信しました。${{ steps.place.outputs.missing_markets_ja }}の部分だけ作れなかったため、その部分は載っていません。'
           action_required: '不要'
-          detail: '動意銘柄レポート 一部市場が欠けたまま配信｜日次レポートは配信済みですが、${{ steps.place.outputs.missing_markets }} 市場のセクションが 2 回の試行で生成できず本号に含まれていません（誌面冒頭に ⚠ 注記あり）。それ以外の市場は通常どおりの内容です。'
+          detail: '動意銘柄レポート 一部市場が欠けたまま配信｜日次レポートは配信済みですが、${{ steps.place.outputs.missing_markets_ja }} の部分が 2 回の試行で生成できず本号に含まれていません（誌面冒頭に ⚠ 注記あり）。それ以外の市場は通常どおりの内容です。'
 
       - name: Discord 通知（⚠️ 配信済み・品質注記あり）
         # PM 2026-07-12（絶対配信原則）: 品質問題があってもレポートは配信済み。何が注記されたかを PM へ通知。

@@ -737,22 +737,54 @@ def _load_sector_names(path: Path | str | None = None) -> dict:
     return out
 
 
+def _industry_name_set(sectors: dict) -> set:
+    """業種名（33業種・17業種）の正規化済み集合。「何の会社」が業種名だけかの判定に使う。"""
+    return {_norm_industry(v) for v in (sectors or {}).values() if str(v).strip()}
+
+
+def _norm_industry(text) -> str:
+    t = re.sub(r"\s+", "", str(text or "")).replace("･", "・").replace("·", "・")
+    return t[3:] if t.startswith("業種:") else t
+
+
+def _is_industry_only(text, industry_names: set) -> bool:
+    """事業説明が業種名そのもの（「情報・通信業」「業種: 電気機器」等）なら True。"""
+    t = _norm_industry(text)
+    return bool(t) and t in industry_names
+
+
+def _safe_call(fn, code) -> str:
+    if fn is None:
+        return ""
+    try:
+        return str(fn(code) or "").strip()
+    except Exception:
+        return ""
+
+
 def build_desc_lookup(
     primary=None,
     trade_date=None,
     context_path: Path | str | None = None,
     screening_path: Path | str | None = None,
     lookback_days: int = CONTEXT_LOOKBACK_DAYS,
+    fallback=None,
 ):
     """「何の会社」の素材を返す callable を、フォールバック連鎖付きで組み立てて返す。
 
     連鎖（上から順に、最初に取れたものを返す。すべて一次情報のみ）:
-      1. primary        当日 raw の EDINET 事業概要（呼び出し側が供給）
+      1. primary        当日 raw の事業概要（EDINET 事業概要／法人プロフィール／株探「概要」／Yahoo「特色」。
+                        呼び出し側が供給）
       2. 蓄積コンテキスト  直近 lookback_days 営業日以内に取得済みの事業概要（同一銘柄）
-      3. 業種名          screening_master の33業種名（`業種: {名前}` 形式で返す）
+      3. fallback       業種名しか無い銘柄に限り呼ぶ callable（動意・PTS は株探「概要」→ Yahoo「特色」を渡す。
+                        2026-09-23 追加。None なら従来どおり呼ばない）
+      4. 業種名          1・2 が業種名だけならそれ、無ければ screening_master の33業種名
+                        （`業種: {名前}` 形式で返す）
 
-    3 まで落ちた場合も**空文字は返さない**ため、誌面の「何の会社」列が構造的に空欄
-    （―）になることが無くなる。3 は事業内容そのものではないので、誌面を書く Claude は
+    1・2 のうち業種名だけのもの（「情報・通信業」等）は具体的な事業内容ではないため、
+    同じ銘柄の具体的な記述（2 の過去分・3）があればそちらを優先する。
+    4 まで落ちた場合も**空文字は返さない**ため、誌面の「何の会社」列が構造的に空欄
+    （―）になることが無くなる。4 は事業内容そのものではないので、誌面を書く Claude は
     これを素材に材料テキストと合わせて15字前後へ言い換える（_cr §38）。
 
     Returns:
@@ -760,9 +792,12 @@ def build_desc_lookup(
     """
     ctx = _load_stock_context(context_path)
     sectors = _load_sector_names(screening_path)
+    industry_names = _industry_name_set(sectors)
 
-    # 蓄積側は「対象日以前・lookback 日以内」の最新行だけを引く辞書へ畳む
+    # 蓄積側は「対象日以前・lookback 日以内」の最新行を引く辞書へ畳む。
+    # 具体的な記述と業種名だけの記述を分けて持ち、新しい業種名が古い具体記述を潰さないようにする。
     ctx_desc = {}
+    ctx_weak = {}
     if not ctx.empty and "desc" in ctx.columns:
         sub = ctx[ctx["desc"].astype(str).str.strip() != ""]
         if trade_date is not None:
@@ -771,20 +806,30 @@ def build_desc_lookup(
             sub = sub[sub["date"].isin(keep)]
         sub = sub.sort_values("date")
         for code, desc in zip(sub["code"], sub["desc"]):
-            ctx_desc[str(code)] = str(desc)  # 後勝ち＝最新日
+            if _is_industry_only(desc, industry_names):
+                ctx_weak[str(code)] = str(desc)  # 後勝ち＝最新日
+            else:
+                ctx_desc[str(code)] = str(desc)  # 後勝ち＝最新日
 
     def _lookup(code) -> str:
         c = str(code or "").strip()
         if not c:
             return ""
-        if primary is not None:
-            try:
-                v = str(primary(c) or "").strip()
-            except Exception:
-                v = ""
-            if v:
+        weak = ""
+        v = _safe_call(primary, c)
+        if v:
+            if not _is_industry_only(v, industry_names):
                 return v
+            weak = v
         v = ctx_desc.get(c) or ctx_desc.get(c[:4], "")
+        if v:
+            return v
+        v = _safe_call(fallback, c)
+        if v:
+            return v
+        if weak:
+            return weak
+        v = ctx_weak.get(c) or ctx_weak.get(c[:4], "")
         if v:
             return v
         sec = sectors.get(c) or sectors.get(c[:4], "")
@@ -2046,14 +2091,14 @@ def render_early_candidates(
 
     新形式はテーマごとのブロック（本日のテーマ・直近2週間と同じ体裁に統一）:
         **{順位（表示順）}位 {テーマ名} ｜ 上昇{n_up}銘柄 ｜ +3%以上の売買代金 {turn3_oku}億円 ｜ {局面}**
-        材料: {Claude が1文で書く。無ければ「材料なし（値動きのみ）」}
+        材料: {Claude がテーマ理由文（①起点 ②増益の中身 ③波及）を書く。書き方はプロンプトの規定}
 
         | コード | 銘柄名 | 何の会社 | 時価総額 | 騰落率 |
         |---|---|---|---|---|
         （+3%以上の点灯銘柄のみ・売買代金順・最大 max_codes 行）
 
     見出し行・銘柄表は機械が出した確定値であり、Claude は**そのまま転記**する
-    （削除・並べ替え・銘柄の追加除外を禁止）。**材料の1文だけ**を Claude が書く。
+    （削除・並べ替え・銘柄の追加除外を禁止）。**`材料:` の理由文だけ**を Claude が書く。
     表に「何の会社」列を新設したため、呼び出し側は codes の各レコードへ desc を
     含めていない場合、誌面を書く Claude が raw 内の該当銘柄ブロックの記述で埋める
     （§38 の「何の会社」空欄禁止の連鎖を流用）。
@@ -2084,9 +2129,11 @@ def render_early_candidates(
         f"うち+{EARLY_MOVE_PCT:.0f}%以上が{EARLY_MIN_NUP3}銘柄以上・その売買代金合計"
         f"{EARLY_MIN_TURN3_OKU:.0f}億円以上の機械条件のみ）。",
         "",
-        "> **`材料:` の1文だけをあなたが書きます**。raw の材料一覧にその行の点灯銘柄の"
-        "材料があれば「銘柄名（コード）」を主語にした**1文**を書き、無ければ"
-        "`材料なし（値動きのみ）` と書いてください。",
+        "> **`材料:` の欄だけをあなたが書きます**。ここはプロンプトの「テーマ理由文」規定に"
+        "従う理由文の置き場所です（①複数社に共通する資金流入の起点 ②業績が理由なら増益の中身 "
+        "③業界への波及 の3部構成。1社の決算・業績をテーマの理由にしない）。"
+        "`持続文脈:` の業績トレンド行（上方修正・黒字転換・営業増益）は②の素材に限って使い、"
+        "テーマの起点として使わないでください。材料が無い場合の書き方もプロンプトの規定に従ってください。",
         "",
         "> **この欄は状況把握であり売買推奨ではありません**。「チャンス」「注目」"
         "「狙い目」「初動」「先回り」等の推奨語と、「可能性が高い」「とみられる」等の"
@@ -2115,7 +2162,7 @@ def render_early_candidates(
                 lines += sustain_ctx(r)
             except Exception:
                 pass
-        lines.append("材料: （ここに1文）")
+        lines.append("材料: （ここに理由文：①起点 ②増益の中身 ③波及）")
         lines.append("")
         lines.append("| コード | 銘柄名 | 何の会社 | 時価総額 | 騰落率 |")
         lines.append("|---|---|---|---|---|")
@@ -2772,26 +2819,43 @@ def build_week_material_lookup(
 def build_week_desc_lookup(
     week_dates: list[str],
     context_path: Path | str | None = None,
+    fallback=None,
 ):
-    """対象週に蓄積された「何の会社」の原文を返す callable（無ければ業種名へ落とす）。"""
+    """対象週に蓄積された「何の会社」の原文を返す callable（無ければ業種名へ落とす）。
+
+    週内の記述が業種名だけ（または無い）銘柄に限り fallback（動意は株探「概要」→ Yahoo「特色」）を挟む
+    （2026-09-23 追加。None なら従来どおり呼ばない）。
+    """
     ctx = _load_stock_context(context_path)
+    sectors = _load_sector_names()
+    industry_names = _industry_name_set(sectors)
     per_code: dict[str, str] = {}
+    weak_code: dict[str, str] = {}
     if not ctx.empty and "desc" in ctx.columns:
         keep = {str(d) for d in (week_dates or [])}
         sub = ctx[ctx["date"].isin(keep)] if keep else ctx
         sub = sub[sub["desc"].astype(str).str.strip() != ""]
         sub = sub.sort_values("date")
         for code, desc in zip(sub["code"], sub["desc"]):
-            per_code[str(code)] = str(desc).strip()  # 後勝ち＝週内の最新日
-    sectors = _load_sector_names()
+            d = str(desc).strip()
+            if _is_industry_only(d, industry_names):
+                weak_code[str(code)] = d  # 後勝ち＝週内の最新日
+            else:
+                per_code[str(code)] = d  # 後勝ち＝週内の最新日
 
     def _lookup(code) -> str:
         c = str(code or "").strip()
         if not c:
             return ""
+        v = per_code.get(c) or per_code.get(c[:4])
+        if v:
+            return v
+        v = _safe_call(fallback, c)
+        if v:
+            return v
         return (
-            per_code.get(c)
-            or per_code.get(c[:4])
+            weak_code.get(c)
+            or weak_code.get(c[:4])
             or sectors.get(c)
             or sectors.get(c[:4])
             or ""
@@ -3685,7 +3749,7 @@ def load_earnings_flags(end: str, path=None, days: int = SUSTAIN_CTX_EARN_DAYS) 
             elif turn.get((code, d)):
                 kind, detail = "黒字転換", "四半期営業利益が黒字へ"
             elif y == y and y >= SUSTAIN_CTX_YOY_MIN:
-                kind, detail = "営業増益", "四半期営業利益 YoY +{:.0f}%".format(y)
+                kind, detail = "営業増益", "四半期営業利益 YoY +{:.0f}%（②の素材・起点ではない）".format(y)
             if not kind:
                 continue
             old = out.get(code)
