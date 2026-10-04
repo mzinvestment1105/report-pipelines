@@ -77,8 +77,7 @@ HAYSTACK=$(jq -r '
 ERRTXT=$(jq -r '[ .[] | select(type == "object" and .type == "result" and .is_error == true)
                  | (.result // .error // "" | tostring) ] | last // empty' "$EXECUTION_FILE" 2>/dev/null | head -c 300 || true)
 if [ -n "$ERRTXT" ]; then
-  echo "attempt ${ATTEMPT}: is_error の本文（先頭 300 字）: $(echo "$ERRTXT" | tr '
-' ' ')"
+  echo "attempt ${ATTEMPT}: is_error の本文（先頭 300 字）: $(echo "$ERRTXT" | tr '\n' ' ')"
 fi
 
 if ! echo "$HAYSTACK" | grep -qE "$CAP_RE"; then
