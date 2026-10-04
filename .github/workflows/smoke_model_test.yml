@@ -1,0 +1,113 @@
+name: Smoke model test (manual only)
+
+# 目的: claude-code-base-action の新しい版（CLI 2.x）で、モデル切替と出力トークン上限の
+# 引き上げが実際に効くかを手動で確認するための検証用 workflow。
+# - 手動起動（workflow_dispatch）のみ。schedule は持たない。
+# - Discord 送信は一切しない。成果物はコミットしない。
+# - 注意: 新しい版の action は `model` / `allowed_tools` / `max_turns` / `timeout_minutes` /
+#   `claude_env` の入力を持たない。モデル・ツール・ターン数は `claude_args` で、
+#   環境変数は step の `env:` で、時間制限は step の `timeout-minutes` で渡す。
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: 'モデル ID（例: claude-opus-5-5 / claude-opus-5）'
+        required: false
+        default: 'claude-opus-5-5'
+        type: string
+      max_output_tokens:
+        description: 'CLAUDE_CODE_MAX_OUTPUT_TOKENS の値'
+        required: false
+        default: '64000'
+        type: string
+      mode:
+        description: 'tiny = 1 語だけ書く / long = 1 応答で約 32,000 トークン超を書かせる'
+        required: false
+        default: 'tiny'
+        type: choice
+        options:
+          - tiny
+          - long
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Build prompt
+        env:
+          MODE: ${{ inputs.mode }}
+        run: |
+          P="${RUNNER_TEMP}/smoke_prompt.md"
+          if [ "$MODE" = "long" ]; then
+            echo "Using a single Write tool call, write the file smoke_long.txt containing the integers 1 through 16000, one per line, with nothing else. Do not use Bash. Do not split into multiple writes." > "$P"
+          else
+            echo "Write the single word OK to the file smoke_out.txt using the Write tool, then stop." > "$P"
+          fi
+          echo "mode=$MODE"
+          cat "$P"
+
+      - name: Run Claude
+        id: claude
+        continue-on-error: true
+        timeout-minutes: 40
+        uses: anthropics/claude-code-base-action@57607815d5d9678acb18dae0e5033d87d4dd4177
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt_file: ${{ runner.temp }}/smoke_prompt.md
+          claude_args: --model ${{ inputs.model }} --max-turns 5 --allowedTools Write
+        env:
+          CLAUDE_CODE_EFFORT_LEVEL: high
+          CLAUDE_CODE_MAX_OUTPUT_TOKENS: ${{ inputs.max_output_tokens }}
+
+      - name: Report result
+        if: always()
+        env:
+          EXECUTION_FILE: ${{ steps.claude.outputs.execution_file }}
+          OUTCOME: ${{ steps.claude.outcome }}
+          CONCLUSION: ${{ steps.claude.outputs.conclusion }}
+          IN_MODEL: ${{ inputs.model }}
+          IN_MAX: ${{ inputs.max_output_tokens }}
+          IN_MODE: ${{ inputs.mode }}
+        run: |
+          echo "=== inputs: model=${IN_MODEL} max_output_tokens=${IN_MAX} mode=${IN_MODE}"
+          echo "=== step outcome=${OUTCOME} conclusion=${CONCLUSION}"
+          echo "=== claude CLI version: $("$HOME/.local/bin/claude" --version 2>&1 || echo 'unknown')"
+          for f in smoke_out.txt smoke_long.txt; do
+            if [ -f "$f" ]; then
+              echo "=== $f lines=$(wc -l < "$f") bytes=$(wc -c < "$f") first=$(head -1 "$f") last=$(tail -1 "$f")"
+            else
+              echo "=== $f not found"
+            fi
+          done
+          if [ -n "$EXECUTION_FILE" ] && [ -s "$EXECUTION_FILE" ]; then
+            echo "=== execution_file: $EXECUTION_FILE"
+            jq -r '
+              [ .[] | select(.type? == "result") ] | last
+              | if . == null then "no result message" else
+                  "modelUsage keys: " + ((.modelUsage // {}) | keys | join(",")),
+                  "modelUsage limits: " + ((.modelUsage // {}) | to_entries | map(.key + " maxOutputTokens=" + ((.value.maxOutputTokens // "null") | tostring) + " contextWindow=" + ((.value.contextWindow // "null") | tostring)) | join(" | ")),
+                  "subtype: " + (.subtype | tostring),
+                  "num_turns: " + (.num_turns | tostring),
+                  "is_error: " + (.is_error | tostring),
+                  "duration_ms: " + (.duration_ms | tostring),
+                  "result(300): " + ((.result // "") | tostring | .[0:300])
+                end
+            ' "$EXECUTION_FILE" || echo "jq failed"
+            echo "=== init model:"
+            jq -r '[ .[] | select(.type? == "system" and .subtype? == "init") ] | first | (.model // "n/a")' "$EXECUTION_FILE" || true
+            echo "=== output-token-limit messages (exact):"
+            jq -r '[ .. | strings | select(test("output token|max_tokens|maximum"; "i")) ] | unique | .[] | .[0:400]' "$EXECUTION_FILE" || true
+          else
+            echo "=== execution_file missing"
+          fi
+
+      - name: Fail if Claude step failed
+        if: steps.claude.outcome != 'success'
+        run: |
+          echo "Claude step outcome: ${{ steps.claude.outcome }}"
+          exit 1
