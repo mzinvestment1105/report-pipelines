@@ -755,12 +755,17 @@ jobs:
         # 注記挿入 step へ届ける。パスの共通親が market/daily のためダウンロード側はフラット配置のまま。
         # 2026-10-04: テーマ欄専用の縮小 raw（{date}_movers_raw_themes.md）を同梱する（日次と同じ関数が
         # --weekly-roster 付きの raw から作る）。出ない日は全量 raw へフォールバックするため欠けても失敗させない。
+        # 2026-10-04: 市場レッグ専用の縮小 raw（{date}_movers_raw_{growth,standard,prime}.md）も同梱する。
+        # 欠けた日は各枠が従来のスライスへフォールバックする。
         uses: actions/upload-artifact@v4
         with:
           name: movers-raw-${{ steps.date.outputs.value }}
           path: |
             private-repo/market/daily/${{ steps.date.outputs.value }}_movers_raw.md
             private-repo/market/daily/${{ steps.date.outputs.value }}_movers_raw_themes.md
+            private-repo/market/daily/${{ steps.date.outputs.value }}_movers_raw_growth.md
+            private-repo/market/daily/${{ steps.date.outputs.value }}_movers_raw_standard.md
+            private-repo/market/daily/${{ steps.date.outputs.value }}_movers_raw_prime.md
             private-repo/market/daily/${{ steps.date.outputs.value }}_quality_flags.txt
             private-repo/market/daily/${{ steps.date.outputs.value }}_weekly_quality_flags.txt
           retention-days: 7
@@ -925,11 +930,31 @@ jobs:
           # 担当外市場の無駄読み・同一 offset 再読込ループを構造的に防ぐ（トークン・コスト削減）。
           # prime は Section 9 が全市場横断のため全 raw を保持する。
           case "$TARGET_MARKET" in
-            growth)
-              awk '/^## グロース/{f=1} f' "$SRC" > "$DST"
-              ;;
-            standard)
-              awk '/^## スタンダード/{f=1} /^## グロース/{f=0} f' "$SRC" > "$DST"
+            growth|standard|prime)
+              # 2026-10-04: 市場レッグは市場別の縮小 raw（ヘッダ＋セクター別フロー＋担当市場の節・需給の小節を除く。
+              # make_mover_report.py の build_market_raw が出す {date}_movers_raw_{market}.md）を読む。
+              # 10/2 のテスト実走で prime 枠が全量 raw（4,363 行）を受け取り、growth・standard・prime 枠で
+              # 出力上限到達が記録されたため入力を絞る。プロンプトは同じパス名を読むため {date}_movers_raw.md の
+              # 名前で置く。無い日は従来のスライス（growth / standard は担当市場の節・prime は全量）へフォールバックする。
+              MKT_SRC=/tmp/movers-raw/${TARGET_DATE}_movers_raw_${TARGET_MARKET}.md
+              if [ -s "$MKT_SRC" ]; then
+                cp "$MKT_SRC" "$DST"
+                echo "${TARGET_MARKET}: 市場別の縮小 raw を使用します ($(wc -l < "$MKT_SRC") 行 / 全量 $(wc -l < "$SRC") 行)"
+              else
+                echo "::warning::${TARGET_MARKET} の縮小 raw（${TARGET_DATE}_movers_raw_${TARGET_MARKET}.md）が無いため従来のスライスへフォールバックします"
+                case "$TARGET_MARKET" in
+                  growth)
+                    awk '/^## グロース/{f=1} f' "$SRC" > "$DST"
+                    ;;
+                  standard)
+                    awk '/^## スタンダード/{f=1} /^## グロース/{f=0} f' "$SRC" > "$DST"
+                    ;;
+                  *)
+                    # prime は全量 raw
+                    cp "$SRC" "$DST"
+                    ;;
+                esac
+              fi
               ;;
             themes)
               # 2026-10-04: テーマ欄は縮小 raw（ヘッダ＋`## 今週の動意母集団` 等のテーマ用の節＋そこに出る
@@ -945,7 +970,6 @@ jobs:
               fi
               ;;
             *)
-              # prime は Section 9 が全市場横断のため全 raw
               cp "$SRC" "$DST"
               ;;
           esac
