@@ -1,4 +1,6 @@
 name: AI レーンツイート日次
+# 2026-10-04: テストモードの run は run-name に「[TEST]」を付ける（check_delivery.sh が配信判定から除外する目印）
+run-name: ${{ github.event.inputs.test_mode == 'true' && format('🧪 [TEST] {0}（{1}）', github.workflow, github.event.inputs.target_date) || github.workflow }}
 
 # PM 2026-09-04 承認: ノクトラ X の AI レーン（記事引用型）を毎日無人で生成し、
 # SNS アナリストの Discord チャンネルへ配信する。
@@ -38,6 +40,11 @@ name: AI レーンツイート日次
         description: 'true で当日重複ガードを無視して強制実行'
         required: false
         default: 'false'
+      test_mode:
+        description: 'テストモード（配信先を BI チャンネルへ切替・配信済み判定を無視・Private へコミットしない・成果物は artifact へ）'
+        type: boolean
+        required: false
+        default: false
   schedule:
     - cron: '0 1 * * *'
     - cron: '0 5 * * *'
@@ -74,7 +81,18 @@ jobs:
           REQUIRE_UPSTREAM: 'false'
           # 素材は朝 06:00 に揃うため時間帯ゲートは掛けない。
           WINDOW_START_HOUR: '0'
-        run: bash .github/scripts/sns_lane_guard.sh
+          TEST_MODE: ${{ github.event.inputs.test_mode }}
+        run: |
+          # 2026-10-04: テストモードは配信済み判定・重複判定・自動リトライ上限を全て無視して実行する
+          # （配信先は BI チャンネル・Private へのコミットなし。run-name の [TEST] で本番の判定から除外される）。
+          if [ "$EVENT" = "workflow_dispatch" ] && [ "$TEST_MODE" = "true" ]; then
+            echo "proceed=true" >> $GITHUB_OUTPUT
+            echo "reason=test_mode (BI 宛てテスト配信)" >> $GITHUB_OUTPUT
+            echo "target_date=${INPUT_DATE:-$(TZ=Asia/Tokyo date +'%Y-%m-%d')}" >> $GITHUB_OUTPUT
+            echo "test_mode=true: 配信済み判定を無視して実行します（配信先は BI チャンネル）"
+            exit 0
+          fi
+          bash .github/scripts/sns_lane_guard.sh
 
       - name: Discord 通知（🚨 自動リトライ停止）
         if: contains(steps.check.outputs.reason, 'retry_cap')
@@ -400,11 +418,25 @@ jobs:
           fi
           echo "生成成功: $F ($(wc -l < "$F") lines)"
 
+      - name: テスト配信の見出し（🧪 テストモードのみ・BI へ）
+        # 2026-10-04: テストモードではツイート案の送り先を BI チャンネルへ切り替える。
+        # 送信スクリプトの本文は変えられないため、直前に「🧪 テスト配信」の見出しを BI へ 1 通送る。
+        if: github.event.inputs.test_mode == 'true' && steps.precheck.outputs.ready == 'true'
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          kind: report
+          bi_webhook: ${{ secrets.DISCORD_WEBHOOK_BI }}
+          test_mode: 'true'
+          label: 'AIツイート'
+          date: ${{ steps.date.outputs.value }}
+          meaning: '次のツイート案はテスト配信です（本番の SNS チャンネルへは送っていません）。'
+
       - name: Send AI tweet drafts to Discord (SNS)
         id: send
         if: success() && steps.precheck.outputs.ready == 'true'
         env:
-          DISCORD_WEBHOOK_SNS: ${{ secrets.DISCORD_WEBHOOK_SNS }}
+          # 2026-10-04: テストモードはツイート案の送り先を BI チャンネルへ切り替える（SNS チャンネルへ送らない）
+          DISCORD_WEBHOOK_SNS: ${{ github.event.inputs.test_mode == 'true' && secrets.DISCORD_WEBHOOK_BI || secrets.DISCORD_WEBHOOK_SNS }}
           TARGET_DATE: ${{ steps.date.outputs.value }}
           PYTHONIOENCODING: utf-8
         run: |
@@ -420,8 +452,21 @@ jobs:
             --header "**AI レーンツイート / ${MD}**" \
             --hide-source
 
+      - name: テスト成果物を artifact へ保存（🧪 テストモードのみ）
+        # テストモードは Private へコミットしないため、ツイート案 md を artifact に残して検証に使う。
+        if: always() && github.event.inputs.test_mode == 'true'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-output-ai-tweet-${{ steps.date.outputs.value }}-${{ github.run_id }}
+          path: |
+            private-repo/research/sns/${{ steps.date.outputs.value }}_ai_tweet.md
+          retention-days: 7
+          if-no-files-found: warn
+
       - name: Commit and push to private repo
-        if: success() && steps.precheck.outputs.ready == 'true'
+        # 2026-10-04: テストモードでは Private へコミット／push しない（成果物は上の artifact）。
+        if: success() && steps.precheck.outputs.ready == 'true' && github.event.inputs.test_mode != 'true'
         working-directory: ./private-repo
         run: |
           bash ../report-pipelines/bi/pipelines/ops/ci_commit_push.sh \

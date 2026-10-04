@@ -1,4 +1,6 @@
 name: セクター週次レポート（フルバージョン）
+# 2026-10-04: テストモードの run は run-name に「[TEST]」を付ける（check_delivery.sh が配信判定から除外する目印）
+run-name: ${{ github.event.inputs.test_mode == 'true' && format('🧪 [TEST] {0}（{1}）', github.workflow, github.event.inputs.target_date) || github.workflow }}
 
 "on":
   # PM 2026-05-27 確定: Cloudflare Worker (mizuki-fund-scheduler-1) からの workflow_dispatch がメイン経路。
@@ -19,6 +21,11 @@ name: セクター週次レポート（フルバージョン）
         description: 'true で当日重複ガードを無視して強制実行（修正後の再テスト用）'
         required: false
         default: 'false'
+      test_mode:
+        description: 'テストモード（配信先を BI チャンネルへ切替・配信済み判定を無視・Private へコミットしない・成果物は artifact へ）'
+        type: boolean
+        required: false
+        default: false
   schedule:
     - cron: '30 8 * * 5'
 
@@ -56,7 +63,23 @@ jobs:
           WINDOW_END_JST: '23:30'
           WAIT_MINUTES: '30'
           LANE_LABEL: 予備タイマー
-        run: bash .github/scripts/standby_guard.sh
+        run: |
+          # 2026-10-04: テストモードは予備タイマー待機・休場判定・配信済み判定・自動リトライ上限を全て無視して実行する
+          # （配信先は BI チャンネル・Private へのコミットなし。run-name の [TEST] で本番の判定から除外される）。
+          # target_date は standby_guard.sh と同じ決め方（入力があればそれ・空なら JST 当日）で出す。
+          if [ "${EVENT}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.test_mode }}" = "true" ]; then
+            if [ -n "${INPUT_DATE}" ]; then
+              TARGET_DATE="${INPUT_DATE}"
+            else
+              TARGET_DATE=$(TZ=Asia/Tokyo date +%Y-%m-%d)
+            fi
+            echo "target_date=${TARGET_DATE}" >> $GITHUB_OUTPUT
+            echo "proceed=true" >> $GITHUB_OUTPUT
+            echo "reason=test_mode (BI 宛てテスト配信)" >> $GITHUB_OUTPUT
+            echo "test_mode=true: 配信済み判定を無視して実行します（対象日 ${TARGET_DATE}・配信先は BI チャンネル）"
+            exit 0
+          fi
+          bash .github/scripts/standby_guard.sh
 
       # ⏱予備タイマー起動通知は削除（PM 2026-07-09）: Worker が週次を発火しておらず cron が
       # 実質本経路のため「Worker未達」案内が毎週金曜に誤発報していた。レポート生成・送信は継続。
@@ -494,6 +517,19 @@ jobs:
         run: |
           python bi/pipelines/lib/crossref_check.py --file market/daily/sector/${{ steps.date.outputs.value }}_full.md || true
 
+      - name: テスト配信の見出し（🧪 テストモードのみ・BI へ）
+        # 2026-10-04: テストモードでは誌面 PDF の送り先を BI チャンネルへ切り替える。
+        # 送信スクリプトの本文は変えられないため、直前に「🧪 テスト配信」の見出しを BI へ 1 通送る。
+        if: github.event.inputs.test_mode == 'true'
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          kind: report
+          bi_webhook: ${{ secrets.DISCORD_WEBHOOK_BI }}
+          test_mode: 'true'
+          label: 'セクター週次'
+          date: ${{ steps.date.outputs.value }}
+          meaning: '次の PDF はテスト配信です（本番のレポート用チャンネルへは送っていません）。'
+
       - name: Send Discord (PDF)
         id: send
         working-directory: ./private-repo/bi/pipelines
@@ -502,10 +538,24 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
           CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
-          DISCORD_WEBHOOK_SECTOR: ${{ secrets.DISCORD_WEBHOOK_SECTOR }}
+          # 2026-10-04: テストモードは誌面の送り先を BI チャンネルへ切り替える（レポート用チャンネルへ送らない）
+          DISCORD_WEBHOOK_SECTOR: ${{ github.event.inputs.test_mode == 'true' && secrets.DISCORD_WEBHOOK_BI || secrets.DISCORD_WEBHOOK_SECTOR }}
           PYTHONIOENCODING: utf-8
         run: |
           python send_report_pdf_discord.py --kind sector_full --date ${{ steps.date.outputs.value }}
+
+      - name: テスト成果物を artifact へ保存（🧪 テストモードのみ）
+        # テストモードは Private へコミットしないため、誌面 md と PDF を artifact に残して検証に使う。
+        if: always() && github.event.inputs.test_mode == 'true'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-output-sector-weekly-full-${{ steps.date.outputs.value }}-${{ github.run_id }}
+          path: |
+            private-repo/market/daily/sector/${{ steps.date.outputs.value }}_full.md
+            private-repo/bi/outputs/report_pdfs/sector_full_${{ steps.date.outputs.value }}.pdf
+          retention-days: 7
+          if-no-files-found: warn
 
       - name: Discord 通知（⚠️ 配信済み・品質注記あり）
         # PM 2026-07-12（絶対配信原則）: 品質問題があってもレポートは配信済み。何が注記されたかを PM へ通知。
@@ -543,7 +593,8 @@ jobs:
         # 旧来は gen 失敗で本 step がスキップされ、新鮮な sector_weekly.parquet が runner ごと破棄され
         # AsOf が 6/13 で 2 週間凍結した事故の恒久対策。
         # rebase 方式は並行 push に弱いため fresh-base 方式の共通ヘルパーへ置換。
-        if: ${{ always() }}
+        # 2026-10-04: テストモードでは Private へコミット／push しない（成果物は上の artifact）。
+        if: always() && github.event.inputs.test_mode != 'true'
         working-directory: ./private-repo
         run: |
           bash ../report-pipelines/bi/pipelines/ops/ci_commit_push.sh \

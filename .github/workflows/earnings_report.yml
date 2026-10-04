@@ -11,6 +11,8 @@
 #   本番 {month}_overview.md を上書き commit しないための安全弁）。
 
 name: 決算シーズン総括レポート
+# 2026-10-04: テストモードの run は run-name に「[TEST]」を付ける（check_delivery.sh が配信判定から除外する目印）
+run-name: ${{ github.event.inputs.test_mode == 'true' && format('🧪 [TEST] {0}', github.workflow) || github.workflow }}
 
 "on":
   # cron なし（決算オフ期）。8月シーズン開始時に cron 追加を PM 承認の上で検討。
@@ -25,7 +27,12 @@ name: 決算シーズン総括レポート
         required: false
         default: 'false'
       dry_run:
-        description: 'true で Discord 送信・private repo への commit-back を両方スキップ（生成物は artifact で確認）'
+        description: 'true で Discord 送信・private repo への commit-back を両方スキップ（生成物は artifact で確認）。test_mode と同時指定時も送信しない（dry_run が優先）'
+        type: boolean
+        required: false
+        default: false
+      test_mode:
+        description: 'テストモード（配信先を BI チャンネルへ切替・配信済み判定を無視・Private へコミットしない・成果物は artifact へ）。dry_run と同時指定時は送信なし'
         type: boolean
         required: false
         default: false
@@ -54,6 +61,14 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # 2026-10-04: テストモードは配信済み判定（当日重複判定）を無視して実行する
+          # （配信先は BI チャンネル・Private へのコミットなし。run-name の [TEST] で本番の判定から除外される）。
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.test_mode }}" = "true" ]; then
+            echo "proceed=true" >> $GITHUB_OUTPUT
+            echo "reason=test_mode (BI 宛てテスト配信)" >> $GITHUB_OUTPUT
+            echo "test_mode=true: 配信済み判定を無視して実行します（配信先は BI チャンネル）"
+            exit 0
+          fi
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.force_rerun }}" = "true" ]; then
             echo "proceed=true" >> $GITHUB_OUTPUT
             echo "reason=force_rerun (manual guard bypass)" >> $GITHUB_OUTPUT
@@ -520,6 +535,20 @@ jobs:
         run: |
           python bi/pipelines/lib/crossref_check.py --file research/earnings/${{ steps.month.outputs.value }}_overview.md || true
 
+      - name: テスト配信の見出し（🧪 テストモードのみ・BI へ）
+        # 2026-10-04: テストモードでは誌面 PDF の送り先を BI チャンネルへ切り替える。
+        # 送信スクリプトの本文は変えられないため、直前に「🧪 テスト配信」の見出しを BI へ 1 通送る。
+        # dry_run と同時指定時は送信しないため見出しも送らない。
+        if: github.event.inputs.test_mode == 'true' && github.event.inputs.dry_run != 'true'
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          kind: report
+          bi_webhook: ${{ secrets.DISCORD_WEBHOOK_BI }}
+          test_mode: 'true'
+          label: '決算総括レポート'
+          date: ${{ steps.month.outputs.value }}
+          meaning: '次の PDF はテスト配信です（本番のレポート用チャンネルへは送っていません）。'
+
       - name: Send Discord (PDF・DISCORD_WEBHOOK_EARNINGS)
         id: send
         if: ${{ github.event.inputs.dry_run != 'true' }}
@@ -529,15 +558,30 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
           CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
-          DISCORD_WEBHOOK_EARNINGS: ${{ secrets.DISCORD_WEBHOOK_EARNINGS }}
+          # 2026-10-04: テストモードは誌面の送り先を BI チャンネルへ切り替える（レポート用チャンネルへ送らない）
+          DISCORD_WEBHOOK_EARNINGS: ${{ github.event.inputs.test_mode == 'true' && secrets.DISCORD_WEBHOOK_BI || secrets.DISCORD_WEBHOOK_EARNINGS }}
           PYTHONIOENCODING: utf-8
         run: |
           python send_report_pdf_discord.py --kind earnings --month ${{ steps.month.outputs.value }}
 
+      - name: テスト成果物を artifact へ保存（🧪 テストモードのみ）
+        # テストモードは Private へコミットしないため、誌面 md と PDF を artifact に残して検証に使う。
+        if: always() && github.event.inputs.test_mode == 'true'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-output-earnings-${{ steps.month.outputs.value }}-${{ github.run_id }}
+          path: |
+            private-repo/research/earnings/${{ steps.month.outputs.value }}_overview.md
+            private-repo/bi/outputs/report_pdfs/earnings_${{ steps.month.outputs.value }}.pdf
+          retention-days: 7
+          if-no-files-found: warn
+
       - name: Commit and push to private repo
         # dry_run=true では commit しない（過去月試運転で本番 overview を上書きしないため）。
+        # 2026-10-04: テストモードでも Private へコミット／push しない（成果物は上の artifact）。
         # rebase 方式は並行 push に弱いため fresh-base 方式の共通ヘルパーへ置換。
-        if: ${{ github.event.inputs.dry_run != 'true' }}
+        if: ${{ github.event.inputs.dry_run != 'true' && github.event.inputs.test_mode != 'true' }}
         working-directory: ./private-repo
         env:
           TARGET_MONTH: ${{ steps.month.outputs.value }}

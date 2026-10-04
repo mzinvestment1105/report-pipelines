@@ -1,4 +1,6 @@
 name: 動意銘柄レポート週次
+# 2026-10-04: テストモードの run は run-name に「[TEST]」を付ける（check_delivery.sh が配信判定から除外する目印）
+run-name: ${{ github.event.inputs.test_mode == 'true' && format('🧪 [TEST] {0}（{1}）', github.workflow, github.event.inputs.target_date) || github.workflow }}
 
 "on":
   # PM 2026-05-27 確定: Cloudflare Worker (mizuki-fund-scheduler-1) からの workflow_dispatch がメイン経路。
@@ -20,6 +22,11 @@ name: 動意銘柄レポート週次
         description: 'true で当日重複ガードを無視して強制実行（修正後の再テスト用）'
         required: false
         default: 'false'
+      test_mode:
+        description: 'テストモード（配信先を BI チャンネルへ切替・配信済み判定を無視・Private へコミットしない・成果物は artifact へ）'
+        type: boolean
+        required: false
+        default: false
   schedule:
     # ---------------------------------------------------------------------------------
     # PM 2026-08-29 確定（案3 + 自動再試行レーン）
@@ -159,7 +166,19 @@ jobs:
           WINDOW_END_JST: ${{ steps.lane.outputs.win_end }}
           WAIT_MINUTES: '30'
           LANE_LABEL: ${{ steps.lane.outputs.label }}
-        run: bash .github/scripts/standby_guard.sh
+          TEST_MODE: ${{ github.event.inputs.test_mode || 'false' }}
+        run: |
+          # 2026-10-04: テストモードは配信済み判定・休場判定・時間帯ゲート・リトライ上限を全て無視して実行する
+          # （配信先は BI チャンネル・Private へのコミットなし。run-name の [TEST] で本番の判定から除外される）。
+          # target_date は standby_guard.sh と同じ決め方（入力値・空なら JST 当日）で出し、normalize が金曜へ寄せる。
+          if [ "$EVENT" = "workflow_dispatch" ] && [ "$TEST_MODE" = "true" ]; then
+            echo "target_date=${INPUT_DATE:-$(TZ=Asia/Tokyo date +%Y-%m-%d)}" >> "$GITHUB_OUTPUT"
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+            echo "reason=test_mode (BI 宛てテスト配信)" >> "$GITHUB_OUTPUT"
+            echo "test_mode=true: 配信済み判定を無視して実行します（配信先は BI チャンネル）"
+            exit 0
+          fi
+          bash .github/scripts/standby_guard.sh
 
       - name: 対象日を「対象週の金曜」へ正規化（土日月レーン対応）
         # PM 2026-08-29 追加: standby_guard.sh の TARGET_DATE は実行日（JST）であり、
@@ -181,6 +200,7 @@ jobs:
         env:
           RAW_DATE: ${{ steps.check.outputs.target_date }}
           INPUT_DATE: ${{ github.event.inputs.target_date }}
+          TEST_MODE: ${{ github.event.inputs.test_mode || 'false' }}
         run: |
           set -euo pipefail
           if [ -n "${INPUT_DATE:-}" ]; then
@@ -195,6 +215,14 @@ jobs:
               6) OFFSET=1 ;;   # 土曜（retry1 / retry2）
               7) OFFSET=2 ;;   # 日曜（retry3 / retry4）
               1) OFFSET=3 ;;   # 月曜（retry5・最終レーン）
+              # 2026-10-04: テストモードで対象日を空欄にした火〜木の手動実行は、直前の金曜を対象週にする
+              2|3|4)
+                if [ "$TEST_MODE" != "true" ]; then
+                  echo "::error::週次動意の対象日を決められません: 実行日 $BASE は dow=$DOW（火〜木）で、金〜月のいずれのレーンにも該当しません"
+                  exit 1
+                fi
+                OFFSET=$(( DOW + 2 ))
+                ;;
               *)
                 echo "::error::週次動意の対象日を決められません: 実行日 $BASE は dow=$DOW（火〜木）で、金〜月のいずれのレーンにも該当しません"
                 exit 1
@@ -1366,7 +1394,11 @@ jobs:
             DETAIL=$(grep '^  - ' /tmp/gate.log | head -5 | sed 's/^  - //' | awk 'NR>1{printf "・"} {printf "%s", $0} END{print ""}')
             NOTE="${NOTE}${NOTE:+ ／ }機械検査で不合格項目あり（${DETAIL}）"
           fi
+          F=market/daily/movers/${TARGET_DATE}_weekly.md
           # 2026-09-21 追加: 市場別レッグ化により一部市場が欠落したまま配信しうる。欠落は誌面で明示する。
+          # 2026-10-04 改定（PM 指示・日次と同じ）: 欠けた枠の注記は誌面冒頭の 1 行「{枠}: 本号未掲載（原因は BI へ通知済み）」
+          # だけにする。原因・状態の説明は誌面にもレポート用チャンネルにも載せず、BI チャンネルへ通知する。
+          # 品質注記（NOTE）とは別行にし、⚠ 品質注記の BI 通知が枠欠落だけで重複して鳴らないようにする。
           MISSING="${{ steps.place.outputs.missing_markets }}"
           if [ -n "$MISSING" ]; then
             NAMES=""
@@ -1380,10 +1412,11 @@ jobs:
               esac
               NAMES="${NAMES}${NAMES:+・}${JP}"
             done
-            NOTE="${NOTE}${NOTE:+ ／ }⚠ ${NAMES} セクションは生成上限到達により本号未掲載"
+            # 先頭へ置く（send_report_pdf_discord.py が文書タイトルを先頭へ足すため、マストヘッド直下に来る）
+            { printf '%s\n\n' "> ${NAMES}: 本号未掲載（原因は BI へ通知済み）"; cat "$F"; } > "${F}.tmp" && mv "${F}.tmp" "$F"
+            echo "欠落注記を挿入: ${NAMES}: 本号未掲載（原因は BI へ通知済み）"
           fi
           if [ -n "$NOTE" ]; then
-            F=market/daily/movers/${TARGET_DATE}_weekly.md
             if grep -q '^# 動意銘柄レポート ' "$F"; then
               awk -v note="> ⚠️ **品質注記**: ${NOTE}" '{print} /^# 動意銘柄レポート /{print ""; print note}' "$F" > "${F}.tmp" && mv "${F}.tmp" "$F"
             else
@@ -1415,6 +1448,12 @@ jobs:
           MY_RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
+          # 2026-10-04: テストモードは本番の配信済み判定を無視して送る（送り先は BI チャンネル）
+          if [ "${{ github.event.inputs.test_mode }}" = "true" ]; then
+            echo "test_mode=true: 送信直前の重複チェックを無視します（配信先は BI チャンネル）"
+            echo "skip_send=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           SINCE="${TARGET_DATE}T00:00:00+09:00"
           STATS=$(bash ../report-pipelines/.github/scripts/check_delivery.sh mover_weekly.yml merge-and-send "${MY_RUN_ID}" "${SINCE}" || echo '{"delivered":0}')
           DELIVERED=$(echo "$STATS" | jq -r '.delivered // 0')
@@ -1426,6 +1465,19 @@ jobs:
             echo "skip_send=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: テスト配信の見出し（🧪 テストモードのみ・BI へ）
+        # 2026-10-04: テストモードでは誌面 PDF の送り先を BI チャンネルへ切り替える。
+        # 送信スクリプトの本文は変えられないため、直前に「🧪 テスト配信」の見出しを BI へ 1 通送る。
+        if: github.event.inputs.test_mode == 'true'
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          kind: report
+          bi_webhook: ${{ secrets.DISCORD_WEBHOOK_BI }}
+          test_mode: 'true'
+          label: '動意レポート週次'
+          date: ${{ needs.setup-raw.outputs.target_date }}
+          meaning: '次の PDF はテスト配信です（本番のレポート用チャンネルへは送っていません）。'
+
       - name: Send Discord (PDF・全市場 1 本)
         id: send
         if: steps.predup.outputs.skip_send != 'true'
@@ -1435,12 +1487,27 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
           CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
-          DISCORD_WEBHOOK_MOVERS: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
+          # 2026-10-04: テストモードは誌面の送り先を BI チャンネルへ切り替える（レポート用チャンネルへ送らない）
+          DISCORD_WEBHOOK_MOVERS: ${{ github.event.inputs.test_mode == 'true' && secrets.DISCORD_WEBHOOK_BI || secrets.DISCORD_WEBHOOK_MOVERS }}
           PYTHONIOENCODING: utf-8
         run: |
           python send_report_pdf_discord.py --kind movers_weekly --date ${{ needs.setup-raw.outputs.target_date }}
 
+      - name: テスト成果物を artifact へ保存（🧪 テストモードのみ）
+        # テストモードは Private へコミットしないため、誌面 md と PDF を artifact に残して検証に使う。
+        if: always() && github.event.inputs.test_mode == 'true'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-output-mover-weekly-${{ needs.setup-raw.outputs.target_date }}-${{ github.run_id }}
+          path: |
+            private-repo/market/daily/movers/${{ needs.setup-raw.outputs.target_date }}_weekly.md
+            private-repo/bi/outputs/report_pdfs/movers_weekly_${{ needs.setup-raw.outputs.target_date }}.pdf
+          retention-days: 7
+          if-no-files-found: warn
+
       - name: Rotate report archives (5 件超過分を archive/ へ退避)
+        if: github.event.inputs.test_mode != 'true'
         working-directory: ./private-repo
         env:
           PYTHONIOENCODING: utf-8
@@ -1457,6 +1524,8 @@ jobs:
       - name: Commit and push to private repo
         # rebase 方式は履歴書き換え・並行 push で index.lock 残留の構造的弱点があるため、
         # fresh-base 方式の共通ヘルパー（Public 側から直接実行・repo 内コピー禁止）へ置換。
+        # 2026-10-04: テストモードでは Private へコミット／push しない（成果物は上の artifact）。
+        if: github.event.inputs.test_mode != 'true'
         working-directory: ./private-repo
         env:
           TARGET_DATE: ${{ needs.setup-raw.outputs.target_date }}
@@ -1476,10 +1545,11 @@ jobs:
           state: partial
           label: '動意レポート週次'
           date: ${{ needs.setup-raw.outputs.target_date }}
-          meaning: '配信しました。${{ steps.place.outputs.missing_markets_ja }}の部分だけ作れなかったため、その部分は載っていません。'
-          # 2026-10-04: 誌面の一部が欠けたため対応「要」・欠けた枠ごとの原因行つき（旧: 対応なし表記）。
+          # 2026-10-04（PM 指示・日次と同じ）: 枠欠けの説明はレポート用チャンネルに出さず BI へ原因付きで送る。
+          # 誌面冒頭には「{枠}: 本号未掲載（原因は BI へ通知済み）」の 1 行だけが載る。
+          meaning: '${{ steps.place.outputs.missing_markets_ja }}の部分を作れず、残りの部分だけで配信しました（誌面冒頭に「本号未掲載」の 1 行あり）。'
           cause: ${{ steps.place.outputs.missing_causes }}
-          detail: '動意銘柄レポート週次 一部市場が欠けたまま配信｜週次レポートは配信済みですが、${{ steps.place.outputs.missing_markets_ja }} の部分が 2 回の試行で生成できず本号に含まれていません（誌面冒頭に ⚠ 注記あり）。それ以外の市場は通常どおりの内容です。'
+          detail: '動意銘柄レポート週次 一部市場が欠けたまま配信｜週次レポートは配信済みですが、${{ steps.place.outputs.missing_markets_ja }} の部分が 2 回の試行で生成できず本号に含まれていません。それ以外の市場は通常どおりの内容です。'
 
       - name: Discord 通知（⚠️ 配信済み・品質注記あり）
         # PM 2026-07-12（絶対配信原則）: 品質問題があってもレポートは配信済み。何が注記されたかを PM へ通知。
@@ -1492,8 +1562,9 @@ jobs:
           state: partial
           label: '動意レポート週次'
           date: ${{ needs.setup-raw.outputs.target_date }}
-          meaning: '配信しました。一部に注意点があるため、誌面の冒頭に注記があります。'
-          # 2026-10-04: 注記に枠の欠落が含まれる（誌面の一部が欠けた）時は対応「要」。
+          meaning: '配信しました。品質検査で注意点が見つかったため、誌面の冒頭に品質注記を付けました。'
+          # 2026-10-04: 枠の欠落は別通知（上）に分離。ここは品質注記の中身を原因行に載せる。
+          cause: ${{ steps.annotate.outputs.note }}
           detail: '動意銘柄レポート週次 配信済み（品質注記あり）｜レポートは配信済みです。品質注記（${{ steps.annotate.outputs.note }}）を各市場の冒頭に付けています。'
 
       - name: Discord 通知（⚠️ 配信済み・後処理のみ失敗）
@@ -1506,7 +1577,8 @@ jobs:
           state: partial
           label: '動意レポート週次'
           date: ${{ needs.setup-raw.outputs.target_date }}
-          meaning: '配信は完了しています。保存処理だけ失敗しましたが誌面に影響はありません。'
+          meaning: '配信は完了しています。配信後の保存処理だけが失敗しました。'
+          cause: '配信後のアーカイブ整理または Private リポへの保存（commit／push）が失敗'
           detail: '動意銘柄レポート週次 後処理のみ失敗｜レポート本体は配信済みです。配信後のアーカイブ整理または commit だけが失敗しました。'
 
       - name: Discord 通知（⏭ 二重配信回避で送信 skip）

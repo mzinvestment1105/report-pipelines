@@ -1,4 +1,6 @@
 name: マクロレポート夕刊
+# 2026-10-04: テストモードの run は run-name に「[TEST]」を付ける（check_delivery.sh が配信判定から除外する目印）
+run-name: ${{ github.event.inputs.test_mode == 'true' && format('🧪 [TEST] {0}（{1}）', github.workflow, github.event.inputs.target_date) || github.workflow }}
 
 "on":
   # PM 2026-05-27 確定: Cloudflare Worker (mizuki-fund-scheduler-1) からの workflow_dispatch がメイン経路。
@@ -15,6 +17,11 @@ name: マクロレポート夕刊
         description: 'true で当日重複ガードを無視して強制実行（修正後の再テスト用）'
         required: false
         default: 'false'
+      test_mode:
+        description: 'テストモード（配信先を BI チャンネルへ切替・配信済み判定を無視・Private へコミットしない・成果物は artifact へ）'
+        type: boolean
+        required: false
+        default: false
   schedule:
     - cron: '30 9 * * 1-5'
 
@@ -44,6 +51,14 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # 2026-10-04: テストモードは配信済み判定・実行中判定・時間帯ゲートを全て無視して実行する
+          # （配信先は BI チャンネル・Private へのコミットなし。run-name の [TEST] で本番の判定から除外される）。
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.test_mode }}" = "true" ]; then
+            echo "proceed=true" >> $GITHUB_OUTPUT
+            echo "reason=test_mode (BI 宛てテスト配信)" >> $GITHUB_OUTPUT
+            echo "test_mode=true: 配信済み判定を無視して実行します（配信先は BI チャンネル）"
+            exit 0
+          fi
           TODAY_JST=$(TZ=Asia/Tokyo date +%Y-%m-%d)
           MY_RUN_ID=${{ github.run_id }}
           EVENT="${{ github.event_name }}"
@@ -497,6 +512,19 @@ jobs:
         run: |
           python bi/pipelines/lib/crossref_check.py --file market/daily/macro/${{ steps.date.outputs.value }}_evening.md || true
 
+      - name: テスト配信の見出し（🧪 テストモードのみ・BI へ）
+        # 2026-10-04: テストモードでは誌面 PDF の送り先を BI チャンネルへ切り替える。
+        # 送信スクリプトの本文は変えられないため、直前に「🧪 テスト配信」の見出しを BI へ 1 通送る。
+        if: success() && steps.build_prompt.outputs.exit_code != '2' && github.event.inputs.test_mode == 'true'
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          kind: report
+          bi_webhook: ${{ secrets.DISCORD_WEBHOOK_BI }}
+          test_mode: 'true'
+          label: 'マクロ夕刊'
+          date: ${{ steps.date.outputs.value }}
+          meaning: '次の PDF はテスト配信です（本番のレポート用チャンネルへは送っていません）。'
+
       - name: Send Discord (PDF)
         id: send
         if: success() && steps.build_prompt.outputs.exit_code != '2'
@@ -506,15 +534,30 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
           CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
-          DISCORD_WEBHOOK_MACRO: ${{ secrets.DISCORD_WEBHOOK_MACRO }}
+          # 2026-10-04: テストモードは誌面の送り先を BI チャンネルへ切り替える（レポート用チャンネルへ送らない）
+          DISCORD_WEBHOOK_MACRO: ${{ github.event.inputs.test_mode == 'true' && secrets.DISCORD_WEBHOOK_BI || secrets.DISCORD_WEBHOOK_MACRO }}
           PYTHONIOENCODING: utf-8
         run: |
           python send_report_pdf_discord.py --kind macro_evening --date ${{ steps.date.outputs.value }}
 
+      - name: テスト成果物を artifact へ保存（🧪 テストモードのみ）
+        # テストモードは Private へコミットしないため、誌面 md と PDF を artifact に残して検証に使う。
+        if: always() && github.event.inputs.test_mode == 'true'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-output-macro-evening-${{ steps.date.outputs.value }}-${{ github.run_id }}
+          path: |
+            private-repo/market/daily/macro/${{ steps.date.outputs.value }}_evening.md
+            private-repo/bi/outputs/report_pdfs/macro_evening_${{ steps.date.outputs.value }}.pdf
+          retention-days: 7
+          if-no-files-found: warn
+
       # マクロ市況ツイート案の生成は macro_tweet_daily.yml へ分離した（PM 2026-09-02 承認・当日分
       # price_history parquet の着地を待つ必要があり、夕刊の時刻では構造的に間に合わないため）。
       - name: Rotate report archives (5 件超過分を archive/ へ退避)
-        if: success() && steps.build_prompt.outputs.exit_code != '2'
+        # 2026-10-04: テストモードではアーカイブ整理をしない（Private へコミットしないため）。
+        if: success() && steps.build_prompt.outputs.exit_code != '2' && github.event.inputs.test_mode != 'true'
         working-directory: ./private-repo
         env:
           PYTHONIOENCODING: utf-8
@@ -531,7 +574,8 @@ jobs:
       - name: Commit and push to private repo
         # rebase 方式は履歴書き換え・並行 push で index.lock 残留の構造的弱点があるため、
         # fresh-base 方式の共通ヘルパー（Public 側から直接実行・repo 内コピー禁止）へ置換。
-        if: success() && steps.build_prompt.outputs.exit_code != '2'
+        # 2026-10-04: テストモードでは Private へコミット／push しない（成果物は上の artifact）。
+        if: success() && steps.build_prompt.outputs.exit_code != '2' && github.event.inputs.test_mode != 'true'
         working-directory: ./private-repo
         run: |
           bash ../report-pipelines/bi/pipelines/ops/ci_commit_push.sh \

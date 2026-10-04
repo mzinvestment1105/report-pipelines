@@ -1,4 +1,6 @@
 name: マクロ市況ツイート日次
+# 2026-10-04: テストモードの run は run-name に「[TEST]」を付ける（check_delivery.sh が配信判定から除外する目印）
+run-name: ${{ github.event.inputs.test_mode == 'true' && format('🧪 [TEST] {0}（{1}）', github.workflow, github.event.inputs.target_date) || github.workflow }}
 
 "on":
   # PM 2026-09-02 承認: マクロ市況ツイート案の生成を夕刊マクロ（macro_report_evening.yml）から分離した。
@@ -51,6 +53,11 @@ name: マクロ市況ツイート日次
         description: 'true で当日重複ガードを無視して強制実行（修正後の再テスト用）'
         required: false
         default: 'false'
+      test_mode:
+        description: 'テストモード（配信先を BI チャンネルへ切替・配信済み判定を無視・Private へコミットしない・成果物は artifact へ）'
+        type: boolean
+        required: false
+        default: false
   schedule:
     - cron: '30 10 * * 1-5'
     - cron: '0 12 * * 1-5'
@@ -92,7 +99,18 @@ jobs:
           UPSTREAM_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
           FORCE_RERUN: ${{ github.event.inputs.force_rerun }}
           INPUT_DATE: ${{ github.event.inputs.target_date }}
+          TEST_MODE: ${{ github.event.inputs.test_mode }}
         run: |
+          # 2026-10-04: テストモードは配信済み判定・重複判定・時間帯ゲート・自動リトライ上限を全て無視して実行する
+          # （配信先は BI チャンネル・Private へのコミットなし。run-name の [TEST] で本番の判定から除外される）。
+          # 後段の休場判定（tradingday step）もテストモードでは走らせない。
+          if [ "$EVENT" = "workflow_dispatch" ] && [ "$TEST_MODE" = "true" ]; then
+            echo "proceed=true" >> $GITHUB_OUTPUT
+            echo "reason=test_mode (BI 宛てテスト配信)" >> $GITHUB_OUTPUT
+            echo "target_date=${INPUT_DATE:-$(TZ=Asia/Tokyo date +'%Y-%m-%d')}" >> $GITHUB_OUTPUT
+            echo "test_mode=true: 配信済み判定を無視して実行します（配信先は BI チャンネル）"
+            exit 0
+          fi
           # 判定ロジック本体は .github/scripts/macro_tweet_guard.sh に切り出してある
           # （ローカルで NOW_OVERRIDE を注入して単体検証できるようにするため）。
           bash .github/scripts/macro_tweet_guard.sh
@@ -104,7 +122,7 @@ jobs:
       # guard が proceed=true と判定した時だけ走る。force_rerun=true の手動実行は通す。
       - name: 営業日判定（祝日・休場ガード）
         id: tradingday
-        if: steps.check.outputs.proceed == 'true' && !(github.event_name == 'workflow_dispatch' && github.event.inputs.force_rerun == 'true')
+        if: steps.check.outputs.proceed == 'true' && !(github.event_name == 'workflow_dispatch' && github.event.inputs.force_rerun == 'true') && github.event.inputs.test_mode != 'true'
         env:
           TARGET_DATE: ${{ steps.check.outputs.target_date }}
         run: |
@@ -407,11 +425,25 @@ jobs:
           fi
           echo "生成成功: $F ($(wc -l < "$F") lines)"
 
+      - name: テスト配信の見出し（🧪 テストモードのみ・BI へ）
+        # 2026-10-04: テストモードではツイート案の送り先を BI チャンネルへ切り替える。
+        # 送信スクリプトの本文は変えられないため、直前に「🧪 テスト配信」の見出しを BI へ 1 通送る。
+        if: github.event.inputs.test_mode == 'true' && steps.precheck.outputs.ready == 'true'
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          kind: report
+          bi_webhook: ${{ secrets.DISCORD_WEBHOOK_BI }}
+          test_mode: 'true'
+          label: '市況ツイート'
+          date: ${{ steps.date.outputs.value }}
+          meaning: '次のツイート案はテスト配信です（本番の SNS チャンネルへは送っていません）。'
+
       - name: Send macro tweet drafts to Discord (SNS)
         id: send
         if: success() && steps.precheck.outputs.ready == 'true'
         env:
-          DISCORD_WEBHOOK_SNS: ${{ secrets.DISCORD_WEBHOOK_SNS }}
+          # 2026-10-04: テストモードはツイート案の送り先を BI チャンネルへ切り替える（SNS チャンネルへ送らない）
+          DISCORD_WEBHOOK_SNS: ${{ github.event.inputs.test_mode == 'true' && secrets.DISCORD_WEBHOOK_BI || secrets.DISCORD_WEBHOOK_SNS }}
           TARGET_DATE: ${{ steps.date.outputs.value }}
           PYTHONIOENCODING: utf-8
         run: |
@@ -427,10 +459,23 @@ jobs:
             --header "**マクロ市況ツイート / ${MD} 大引け**" \
             --hide-source
 
+      - name: テスト成果物を artifact へ保存（🧪 テストモードのみ）
+        # テストモードは Private へコミットしないため、ツイート案 md を artifact に残して検証に使う。
+        if: always() && github.event.inputs.test_mode == 'true'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-output-macro-tweet-${{ steps.date.outputs.value }}-${{ github.run_id }}
+          path: |
+            private-repo/research/sns/${{ steps.date.outputs.value }}_macro_tweet.md
+          retention-days: 7
+          if-no-files-found: warn
+
       - name: Commit and push to private repo
         # rebase 方式は履歴書き換え・並行 push で index.lock 残留の構造的弱点があるため、
         # fresh-base 方式の共通ヘルパー（Public 側から直接実行・repo 内コピー禁止）へ置換。
-        if: success() && steps.precheck.outputs.ready == 'true'
+        # 2026-10-04: テストモードでは Private へコミット／push しない（成果物は上の artifact）。
+        if: success() && steps.precheck.outputs.ready == 'true' && github.event.inputs.test_mode != 'true'
         working-directory: ./private-repo
         run: |
           bash ../report-pipelines/bi/pipelines/ops/ci_commit_push.sh \

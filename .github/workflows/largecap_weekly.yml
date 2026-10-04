@@ -1,4 +1,6 @@
 name: 週次大型株速報（セクター輪番）
+# 2026-10-04: テストモードの run は run-name に「[TEST]」を付ける（check_delivery.sh が配信判定から除外する目印）
+run-name: ${{ github.event.inputs.test_mode == 'true' && format('🧪 [TEST] {0}（{1}）', github.workflow, github.event.inputs.target_date) || github.workflow }}
 
 "on":
   # PM 2026-06-28 確定: 金曜 21:00 JST = UTC 12:00（cron '0 12 * * 5'）で発火。
@@ -15,7 +17,12 @@ name: 週次大型株速報（セクター輪番）
         required: false
         default: 'false'
       dry_run:
-        description: 'true で Discord 送信せず生成・PDF 化のみ（送信ステップに --skip-send を付与）'
+        description: 'true で Discord 送信せず生成・PDF 化のみ（送信ステップに --skip-send を付与・Private へコミットしない・成果物は artifact へ）。test_mode と同時指定時も送信しない（dry_run が優先）'
+        type: boolean
+        required: false
+        default: false
+      test_mode:
+        description: 'テストモード（配信先を BI チャンネルへ切替・配信済み判定を無視・Private へコミットしない・成果物は artifact へ）。dry_run と同時指定時は送信なし'
         type: boolean
         required: false
         default: false
@@ -46,6 +53,14 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # 2026-10-04: テストモードは配信済み判定・自動リトライ上限を全て無視して実行する
+          # （配信先は BI チャンネル・Private へのコミットなし。run-name の [TEST] で本番の判定から除外される）。
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.test_mode }}" = "true" ]; then
+            echo "proceed=true" >> $GITHUB_OUTPUT
+            echo "reason=test_mode (BI 宛てテスト配信)" >> $GITHUB_OUTPUT
+            echo "test_mode=true: 配信済み判定を無視して実行します（配信先は BI チャンネル）"
+            exit 0
+          fi
           # force_rerun は「手動 workflow_dispatch かつ明示 true」の時のみ有効。
           # schedule(cron) / 通常 dispatch は既定 false のままで重複ガードが効く（誤再発火しない）。
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.force_rerun }}" = "true" ]; then
@@ -447,6 +462,20 @@ jobs:
         run: |
           python bi/pipelines/lib/crossref_check.py --file market/daily/largecap/${{ steps.date.outputs.value }}.md || true
 
+      - name: テスト配信の見出し（🧪 テストモードのみ・BI へ）
+        # 2026-10-04: テストモードでは誌面 PDF の送り先を BI チャンネルへ切り替える。
+        # 送信スクリプトの本文は変えられないため、直前に「🧪 テスト配信」の見出しを BI へ 1 通送る。
+        # dry_run と同時指定時は送信しないため見出しも送らない。
+        if: github.event.inputs.test_mode == 'true' && github.event.inputs.dry_run != 'true'
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          kind: report
+          bi_webhook: ${{ secrets.DISCORD_WEBHOOK_BI }}
+          test_mode: 'true'
+          label: '大型株週次'
+          date: ${{ steps.date.outputs.value }}
+          meaning: '次の PDF はテスト配信です（本番のレポート用チャンネルへは送っていません）。'
+
       - name: Send Discord (PDF)
         id: send
         working-directory: ./private-repo/bi/pipelines
@@ -455,7 +484,8 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
           CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
-          DISCORD_WEBHOOK_LARGECAP: ${{ secrets.DISCORD_WEBHOOK_LARGECAP }}
+          # 2026-10-04: テストモードは誌面の送り先を BI チャンネルへ切り替える（レポート用チャンネルへ送らない）
+          DISCORD_WEBHOOK_LARGECAP: ${{ github.event.inputs.test_mode == 'true' && secrets.DISCORD_WEBHOOK_BI || secrets.DISCORD_WEBHOOK_LARGECAP }}
           PYTHONIOENCODING: utf-8
         run: |
           SKIP=""
@@ -465,7 +495,23 @@ jobs:
           fi
           python send_report_pdf_discord.py --kind largecap_weekly --date ${{ steps.date.outputs.value }} $SKIP
 
+      - name: テスト成果物を artifact へ保存（🧪 テストモード・dry_run のみ）
+        # テストモード・dry_run は Private へコミットしないため、誌面 md と PDF を artifact に残して検証に使う。
+        if: always() && (github.event.inputs.test_mode == 'true' || github.event.inputs.dry_run == 'true')
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-output-largecap-weekly-${{ steps.date.outputs.value }}-${{ github.run_id }}
+          path: |
+            private-repo/market/daily/largecap/${{ steps.date.outputs.value }}.md
+            private-repo/bi/outputs/report_pdfs/largecap_weekly_${{ steps.date.outputs.value }}.pdf
+            private-repo/research/largecap/sector_ledger.json
+          retention-days: 7
+          if-no-files-found: warn
+
       - name: Rotate report archives (5 件超過分を archive/ へ退避)
+        # 2026-10-04: テストモード・dry_run ではアーカイブ整理をしない（コミットしないため）。
+        if: github.event.inputs.test_mode != 'true' && github.event.inputs.dry_run != 'true'
         working-directory: ./private-repo
         env:
           PYTHONIOENCODING: utf-8
@@ -484,7 +530,8 @@ jobs:
         # private repo に commit-back（既存方式・Public へは出さない）。
         # always() で生成 step 失敗時もここを通すが、差分が無ければ no-op。
         # rebase 方式は並行 push に弱いため fresh-base 方式の共通ヘルパーへ置換。
-        if: ${{ always() }}
+        # 2026-10-04: テストモード・dry_run では Private へコミット／push しない（成果物は上の artifact）。
+        if: ${{ always() && github.event.inputs.test_mode != 'true' && github.event.inputs.dry_run != 'true' }}
         working-directory: ./private-repo
         run: |
           bash ../report-pipelines/bi/pipelines/ops/ci_commit_push.sh \
