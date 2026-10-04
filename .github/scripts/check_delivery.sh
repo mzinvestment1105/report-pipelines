@@ -68,7 +68,10 @@ fi
 RUNS=$(gh api -X GET "repos/${REPO}/actions/workflows/${WF}/runs" \
   -f "created=${CREATED_FILTER}" \
   -f per_page=50 \
-  --jq "[.workflow_runs[] | select(.id != ${SELF_RUN_ID}) | {id: .id, event: .event, status: .status, conclusion: (.conclusion // \"none\")}]")
+  --jq "[.workflow_runs[] | select(.id != ${SELF_RUN_ID}) | select(((.display_title // \"\") | contains(\"[TEST]\")) | not) | {id: .id, event: .event, status: .status, conclusion: (.conclusion // \"none\")}]")
+# 2026-10-04: テストモード（workflow_dispatch の test_mode=true）の run は run-name に「[TEST]」を含む。
+# テスト配信は BI チャンネル宛てで本番の配信ではないため、配信済み・失敗・実行中のいずれにも数えない
+# （テスト run の成否が同日の本番 run の重複ガード・自動リトライ上限を動かさないようにする）。
 
 TOTAL=$(echo "$RUNS" | jq 'length')
 DELIVERED=0

@@ -3,7 +3,10 @@ name: Smoke model test (manual only)
 # 目的: claude-code-base-action の新しい版（CLI 2.x）で、モデル切替と出力トークン上限の
 # 引き上げが実際に効くかを手動で確認するための検証用 workflow。
 # - 手動起動（workflow_dispatch）のみ。schedule は持たない。
-# - Discord 送信は一切しない。成果物はコミットしない。
+# - mode=tiny/long は Discord 送信を一切しない。成果物はコミットしない。
+# - mode=notify（2026-10-04 追加）は Claude を起動せず、notify-discord action 経由で BI チャンネルへ
+#   kind: status 1 通と kind: report（test_mode）1 通を実送信し、HTTP 2xx でなければ失敗させる（strict）。
+#   レポート用チャンネルへは送らない（status は action が必ず BI へ送り、report も test_mode で BI へ切り替わる）。
 # - 注意: 新しい版の action は `model` / `allowed_tools` / `max_turns` / `timeout_minutes` /
 #   `claude_env` の入力を持たない。モデル・ツール・ターン数は `claude_args` で、
 #   環境変数は step の `env:` で、時間制限は step の `timeout-minutes` で渡す。
@@ -22,19 +25,52 @@ on:
         default: '64000'
         type: string
       mode:
-        description: 'tiny = 1 語だけ書く / long = 1 応答で約 32,000 トークン超を書かせる'
+        description: 'tiny = 1 語だけ書く / long = 1 応答で約 32,000 トークン超を書かせる / notify = 通知経路（BI）の実送信確認（Claude は起動しない）'
         required: false
         default: 'tiny'
         type: choice
         options:
           - tiny
           - long
+          - notify
 
 permissions:
   contents: read
 
 jobs:
+  notify:
+    if: inputs.mode == 'notify'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout report-pipelines (通知 action 用)
+        uses: actions/checkout@v4
+
+      - name: 通知経路の確認 1/2（kind=status → BI）
+        uses: ./.github/actions/notify-discord
+        with:
+          kind: status
+          bi_webhook: ${{ secrets.DISCORD_WEBHOOK_BI }}
+          test_mode: 'true'
+          strict: 'true'
+          state: failed
+          label: '通知経路の確認'
+          meaning: '状態通知が BI チャンネルへ届くかの確認です（実際のエラーではありません）。'
+          cause: '検証用の送信（smoke_model_test mode=notify）'
+
+      - name: 通知経路の確認 2/2（kind=report + test_mode → BI）
+        uses: ./.github/actions/notify-discord
+        with:
+          kind: report
+          bi_webhook: ${{ secrets.DISCORD_WEBHOOK_BI }}
+          webhook: ''
+          test_mode: 'true'
+          strict: 'true'
+          label: '通知経路の確認'
+          meaning: 'テストモードの誌面送信が BI チャンネルへ切り替わるかの確認です。'
+
   smoke:
+    if: inputs.mode != 'notify'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:

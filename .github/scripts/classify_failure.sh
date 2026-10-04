@@ -53,7 +53,7 @@ OUT_FILE="${WORKDIR}/research/sns/${TARGET_DATE}_macro_tweet.md"
 
 # 成果物が既にあるなら、そもそも失敗として扱う必要がない（Verify 側が成功と判定する）。
 if [ -s "$OUT_FILE" ]; then
-  emit "permanent" "attempt ${ATTEMPT}: 成果物が存在するため再試行不要"
+  emit "permanent" "attempt ${ATTEMPT}: 成果物が存在するため再試行は行わない"
   exit 0
 fi
 

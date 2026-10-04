@@ -85,22 +85,24 @@ jobs:
         if: github.event_name == 'schedule' && steps.check.outputs.proceed == 'true'
         uses: ./.github/actions/notify-discord
         with:
-          webhook: ${{ secrets.DISCORD_WEBHOOK_SECTOR }}
+          kind: status
+          bi_webhook: ${{ secrets.DISCORD_WEBHOOK_BI }}
+          test_mode: ${{ github.event.inputs.test_mode || 'false' }}
           state: none
           label: 'セクター日次'
           meaning: '休止中のため本日は発行しません。'
-          action_required: '不要'
           detail: 'セクター日次レポート 発行なし｜セクター日次レーンは休止中（週末フル版へ移行済み・生成ジョブ無効化）のため、この起動では何も生成されません（正常動作）。'
 
       - name: Discord 通知（guard 失敗）
         if: failure() || cancelled()
         uses: ./.github/actions/notify-discord
         with:
-          webhook: ${{ secrets.DISCORD_WEBHOOK_SECTOR || secrets.DISCORD_WEBHOOK_URL }}
+          kind: status
+          bi_webhook: ${{ secrets.DISCORD_WEBHOOK_BI }}
+          test_mode: ${{ github.event.inputs.test_mode || 'false' }}
           state: failed
           label: 'セクター日次'
           meaning: '内部エラーが出ましたが、休止中のため影響はありません。'
-          action_required: '不要'
           detail: 'セクター日次レポート guard 失敗｜実行前チェック（当日重複判定）自体がエラーになりました（日次レーン休止中のため配信への影響はありません）。'
 
   generate:
@@ -448,18 +450,17 @@ jobs:
             git stash drop 2>/dev/null || true
           fi
 
-      - name: Discord 通知（失敗）
+      - name: Discord 通知（❌ 失敗）
+        # 2026-10-04（PM 指示）: 状態通知は notify-discord の kind: status で必ず BI チャンネルへ送る
+        # （旧: レポート用チャンネルへ curl で直接送っていた）。
         if: failure()
-        env:
-          DISCORD_WEBHOOK_SECTOR: ${{ secrets.DISCORD_WEBHOOK_SECTOR }}
-          CAUSE: ${{ steps.gensum.outputs.cause }}
-        run: |
-          # 2026-09-23（PM 判断・運用通知の平易化）: 本文は平易な 2 行のみ。実行リンクはログにだけ出す。
-          # 2026-10-04: 生成の原因（出力上限到達の回数等）が分かる時だけ「原因: 」行を足す（最大 3 行）。
-          echo "::notice title=この実行のログ::https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          NL=$'\n'
-          MSG="❌ セクター日次（${{ steps.date.outputs.value }}） — 内部エラーで本日分を作れませんでした。"
-          if [ -n "$CAUSE" ]; then MSG="${MSG}${NL}原因: ${CAUSE}"; fi
-          MSG="${MSG}${NL}対応: 要 — 次回 Claude Code で「セクター日次を復旧して」とお伝えください"
-          jq -n --arg content "$MSG" '{content: $content}' \
-            | curl -s -X POST "$DISCORD_WEBHOOK_SECTOR" -H "Content-Type: application/json" -d @-
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          kind: status
+          bi_webhook: ${{ secrets.DISCORD_WEBHOOK_BI }}
+          test_mode: ${{ github.event.inputs.test_mode || 'false' }}
+          state: failed
+          label: 'セクター日次'
+          date: ${{ steps.date.outputs.value }}
+          meaning: '内部エラーで本日分を作れませんでした。'
+          cause: ${{ steps.gensum.outputs.cause }}

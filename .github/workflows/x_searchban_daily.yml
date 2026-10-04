@@ -33,7 +33,7 @@ name: X 検索除外・インプレッション 日次測定
 #   X_BURNER_AUTH_TOKEN     … バーナー垢の auth_token cookie
 #   X_BURNER_CT0            … バーナー垢の ct0 cookie
 #   PRIVATE_REPO_DEPLOY_KEY … Private リポ（mizuki-fund）への push 用デプロイキー
-#   DISCORD_WEBHOOK_SNS     … 失敗通知の送信先（未設定なら DISCORD_WEBHOOK_URL）
+#   DISCORD_WEBHOOK_BI      … 失敗通知の送信先（2026-10-04 から状態通知は全て BI チャンネル）
 #
 # 設計上の注意（このリポジトリは Public のため）:
 #   - ハンドル・投稿本文を公開ログへ一切 echo しない。スクリプトの stdout は
@@ -189,12 +189,12 @@ jobs:
         if: steps.measure.outputs.status != 'ok'
         uses: ./report-pipelines/.github/actions/notify-discord
         with:
-          webhook: ${{ secrets.DISCORD_WEBHOOK_SNS || secrets.DISCORD_WEBHOOK_URL }}
+          kind: status
+          bi_webhook: ${{ secrets.DISCORD_WEBHOOK_BI }}
           state: failed
           label: 'X 検索除外チェック'
           date: ${{ steps.date.outputs.value }}
           meaning: 'X の検索除外の測定ができませんでした（ログイン切れなど）。'
-          action_required: '要 — 次回 Claude Code で「X 検索除外チェックを復旧して」とお伝えください'
           detail: 'X 検索除外 日次測定 失敗｜検索除外の判定が成立しませんでした（cookie 失効・レート制限・GraphQL 仕様変更のいずれか）。本日の除外状態は未測定です。'
 
       - name: 成否サマリ（ハンドル・本文を含まない値のみ）

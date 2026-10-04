@@ -1,4 +1,6 @@
 name: 動意銘柄レポート日次
+# 2026-10-04: テストモードの run は run-name に「[TEST]」を付ける（check_delivery.sh が配信判定から除外する目印）
+run-name: ${{ github.event.inputs.test_mode == 'true' && format('🧪 [TEST] {0}（{1}）', github.workflow, github.event.inputs.target_date) || github.workflow }}
 
 "on":
   # PM 2026-05-27 確定: Cloudflare Worker (mizuki-fund-scheduler-1) からの workflow_dispatch がメイン経路。
@@ -15,6 +17,11 @@ name: 動意銘柄レポート日次
         description: 'true で当日重複ガードを無視して強制実行（修正後の再テスト用）'
         required: false
         default: 'false'
+      test_mode:
+        description: 'テストモード（配信先を BI チャンネルへ切替・配信済み判定を無視・Private へコミットしない・成果物は artifact へ）'
+        type: boolean
+        required: false
+        default: false
   schedule:
     - cron: '45 8 * * 1-5'
 
@@ -59,6 +66,14 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # 2026-10-04: テストモードは配信済み判定・休場判定・時間帯ゲートを全て無視して実行する
+          # （配信先は BI チャンネル・Private へのコミットなし。run-name の [TEST] で本番の判定から除外される）。
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.test_mode }}" = "true" ]; then
+            echo "proceed=true" >> $GITHUB_OUTPUT
+            echo "reason=test_mode (BI 宛てテスト配信)" >> $GITHUB_OUTPUT
+            echo "test_mode=true: 配信済み判定を無視して実行します（配信先は BI チャンネル）"
+            exit 0
+          fi
           # force_rerun は「手動 workflow_dispatch かつ明示 true」の時のみ有効。
           # schedule(cron) / Cloudflare Worker / 通常 dispatch は既定 false のままで重複ガードが効く（誤再発火しない）。
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.force_rerun }}" = "true" ]; then
@@ -135,35 +150,38 @@ jobs:
         if: github.event_name == 'schedule' && steps.check.outputs.proceed == 'true'
         uses: ./.github/actions/notify-discord
         with:
-          webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
+          kind: status
+          bi_webhook: ${{ secrets.DISCORD_WEBHOOK_BI }}
+          test_mode: ${{ github.event.inputs.test_mode || 'false' }}
           state: timer
           label: '動意レポート'
           # 2026-08-19 修正: 旧文面は「Worker 発火が届かなかった」と断定していたが、Worker が正常着弾し
           # その run が失敗した場合も同じ通知が出る。guard が実際に把握している当日実績のみを述べる。
           meaning: '通常の時刻に届かなかったため、予備の仕組みで作り直しています。このあと届きます。'
-          action_required: '不要'
           detail: '動意銘柄レポート 予備タイマー起動｜本日の生成がまだ成功していないため、GHA 側の予備タイマーが救援起動しました（本日: 成功 ${{ steps.check.outputs.done_ok }} 件・失敗 ${{ steps.check.outputs.done_fail }} 件・実行中 ${{ steps.check.outputs.active }} 件）。レポートはこのあと通常どおり届きます。'
 
       - name: Discord 通知（🚨 自動リトライ停止）
         if: contains(steps.check.outputs.reason, 'retry_cap')
         uses: ./.github/actions/notify-discord
         with:
-          webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
+          kind: status
+          bi_webhook: ${{ secrets.DISCORD_WEBHOOK_BI }}
+          test_mode: ${{ github.event.inputs.test_mode || 'false' }}
           state: alert
           label: '動意レポート'
           meaning: '本日分を自動では作れませんでした（再試行の上限）。'
-          action_required: '要 — 次回 Claude Code で「動意レポートを復旧して」とお伝えください'
           detail: '動意銘柄レポート 自動リトライ停止｜当日 2 回以上失敗したため cron の自動再実行を停止しました。本日未配信です。'
 
       - name: Discord 通知（guard 失敗）
         if: failure() || cancelled()
         uses: ./.github/actions/notify-discord
         with:
-          webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS || secrets.DISCORD_WEBHOOK_URL }}
+          kind: status
+          bi_webhook: ${{ secrets.DISCORD_WEBHOOK_BI }}
+          test_mode: ${{ github.event.inputs.test_mode || 'false' }}
           state: failed
           label: '動意レポート'
           meaning: '内部エラーで作成を開始できませんでした。'
-          action_required: '要 — 次回 Claude Code で「動意レポートを復旧して」とお伝えください'
           detail: '動意銘柄レポート guard 失敗｜実行前チェック（当日重複判定）自体がエラーになり、生成ジョブが起動していません。'
 
   setup-raw:
@@ -321,6 +339,8 @@ jobs:
         # -f は gitignore 対象の未追跡 parquet を ci_commit_push.sh の差分検出（--ignored=matching）と
         # git add -f に載せるために必須（Private .gitignore 側にも un-ignore 行を追加済み）。
         # 蓄積の欠落は配信を止める理由にならないため continue-on-error（絶対配信原則）。
+        # 2026-10-04: テストモードでは Private へコミットしない。
+        if: github.event.inputs.test_mode != 'true'
         continue-on-error: true
         working-directory: ./private-repo
         env:
@@ -334,12 +354,13 @@ jobs:
         if: failure() || cancelled()
         uses: ./report-pipelines/.github/actions/notify-discord
         with:
-          webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
+          kind: status
+          bi_webhook: ${{ secrets.DISCORD_WEBHOOK_BI }}
+          test_mode: ${{ github.event.inputs.test_mode || 'false' }}
           state: failed
           label: '動意レポート'
           date: ${{ steps.date.outputs.value }}
           meaning: '内部エラーで本日分を作れませんでした。'
-          action_required: '要 — 次回 Claude Code で「動意レポートを復旧して」とお伝えください'
           detail: '動意銘柄レポート 失敗（raw 生成）｜動意銘柄の元データ（raw）生成が失敗し、後続の市場別生成が始まらないため本日未配信です。'
 
   generate-market:
@@ -402,7 +423,7 @@ jobs:
         run: pip install -r report-pipelines/bi/pipelines/requirements.txt
 
       # PM 2026-07-05: generate-market は .md 生成のみ（PDF 化は merge-and-send 側）のため
-      # Japanese fonts / Playwright のインストールは不要・削除。
+      # Japanese fonts / Playwright のインストールは要らないため削除。
 
       - name: Download movers raw artifact (from setup-raw)
         # PM 2026-05-25 確定: setup-raw ジョブで生成した raw を全 generate-market 並列で共有
@@ -622,16 +643,17 @@ jobs:
           if-no-files-found: ignore
 
       - name: Discord 通知（❌ 市場別失敗）
-        # 2026-10-04: 再試行後もこの枠が欠けた＝誌面の一部が欠けるため対応「要」・原因行つき（旧: 不要）。
+        # 2026-10-04: 再試行後もこの枠が欠けた＝誌面の一部が欠けるため対応「要」・原因行つき（旧: 対応なし表記）。
         if: failure() || cancelled()
         uses: ./report-pipelines/.github/actions/notify-discord
         with:
-          webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
+          kind: status
+          bi_webhook: ${{ secrets.DISCORD_WEBHOOK_BI }}
+          test_mode: ${{ github.event.inputs.test_mode || 'false' }}
           state: failed
           label: '動意レポート'
           date: ${{ needs.setup-raw.outputs.target_date }}
           meaning: '${{ matrix.market == ''themes'' && ''テーマ欄'' || matrix.market == ''growth'' && ''グロース'' || matrix.market == ''standard'' && ''スタンダード'' || ''プライム'' }}の部分を作れませんでした。残りの部分だけで配信を試みます。'
-          action_required: '要 — 次回 Claude Code で「動意レポートを復旧して」とお伝えください'
           cause: ${{ steps.gensum.outputs.cause }}
           detail: '動意銘柄レポート 失敗（${{ matrix.market }} 枠の生成）｜${{ matrix.market }} 枠のセクションが再試行後も生成できませんでした。残りの枠だけで配信を試みます（この枠は本号に載りません）。'
 
@@ -868,7 +890,11 @@ jobs:
             DETAIL=$(grep '^  - ' /tmp/gate.log | head -5 | sed 's/^  - //' | awk 'NR>1{printf "・"} {printf "%s", $0} END{print ""}')
             NOTE="${NOTE}${NOTE:+ ／ }機械検査で不合格項目あり（${DETAIL}）"
           fi
+          F=market/daily/movers/${TARGET_DATE}.md
           # 2026-09-21 追加: 市場別レッグ化により一部市場が欠落したまま配信しうる。欠落は誌面で明示する。
+          # 2026-10-04 改定（PM 指示）: 欠けた枠の注記は誌面冒頭の 1 行「{枠}: 本号未掲載（原因は BI へ通知済み）」
+          # だけにする。原因・状態の説明は誌面にもレポート用チャンネルにも載せず、BI チャンネルへ通知する。
+          # 品質注記（NOTE）とは別行にし、⚠ 品質注記の BI 通知が枠欠落だけで重複して鳴らないようにする。
           MISSING="${{ steps.place.outputs.missing_markets }}"
           if [ -n "$MISSING" ]; then
             NAMES=""
@@ -882,10 +908,11 @@ jobs:
               esac
               NAMES="${NAMES}${NAMES:+・}${JP}"
             done
-            NOTE="${NOTE}${NOTE:+ ／ }⚠ ${NAMES} セクションは生成上限到達により本号未掲載"
+            # 先頭へ置く（send_report_pdf_discord.py が文書タイトルを先頭へ足すため、マストヘッド直下に来る）
+            { printf '%s\n\n' "> ${NAMES}: 本号未掲載（原因は BI へ通知済み）"; cat "$F"; } > "${F}.tmp" && mv "${F}.tmp" "$F"
+            echo "欠落注記を挿入: ${NAMES}: 本号未掲載（原因は BI へ通知済み）"
           fi
           if [ -n "$NOTE" ]; then
-            F=market/daily/movers/${TARGET_DATE}.md
             # 2026-09-21 修正: 日次の誌面タイトルは「# グロース市場」等の市場名行であり、
             # 旧アンカー /^# 動意銘柄レポート / は一度も一致せず注記が挿入されていなかった。
             # 市場名タイトルの【最初の 1 件】の直後にだけ挿入する（誌面冒頭に 1 回）。
@@ -905,6 +932,19 @@ jobs:
             echo "品質フラグなし・注記挿入なし"
           fi
 
+      - name: テスト配信の見出し（🧪 テストモードのみ・BI へ）
+        # 2026-10-04: テストモードでは誌面 PDF の送り先を BI チャンネルへ切り替える。
+        # 送信スクリプトの本文は変えられないため、直前に「🧪 テスト配信」の見出しを BI へ 1 通送る。
+        if: github.event.inputs.test_mode == 'true'
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          kind: report
+          bi_webhook: ${{ secrets.DISCORD_WEBHOOK_BI }}
+          test_mode: 'true'
+          label: '動意レポート'
+          date: ${{ needs.setup-raw.outputs.target_date }}
+          meaning: '次の PDF はテスト配信です（本番のレポート用チャンネルへは送っていません）。'
+
       - name: Send Discord (PDF・全市場 1 本)
         id: send
         working-directory: ./private-repo/bi/pipelines
@@ -913,12 +953,27 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
           CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
-          DISCORD_WEBHOOK_MOVERS: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
+          # 2026-10-04: テストモードは誌面の送り先を BI チャンネルへ切り替える（レポート用チャンネルへ送らない）
+          DISCORD_WEBHOOK_MOVERS: ${{ github.event.inputs.test_mode == 'true' && secrets.DISCORD_WEBHOOK_BI || secrets.DISCORD_WEBHOOK_MOVERS }}
           PYTHONIOENCODING: utf-8
         run: |
           python send_report_pdf_discord.py --kind movers --date ${{ needs.setup-raw.outputs.target_date }}
 
+      - name: テスト成果物を artifact へ保存（🧪 テストモードのみ）
+        # テストモードは Private へコミットしないため、誌面 md と PDF を artifact に残して検証に使う。
+        if: always() && github.event.inputs.test_mode == 'true'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-output-mover-daily-${{ needs.setup-raw.outputs.target_date }}-${{ github.run_id }}
+          path: |
+            private-repo/market/daily/movers/${{ needs.setup-raw.outputs.target_date }}.md
+            private-repo/bi/outputs/report_pdfs/movers_${{ needs.setup-raw.outputs.target_date }}.pdf
+          retention-days: 7
+          if-no-files-found: warn
+
       - name: Rotate report archives (5 件超過分を archive/ へ退避)
+        if: github.event.inputs.test_mode != 'true'
         working-directory: ./private-repo
         env:
           PYTHONIOENCODING: utf-8
@@ -937,6 +992,8 @@ jobs:
         # fresh-base 方式の共通ヘルパー（Public 側から直接実行・repo 内コピー禁止）へ置換。
         # PM 2026-09-02: theme_radar の蓄積 parquet は本ジョブの clone には存在しない
         # （書き出しは setup-raw の make_mover_report.py）。そちらの専用 commit step が push する。
+        # 2026-10-04: テストモードでは Private へコミット／push しない（成果物は上の artifact）。
+        if: github.event.inputs.test_mode != 'true'
         working-directory: ./private-repo
         env:
           TARGET_DATE: ${{ needs.setup-raw.outputs.target_date }}
@@ -949,51 +1006,58 @@ jobs:
         if: steps.place.outputs.missing_markets != '' && steps.send.outcome == 'success'
         uses: ./report-pipelines/.github/actions/notify-discord
         with:
-          webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
+          kind: status
+          bi_webhook: ${{ secrets.DISCORD_WEBHOOK_BI }}
+          test_mode: ${{ github.event.inputs.test_mode || 'false' }}
           state: partial
           label: '動意レポート'
           date: ${{ needs.setup-raw.outputs.target_date }}
-          meaning: '配信しました。${{ steps.place.outputs.missing_markets_ja }}の部分だけ作れなかったため、その部分は載っていません。'
-          # 2026-10-04: 誌面の一部が欠けたため対応「要」・欠けた枠ごとの原因行つき（旧: 不要）。
-          action_required: '要 — 次回 Claude Code で「動意レポートを復旧して」とお伝えください'
+          # 2026-10-04（PM 指示）: 枠欠けの説明はレポート用チャンネルに出さず BI へ原因付きで送る。
+          # 誌面冒頭には「{枠}: 本号未掲載（原因は BI へ通知済み）」の 1 行だけが載る。
+          meaning: '${{ steps.place.outputs.missing_markets_ja }}の部分を作れず、残りの部分だけで配信しました（誌面冒頭に「本号未掲載」の 1 行あり）。'
           cause: ${{ steps.place.outputs.missing_causes }}
-          detail: '動意銘柄レポート 一部市場が欠けたまま配信｜日次レポートは配信済みですが、${{ steps.place.outputs.missing_markets_ja }} の部分が 2 回の試行で生成できず本号に含まれていません（誌面冒頭に ⚠ 注記あり）。それ以外の市場は通常どおりの内容です。'
+          detail: '動意銘柄レポート 一部市場が欠けたまま配信｜日次レポートは配信済みですが、${{ steps.place.outputs.missing_markets_ja }} の部分が 2 回の試行で生成できず本号に含まれていません。それ以外の市場は通常どおりの内容です。'
 
       - name: Discord 通知（⚠️ 配信済み・品質注記あり）
         # PM 2026-07-12（絶対配信原則）: 品質問題があってもレポートは配信済み。何が注記されたかを PM へ通知。
         if: steps.annotate.outputs.annotated == 'true' && steps.send.outcome == 'success'
         uses: ./report-pipelines/.github/actions/notify-discord
         with:
-          webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
+          kind: status
+          bi_webhook: ${{ secrets.DISCORD_WEBHOOK_BI }}
+          test_mode: ${{ github.event.inputs.test_mode || 'false' }}
           state: partial
           label: '動意レポート'
           date: ${{ needs.setup-raw.outputs.target_date }}
-          meaning: '配信しました。一部に注意点があるため、誌面の冒頭に注記があります。'
-          # 2026-10-04: 注記に枠の欠落が含まれる（誌面の一部が欠けた）時は対応「要」。
-          action_required: '${{ steps.place.outputs.missing_markets != '''' && ''要 — 次回 Claude Code で「動意レポートを復旧して」とお伝えください'' || ''不要'' }}'
+          meaning: '配信しました。品質検査で注意点が見つかったため、誌面の冒頭に品質注記を付けました。'
+          # 2026-10-04: 枠の欠落は別通知（上）に分離。ここは品質注記の中身を原因行に載せる。
+          cause: ${{ steps.annotate.outputs.note }}
           detail: '動意銘柄レポート 配信済み（品質注記あり）｜レポートは配信済みです。品質注記（${{ steps.annotate.outputs.note }}）を各市場の冒頭に付けています。'
 
       - name: Discord 通知（⚠️ 配信済み・後処理のみ失敗）
         if: (failure() || cancelled()) && steps.send.outcome == 'success'
         uses: ./report-pipelines/.github/actions/notify-discord
         with:
-          webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
+          kind: status
+          bi_webhook: ${{ secrets.DISCORD_WEBHOOK_BI }}
+          test_mode: ${{ github.event.inputs.test_mode || 'false' }}
           state: partial
           label: '動意レポート'
           date: ${{ needs.setup-raw.outputs.target_date }}
-          meaning: '配信は完了しています。保存処理だけ失敗しましたが誌面に影響はありません。'
-          action_required: '不要'
+          meaning: '配信は完了しています。配信後の保存処理だけが失敗しました。'
+          cause: '配信後のアーカイブ整理または Private リポへの保存（commit／push）が失敗'
           detail: '動意銘柄レポート 後処理のみ失敗｜レポート本体は配信済みです。配信後のアーカイブ整理または commit だけが失敗しました。'
 
       - name: Discord 通知（❌ merge/送信失敗）
         if: (failure() || cancelled()) && steps.send.outcome != 'success'
         uses: ./report-pipelines/.github/actions/notify-discord
         with:
-          webhook: ${{ secrets.DISCORD_WEBHOOK_MOVERS }}
+          kind: status
+          bi_webhook: ${{ secrets.DISCORD_WEBHOOK_BI }}
+          test_mode: ${{ github.event.inputs.test_mode || 'false' }}
           state: failed
           label: '動意レポート'
           date: ${{ needs.setup-raw.outputs.target_date }}
           meaning: '内部エラーで本日分を作れませんでした。'
-          action_required: '要 — 次回 Claude Code で「動意レポートを復旧して」とお伝えください'
           cause: ${{ steps.place.outputs.missing_causes }}
           detail: '動意銘柄レポート 失敗（統合/送信）｜市場別セクションの統合または Discord 送信が失敗し、本日未配信です。'

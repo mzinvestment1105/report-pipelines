@@ -113,22 +113,22 @@ jobs:
         if: contains(steps.check.outputs.reason, 'retry_cap')
         uses: ./.github/actions/notify-discord
         with:
-          webhook: ${{ secrets.DISCORD_WEBHOOK_THEME }}
+          kind: status
+          bi_webhook: ${{ secrets.DISCORD_WEBHOOK_BI }}
           state: alert
           label: 'テーマ動意'
           meaning: '本日のテーマデータを自動では集められませんでした（再試行の上限）。レポートの配信には影響ありません。'
-          action_required: '要 — 次回 Claude Code で「テーマ動意を復旧して」とお伝えください'
           detail: 'テーマランキング蓄積 自動リトライ停止｜当日 2 回以上失敗したため cron の自動再実行を停止しました。本日分の theme_momentum.parquet が未蓄積です。'
 
       - name: Discord 通知（guard 失敗）
         if: failure() || cancelled()
         uses: ./.github/actions/notify-discord
         with:
-          webhook: ${{ secrets.DISCORD_WEBHOOK_THEME || secrets.DISCORD_WEBHOOK_URL }}
+          kind: status
+          bi_webhook: ${{ secrets.DISCORD_WEBHOOK_BI }}
           state: failed
           label: 'テーマ動意'
           meaning: '内部エラーでテーマデータの収集を開始できませんでした。レポートの配信には影響ありません。'
-          action_required: '要 — 次回 Claude Code で「テーマ動意を復旧して」とお伝えください'
           detail: 'テーマランキング蓄積 guard 失敗｜実行前チェック（当日重複判定）自体がエラーになり、蓄積ジョブが起動していません。'
 
   generate:
@@ -170,7 +170,7 @@ jobs:
 
       - name: Copy pipelines from Public into private working tree
         # PM 2026-09-02: 誌面生成を廃止したため、フォント（assets/fonts）・agents・playbook の
-        # overlay は不要（PDF を作らない・Claude を起動しない）。*.py と lib/ のみで足りる。
+        # overlay は要らない（PDF を作らない・Claude を起動しない）。*.py と lib/ のみで足りる。
         run: |
           cp -f report-pipelines/bi/pipelines/*.py private-repo/bi/pipelines/
           cp -f report-pipelines/bi/pipelines/requirements.txt private-repo/bi/pipelines/
@@ -265,12 +265,12 @@ jobs:
         if: success() && steps.failmark.outputs.recovered == 'true'
         uses: ./report-pipelines/.github/actions/notify-discord
         with:
-          webhook: ${{ secrets.DISCORD_WEBHOOK_THEME }}
+          kind: status
+          bi_webhook: ${{ secrets.DISCORD_WEBHOOK_BI }}
           state: done
           label: 'テーマランキング蓄積'
           date: ${{ steps.date.outputs.value }}
           meaning: '復旧しました（予備起動）。本日のテーマデータを集めて保存しました。'
-          action_required: '不要'
           detail: 'テーマランキング蓄積 復旧（予備起動）｜同日の主経路の失敗後、予備起動（cron）の再試行で theme_momentum.parquet への蓄積が完了しました。'
 
       - name: Discord 通知（❌ ランキング取得ブロック）
@@ -279,24 +279,24 @@ jobs:
         if: (failure() || cancelled()) && steps.fetch_raw.outcome == 'failure'
         uses: ./report-pipelines/.github/actions/notify-discord
         with:
-          webhook: ${{ secrets.DISCORD_WEBHOOK_THEME }}
+          kind: status
+          bi_webhook: ${{ secrets.DISCORD_WEBHOOK_BI }}
           state: failed
           label: 'テーマ動意'
           date: ${{ steps.date.outputs.value }}
           # 2026-10-04: 主経路（dispatch）の失敗は同日の予備起動（cron）が自動で再試行し、復旧時は ✅ を通知する。
           # 予備起動自身の失敗は以後の自動再試行が無いため対応「要」。
           meaning: '${{ github.event_name == ''schedule'' && ''テーマ情報の取得元に接続を断られ、予備起動でも本日のテーマデータを集められませんでした。レポートの配信には影響ありません。'' || ''テーマ情報の取得元に接続を断られ、本日のテーマデータを集められませんでした。予備起動（cron）で同日中に自動再試行します。復旧時は通知します。'' }}'
-          action_required: '${{ github.event_name == ''schedule'' && ''要 — 次回 Claude Code で「テーマ動意を復旧して」とお伝えください'' || ''不要（予備起動でも集められなければ、改めて通知します）'' }}'
           detail: 'テーマランキング蓄積 失敗（取得ブロック）｜テーマランキングの取得元（株探/みんかぶ）が GHA の接続を拒否し（IP ブロック起因・リトライ済み）、本日分が未蓄積です。誌面配信は 2026-09-02 に廃止済のため配信影響はありません。'
 
       - name: Discord 通知（❌ 失敗）
         if: (failure() || cancelled()) && steps.fetch_raw.outcome != 'failure'
         uses: ./report-pipelines/.github/actions/notify-discord
         with:
-          webhook: ${{ secrets.DISCORD_WEBHOOK_THEME }}
+          kind: status
+          bi_webhook: ${{ secrets.DISCORD_WEBHOOK_BI }}
           state: failed
           label: 'テーマ動意'
           date: ${{ steps.date.outputs.value }}
           meaning: '${{ github.event_name == ''schedule'' && ''予備起動でも本日のテーマデータの保存が完了しませんでした。レポートの配信には影響ありません。'' || ''本日のテーマデータの保存が完了しませんでした。予備起動（cron）で同日中に自動再試行します。復旧時は通知します。'' }}'
-          action_required: '${{ github.event_name == ''schedule'' && ''要 — 次回 Claude Code で「テーマ動意を復旧して」とお伝えください'' || ''不要（予備起動でも保存できなければ、改めて通知します）'' }}'
           detail: 'テーマランキング蓄積 失敗｜theme_momentum.parquet の蓄積または commit が完了しませんでした。誌面配信は 2026-09-02 に廃止済のため配信影響はありません。'

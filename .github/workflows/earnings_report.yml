@@ -92,22 +92,24 @@ jobs:
         if: steps.check.outputs.proceed == 'false'
         uses: ./.github/actions/notify-discord
         with:
-          webhook: ${{ secrets.DISCORD_WEBHOOK_EARNINGS || secrets.DISCORD_WEBHOOK_URL }}
+          kind: status
+          bi_webhook: ${{ secrets.DISCORD_WEBHOOK_BI }}
+          test_mode: ${{ github.event.inputs.test_mode || 'false' }}
           state: none
           label: '決算総括レポート'
           meaning: '既に届いているか作成中のため、重ねて作りません。'
-          action_required: '不要'
           detail: '決算シーズン総括 発行なし｜当日すでに成功済みまたは実行中の run があるため、この起動では生成しません（正常動作）。'
 
       - name: Discord 通知（guard 失敗）
         if: failure() || cancelled()
         uses: ./.github/actions/notify-discord
         with:
-          webhook: ${{ secrets.DISCORD_WEBHOOK_EARNINGS || secrets.DISCORD_WEBHOOK_URL }}
+          kind: status
+          bi_webhook: ${{ secrets.DISCORD_WEBHOOK_BI }}
+          test_mode: ${{ github.event.inputs.test_mode || 'false' }}
           state: failed
           label: '決算総括レポート'
           meaning: '内部エラーで作成を開始できませんでした。'
-          action_required: '要 — 次回 Claude Code で「決算総括レポートを復旧して」とお伝えください'
           detail: '決算シーズン総括 guard 失敗｜実行前チェック（当日重複判定）自体がエラーになり、生成ジョブが起動していません。'
 
   generate:
@@ -270,7 +272,7 @@ jobs:
 
       - name: "ETL Step 5: 保有・Watchlist の TDNet 取得 (fetch_tdnet_disclosures.py)"
         # coverage_stocks.csv の sources 列に positions / watchlist を含む銘柄のみ対象。
-        # やのしん WebAPI は認証不要 HTTP・GHA IP でのブロック有無は試運転で要確認のため
+        # やのしん WebAPI は認証なし HTTP・GHA IP でのブロック有無は試運転で要確認のため
         # continue-on-error（TDNet 欠落時もレポート生成は続行・プロンプト側で欠落許容）。
         working-directory: ./private-repo/bi/pipelines
         continue-on-error: true
@@ -548,12 +550,13 @@ jobs:
         if: failure() && steps.gate.outputs.exit_code == '3'
         uses: ./report-pipelines/.github/actions/notify-discord
         with:
-          webhook: ${{ secrets.DISCORD_WEBHOOK_EARNINGS || secrets.DISCORD_WEBHOOK_URL }}
+          kind: status
+          bi_webhook: ${{ secrets.DISCORD_WEBHOOK_BI }}
+          test_mode: ${{ github.event.inputs.test_mode || 'false' }}
           state: blocked
           label: '決算総括レポート'
           date: ${{ steps.month.outputs.value }}
           meaning: '誌面がうまく作れなかったため、送信を止めました。今回分は届いていません。'
-          action_required: '要 — 次回 Claude Code で「決算総括レポートを復旧して」とお伝えください'
           cause: ${{ steps.gensum.outputs.cause }}
           detail: '決算シーズン総括 送信中止（生成確認不合格）｜レポートが未生成または極端に短く不完全だったため、配信を止めました。未配信です。'
 
@@ -561,23 +564,25 @@ jobs:
         if: (failure() || cancelled()) && steps.send.outcome == 'success'
         uses: ./report-pipelines/.github/actions/notify-discord
         with:
-          webhook: ${{ secrets.DISCORD_WEBHOOK_EARNINGS || secrets.DISCORD_WEBHOOK_URL }}
+          kind: status
+          bi_webhook: ${{ secrets.DISCORD_WEBHOOK_BI }}
+          test_mode: ${{ github.event.inputs.test_mode || 'false' }}
           state: partial
           label: '決算総括レポート'
           date: ${{ steps.month.outputs.value }}
           meaning: '配信は完了しています。保存処理だけ失敗しましたが誌面に影響はありません。'
-          action_required: '不要'
           detail: '決算シーズン総括 後処理のみ失敗｜レポート本体は配信済みです。配信後の commit だけが失敗しました。'
 
       - name: Discord 通知（❌ 失敗）
         if: (failure() || cancelled()) && steps.gate.outputs.exit_code != '3' && steps.send.outcome != 'success'
         uses: ./report-pipelines/.github/actions/notify-discord
         with:
-          webhook: ${{ secrets.DISCORD_WEBHOOK_EARNINGS || secrets.DISCORD_WEBHOOK_URL }}
+          kind: status
+          bi_webhook: ${{ secrets.DISCORD_WEBHOOK_BI }}
+          test_mode: ${{ github.event.inputs.test_mode || 'false' }}
           state: failed
           label: '決算総括レポート'
           date: ${{ steps.month.outputs.value }}
           meaning: '内部エラーで今回分を作れませんでした。'
-          action_required: '要 — 次回 Claude Code で「決算総括レポートを復旧して」とお伝えください'
           cause: ${{ steps.gensum.outputs.cause }}
           detail: '決算シーズン総括 失敗｜ETL・生成・送信のいずれかが完了せず、未配信です。'

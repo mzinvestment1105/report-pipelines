@@ -95,22 +95,22 @@ jobs:
         if: contains(steps.check.outputs.reason, 'retry_cap')
         uses: ./.github/actions/notify-discord
         with:
-          webhook: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          kind: status
+          bi_webhook: ${{ secrets.DISCORD_WEBHOOK_BI }}
           state: alert
           label: 'スクリーニング更新'
           meaning: '本日の更新を自動では完了できませんでした（再試行の上限）。データは前回のままです。'
-          action_required: '要 — 次回 Claude Code で「スクリーニング更新を復旧して」とお伝えください'
           detail: 'スクリーニングETL 自動リトライ停止｜当日 2 回以上失敗したため cron の自動再実行を停止しました。screening_master は前回値のまま更新されていません。'
 
       - name: Discord 通知（guard 失敗）
         if: failure() || cancelled()
         uses: ./.github/actions/notify-discord
         with:
-          webhook: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          kind: status
+          bi_webhook: ${{ secrets.DISCORD_WEBHOOK_BI }}
           state: failed
           label: 'スクリーニング更新'
           meaning: '内部エラーで更新を開始できませんでした。データは前回のままです。'
-          action_required: '要 — 次回 Claude Code で「スクリーニング更新を復旧して」とお伝えください'
           detail: 'スクリーニングETL guard 失敗｜実行前チェック（当日重複判定）自体がエラーになり、更新ジョブが起動していません。'
 
   update:
@@ -231,11 +231,11 @@ jobs:
         if: success()
         uses: ./report-pipelines/.github/actions/notify-discord
         with:
-          webhook: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          kind: status
+          bi_webhook: ${{ secrets.DISCORD_WEBHOOK_BI }}
           state: done
           label: 'スクリーニング更新'
           meaning: '更新が完了しました。'
-          action_required: '不要'
           detail: 'スクリーニングETL 完了｜screening_master を更新しました（銘柄数 ${{ steps.etl.outputs.rows }}・YF補完 ${{ steps.etl.outputs.yf_used }}銘柄）。'
 
       - name: Discord 通知（❌ 失敗）
@@ -244,9 +244,9 @@ jobs:
         if: failure() || cancelled()
         uses: ./report-pipelines/.github/actions/notify-discord
         with:
-          webhook: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          kind: status
+          bi_webhook: ${{ secrets.DISCORD_WEBHOOK_BI }}
           state: failed
           label: 'スクリーニング更新'
           meaning: '更新が完了しませんでした。データは前回のままです。'
-          action_required: '要 — 次回 Claude Code で「スクリーニング更新を復旧して」とお伝えください'
           detail: 'スクリーニングETL 失敗｜日次更新が完了せず（エラーまたは制限時間超過）、screening_master は前回値のまま更新されていません。'

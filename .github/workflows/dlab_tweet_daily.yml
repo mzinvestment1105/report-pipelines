@@ -90,22 +90,24 @@ jobs:
         if: contains(steps.check.outputs.reason, 'retry_cap')
         uses: ./.github/actions/notify-discord
         with:
-          webhook: ${{ secrets.DISCORD_WEBHOOK_SNS || secrets.DISCORD_WEBHOOK_URL }}
+          kind: status
+          bi_webhook: ${{ secrets.DISCORD_WEBHOOK_BI }}
+          test_mode: ${{ github.event.inputs.test_mode || 'false' }}
           state: alert
           label: 'D-Labツイート'
           meaning: '本日のツイート案を自動では作れませんでした（再試行の上限）。'
-          action_required: '要 — 次回 Claude Code で「D-Labツイートを復旧して」とお伝えください'
           detail: 'D ラボレーンツイート 自動リトライ停止｜対象日に 3 回以上失敗したため自動再実行を停止しました。ツイート案は未生成です。'
 
       - name: Discord 通知（guard 失敗）
         if: failure() || cancelled()
         uses: ./.github/actions/notify-discord
         with:
-          webhook: ${{ secrets.DISCORD_WEBHOOK_SNS || secrets.DISCORD_WEBHOOK_URL }}
+          kind: status
+          bi_webhook: ${{ secrets.DISCORD_WEBHOOK_BI }}
+          test_mode: ${{ github.event.inputs.test_mode || 'false' }}
           state: failed
           label: 'D-Labツイート'
           meaning: '内部エラーで作成を開始できませんでした。'
-          action_required: '要 — 次回 Claude Code で「D-Labツイートを復旧して」とお伝えください'
           detail: 'D ラボレーンツイート guard 失敗｜実行前チェック自体がエラーになり、生成ジョブが起動していません。'
 
   generate:
@@ -478,23 +480,25 @@ jobs:
         if: (failure() || cancelled()) && steps.send.outcome == 'success'
         uses: ./report-pipelines/.github/actions/notify-discord
         with:
-          webhook: ${{ secrets.DISCORD_WEBHOOK_SNS || secrets.DISCORD_WEBHOOK_URL }}
+          kind: status
+          bi_webhook: ${{ secrets.DISCORD_WEBHOOK_BI }}
+          test_mode: ${{ github.event.inputs.test_mode || 'false' }}
           state: partial
           label: 'D-Labツイート'
           date: ${{ steps.date.outputs.value }}
           meaning: '配信は完了しています。記録の保存だけ失敗したため、明日同じ話題が選ばれることがあります。'
-          action_required: '不要'
           detail: 'D ラボレーンツイート 後処理のみ失敗｜ツイート案は Discord へ配信済みです。配信後の記録または commit だけが失敗しました。'
 
       - name: Discord 通知（❌ 失敗）
         if: (failure() || cancelled()) && steps.send.outcome != 'success'
         uses: ./report-pipelines/.github/actions/notify-discord
         with:
-          webhook: ${{ secrets.DISCORD_WEBHOOK_SNS || secrets.DISCORD_WEBHOOK_URL }}
+          kind: status
+          bi_webhook: ${{ secrets.DISCORD_WEBHOOK_BI }}
+          test_mode: ${{ github.event.inputs.test_mode || 'false' }}
           state: failed
           label: 'D-Labツイート'
           date: ${{ steps.date.outputs.value }}
           meaning: '内部エラーで本日のツイート案を作れませんでした。'
-          action_required: '要 — 次回 Claude Code で「D-Labツイートを復旧して」とお伝えください'
           cause: ${{ steps.gensum.outputs.cause }}
           detail: 'D ラボレーンツイート 失敗｜生成または送信が完了せず、本日の D ラボレーンツイート案は未配信です。'
