@@ -121,7 +121,7 @@ jobs:
           state: alert
           label: 'X フォロー候補'
           meaning: '本日分を自動では作れませんでした（再試行の上限）。'
-          action_required: '次回 Claude Code で「X フォロー候補を復旧して」とお伝えください'
+          action_required: '要 — 次回 Claude Code で「X フォロー候補を復旧して」とお伝えください'
           detail: 'X 先行フォロー候補 日次 自動リトライ停止｜当日 2 回以上失敗したため cron の自動再実行を停止しました。本日の先行フォロー候補は未発行です。'
 
       - name: Discord 通知（guard 失敗）
@@ -132,7 +132,7 @@ jobs:
           state: failed
           label: 'X フォロー候補'
           meaning: '内部エラーで作成を開始できませんでした。'
-          action_required: '次回 Claude Code で「X フォロー候補を復旧して」とお伝えください'
+          action_required: '要 — 次回 Claude Code で「X フォロー候補を復旧して」とお伝えください'
           detail: 'X 先行フォロー候補 日次 guard 失敗｜実行前チェック（当日重複判定）自体がエラーになり、生成ジョブが起動していません。'
 
   generate:
@@ -415,7 +415,7 @@ jobs:
           label: 'X フォロー候補'
           date: ${{ steps.date.outputs.value }}
           meaning: '内部エラーで本日分を作れませんでした。'
-          action_required: '次回 Claude Code で「X フォロー候補を復旧して」とお伝えください'
+          action_required: '要 — 次回 Claude Code で「X フォロー候補を復旧して」とお伝えください'
           detail: 'X 先行フォロー候補 日次 失敗｜生成または送信が完了せず、本日の先行フォロー候補は未配信です。'
 
       - name: 成否サマリ（bool のみ）

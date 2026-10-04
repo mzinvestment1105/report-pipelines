@@ -117,7 +117,7 @@ jobs:
           state: alert
           label: 'テーマ動意'
           meaning: '本日のテーマデータを自動では集められませんでした（再試行の上限）。レポートの配信には影響ありません。'
-          action_required: '次回 Claude Code で「テーマ動意を復旧して」とお伝えください'
+          action_required: '要 — 次回 Claude Code で「テーマ動意を復旧して」とお伝えください'
           detail: 'テーマランキング蓄積 自動リトライ停止｜当日 2 回以上失敗したため cron の自動再実行を停止しました。本日分の theme_momentum.parquet が未蓄積です。'
 
       - name: Discord 通知（guard 失敗）
@@ -128,7 +128,7 @@ jobs:
           state: failed
           label: 'テーマ動意'
           meaning: '内部エラーでテーマデータの収集を開始できませんでした。レポートの配信には影響ありません。'
-          action_required: '次回 Claude Code で「テーマ動意を復旧して」とお伝えください'
+          action_required: '要 — 次回 Claude Code で「テーマ動意を復旧して」とお伝えください'
           detail: 'テーマランキング蓄積 guard 失敗｜実行前チェック（当日重複判定）自体がエラーになり、蓄積ジョブが起動していません。'
 
   generate:
@@ -218,6 +218,61 @@ jobs:
             -m "data: theme momentum ${{ steps.date.outputs.value }}" \
             bi/outputs/theme_momentum.parquet bi/outputs/theme_master_minkabu.parquet
 
+      # 2026-10-04: 失敗マーカー／復旧通知。
+      # 主経路（Worker からの workflow_dispatch）が失敗しても、同日の予備起動（cron）が自動で再試行する。
+      # そこで失敗時は「当日失敗した」ことを小さな artifact（theme-fail-<対象日>-<run_id>）で残し、
+      # 予備起動の run が成功した時にそれを Artifacts API で見つけたら「✅ 復旧」を同じ webhook へ送る。
+      # 同日に失敗通知が出ていなければマーカーが無いので復旧通知は送らない（判定に gh run list は使わない。
+      # 既存の枠切れマーカー spending-cap-* / count_capped_failures.sh と同じ方式）。
+      - name: 失敗マーカーを作成（予備起動の復旧通知用）
+        if: failure() || cancelled()
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+        run: |
+          mkdir -p /tmp/theme-fail
+          {
+            echo "target_date=${TARGET_DATE}"
+            echo "run_id=${{ github.run_id }}"
+            echo "event=${{ github.event_name }}"
+          } > /tmp/theme-fail/theme_fail.txt
+
+      - name: 失敗マーカーを artifact へ退避
+        if: failure() || cancelled()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: theme-fail-${{ steps.date.outputs.value }}-${{ github.run_id }}
+          path: /tmp/theme-fail/theme_fail.txt
+          retention-days: 2
+
+      - name: 同日の失敗マーカーを確認（予備起動の成功時のみ）
+        id: failmark
+        if: success() && github.event_name == 'schedule'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+        run: |
+          PREFIX="theme-fail-${TARGET_DATE}-"
+          COUNT=$(gh api -X GET "repos/${GITHUB_REPOSITORY}/actions/artifacts" -f per_page=100 \
+            --jq "[.artifacts[] | select(.expired == false) | select(.name | startswith(\"${PREFIX}\")) | select((.workflow_run.id // 0) != ${{ github.run_id }})] | length" \
+            2>/dev/null || echo 0)
+          case "$COUNT" in ''|*[!0-9]*) COUNT=0 ;; esac
+          echo "同日（${TARGET_DATE}）の失敗マーカー: ${COUNT} 件"
+          if [ "$COUNT" -gt 0 ]; then echo "recovered=true" >> $GITHUB_OUTPUT; else echo "recovered=false" >> $GITHUB_OUTPUT; fi
+
+      - name: Discord 通知（✅ 復旧・予備起動）
+        if: success() && steps.failmark.outputs.recovered == 'true'
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_THEME }}
+          state: done
+          label: 'テーマランキング蓄積'
+          date: ${{ steps.date.outputs.value }}
+          meaning: '復旧しました（予備起動）。本日のテーマデータを集めて保存しました。'
+          action_required: '不要'
+          detail: 'テーマランキング蓄積 復旧（予備起動）｜同日の主経路の失敗後、予備起動（cron）の再試行で theme_momentum.parquet への蓄積が完了しました。'
+
       - name: Discord 通知（❌ ランキング取得ブロック）
         # fetch_theme_momentum.py の失敗（exit 1 = 3ソース全滅）= 株探/みんかぶが GHA ランナー IP を
         # 弾いた（405 等・リトライ済み）とみられるため、専用文言でリカバリ手段を明示する。
@@ -228,8 +283,10 @@ jobs:
           state: failed
           label: 'テーマ動意'
           date: ${{ steps.date.outputs.value }}
-          meaning: 'テーマ情報の取得元に接続を断られ、本日のテーマデータを集められませんでした。レポートの配信には影響ありません。'
-          action_required: '次回 Claude Code で「テーマ動意を復旧して」とお伝えください'
+          # 2026-10-04: 主経路（dispatch）の失敗は同日の予備起動（cron）が自動で再試行し、復旧時は ✅ を通知する。
+          # 予備起動自身の失敗は以後の自動再試行が無いため対応「要」。
+          meaning: '${{ github.event_name == ''schedule'' && ''テーマ情報の取得元に接続を断られ、予備起動でも本日のテーマデータを集められませんでした。レポートの配信には影響ありません。'' || ''テーマ情報の取得元に接続を断られ、本日のテーマデータを集められませんでした。予備起動（cron）で同日中に自動再試行します。復旧時は通知します。'' }}'
+          action_required: '${{ github.event_name == ''schedule'' && ''要 — 次回 Claude Code で「テーマ動意を復旧して」とお伝えください'' || ''不要（予備起動でも集められなければ、改めて通知します）'' }}'
           detail: 'テーマランキング蓄積 失敗（取得ブロック）｜テーマランキングの取得元（株探/みんかぶ）が GHA の接続を拒否し（IP ブロック起因・リトライ済み）、本日分が未蓄積です。誌面配信は 2026-09-02 に廃止済のため配信影響はありません。'
 
       - name: Discord 通知（❌ 失敗）
@@ -240,6 +297,6 @@ jobs:
           state: failed
           label: 'テーマ動意'
           date: ${{ steps.date.outputs.value }}
-          meaning: '本日のテーマデータの保存が完了しませんでした。レポートの配信には影響ありません。'
-          action_required: '次回 Claude Code で「テーマ動意を復旧して」とお伝えください'
+          meaning: '${{ github.event_name == ''schedule'' && ''予備起動でも本日のテーマデータの保存が完了しませんでした。レポートの配信には影響ありません。'' || ''本日のテーマデータの保存が完了しませんでした。予備起動（cron）で同日中に自動再試行します。復旧時は通知します。'' }}'
+          action_required: '${{ github.event_name == ''schedule'' && ''要 — 次回 Claude Code で「テーマ動意を復旧して」とお伝えください'' || ''不要（予備起動でも保存できなければ、改めて通知します）'' }}'
           detail: 'テーマランキング蓄積 失敗｜theme_momentum.parquet の蓄積または commit が完了しませんでした。誌面配信は 2026-09-02 に廃止済のため配信影響はありません。'

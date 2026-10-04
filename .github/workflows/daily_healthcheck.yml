@@ -201,7 +201,7 @@ jobs:
           label: '健全性チェック'
           date: ${{ steps.scope.outputs.today_jst }}
           meaning: '${{ steps.check.outputs.meaning }}'
-          action_required: '次回 Claude Code で「${{ steps.check.outputs.names }}を復旧して」とお伝えください'
+          action_required: '要 — 次回 Claude Code で「${{ steps.check.outputs.names }}を復旧して」とお伝えください'
           detail: '${{ steps.scope.outputs.label }}｜${{ steps.check.outputs.detail }}'
 
       - name: Healthy heartbeat (when all OK)
@@ -218,5 +218,5 @@ jobs:
           state: failed
           label: '健全性チェック'
           meaning: '内部エラーで点検ができませんでした。未配信があっても気づけない状態です。'
-          action_required: '次回 Claude Code で「健全性チェックを復旧して」とお伝えください'
+          action_required: '要 — 次回 Claude Code で「健全性チェックを復旧して」とお伝えください'
           detail: 'Healthcheck 自体が失敗｜無音検知の見張り役（healthcheck）自体がエラーになりました。このままだと各レーンの未発行を検知できません。'

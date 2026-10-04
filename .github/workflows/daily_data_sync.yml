@@ -208,7 +208,7 @@ jobs:
           label: 'SNS データ同期'
           date: ${{ steps.date.outputs.value }}
           meaning: 'X のフォロワー数などが取れませんでした（ログイン切れの疑い）。本日のフォロワー増減は正しくありません。'
-          action_required: '次回 Claude Code で「X のログインを更新して」とお伝えください'
+          action_required: '要 — 次回 Claude Code で「X のログインを更新して」とお伝えください'
           detail: 'SNS デイリーデータ同期 X 取得 0 件｜X プロフィール取得の件数が 0 でした（0 件の対象: ${{ steps.profile_gate.outputs.empty }}）。スクリプトは正常終了しているため、バーナー垢の cookie 失効によるサイレント失敗が疑われます。当日のフォロワー増減・churn は信用できません。'
 
       - name: 2/4 前日比 churn 算出

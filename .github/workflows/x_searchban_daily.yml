@@ -194,7 +194,7 @@ jobs:
           label: 'X 検索除外チェック'
           date: ${{ steps.date.outputs.value }}
           meaning: 'X の検索除外の測定ができませんでした（ログイン切れなど）。'
-          action_required: '次回 Claude Code で「X 検索除外チェックを復旧して」とお伝えください'
+          action_required: '要 — 次回 Claude Code で「X 検索除外チェックを復旧して」とお伝えください'
           detail: 'X 検索除外 日次測定 失敗｜検索除外の判定が成立しませんでした（cookie 失効・レート制限・GraphQL 仕様変更のいずれか）。本日の除外状態は未測定です。'
 
       - name: 成否サマリ（ハンドル・本文を含まない値のみ）

@@ -89,7 +89,7 @@ jobs:
           state: failed
           label: '株価データ更新'
           meaning: '内部エラーで更新を開始できませんでした。データは前回のままです。'
-          action_required: '次回 Claude Code で「株価データ更新を復旧して」とお伝えください'
+          action_required: '要 — 次回 Claude Code で「株価データ更新を復旧して」とお伝えください'
           detail: '価格履歴ETL guard 失敗｜実行前チェック（当日重複判定）自体がエラーになり、更新ジョブが起動していません。'
 
   update:
@@ -180,5 +180,5 @@ jobs:
           state: failed
           label: '株価データ更新'
           meaning: '更新が完了しませんでした。データは前回のままです。'
-          action_required: '次回 Claude Code で「株価データ更新を復旧して」とお伝えください'
+          action_required: '要 — 次回 Claude Code で「株価データ更新を復旧して」とお伝えください'
           detail: '価格履歴ETL 失敗（${{ steps.mode.outputs.mode }}）｜更新が完了せず（エラーまたは制限時間超過）、価格履歴は前回値のまま更新されていません。'

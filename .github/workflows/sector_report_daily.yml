@@ -247,26 +247,35 @@ jobs:
       # 第三者製の新規 action を足さず、continue-on-error + outcome 判定の再試行ステップだけで構成する。
       # 529 は即時再試行が無意味なため待機を指数的に伸ばす（60 秒 → 180 秒）。3 ステップとも
       # continue-on-error のため、成否は最後の Verify ステップ 1 箇所（成果物ファイルが非空か）で決まる。
-      - name: Generate sector report via Claude Code (Opus 5 + effort high・Deep Research 内包)
+      - name: Generate sector report via Claude Code (Opus 5.5 + effort high・Deep Research 内包)
         id: gen1
         continue-on-error: true
         # PM 2026-05-23 確定: ローカルと全く同じ精度を担保する。Deep Research は GHA 内で
         # Claude Code Action が WebSearch を使って実施 → make_sector_raw.py に --deep-research-file
         # で渡す → メインレポート生成、までを 1 Action で完結する。
-        uses: anthropics/claude-code-base-action@beta
+        timeout-minutes: 60
+        uses: anthropics/claude-code-base-action@57607815d5d9678acb18dae0e5033d87d4dd4177
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          model: claude-opus-5
           prompt_file: report-pipelines/prompts/sector-report.md
-          allowed_tools: "Read,Write,Edit,Bash,Grep,Glob,WebSearch,WebFetch"
-          timeout_minutes: "60"
-          claude_env: |
-            CLAUDE_CODE_EFFORT_LEVEL: high
-            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+          claude_args: --model claude-opus-5-5 --allowedTools Read,Write,Edit,Bash,Grep,Glob,WebSearch,WebFetch
         env:
+          CLAUDE_CODE_EFFORT_LEVEL: high
+          CLAUDE_CODE_MAX_OUTPUT_TOKENS: "64000"
           TARGET_DATE: ${{ steps.date.outputs.value }}
           PRIVATE_REPO_ROOT: private-repo
           JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
+
+      - name: Check attempt 1 (成果物と出力上限到達の確認)
+        id: chk1
+        if: steps.gen1.outcome != 'skipped'
+        env:
+          ATTEMPT: '1'
+          OUTCOME: ${{ steps.gen1.outcome }}
+          EXECUTION_FILE: ${{ steps.gen1.outputs.execution_file }}
+          PROMPT_FILE: report-pipelines/prompts/sector-report.md
+          OUT_FILES: private-repo/market/daily/sector/${{ steps.date.outputs.value }}.md
+        run: bash report-pipelines/.github/scripts/check_attempt.sh
 
       # PM 2026-09-05 承認: 枠切れ（Spending cap reached）は待機しても同一 run 内では回復しない。
       # 実測（2026-09-04 の夜間PTS動意 run）では枠切れ後の再試行が 1.5 秒で即時拒否されるだけで、
@@ -281,7 +290,7 @@ jobs:
         run: bash report-pipelines/.github/scripts/detect_spending_cap.sh
 
       - name: Wait before retry 2 (Claude overloaded 等の一時エラー)
-        if: success() && steps.gen1.outcome == 'failure' && steps.cap1.outputs.capped != 'true'
+        if: success() && steps.chk1.outputs.ok != 'true' && steps.cap1.outputs.capped != 'true'
         env:
           TARGET_DATE: ${{ steps.date.outputs.value }}
         run: |
@@ -296,22 +305,31 @@ jobs:
 
       - name: Generate sector report via Claude Code (retry 2)
         id: gen2
-        if: success() && steps.gen1.outcome == 'failure' && steps.cap1.outputs.capped != 'true'
+        if: success() && steps.chk1.outputs.ok != 'true' && steps.cap1.outputs.capped != 'true'
         continue-on-error: true
-        uses: anthropics/claude-code-base-action@beta
+        timeout-minutes: 30
+        uses: anthropics/claude-code-base-action@57607815d5d9678acb18dae0e5033d87d4dd4177
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          model: claude-opus-5
-          prompt_file: report-pipelines/prompts/sector-report.md
-          allowed_tools: "Read,Write,Edit,Bash,Grep,Glob,WebSearch,WebFetch"
-          timeout_minutes: "30"
-          claude_env: |
-            CLAUDE_CODE_EFFORT_LEVEL: high
-            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+          prompt_file: ${{ steps.chk1.outputs.next_prompt || 'report-pipelines/prompts/sector-report.md' }}
+          claude_args: --model claude-opus-5-5 --allowedTools Read,Write,Edit,Bash,Grep,Glob,WebSearch,WebFetch
         env:
+          CLAUDE_CODE_EFFORT_LEVEL: high
+          CLAUDE_CODE_MAX_OUTPUT_TOKENS: "64000"
           TARGET_DATE: ${{ steps.date.outputs.value }}
           PRIVATE_REPO_ROOT: private-repo
           JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
+
+      - name: Check attempt 2 (成果物と出力上限到達の確認)
+        id: chk2
+        if: steps.gen2.outcome != 'skipped'
+        env:
+          ATTEMPT: '2'
+          OUTCOME: ${{ steps.gen2.outcome }}
+          EXECUTION_FILE: ${{ steps.gen2.outputs.execution_file }}
+          PROMPT_FILE: report-pipelines/prompts/sector-report.md
+          OUT_FILES: private-repo/market/daily/sector/${{ steps.date.outputs.value }}.md
+        run: bash report-pipelines/.github/scripts/check_attempt.sh
 
       - name: Detect spending cap (attempt 2)
         id: cap2
@@ -322,7 +340,7 @@ jobs:
         run: bash report-pipelines/.github/scripts/detect_spending_cap.sh
 
       - name: Wait before retry 3 (Claude overloaded 等の一時エラー)
-        if: success() && steps.gen2.outcome == 'failure' && steps.cap2.outputs.capped != 'true'
+        if: success() && steps.chk2.outputs.ok != 'true' && steps.cap2.outputs.capped != 'true'
         env:
           TARGET_DATE: ${{ steps.date.outputs.value }}
         run: |
@@ -337,22 +355,41 @@ jobs:
 
       - name: Generate sector report via Claude Code (retry 3)
         id: gen3
-        if: success() && steps.gen2.outcome == 'failure' && steps.cap2.outputs.capped != 'true'
+        if: success() && steps.chk2.outputs.ok != 'true' && steps.cap2.outputs.capped != 'true'
         continue-on-error: true
-        uses: anthropics/claude-code-base-action@beta
+        timeout-minutes: 30
+        uses: anthropics/claude-code-base-action@57607815d5d9678acb18dae0e5033d87d4dd4177
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          model: claude-opus-5
-          prompt_file: report-pipelines/prompts/sector-report.md
-          allowed_tools: "Read,Write,Edit,Bash,Grep,Glob,WebSearch,WebFetch"
-          timeout_minutes: "30"
-          claude_env: |
-            CLAUDE_CODE_EFFORT_LEVEL: high
-            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+          prompt_file: ${{ steps.chk2.outputs.next_prompt || steps.chk1.outputs.next_prompt || 'report-pipelines/prompts/sector-report.md' }}
+          claude_args: --model claude-opus-5-5 --allowedTools Read,Write,Edit,Bash,Grep,Glob,WebSearch,WebFetch
         env:
+          CLAUDE_CODE_EFFORT_LEVEL: high
+          CLAUDE_CODE_MAX_OUTPUT_TOKENS: "64000"
           TARGET_DATE: ${{ steps.date.outputs.value }}
           PRIVATE_REPO_ROOT: private-repo
           JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
+
+      - name: Check attempt 3 (成果物と出力上限到達の確認)
+        id: chk3
+        if: steps.gen3.outcome != 'skipped'
+        env:
+          ATTEMPT: '3'
+          OUTCOME: ${{ steps.gen3.outcome }}
+          EXECUTION_FILE: ${{ steps.gen3.outputs.execution_file }}
+          PROMPT_FILE: report-pipelines/prompts/sector-report.md
+          OUT_FILES: private-repo/market/daily/sector/${{ steps.date.outputs.value }}.md
+        run: bash report-pipelines/.github/scripts/check_attempt.sh
+
+      - name: Summarize generation attempts (成果物と出力上限到達の集計)
+        # 以降の失敗通知が「原因」行（例: テーマ欄: 出力上限到達 2 回・成果物なし）に使う。
+        id: gensum
+        if: always()
+        continue-on-error: true
+        env:
+          MODE: summary
+          LABEL: セクターレポート
+        run: bash report-pipelines/.github/scripts/check_attempt.sh
 
       - name: Verify generated sector report (成否の一元判定)
         # 上の 3 ステップは全て continue-on-error のため、ジョブの成否はここだけで決まる。
@@ -415,9 +452,14 @@ jobs:
         if: failure()
         env:
           DISCORD_WEBHOOK_SECTOR: ${{ secrets.DISCORD_WEBHOOK_SECTOR }}
+          CAUSE: ${{ steps.gensum.outputs.cause }}
         run: |
           # 2026-09-23（PM 判断・運用通知の平易化）: 本文は平易な 2 行のみ。実行リンクはログにだけ出す。
+          # 2026-10-04: 生成の原因（出力上限到達の回数等）が分かる時だけ「原因: 」行を足す（最大 3 行）。
           echo "::notice title=この実行のログ::https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          curl -s -X POST "$DISCORD_WEBHOOK_SECTOR" \
-            -H "Content-Type: application/json" \
-            -d "{\"content\": \"❌ セクター日次（${{ steps.date.outputs.value }}） — 内部エラーで本日分を作れませんでした。\n対応: 次回 Claude Code で「セクター日次を復旧して」とお伝えください\"}"
+          NL=$'\n'
+          MSG="❌ セクター日次（${{ steps.date.outputs.value }}） — 内部エラーで本日分を作れませんでした。"
+          if [ -n "$CAUSE" ]; then MSG="${MSG}${NL}原因: ${CAUSE}"; fi
+          MSG="${MSG}${NL}対応: 要 — 次回 Claude Code で「セクター日次を復旧して」とお伝えください"
+          jq -n --arg content "$MSG" '{content: $content}' \
+            | curl -s -X POST "$DISCORD_WEBHOOK_SECTOR" -H "Content-Type: application/json" -d @-

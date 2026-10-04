@@ -107,7 +107,7 @@ jobs:
           state: failed
           label: '決算総括レポート'
           meaning: '内部エラーで作成を開始できませんでした。'
-          action_required: '次回 Claude Code で「決算総括レポートを復旧して」とお伝えください'
+          action_required: '要 — 次回 Claude Code で「決算総括レポートを復旧して」とお伝えください'
           detail: '決算シーズン総括 guard 失敗｜実行前チェック（当日重複判定）自体がエラーになり、生成ジョブが起動していません。'
 
   generate:
@@ -310,25 +310,33 @@ jobs:
       # 第三者製の新規 action を足さず、continue-on-error + outcome 判定の再試行ステップだけで構成する。
       # 529 は即時再試行が無意味なため待機を指数的に伸ばす（60 秒 → 180 秒）。3 ステップとも
       # continue-on-error のため、成否は最後の Verify ステップ 1 箇所（成果物ファイルが非空か）で決まる。
-      - name: Generate earnings overview via Claude Code (Opus 5 + effort high)
+      - name: Generate earnings overview via Claude Code (Opus 5.5 + effort high)
         # 既存 {month}_overview.md は削除しない（累積スナップショット運用・
         # 更新履歴 v1/v2/v3 をプロンプト側で引き継がせるため）。
         id: gen1
         continue-on-error: true
-        uses: anthropics/claude-code-base-action@beta
+        timeout-minutes: 50
+        uses: anthropics/claude-code-base-action@57607815d5d9678acb18dae0e5033d87d4dd4177
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          model: claude-opus-5
           prompt_file: report-pipelines/prompts/earnings-report.md
-          allowed_tools: "Read,Write,Edit,Bash,Grep,Glob"
-          timeout_minutes: "50"
-          claude_env: |
-            CLAUDE_CODE_EFFORT_LEVEL: high
-            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+          claude_args: --model claude-opus-5-5 --allowedTools Read,Write,Edit,Bash,Grep,Glob
         env:
+          CLAUDE_CODE_EFFORT_LEVEL: high
+          CLAUDE_CODE_MAX_OUTPUT_TOKENS: "64000"
           TARGET_MONTH: ${{ steps.month.outputs.value }}
           PRIVATE_REPO_ROOT: private-repo
-          CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+
+      - name: Check attempt 1 (成果物と出力上限到達の確認)
+        id: chk1
+        if: steps.gen1.outcome != 'skipped'
+        env:
+          ATTEMPT: '1'
+          OUTCOME: ${{ steps.gen1.outcome }}
+          EXECUTION_FILE: ${{ steps.gen1.outputs.execution_file }}
+          PROMPT_FILE: report-pipelines/prompts/earnings-report.md
+          OUT_FILES: private-repo/research/earnings/${{ steps.month.outputs.value }}_overview.md
+        run: bash report-pipelines/.github/scripts/check_attempt.sh
 
       # PM 2026-09-05 承認: 枠切れ（Spending cap reached）は待機しても同一 run 内では回復しない。
       # 実測（2026-09-04 の夜間PTS動意 run）では枠切れ後の再試行が 1.5 秒で即時拒否されるだけで、
@@ -343,7 +351,7 @@ jobs:
         run: bash report-pipelines/.github/scripts/detect_spending_cap.sh
 
       - name: Wait before retry 2 (Claude overloaded 等の一時エラー)
-        if: success() && steps.gen1.outcome == 'failure' && steps.cap1.outputs.capped != 'true'
+        if: success() && steps.chk1.outputs.ok != 'true' && steps.cap1.outputs.capped != 'true'
         env:
           TARGET_MONTH: ${{ steps.month.outputs.value }}
         run: |
@@ -363,22 +371,30 @@ jobs:
 
       - name: Generate earnings overview via Claude Code (retry 2)
         id: gen2
-        if: success() && steps.gen1.outcome == 'failure' && steps.cap1.outputs.capped != 'true'
+        if: success() && steps.chk1.outputs.ok != 'true' && steps.cap1.outputs.capped != 'true'
         continue-on-error: true
-        uses: anthropics/claude-code-base-action@beta
+        timeout-minutes: 30
+        uses: anthropics/claude-code-base-action@57607815d5d9678acb18dae0e5033d87d4dd4177
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          model: claude-opus-5
-          prompt_file: report-pipelines/prompts/earnings-report.md
-          allowed_tools: "Read,Write,Edit,Bash,Grep,Glob"
-          timeout_minutes: "30"
-          claude_env: |
-            CLAUDE_CODE_EFFORT_LEVEL: high
-            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+          prompt_file: ${{ steps.chk1.outputs.next_prompt || 'report-pipelines/prompts/earnings-report.md' }}
+          claude_args: --model claude-opus-5-5 --allowedTools Read,Write,Edit,Bash,Grep,Glob
         env:
+          CLAUDE_CODE_EFFORT_LEVEL: high
+          CLAUDE_CODE_MAX_OUTPUT_TOKENS: "64000"
           TARGET_MONTH: ${{ steps.month.outputs.value }}
           PRIVATE_REPO_ROOT: private-repo
-          CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+
+      - name: Check attempt 2 (成果物と出力上限到達の確認)
+        id: chk2
+        if: steps.gen2.outcome != 'skipped'
+        env:
+          ATTEMPT: '2'
+          OUTCOME: ${{ steps.gen2.outcome }}
+          EXECUTION_FILE: ${{ steps.gen2.outputs.execution_file }}
+          PROMPT_FILE: report-pipelines/prompts/earnings-report.md
+          OUT_FILES: private-repo/research/earnings/${{ steps.month.outputs.value }}_overview.md
+        run: bash report-pipelines/.github/scripts/check_attempt.sh
 
       - name: Detect spending cap (attempt 2)
         id: cap2
@@ -389,7 +405,7 @@ jobs:
         run: bash report-pipelines/.github/scripts/detect_spending_cap.sh
 
       - name: Wait before retry 3 (Claude overloaded 等の一時エラー)
-        if: success() && steps.gen2.outcome == 'failure' && steps.cap2.outputs.capped != 'true'
+        if: success() && steps.chk2.outputs.ok != 'true' && steps.cap2.outputs.capped != 'true'
         env:
           TARGET_MONTH: ${{ steps.month.outputs.value }}
         run: |
@@ -409,22 +425,40 @@ jobs:
 
       - name: Generate earnings overview via Claude Code (retry 3)
         id: gen3
-        if: success() && steps.gen2.outcome == 'failure' && steps.cap2.outputs.capped != 'true'
+        if: success() && steps.chk2.outputs.ok != 'true' && steps.cap2.outputs.capped != 'true'
         continue-on-error: true
-        uses: anthropics/claude-code-base-action@beta
+        timeout-minutes: 30
+        uses: anthropics/claude-code-base-action@57607815d5d9678acb18dae0e5033d87d4dd4177
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          model: claude-opus-5
-          prompt_file: report-pipelines/prompts/earnings-report.md
-          allowed_tools: "Read,Write,Edit,Bash,Grep,Glob"
-          timeout_minutes: "30"
-          claude_env: |
-            CLAUDE_CODE_EFFORT_LEVEL: high
-            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+          prompt_file: ${{ steps.chk2.outputs.next_prompt || steps.chk1.outputs.next_prompt || 'report-pipelines/prompts/earnings-report.md' }}
+          claude_args: --model claude-opus-5-5 --allowedTools Read,Write,Edit,Bash,Grep,Glob
         env:
+          CLAUDE_CODE_EFFORT_LEVEL: high
+          CLAUDE_CODE_MAX_OUTPUT_TOKENS: "64000"
           TARGET_MONTH: ${{ steps.month.outputs.value }}
           PRIVATE_REPO_ROOT: private-repo
-          CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+
+      - name: Check attempt 3 (成果物と出力上限到達の確認)
+        id: chk3
+        if: steps.gen3.outcome != 'skipped'
+        env:
+          ATTEMPT: '3'
+          OUTCOME: ${{ steps.gen3.outcome }}
+          EXECUTION_FILE: ${{ steps.gen3.outputs.execution_file }}
+          PROMPT_FILE: report-pipelines/prompts/earnings-report.md
+          OUT_FILES: private-repo/research/earnings/${{ steps.month.outputs.value }}_overview.md
+        run: bash report-pipelines/.github/scripts/check_attempt.sh
+
+      - name: Summarize generation attempts (成果物と出力上限到達の集計)
+        # 以降の失敗通知が「原因」行（例: テーマ欄: 出力上限到達 2 回・成果物なし）に使う。
+        id: gensum
+        if: always()
+        continue-on-error: true
+        env:
+          MODE: summary
+          LABEL: 決算総括
+        run: bash report-pipelines/.github/scripts/check_attempt.sh
 
       - name: Verify generated earnings overview (成否の一元判定)
         # 上の 3 ステップは全て continue-on-error のため、ジョブの成否はここだけで決まる。
@@ -519,7 +553,8 @@ jobs:
           label: '決算総括レポート'
           date: ${{ steps.month.outputs.value }}
           meaning: '誌面がうまく作れなかったため、送信を止めました。今回分は届いていません。'
-          action_required: '次回 Claude Code で「決算総括レポートを復旧して」とお伝えください'
+          action_required: '要 — 次回 Claude Code で「決算総括レポートを復旧して」とお伝えください'
+          cause: ${{ steps.gensum.outputs.cause }}
           detail: '決算シーズン総括 送信中止（生成確認不合格）｜レポートが未生成または極端に短く不完全だったため、配信を止めました。未配信です。'
 
       - name: Discord 通知（⚠️ 配信済み・後処理のみ失敗）
@@ -543,5 +578,6 @@ jobs:
           label: '決算総括レポート'
           date: ${{ steps.month.outputs.value }}
           meaning: '内部エラーで今回分を作れませんでした。'
-          action_required: '次回 Claude Code で「決算総括レポートを復旧して」とお伝えください'
+          action_required: '要 — 次回 Claude Code で「決算総括レポートを復旧して」とお伝えください'
+          cause: ${{ steps.gensum.outputs.cause }}
           detail: '決算シーズン総括 失敗｜ETL・生成・送信のいずれかが完了せず、未配信です。'

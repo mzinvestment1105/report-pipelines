@@ -99,7 +99,7 @@ jobs:
           state: alert
           label: 'スクリーニング更新'
           meaning: '本日の更新を自動では完了できませんでした（再試行の上限）。データは前回のままです。'
-          action_required: '次回 Claude Code で「スクリーニング更新を復旧して」とお伝えください'
+          action_required: '要 — 次回 Claude Code で「スクリーニング更新を復旧して」とお伝えください'
           detail: 'スクリーニングETL 自動リトライ停止｜当日 2 回以上失敗したため cron の自動再実行を停止しました。screening_master は前回値のまま更新されていません。'
 
       - name: Discord 通知（guard 失敗）
@@ -110,7 +110,7 @@ jobs:
           state: failed
           label: 'スクリーニング更新'
           meaning: '内部エラーで更新を開始できませんでした。データは前回のままです。'
-          action_required: '次回 Claude Code で「スクリーニング更新を復旧して」とお伝えください'
+          action_required: '要 — 次回 Claude Code で「スクリーニング更新を復旧して」とお伝えください'
           detail: 'スクリーニングETL guard 失敗｜実行前チェック（当日重複判定）自体がエラーになり、更新ジョブが起動していません。'
 
   update:
@@ -248,5 +248,5 @@ jobs:
           state: failed
           label: 'スクリーニング更新'
           meaning: '更新が完了しませんでした。データは前回のままです。'
-          action_required: '次回 Claude Code で「スクリーニング更新を復旧して」とお伝えください'
+          action_required: '要 — 次回 Claude Code で「スクリーニング更新を復旧して」とお伝えください'
           detail: 'スクリーニングETL 失敗｜日次更新が完了せず（エラーまたは制限時間超過）、screening_master は前回値のまま更新されていません。'

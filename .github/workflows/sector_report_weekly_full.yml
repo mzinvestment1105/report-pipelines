@@ -83,7 +83,7 @@ jobs:
           state: alert
           label: 'セクター週次'
           meaning: '今週分を自動では作れませんでした（再試行の上限）。'
-          action_required: '次回 Claude Code で「セクター週次を復旧して」とお伝えください'
+          action_required: '要 — 次回 Claude Code で「セクター週次を復旧して」とお伝えください'
           detail: 'セクター週次レポート 自動リトライ停止｜当日 2 回以上失敗したため cron の自動再実行を停止しました。今週分は未配信です。'
 
       - name: Discord 通知（guard 失敗）
@@ -94,7 +94,7 @@ jobs:
           state: failed
           label: 'セクター週次'
           meaning: '内部エラーで作成を開始できませんでした。'
-          action_required: '次回 Claude Code で「セクター週次を復旧して」とお伝えください'
+          action_required: '要 — 次回 Claude Code で「セクター週次を復旧して」とお伝えください'
           detail: 'セクター週次レポート guard 失敗｜実行前チェック（当日重複判定）自体がエラーになり、生成ジョブが起動していません。'
 
   generate:
@@ -288,19 +288,29 @@ jobs:
         # レポート md の実在のみを必須とし、3 回とも追記に失敗した場合は警告のみで配信を続行する。
         id: gen1
         continue-on-error: true
-        uses: anthropics/claude-code-base-action@beta
+        timeout-minutes: 20
+        uses: anthropics/claude-code-base-action@57607815d5d9678acb18dae0e5033d87d4dd4177
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          model: claude-opus-5
           prompt_file: report-pipelines/prompts/sector-report-full.md
-          allowed_tools: "Read,Edit,Bash,Grep,Glob"
-          timeout_minutes: "20"
-          claude_env: |
-            CLAUDE_CODE_EFFORT_LEVEL: high
-            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+          claude_args: --model claude-opus-5-5 --allowedTools Read,Edit,Bash,Grep,Glob
         env:
+          CLAUDE_CODE_EFFORT_LEVEL: high
+          CLAUDE_CODE_MAX_OUTPUT_TOKENS: "64000"
           TARGET_DATE: ${{ steps.date.outputs.value }}
           PRIVATE_REPO_ROOT: private-repo
+
+      - name: Check attempt 1 (成果物と出力上限到達の確認)
+        id: chk1
+        if: steps.gen1.outcome != 'skipped'
+        env:
+          ATTEMPT: '1'
+          OUTCOME: ${{ steps.gen1.outcome }}
+          EXECUTION_FILE: ${{ steps.gen1.outputs.execution_file }}
+          PROMPT_FILE: report-pipelines/prompts/sector-report-full.md
+          OUT_FILES: ''
+          MISSING_NOUN: '理由欄の追記なし'
+        run: bash report-pipelines/.github/scripts/check_attempt.sh
 
       # PM 2026-09-05 承認: 枠切れ（Spending cap reached）は待機しても同一 run 内では回復しない。
       # 実測（2026-09-04 の夜間PTS動意 run）では枠切れ後の再試行が 1.5 秒で即時拒否されるだけで、
@@ -315,7 +325,7 @@ jobs:
         run: bash report-pipelines/.github/scripts/detect_spending_cap.sh
 
       - name: Wait before retry 2 (Claude overloaded 等の一時エラー)
-        if: success() && steps.gen1.outcome == 'failure' && steps.cap1.outputs.capped != 'true'
+        if: success() && steps.chk1.outputs.ok != 'true' && steps.cap1.outputs.capped != 'true'
         env:
           TARGET_DATE: ${{ steps.date.outputs.value }}
         run: |
@@ -326,21 +336,31 @@ jobs:
 
       - name: セクター「なぜ動いた」理由補完（Claude・追記専用） (retry 2)
         id: gen2
-        if: success() && steps.gen1.outcome == 'failure' && steps.cap1.outputs.capped != 'true'
+        if: success() && steps.chk1.outputs.ok != 'true' && steps.cap1.outputs.capped != 'true'
         continue-on-error: true
-        uses: anthropics/claude-code-base-action@beta
+        timeout-minutes: 20
+        uses: anthropics/claude-code-base-action@57607815d5d9678acb18dae0e5033d87d4dd4177
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          model: claude-opus-5
-          prompt_file: report-pipelines/prompts/sector-report-full.md
-          allowed_tools: "Read,Edit,Bash,Grep,Glob"
-          timeout_minutes: "20"
-          claude_env: |
-            CLAUDE_CODE_EFFORT_LEVEL: high
-            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+          prompt_file: ${{ steps.chk1.outputs.next_prompt || 'report-pipelines/prompts/sector-report-full.md' }}
+          claude_args: --model claude-opus-5-5 --allowedTools Read,Edit,Bash,Grep,Glob
         env:
+          CLAUDE_CODE_EFFORT_LEVEL: high
+          CLAUDE_CODE_MAX_OUTPUT_TOKENS: "64000"
           TARGET_DATE: ${{ steps.date.outputs.value }}
           PRIVATE_REPO_ROOT: private-repo
+
+      - name: Check attempt 2 (成果物と出力上限到達の確認)
+        id: chk2
+        if: steps.gen2.outcome != 'skipped'
+        env:
+          ATTEMPT: '2'
+          OUTCOME: ${{ steps.gen2.outcome }}
+          EXECUTION_FILE: ${{ steps.gen2.outputs.execution_file }}
+          PROMPT_FILE: report-pipelines/prompts/sector-report-full.md
+          OUT_FILES: ''
+          MISSING_NOUN: '理由欄の追記なし'
+        run: bash report-pipelines/.github/scripts/check_attempt.sh
 
       - name: Detect spending cap (attempt 2)
         id: cap2
@@ -351,7 +371,7 @@ jobs:
         run: bash report-pipelines/.github/scripts/detect_spending_cap.sh
 
       - name: Wait before retry 3 (Claude overloaded 等の一時エラー)
-        if: success() && steps.gen2.outcome == 'failure' && steps.cap2.outputs.capped != 'true'
+        if: success() && steps.chk2.outputs.ok != 'true' && steps.cap2.outputs.capped != 'true'
         env:
           TARGET_DATE: ${{ steps.date.outputs.value }}
         run: |
@@ -362,21 +382,42 @@ jobs:
 
       - name: セクター「なぜ動いた」理由補完（Claude・追記専用） (retry 3)
         id: gen3
-        if: success() && steps.gen2.outcome == 'failure' && steps.cap2.outputs.capped != 'true'
+        if: success() && steps.chk2.outputs.ok != 'true' && steps.cap2.outputs.capped != 'true'
         continue-on-error: true
-        uses: anthropics/claude-code-base-action@beta
+        timeout-minutes: 20
+        uses: anthropics/claude-code-base-action@57607815d5d9678acb18dae0e5033d87d4dd4177
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          model: claude-opus-5
-          prompt_file: report-pipelines/prompts/sector-report-full.md
-          allowed_tools: "Read,Edit,Bash,Grep,Glob"
-          timeout_minutes: "20"
-          claude_env: |
-            CLAUDE_CODE_EFFORT_LEVEL: high
-            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+          prompt_file: ${{ steps.chk2.outputs.next_prompt || steps.chk1.outputs.next_prompt || 'report-pipelines/prompts/sector-report-full.md' }}
+          claude_args: --model claude-opus-5-5 --allowedTools Read,Edit,Bash,Grep,Glob
         env:
+          CLAUDE_CODE_EFFORT_LEVEL: high
+          CLAUDE_CODE_MAX_OUTPUT_TOKENS: "64000"
           TARGET_DATE: ${{ steps.date.outputs.value }}
           PRIVATE_REPO_ROOT: private-repo
+
+      - name: Check attempt 3 (成果物と出力上限到達の確認)
+        id: chk3
+        if: steps.gen3.outcome != 'skipped'
+        env:
+          ATTEMPT: '3'
+          OUTCOME: ${{ steps.gen3.outcome }}
+          EXECUTION_FILE: ${{ steps.gen3.outputs.execution_file }}
+          PROMPT_FILE: report-pipelines/prompts/sector-report-full.md
+          OUT_FILES: ''
+          MISSING_NOUN: '理由欄の追記なし'
+        run: bash report-pipelines/.github/scripts/check_attempt.sh
+
+      - name: Summarize generation attempts (成果物と出力上限到達の集計)
+        # 以降の失敗通知が「原因」行（例: テーマ欄: 出力上限到達 2 回・成果物なし）に使う。
+        id: gensum
+        if: always()
+        continue-on-error: true
+        env:
+          MODE: summary
+          LABEL: 理由欄
+          MISSING_NOUN: '理由欄の追記なし'
+        run: bash report-pipelines/.github/scripts/check_attempt.sh
 
       - name: Verify sector full report (成否の一元判定)
         # 上の 3 ステップは全て continue-on-error のため、ジョブの成否はここだけで決まる。
@@ -391,8 +432,10 @@ jobs:
             echo "::error::セクター週次フルレポート（決定論生成）が見つかりません: $F"
             exit 1
           fi
-          if [ "${{ steps.gen3.outcome }}" = "failure" ]; then
-            echo "::warning::理由層の Claude 追記は 3 回とも失敗しました。決定論生成のレポートをそのまま配信します"
+          # 2026-10-04: 旧判定（gen3 の outcome）は枠切れで gen2/gen3 が skip された日に警告が出なかった。
+          # 全試行の集計（check_attempt.sh summary）で判定する。欠けた場合は配信後に ⚠️（対応「要」）を通知する。
+          if [ "${{ steps.gensum.outputs.ok }}" != "true" ]; then
+            echo "::warning::理由層の Claude 追記が完了しませんでした（${{ steps.gensum.outputs.cause }}）。決定論生成のレポートをそのまま配信します"
           fi
           echo "生成成功: $F ($(wc -l < "$F") lines)"
 
@@ -474,6 +517,22 @@ jobs:
           action_required: '不要'
           detail: 'セクター週次レポート 配信済み（品質注記あり）｜レポートは配信済みです。品質注記（${{ steps.annotate.outputs.note }}）を冒頭に付けています。'
 
+      - name: Discord 通知（⚠️ 配信済み・理由欄が欠けたまま）
+        # 2026-10-04 追加: 理由層（なぜ動いた）の Claude 追記が再試行後も完了しなかった場合、
+        # 決定論部分だけで配信される＝誌面の一部が欠けるため、対応「要」と原因行で知らせる
+        # （旧: ログの warning のみで PM へは通知されなかった）。
+        if: steps.gensum.outputs.ok != 'true' && steps.gensum.outputs.attempts != '0' && steps.send.outcome == 'success'
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_SECTOR }}
+          state: partial
+          label: 'セクター週次'
+          date: ${{ steps.date.outputs.value }}
+          meaning: '配信しました。各セクターの「なぜ動いた」の欄を作れなかったため、その欄は載っていません。'
+          action_required: '要 — 次回 Claude Code で「セクター週次を復旧して」とお伝えください'
+          cause: ${{ steps.gensum.outputs.cause }}
+          detail: 'セクター週次レポート 理由欄なしで配信｜決定論生成の表とランキングは配信済みですが、理由層の Claude 追記が再試行後も完了しませんでした。'
+
       - name: Commit and push to private repo
         # PM 2026-06-28: 生成 step が失敗しても再生成済 parquet を必ずコミットする（データ凍結防止）。
         # 旧来は gen 失敗で本 step がスキップされ、新鮮な sector_weekly.parquet が runner ごと破棄され
@@ -507,5 +566,6 @@ jobs:
           label: 'セクター週次'
           date: ${{ steps.date.outputs.value }}
           meaning: '内部エラーで今週分を作れませんでした。'
-          action_required: '次回 Claude Code で「セクター週次を復旧して」とお伝えください'
+          action_required: '要 — 次回 Claude Code で「セクター週次を復旧して」とお伝えください'
+          cause: ${{ steps.gensum.outputs.cause }}
           detail: 'セクター週次レポート 失敗｜生成または送信が完了せず、今週分は未配信です（集計 parquet は可能な範囲で commit 済み）。'

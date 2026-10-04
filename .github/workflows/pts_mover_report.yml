@@ -113,7 +113,7 @@ jobs:
           state: alert
           label: '夜間PTS動意レポート'
           meaning: '本日分を自動では作れませんでした（再試行の上限）。'
-          action_required: '次回 Claude Code で「夜間PTS動意レポートを復旧して」とお伝えください'
+          action_required: '要 — 次回 Claude Code で「夜間PTS動意レポートを復旧して」とお伝えください'
           detail: '夜間PTS動意レポート 自動リトライ停止｜当日 2 回以上失敗したため cron の自動再実行を停止しました。本日未配信です。'
 
       # 2026-09-07 追加: guard が「実行しない」と判定した経路のうち、当日未配信のまま終わる
@@ -129,7 +129,7 @@ jobs:
           label: '夜間PTS動意レポート'
           date: ${{ steps.check.outputs.target_date }}
           meaning: '本日分を自動では作れませんでした（Claude の利用枠切れ）。'
-          action_required: '次回 Claude Code で「夜間PTS動意レポートを復旧して」とお伝えください'
+          action_required: '要 — 次回 Claude Code で「夜間PTS動意レポートを復旧して」とお伝えください'
           detail: '夜間PTS動意レポート 未発行（枠切れ再試行の上限）｜Claude の利用枠切れによる失敗が本日の再試行上限に達したため、これ以上の自動再実行を止めました。本日は未配信です（判定: ${{ steps.check.outputs.reason }}）。'
 
       - name: Discord 通知（🚨 想定外の時間帯で中止）
@@ -141,7 +141,7 @@ jobs:
           label: '夜間PTS動意レポート'
           date: ${{ steps.check.outputs.target_date }}
           meaning: '${{ steps.check.outputs.window_side == ''early'' && ''予備の起動が深夜にずれましたが、本日分は通常の時刻に作ります。'' || ''本日分を作れませんでした（起動が遅すぎました）。'' }}'
-          action_required: '${{ steps.check.outputs.window_side == ''early'' && ''不要'' || ''次回 Claude Code で「夜間PTS動意レポートを再送して」とお伝えください'' }}'
+          action_required: '${{ steps.check.outputs.window_side == ''early'' && ''不要'' || ''要 — 次回 Claude Code で「夜間PTS動意レポートを再送して」とお伝えください'' }}'
           detail: '夜間PTS動意レポート 未発行（発行時間帯を外れた）｜cron の着火が想定の発行時間帯（12:00〜23:30 JST）を外れたため、日付ズレ配信を避けて中止しました。本日は未配信です（判定: ${{ steps.check.outputs.reason }}）。'
 
       - name: Discord 通知（guard 失敗）
@@ -152,7 +152,7 @@ jobs:
           state: failed
           label: '夜間PTS動意レポート'
           meaning: '内部エラーで作成を開始できませんでした。'
-          action_required: '次回 Claude Code で「夜間PTS動意レポートを復旧して」とお伝えください'
+          action_required: '要 — 次回 Claude Code で「夜間PTS動意レポートを復旧して」とお伝えください'
           detail: '夜間PTS動意レポート guard 失敗｜実行前チェック（当日配信済み判定）自体がエラーになり、生成ジョブが起動していません。'
 
   # 2026-09-07 追加: guard が未配信のまま終わった日の理由を Private 側へ 1 行残す。
@@ -332,24 +332,32 @@ jobs:
       # 第三者製の新規 action を足さず、continue-on-error + outcome 判定の再試行ステップだけで構成する。
       # 529 は即時再試行が無意味なため待機を指数的に伸ばす（60 秒 → 180 秒）。3 ステップとも
       # continue-on-error のため、成否は最後の Verify ステップ 1 箇所（成果物ファイルが非空か）で決まる。
-      - name: Generate report via Claude Code (Opus 5 + effort high)
+      - name: Generate report via Claude Code (Opus 5.5 + effort high)
         if: steps.raw.outputs.skipped != 'true'
         id: gen1
         continue-on-error: true
-        uses: anthropics/claude-code-base-action@beta
+        timeout-minutes: 30
+        uses: anthropics/claude-code-base-action@57607815d5d9678acb18dae0e5033d87d4dd4177
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          model: claude-opus-5
           prompt_file: report-pipelines/prompts/pts-mover-report.md
-          allowed_tools: "Read,Write,Edit,Bash,Grep,Glob"
-          timeout_minutes: "30"
-          claude_env: |
-            CLAUDE_CODE_EFFORT_LEVEL: high
-            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+          claude_args: --model claude-opus-5-5 --allowedTools Read,Write,Edit,Bash,Grep,Glob
         env:
+          CLAUDE_CODE_EFFORT_LEVEL: high
+          CLAUDE_CODE_MAX_OUTPUT_TOKENS: "64000"
           TARGET_DATE: ${{ steps.date.outputs.value }}
           PRIVATE_REPO_ROOT: private-repo
-          CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+
+      - name: Check attempt 1 (成果物と出力上限到達の確認)
+        id: chk1
+        if: steps.gen1.outcome != 'skipped'
+        env:
+          ATTEMPT: '1'
+          OUTCOME: ${{ steps.gen1.outcome }}
+          EXECUTION_FILE: ${{ steps.gen1.outputs.execution_file }}
+          PROMPT_FILE: report-pipelines/prompts/pts-mover-report.md
+          OUT_FILES: private-repo/market/daily/pts_movers/${{ steps.date.outputs.value }}.md
+        run: bash report-pipelines/.github/scripts/check_attempt.sh
 
       # PM 2026-09-05 承認: 枠切れ（Spending cap reached）だけは待機しても同一 run 内では回復しない。
       # 実測（2026-09-04 run 33870602080 / 33875016222）では gen1 の枠切れ後、60 / 180 秒の待機では
@@ -365,7 +373,7 @@ jobs:
         run: bash report-pipelines/.github/scripts/detect_spending_cap.sh
 
       - name: Wait before retry 2 (Claude overloaded 等の一時エラー)
-        if: steps.raw.outputs.skipped != 'true' && (success() && steps.gen1.outcome == 'failure' && steps.cap1.outputs.capped != 'true')
+        if: steps.raw.outputs.skipped != 'true' && (success() && steps.chk1.outputs.ok != 'true' && steps.cap1.outputs.capped != 'true')
         env:
           TARGET_DATE: ${{ steps.date.outputs.value }}
         run: |
@@ -380,22 +388,30 @@ jobs:
 
       - name: Generate report via Claude Code (retry 2)
         id: gen2
-        if: steps.raw.outputs.skipped != 'true' && (success() && steps.gen1.outcome == 'failure' && steps.cap1.outputs.capped != 'true')
+        if: steps.raw.outputs.skipped != 'true' && (success() && steps.chk1.outputs.ok != 'true' && steps.cap1.outputs.capped != 'true')
         continue-on-error: true
-        uses: anthropics/claude-code-base-action@beta
+        timeout-minutes: 30
+        uses: anthropics/claude-code-base-action@57607815d5d9678acb18dae0e5033d87d4dd4177
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          model: claude-opus-5
-          prompt_file: report-pipelines/prompts/pts-mover-report.md
-          allowed_tools: "Read,Write,Edit,Bash,Grep,Glob"
-          timeout_minutes: "30"
-          claude_env: |
-            CLAUDE_CODE_EFFORT_LEVEL: high
-            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+          prompt_file: ${{ steps.chk1.outputs.next_prompt || 'report-pipelines/prompts/pts-mover-report.md' }}
+          claude_args: --model claude-opus-5-5 --allowedTools Read,Write,Edit,Bash,Grep,Glob
         env:
+          CLAUDE_CODE_EFFORT_LEVEL: high
+          CLAUDE_CODE_MAX_OUTPUT_TOKENS: "64000"
           TARGET_DATE: ${{ steps.date.outputs.value }}
           PRIVATE_REPO_ROOT: private-repo
-          CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+
+      - name: Check attempt 2 (成果物と出力上限到達の確認)
+        id: chk2
+        if: steps.gen2.outcome != 'skipped'
+        env:
+          ATTEMPT: '2'
+          OUTCOME: ${{ steps.gen2.outcome }}
+          EXECUTION_FILE: ${{ steps.gen2.outputs.execution_file }}
+          PROMPT_FILE: report-pipelines/prompts/pts-mover-report.md
+          OUT_FILES: private-repo/market/daily/pts_movers/${{ steps.date.outputs.value }}.md
+        run: bash report-pipelines/.github/scripts/check_attempt.sh
 
       - name: Detect spending cap (attempt 2)
         id: cap2
@@ -406,7 +422,7 @@ jobs:
         run: bash report-pipelines/.github/scripts/detect_spending_cap.sh
 
       - name: Wait before retry 3 (Claude overloaded 等の一時エラー)
-        if: steps.raw.outputs.skipped != 'true' && (success() && steps.gen2.outcome == 'failure' && steps.cap2.outputs.capped != 'true')
+        if: steps.raw.outputs.skipped != 'true' && (success() && steps.chk2.outputs.ok != 'true' && steps.cap2.outputs.capped != 'true')
         env:
           TARGET_DATE: ${{ steps.date.outputs.value }}
         run: |
@@ -421,22 +437,30 @@ jobs:
 
       - name: Generate report via Claude Code (retry 3)
         id: gen3
-        if: steps.raw.outputs.skipped != 'true' && (success() && steps.gen2.outcome == 'failure' && steps.cap2.outputs.capped != 'true')
+        if: steps.raw.outputs.skipped != 'true' && (success() && steps.chk2.outputs.ok != 'true' && steps.cap2.outputs.capped != 'true')
         continue-on-error: true
-        uses: anthropics/claude-code-base-action@beta
+        timeout-minutes: 30
+        uses: anthropics/claude-code-base-action@57607815d5d9678acb18dae0e5033d87d4dd4177
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          model: claude-opus-5
-          prompt_file: report-pipelines/prompts/pts-mover-report.md
-          allowed_tools: "Read,Write,Edit,Bash,Grep,Glob"
-          timeout_minutes: "30"
-          claude_env: |
-            CLAUDE_CODE_EFFORT_LEVEL: high
-            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+          prompt_file: ${{ steps.chk2.outputs.next_prompt || steps.chk1.outputs.next_prompt || 'report-pipelines/prompts/pts-mover-report.md' }}
+          claude_args: --model claude-opus-5-5 --allowedTools Read,Write,Edit,Bash,Grep,Glob
         env:
+          CLAUDE_CODE_EFFORT_LEVEL: high
+          CLAUDE_CODE_MAX_OUTPUT_TOKENS: "64000"
           TARGET_DATE: ${{ steps.date.outputs.value }}
           PRIVATE_REPO_ROOT: private-repo
-          CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+
+      - name: Check attempt 3 (成果物と出力上限到達の確認)
+        id: chk3
+        if: steps.gen3.outcome != 'skipped'
+        env:
+          ATTEMPT: '3'
+          OUTCOME: ${{ steps.gen3.outcome }}
+          EXECUTION_FILE: ${{ steps.gen3.outputs.execution_file }}
+          PROMPT_FILE: report-pipelines/prompts/pts-mover-report.md
+          OUT_FILES: private-repo/market/daily/pts_movers/${{ steps.date.outputs.value }}.md
+        run: bash report-pipelines/.github/scripts/check_attempt.sh
 
       # ================================================================
       # 枠切れ（Spending cap）からの自動復旧（2026-09-07 追加）
@@ -486,20 +510,28 @@ jobs:
         id: rec1
         if: steps.raw.outputs.skipped != 'true' && (steps.wait1.outputs.should_retry == 'true')
         continue-on-error: true
-        uses: anthropics/claude-code-base-action@beta
+        timeout-minutes: 30
+        uses: anthropics/claude-code-base-action@57607815d5d9678acb18dae0e5033d87d4dd4177
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          model: claude-opus-5
-          prompt_file: report-pipelines/prompts/pts-mover-report.md
-          allowed_tools: "Read,Write,Edit,Bash,Grep,Glob"
-          timeout_minutes: "30"
-          claude_env: |
-            CLAUDE_CODE_EFFORT_LEVEL: high
-            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+          prompt_file: ${{ steps.chk3.outputs.next_prompt || steps.chk2.outputs.next_prompt || steps.chk1.outputs.next_prompt || 'report-pipelines/prompts/pts-mover-report.md' }}
+          claude_args: --model claude-opus-5-5 --allowedTools Read,Write,Edit,Bash,Grep,Glob
         env:
+          CLAUDE_CODE_EFFORT_LEVEL: high
+          CLAUDE_CODE_MAX_OUTPUT_TOKENS: "64000"
           TARGET_DATE: ${{ steps.date.outputs.value }}
           PRIVATE_REPO_ROOT: private-repo
-          CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+
+      - name: Check attempt recovery-1 (成果物と出力上限到達の確認)
+        id: chkr1
+        if: steps.rec1.outcome != 'skipped'
+        env:
+          ATTEMPT: 'recovery-1'
+          OUTCOME: ${{ steps.rec1.outcome }}
+          EXECUTION_FILE: ${{ steps.rec1.outputs.execution_file }}
+          PROMPT_FILE: report-pipelines/prompts/pts-mover-report.md
+          OUT_FILES: private-repo/market/daily/pts_movers/${{ steps.date.outputs.value }}.md
+        run: bash report-pipelines/.github/scripts/check_attempt.sh
 
       - name: Detect spending cap (復旧 1 回目)
         id: reccap1
@@ -523,20 +555,38 @@ jobs:
         id: rec2
         if: steps.raw.outputs.skipped != 'true' && (steps.wait2.outputs.should_retry == 'true')
         continue-on-error: true
-        uses: anthropics/claude-code-base-action@beta
+        timeout-minutes: 30
+        uses: anthropics/claude-code-base-action@57607815d5d9678acb18dae0e5033d87d4dd4177
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          model: claude-opus-5
-          prompt_file: report-pipelines/prompts/pts-mover-report.md
-          allowed_tools: "Read,Write,Edit,Bash,Grep,Glob"
-          timeout_minutes: "30"
-          claude_env: |
-            CLAUDE_CODE_EFFORT_LEVEL: high
-            CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+          prompt_file: ${{ steps.chkr1.outputs.next_prompt || steps.chk3.outputs.next_prompt || steps.chk2.outputs.next_prompt || steps.chk1.outputs.next_prompt || 'report-pipelines/prompts/pts-mover-report.md' }}
+          claude_args: --model claude-opus-5-5 --allowedTools Read,Write,Edit,Bash,Grep,Glob
         env:
+          CLAUDE_CODE_EFFORT_LEVEL: high
+          CLAUDE_CODE_MAX_OUTPUT_TOKENS: "64000"
           TARGET_DATE: ${{ steps.date.outputs.value }}
           PRIVATE_REPO_ROOT: private-repo
-          CLAUDE_CODE_MAX_OUTPUT_TOKENS: 32000
+
+      - name: Check attempt recovery-2 (成果物と出力上限到達の確認)
+        id: chkr2
+        if: steps.rec2.outcome != 'skipped'
+        env:
+          ATTEMPT: 'recovery-2'
+          OUTCOME: ${{ steps.rec2.outcome }}
+          EXECUTION_FILE: ${{ steps.rec2.outputs.execution_file }}
+          PROMPT_FILE: report-pipelines/prompts/pts-mover-report.md
+          OUT_FILES: private-repo/market/daily/pts_movers/${{ steps.date.outputs.value }}.md
+        run: bash report-pipelines/.github/scripts/check_attempt.sh
+
+      - name: Summarize generation attempts (成果物と出力上限到達の集計)
+        # 以降の失敗通知が「原因」行（例: テーマ欄: 出力上限到達 2 回・成果物なし）に使う。
+        id: gensum
+        if: always()
+        continue-on-error: true
+        env:
+          MODE: summary
+          LABEL: 夜間PTS動意
+        run: bash report-pipelines/.github/scripts/check_attempt.sh
 
       - name: Verify generated PTS mover report (成否の一元判定)
         if: steps.raw.outputs.skipped != 'true'
@@ -722,7 +772,7 @@ jobs:
           label: '夜間PTS動意レポート'
           date: ${{ steps.date.outputs.value }}
           meaning: 'Claude の利用枠が切れたため、枠が戻り次第、予備の仕組みで作り直します。'
-          action_required: '不要'
+          action_required: '要 — 本日中に届かなければ、次回 Claude Code で「夜間PTS動意レポートを復旧して」とお伝えください'
           detail: '夜間PTS動意レポート 生成見送り（Claude 利用枠切れ）｜Claude の利用枠が上限に達したため生成できませんでした${{ steps.cap1.outputs.resets != '''' && format(''（枠のリセット {0}）'', steps.cap1.outputs.resets) || (steps.cap2.outputs.resets != '''' && format(''（枠のリセット {0}）'', steps.cap2.outputs.resets) || '''') }}。設備やデータの障害ではなく、枠が戻れば同じ手順で生成できます。無駄打ちを避けるため同一 run 内の再試行は打ち切っています。'
 
       - name: Discord 通知（❌ 生成/送信失敗）
@@ -734,5 +784,6 @@ jobs:
           label: '夜間PTS動意レポート'
           date: ${{ steps.date.outputs.value }}
           meaning: '内部エラーで本日分を作れませんでした。'
-          action_required: '次回 Claude Code で「夜間PTS動意レポートを復旧して」とお伝えください'
+          action_required: '要 — 次回 Claude Code で「夜間PTS動意レポートを復旧して」とお伝えください'
+          cause: ${{ steps.gensum.outputs.cause }}
           detail: '夜間PTS動意レポート 失敗（生成/送信）｜raw 生成・Claude 生成・Discord 送信のいずれかが失敗し、本日未配信です。'
