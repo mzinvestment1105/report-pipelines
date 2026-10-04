@@ -553,7 +553,9 @@ jobs:
           detail: '週次大型株速報 送信中止（生成確認不合格）｜レポートが未生成または極端に短く不完全だったため、配信を止めました。今週分は未配信です。'
 
       - name: Discord 通知（⚠️ 配信済み・後処理のみ失敗）
-        if: (failure() || cancelled()) && steps.send.outcome == 'success'
+        # 2026-10-04 修正: dry_run は --skip-send で送っていないのに send step が success になるため、
+        # 「配信済み」と誤報しないよう dry_run を除外する（dry_run の失敗は下の ❌ 通知で知らせる）。
+        if: (failure() || cancelled()) && steps.send.outcome == 'success' && github.event.inputs.dry_run != 'true'
         uses: ./report-pipelines/.github/actions/notify-discord
         with:
           kind: status
@@ -566,7 +568,7 @@ jobs:
           detail: '週次大型株速報 後処理のみ失敗｜レポート本体は配信済みです。配信後のアーカイブ整理または commit だけが失敗しました。'
 
       - name: Discord 通知（❌ 失敗）
-        if: (failure() || cancelled()) && steps.gate.outputs.exit_code != '3' && steps.send.outcome != 'success'
+        if: (failure() || cancelled()) && steps.gate.outputs.exit_code != '3' && (steps.send.outcome != 'success' || github.event.inputs.dry_run == 'true')
         uses: ./report-pipelines/.github/actions/notify-discord
         with:
           kind: status

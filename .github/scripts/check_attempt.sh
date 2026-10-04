@@ -46,6 +46,8 @@ STATE="${STATE_DIR}/${SLOT}.state"
 mkdir -p "$STATE_DIR"
 
 LIMIT_MSG='Output token limit hit'
+# CLI が差し込む再開指示の行頭（この正規表現に一致する user メッセージ本文だけを上限到達として数える）
+INJECT_RE='^\s*Output token limit hit\. Resume directly'
 SHRINK_BLOCK='【再試行・縮小モード】前回の試行は 1 応答の出力上限に達して成果物を保存できなかった。思考を最小にし、節を 1 つ考えたら即 Write で保存し、1 応答で 3,000 字を超えて書かない。目標字数は本文規定の 6 割でよい。'
 
 TOTAL_HITS=0
@@ -110,14 +112,29 @@ if [ -n "$EXECUTION_FILE" ] && [ -s "$EXECUTION_FILE" ]; then
   if [ "$SHA" = "$LAST_SHA" ]; then
     echo "attempt ${ATTEMPT}: execution_file が前回の試行と同一（この試行は書き出し前に終了）。上限到達は数えません"
   else
-    # CLI が差し込む再開指示（assistant 以外のメッセージ）だけを数える。
-    # assistant の発言と最終 result は、同じ語を引用しても数えない。
-    if ! HITS="$(jq --arg m "$LIMIT_MSG" \
-          '[ .[] | select(type == "object" and .type != "assistant" and .type != "result")
-                 | tostring | select(contains($m)) ] | length' \
+    # CLI が差し込む再開指示だけを数える（2026-10-04 改修）。
+    # 実機（smoke run 37183298026）で確認した差し込みの形は、type=="user" のメッセージで
+    # message.content が文字列、または text ブロックの本文が "Output token limit hit. Resume directly" で
+    # 始まるもの。旧版は assistant/result 以外のメッセージ全体を文字列化して部分一致で数えていたため、
+    # Claude が Read した prompts/_common_rules.md §49 の文（tool_result の中身）まで上限到達と誤計上した。
+    # tool_result ブロックは数えない（本文中に同じ語が出ても上限到達ではない）。
+    if ! HITS="$(jq --arg re "$INJECT_RE" \
+          '[ .[] | select(type == "object" and .type == "user")
+                 | (.message.content // empty)
+                 | if type == "string" then .
+                   elif type == "array" then (.[] | select(type == "object" and .type == "text") | (.text // empty))
+                   else empty end
+                 | select(type == "string" and test($re)) ] | length' \
           "$EXECUTION_FILE" 2>/dev/null)"; then
-      HITS="$(grep -o "$LIMIT_MSG" "$EXECUTION_FILE" | wc -l | tr -d ' ')"
+      echo "::warning::execution_file を jq で解析できないため、差し込み文の行頭一致だけを grep で数えます"
+      HITS="$(grep -Eo '"(text|content)": ?"Output token limit hit\. Resume directly' "$EXECUTION_FILE" | wc -l | tr -d ' ')"
     fi
+    # 診断用: tool_result 等に同じ語が含まれていた件数（上限到達としては数えない）
+    QUOTED="$(jq --arg m "$LIMIT_MSG" \
+          '[ .[] | select(type == "object" and .type == "user") | .message.content
+                 | if type == "array" then (.[] | select(type == "object" and .type == "tool_result") | tostring) else empty end
+                 | select(contains($m)) ] | length' "$EXECUTION_FILE" 2>/dev/null || echo "?")"
+    echo "attempt ${ATTEMPT}: CLI の差し込み（上限到達）=${HITS:-?} 件・tool_result 内の同語（数えない）=${QUOTED} 件"
     LAST_SHA="$SHA"
   fi
 else

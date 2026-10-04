@@ -1455,7 +1455,13 @@ jobs:
             exit 0
           fi
           SINCE="${TARGET_DATE}T00:00:00+09:00"
-          STATS=$(bash ../report-pipelines/.github/scripts/check_delivery.sh mover_weekly.yml merge-and-send "${MY_RUN_ID}" "${SINCE}" || echo '{"delivered":0}')
+          # 2026-10-04 修正: この step は working-directory 未指定（$GITHUB_WORKSPACE 直下）で動くため、
+          # 旧パス ../report-pipelines/... は存在せず、失敗を || で delivered=0 に握りつぶして
+          # 二重配信防止が常に素通りになっていた。正しい相対パスに直し、判定不能は警告として残す。
+          if ! STATS=$(bash report-pipelines/.github/scripts/check_delivery.sh mover_weekly.yml merge-and-send "${MY_RUN_ID}" "${SINCE}"); then
+            echo "::warning::送信直前の重複チェック自体が失敗しました（判定不能）。配信絶対の原則により送信を続行します"
+            STATS='{"delivered":0}'
+          fi
           DELIVERED=$(echo "$STATS" | jq -r '.delivered // 0')
           echo "送信直前の対象週配信済み件数: ${DELIVERED}"
           if [ "$DELIVERED" -gt 0 ]; then
