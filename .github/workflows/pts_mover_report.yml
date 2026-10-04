@@ -446,7 +446,7 @@ jobs:
         run: bash report-pipelines/.github/scripts/detect_spending_cap.sh
 
       - name: Wait before retry 3 (Claude overloaded 等の一時エラー)
-        if: steps.raw.outputs.skipped != 'true' && (success() && steps.chk2.outputs.ok != 'true' && steps.cap2.outputs.capped != 'true')
+        if: steps.raw.outputs.skipped != 'true' && (success() && steps.chk1.outputs.ok != 'true' && steps.chk2.outputs.ok != 'true' && steps.cap1.outputs.capped != 'true' && steps.cap2.outputs.capped != 'true')
         env:
           TARGET_DATE: ${{ steps.date.outputs.value }}
         run: |
@@ -461,7 +461,7 @@ jobs:
 
       - name: Generate report via Claude Code (retry 3)
         id: gen3
-        if: steps.raw.outputs.skipped != 'true' && (success() && steps.chk2.outputs.ok != 'true' && steps.cap2.outputs.capped != 'true')
+        if: steps.raw.outputs.skipped != 'true' && (success() && steps.chk1.outputs.ok != 'true' && steps.chk2.outputs.ok != 'true' && steps.cap1.outputs.capped != 'true' && steps.cap2.outputs.capped != 'true')
         continue-on-error: true
         timeout-minutes: 30
         uses: anthropics/claude-code-base-action@57607815d5d9678acb18dae0e5033d87d4dd4177
