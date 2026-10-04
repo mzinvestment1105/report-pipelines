@@ -41,7 +41,10 @@ EXECUTION_FILE="${EXECUTION_FILE:-}"
 # 実測の文言は "Spending cap reached resets 1:10pm"。
 # 表記揺れ（usage limit / limit reached 等）も拾えるようにするが、
 # 枠切れ以外を巻き込まないよう語の組み合わせで縛る。
-CAP_RE='[Ss]pending cap reached|[Uu]sage limit reached|[Cc]laude usage limit'
+# 2026-10-04 追加: 新しい Claude Code CLI（2.x）は "You've hit your session limit · resets 9pm (Asia/Tokyo)"
+# の形で返す（ローカル CLI の実記録で確認。旧パターンでは拾えず、テスト実走 run 37194492256 /
+# 37193169959 は is_error:true のまま capped=false と判定され、即時再試行を空振りしていた）。
+CAP_RE="[Ss]pending cap reached|[Uu]sage limit reached|[Cc]laude usage limit|[Yy]ou'?ve hit your [a-z ]*limit"
 
 emit() {
   echo "capped=$1"
@@ -68,6 +71,15 @@ HAYSTACK=$(jq -r '
         (select(.type? == "text") | .text? // empty)
     ] | map(select(type == "string")) | join("\n")
   ' "$EXECUTION_FILE" 2>/dev/null || cat "$EXECUTION_FILE")
+
+# 2026-10-04 追加: is_error:true で終わった試行は、原因を後から特定できるよう result / error の本文を
+# 先頭 300 字だけログへ出す（従来は action のログに本文が出ず、失敗理由が読めなかった）。
+ERRTXT=$(jq -r '[ .[] | select(type == "object" and .type == "result" and .is_error == true)
+                 | (.result // .error // "" | tostring) ] | last // empty' "$EXECUTION_FILE" 2>/dev/null | head -c 300 || true)
+if [ -n "$ERRTXT" ]; then
+  echo "attempt ${ATTEMPT}: is_error の本文（先頭 300 字）: $(echo "$ERRTXT" | tr '
+' ' ')"
+fi
 
 if ! echo "$HAYSTACK" | grep -qE "$CAP_RE"; then
   echo "attempt ${ATTEMPT}: 枠切れの文言は検出されませんでした"
