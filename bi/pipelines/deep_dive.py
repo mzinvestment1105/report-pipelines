@@ -604,11 +604,16 @@ def fetch_margin_interest_series(code4: str, as_of: date | None = None) -> dict:
     IssType（1=制度信用銘柄, 2=貸借銘柄 等）が複数返る日は制度側（小さい番号）を優先し
     1 日 1 行に畳む（market_overlays.fetch_weekly_margin_overlay と同じ方針）。
 
+    本エンドポイントは 2026-09-28 から日次配信になり、2026-09-25 申込分から毎営業日の行が
+    入る。行数を週数として数えると n 週前比・52 週ピークが日次行で狂うため、1 日 1 行に
+    畳んだ後で jq_client_utils.resample_weekly_last により「週（月〜日）ごとの最終行 1 本」
+    へ再サンプリングしてから返す（金曜休場週は木曜、進行中の週はその週の最新行）。
+
     Args:
         code4: 銘柄コード（4桁 or 485A のような英数字混在）。
         as_of: 基準日（この日以前の公表週までを対象にする）。省略時は当日。
     Returns:
-        {"status": "ok"|"error:...", "rows": [{"date": date, "long": float, "short": float}, ...昇順],
+        {"status": "ok"|"error:...", "rows": [{"date": date, "long": float, "short": float}, ...昇順・1 週 1 行],
          "note": str}
         取得失敗時は rows=[] と status に理由を入れる（黙った補完をしないため）。
     """
@@ -623,7 +628,7 @@ def fetch_margin_interest_series(code4: str, as_of: date | None = None) -> dict:
 
     try:
         import jquantsapi
-        from jq_client_utils import fetch_paginated_v2
+        from jq_client_utils import fetch_paginated_v2, resample_weekly_last
         client = jquantsapi.ClientV2(api_key=api_key)
     except Exception as e:
         out["status"] = f"error:クライアント生成失敗（{type(e).__name__}）"
@@ -682,6 +687,8 @@ def fetch_margin_interest_series(code4: str, as_of: date | None = None) -> dict:
             "long":  _to_f(r.get("LongVol")),
             "short": _to_f(r.get("ShrtVol")),
         })
+    # 日次行が混ざっても 1 週 1 行になるよう、週ごとの最終行へ畳む。
+    series = resample_weekly_last(series)
     if not series:
         out["status"] = f"error:基準日 {as_of} 以前の公表週が0件"
         return out
@@ -788,6 +795,16 @@ def _pick_margin_week(series: list, target: date):
     return cand[-1] if cand else None
 
 
+def _margin_week_end(d: date) -> date:
+    """d を含む週（月〜日）の日曜日を返す。
+
+    週次信用残の「n 週前」を暦日ではなく週単位で引くための基準。直近行が週の途中
+    （日次配信の進行中の週）や木曜（金曜休場週）でも、日曜 − n×7 日以前の最終行を
+    採れば「n 週前の週の最終行」になり、1 週ずれない。
+    """
+    return d + timedelta(days=6 - d.weekday())
+
+
 def _weekly_close_lookup(price_df):
     """日足 DataFrame から「任意の日付以前で最も近い営業日の終値」を引く関数を返す。
 
@@ -831,7 +848,8 @@ def _weekly_close_lookup(price_df):
     return _lookup
 
 
-def _find_same_level_week(series: list, latest: dict, close_lookup):
+def _find_same_level_week(series: list, latest: dict, close_lookup,
+                          weekly: bool = False):
     """「直近と同じくらいの株価水準だった過去の週」を1つ選ぶ。
 
     PM 2026-09-13 指示: 固定の週数（26 週前等）に意味はないので、
@@ -844,6 +862,8 @@ def _find_same_level_week(series: list, latest: dict, close_lookup):
         ±MARGIN_SAMELEVEL_PRICE_TOL_PCT% 以内なら「同水準」と判定する。
       - 該当が複数あれば最も新しい週を採る。
       - 該当が無ければ株価差が最小の週（最接近週）を参考として返す。
+      - weekly=True（週次信用残）の場合、候補範囲を週単位（月〜日）で取る
+        （直近週の 52 週前の週〜4 週前の週）。False は暦日で取る（機関空売り残）。
 
     Returns:
         {"status": "ok"|"nearest_only"|"error:...", "base": 週の行 or None,
@@ -867,8 +887,13 @@ def _find_same_level_week(series: list, latest: dict, close_lookup):
         return out
     out["latest_close"] = lt_close
 
-    oldest = lt_date - timedelta(days=MARGIN_SAMELEVEL_LOOKBACK_WEEKS * 7)
-    newest = lt_date - timedelta(days=MARGIN_SAMELEVEL_MIN_GAP_WEEKS * 7)
+    if weekly:
+        wk_end = _margin_week_end(lt_date)
+        oldest = wk_end - timedelta(days=MARGIN_SAMELEVEL_LOOKBACK_WEEKS * 7 + 6)  # 52 週前の週の月曜
+        newest = wk_end - timedelta(days=MARGIN_SAMELEVEL_MIN_GAP_WEEKS * 7)       # 4 週前の週の日曜
+    else:
+        oldest = lt_date - timedelta(days=MARGIN_SAMELEVEL_LOOKBACK_WEEKS * 7)
+        newest = lt_date - timedelta(days=MARGIN_SAMELEVEL_MIN_GAP_WEEKS * 7)
     cands = []
     for row in series:
         d = row.get("date")
@@ -922,12 +947,15 @@ def _judge_margin(chg, kind: str = "long"):
     return "減少（良い兆候）" if chg < 0 else "増加（悪化）"
 
 
-def _build_longterm_block(series: list, latest: dict, value_key: str) -> dict:
+def _build_longterm_block(series: list, latest: dict, value_key: str,
+                          weekly: bool = False) -> dict:
     """長期トレンド（52週ピーク→直近の減少率 + 13/26/52週前比）を1行分にまとめる。
 
     固定期間（26 週等）に意味を持たせず「どこまで減ったか」を見るための行。
     株価が大きく下がって同水準の過去が無い銘柄（7256 のような例）でも成立する。
     取得範囲より前を要求された期間は base=None とし、誌面では「-」で出す。
+    weekly=True（週次信用残）の場合、ピーク窓と n 週前を週単位（月〜日）で取る
+    （直近週の 52 週前の週〜直近週、n 週前の週の最終行）。False は暦日（機関空売り残）。
 
     Returns:
         {"peak": 行 or None, "peak_pct": float or None,
@@ -937,7 +965,8 @@ def _build_longterm_block(series: list, latest: dict, value_key: str) -> dict:
     if not series or not latest:
         return out
     lt_date = latest.get("date")
-    oldest = lt_date - timedelta(days=MARGIN_SAMELEVEL_LOOKBACK_WEEKS * 7)
+    ref = _margin_week_end(lt_date) if weekly else lt_date
+    oldest = ref - timedelta(days=MARGIN_SAMELEVEL_LOOKBACK_WEEKS * 7 + (6 if weekly else 0))
     window = [r for r in series
               if r.get("date") is not None and oldest <= r["date"] <= lt_date
               and r.get(value_key) is not None]
@@ -947,7 +976,7 @@ def _build_longterm_block(series: list, latest: dict, value_key: str) -> dict:
         out["peak_pct"] = _margin_pct_change(peak.get(value_key), latest.get(value_key))
     first = series[0]["date"]
     for wk in MARGIN_INTEREST_LONGTERM_WEEKS:
-        want = lt_date - timedelta(days=wk * 7)
+        want = ref - timedelta(days=wk * 7)
         base = _pick_margin_week(series, want)
         # 取得範囲の先頭より前を要求された場合（上場が浅い等）は基準週なしとして扱う。
         if base is not None and first > want + timedelta(days=10):
@@ -1000,9 +1029,11 @@ def build_margin_trend_rows(code4: str, as_of: date | None = None,
     out["fetch_first_week"] = series[0]["date"]
     out["fetch_weeks"] = len(series)
 
-    # 1) 短期（6週前比）
+    # 1) 短期（6週前比）。series は 1 週 1 行なので、直近週の日曜から n 週戻った日以前の
+    #    最終行＝「n 週前の週の最終行」を採る（直近が週の途中・木曜でも 1 週ずれない）。
+    lt_week_end = _margin_week_end(latest["date"])
     for wk in MARGIN_INTEREST_TREND_WEEKS:
-        base = _pick_margin_week(series, latest["date"] - timedelta(days=wk * 7))
+        base = _pick_margin_week(series, lt_week_end - timedelta(days=wk * 7))
         entry: dict = {"weeks": wk, "base": base}
         if base is None:
             entry["note"] = f"{wk}週前の公表週が取得範囲に無い"
@@ -1015,7 +1046,7 @@ def build_margin_trend_rows(code4: str, as_of: date | None = None,
         out["weeks"][wk] = entry
 
     # 2) 同水準株価時点比
-    sl = _find_same_level_week(series, latest, close_lookup)
+    sl = _find_same_level_week(series, latest, close_lookup, weekly=True)
     if sl.get("status") in ("ok", "nearest_only"):
         pick = sl.get("base") or (sl.get("nearest") or {}).get("base")
         for key in ("long", "short"):
@@ -1025,8 +1056,8 @@ def build_margin_trend_rows(code4: str, as_of: date | None = None,
 
     # 3) 長期トレンド（52週ピーク比 + 13/26/52週前比）
     out["longterm"] = {
-        "long":  _build_longterm_block(series, latest, "long"),
-        "short": _build_longterm_block(series, latest, "short"),
+        "long":  _build_longterm_block(series, latest, "long", weekly=True),
+        "short": _build_longterm_block(series, latest, "short", weekly=True),
     }
 
     # 機関空売り残（空売り残高報告制度・合計）を同じ3軸で併記する。
@@ -1572,7 +1603,8 @@ def _fmt_margin_trend(mt: dict | None, shares_out) -> list[str]:
 
     lines += [
         "",
-        f"- **直近基準日**: {lt_date}（信用残は毎週金曜時点の公表）。"
+        f"- **直近基準日**: {lt_date}（週次の値は各週の最終営業日時点。"
+        "2026-09-25 申込分から日次配信のため、直近週はその週の最新営業日の値）。"
         f" 直近の信用売残: {_shares_fmt(latest.get('short'), shares_out)}。",
         f"- **信用売残の増減率**: 6週前比 {_pct_fmt(wk6.get('short_pct'))} / "
         f"同水準株価時点比 {_pct_fmt(sl_short_pct)}。",
@@ -1591,11 +1623,13 @@ def _fmt_margin_trend(mt: dict | None, shares_out) -> list[str]:
     lines += [
         "",
         f"- **根拠**: {mt.get('source_note') or 'J-Quants v2 /markets/margin-interest'}。"
-        f" 取得期間は {mt.get('fetch_first_week')} 〜 {lt_date}（{mt.get('fetch_weeks')} 週）。",
-        "- **基準週の選び方**: 6週前比は「直近公表週の 6 週前の暦日以前で最も近い公表週」。"
+        f" 取得期間は {mt.get('fetch_first_week')} 〜 {lt_date}（{mt.get('fetch_weeks')} 週・"
+        "週ごとに最終営業日の 1 行を採用）。",
+        "- **基準週の選び方**: 6週前比は「直近週の 6 週前の週（月〜日）の最終営業日の値」"
+        "（その週に値が無ければそれ以前で最も近い週）。"
         f" 同水準株価時点比は「直近 {MARGIN_SAMELEVEL_LOOKBACK_WEEKS} 週内で、直近終値との差が"
         f" ±{MARGIN_SAMELEVEL_PRICE_TOL_PCT:.0f}% 以内かつ直近 {MARGIN_SAMELEVEL_MIN_GAP_WEEKS} 週より前の"
-        " 最も新しい公表週」。該当が無い場合は株価が最も近い週を参考として併記する。"
+        " 最も新しい週」。該当が無い場合は株価が最も近い週を参考として併記する。"
         " 終値は yfinance 日足（分割調整済み・配当未調整）の、基準日以前で最も近い営業日。",
         "- **長期トレンド**: 過去 52 週の残高ピークからの減少率と 13/26/52 週前比。"
         " 固定期間の恣意性を避け「どこまで減ったか」を複数期間で示す（取得範囲外は「-」）。",
@@ -5570,8 +5604,8 @@ def _fmt_reaction_context(ctx: dict) -> list:
         "> **「権利落ち」「権利付最終日」を主因として書けるのは、下の『権利落ち』行が"
         "「当日と一致する」と書いている日だけである。一致しない日に権利落ちを主因として"
         "書くことを禁止する（基準日と権利落ち日の取り違えを防ぐため）。**",
-        "> **信用残は週次（毎週金曜時点）のため対象日そのものの残高は存在しない。"
-        "対象日を挟む2回の公表値とその増減を示してある。信用倍率は使わない。**",
+        "> **信用残は週次（各週の最終営業日時点の値を週 1 本）で示しており、対象日そのものの残高ではない。"
+        "対象日を挟む2回の週次値とその増減を示してある。信用倍率は使わない。**",
         "",
     ]
     if ctx.get("note"):

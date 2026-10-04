@@ -276,6 +276,34 @@ def recent_trading_days_v2(
     return list(reversed(last_n))  # 新しい順 [最新, 1日前, …]
 
 
+def resample_weekly_last(rows: list[dict], date_key: str = "date") -> list[dict]:
+    """
+    日付付きの行を「週（月〜日）ごとに最後の 1 行」へ畳み、日付の昇順で返す。
+
+    /markets/margin-interest は 2026-09-28 から日次配信になり、2026-09-25 申込分から
+    毎営業日の行が入る（9/24 以前は週末＝金曜、金曜休場なら直前営業日の行のみ）。
+    週次比較（n 週前比・前週比）を行の並び順や行数で数えると日次行の混入で狂うため、
+    週ごとの最終行を 1 本だけ採って週次へ戻す。金曜休場の週は木曜の行が、
+    進行中の週はその週の最新行が、その週の値になる。
+
+    Args:
+        rows: `date_key` に datetime.date を持つ dict のリスト（順不同可）。
+        date_key: 日付が入っているキー名。
+    Returns:
+        1 週 1 行・日付昇順のリスト。同じ日付の行が複数あれば入力順で後ろの行を採る。
+    """
+    last: dict = {}
+    for r in rows:
+        d = r.get(date_key)
+        if d is None:
+            continue
+        wk = d.isocalendar()[:2]  # (ISO 年, ISO 週番号) = 月曜始まりの週
+        cur = last.get(wk)
+        if cur is None or d >= cur[date_key]:
+            last[wk] = r
+    return sorted(last.values(), key=lambda r: r[date_key])
+
+
 # 既存スクリプトとの互換用エイリアス
 _normalize_code_4 = normalize_code_4
 _get_json_with_429_backoff = get_json_with_429_backoff

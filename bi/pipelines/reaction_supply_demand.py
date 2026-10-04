@@ -12,7 +12,8 @@
      … J-Quants v2 /markets/short-sale-report。JPX の大量空売りポジション報告
        （発行済株式数の 0.5% 以上で報告義務）が原データ。
   2. 信用取引の売残・買残と増減（対発行済株式数 %）
-     … J-Quants v2 /markets/margin-interest（週次・毎週金曜時点）。
+     … J-Quants v2 /markets/margin-interest（2026-09-25 申込分から日次配信だが、
+       週ごとの最終営業日の行 1 本に畳んで週次として使う）。
        信用倍率は使わない（_cr / feedback_data_accuracy_rules）。
   3. 立会外分売・自己株取得・大量保有報告書の提出（対象日前後）
      … TDNet の開示表題から機械的に抽出する。
@@ -233,19 +234,24 @@ def total_short_balance_on(reports: list, day: date):
 def fetch_margin_interest(code4: str) -> list:
     """当該銘柄の週次信用残（売残・買残）を Date 昇順で返す。
 
-    J-Quants v2 /markets/margin-interest。毎週金曜時点の残高が翌週に公表される。
-    日次の信用残（/markets/daily-margin-interest）は上位プランのみで
-    本環境では 403 になるため使わない（実測 2026-09-06）。
+    J-Quants v2 /markets/margin-interest。2026-09-24 以前は週末（金曜、金曜休場なら
+    直前営業日）時点の行のみ、2026-09-25 申込分からは毎営業日の行が入る（2026-09-28 に
+    日次配信へ切替）。本モジュールは対象日を含む週の増減を示す用途のため、
+    jq_client_utils.resample_weekly_last で「週（月〜日）ごとの最終行 1 本」に畳み、
+    日次行が混ざっても直前／直後の値が週次のまま取れるようにする。
+    なお /markets/daily-margin-interest は v1 時代の旧パスで v2 には存在しない。
+    403 の応答本文は「The requested endpoint does not exist」で、プラン制限による
+    403 ではない（実測 2026-09-28）。
 
     Returns:
-        [{"date": date, "short": float|None, "long": float|None}]
+        [{"date": date, "short": float|None, "long": float|None}]（1 週 1 行）
     """
     api_key = os.environ.get("JQUANTS_API_KEY", "").strip()
     if not api_key:
         return []
     try:
         import jquantsapi
-        from jq_client_utils import fetch_paginated_v2
+        from jq_client_utils import fetch_paginated_v2, resample_weekly_last
         client = jquantsapi.ClientV2(api_key=api_key)
         rows = fetch_paginated_v2(
             client, "/markets/margin-interest", params={"code": str(code4)},
@@ -266,14 +272,16 @@ def fetch_margin_interest(code4: str) -> list:
             "long": _f(r.get("LongVol")),
         })
     out.sort(key=lambda x: x["date"])
-    return out
+    # 日次行が混ざっても 1 週 1 行になるよう、週ごとの最終行へ畳む。
+    return resample_weekly_last(out)
 
 
 def margin_around(margin: list, day: date) -> dict:
     """day を挟む直近2回の信用残と、その間の増減を返す。
 
-    週次のため対象日そのものの残高は存在しない。対象日の直前の公表日と、
-    対象日より後の最初の公表日を並べ、対象日を含む週の増減として示す。
+    margin は 1 週 1 行（各週の最終営業日の値）のため、対象日そのものの残高は使わない。
+    対象日以前の直近の週次値と、対象日より後の最初の週次値を並べ、
+    対象日を含む週の増減として示す。
     """
     before = [m for m in margin if m["date"] <= day]
     after = [m for m in margin if m["date"] > day]

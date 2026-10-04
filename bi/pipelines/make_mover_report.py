@@ -2656,6 +2656,114 @@ def _has_tiktoken() -> bool:
 
 
 # ---------------------------------------------------------------------------
+# テーマ欄枠（themes レッグ）専用の縮小 raw（2026-10-04）
+# ---------------------------------------------------------------------------
+# 10/1・10/2 の動意日次でテーマ欄枠が全量 raw（約 4,400 行）を受け取り、思考だけで
+# 出力上限 32,000 トークンを使い切って本文を書く前に止まった。themes レッグが要るのは
+# prompts/mover-report.md の themes 節が読む節（ヘッダ＝対象日検証アンカー・対象日市場概況、
+# 本日/今週の動意母集団・初動候補テーマ・直近2週間の熱いテーマ・理由素材）と、
+# そこに出る銘柄の市場節 `### {コード} {社名}` ブロック（何の会社・材料の補完用）だけである。
+# 全量 raw はそのまま出力し、本関数の結果は `{date}_movers_raw_themes.md` へ別出力する。
+_THEME_SECTION_RE = re.compile(
+    r"^## (本日の動意母集団|今週の動意母集団|初動候補テーマ|直近2週間の熱いテーマ)"
+)
+_MARKET_SECTION_RE = re.compile(r"^## (プライム|スタンダード|グロース)\s*$")
+_THEME_CODE_RES = (
+    re.compile(r"^\| ([0-9][0-9A-Z]{2}[0-9A-Z]) \|"),        # 母集団表・主導銘柄表の行
+    re.compile(r"^- \*\*([0-9][0-9A-Z]{2}[0-9A-Z]) "),       # 理由素材の銘柄見出し
+    re.compile(r"^\s*- [^:：]*?: ([0-9][0-9A-Z]{2}[0-9A-Z]) "),  # 持続文脈の銘柄行
+    re.compile(r"^- ([0-9][0-9A-Z]{2}[0-9A-Z]) "),           # 重複掲載の注記行
+)
+_DETAIL_HEAD_RE = re.compile(r"^### ([0-9][0-9A-Z]{2}[0-9A-Z]) ")
+_THEME_BOARD_MAX = 3
+
+
+def build_themes_raw(report_md: str) -> str | None:
+    """全量 raw の文字列から themes レッグ専用の縮小 raw を組み立てる。
+
+    構成: ヘッダ（`## Layer 1` より前＝タイトル・価格比較・品質注記・対象日市場概況）
+    → テーマ用の節（最初のテーマ見出しから最初の市場見出しの直前まで）
+    → 参照銘柄ブロック（テーマ用の節に出るコードの市場節ブロック。需給の小節は除く・重複は1回）。
+    テーマ用の節が見つからない日は None を返す（呼び出し側は縮小版を出さず全量 raw に任せる）。
+    """
+    lines = report_md.split("\n")
+    header: list[str] = []
+    for ln in lines:
+        if ln.startswith("## Layer 1"):
+            break
+        header.append(ln)
+
+    t_start = next((i for i, ln in enumerate(lines) if _THEME_SECTION_RE.match(ln)), None)
+    if t_start is None:
+        return None
+    t_end = next(
+        (i for i in range(t_start, len(lines)) if _MARKET_SECTION_RE.match(lines[i])),
+        len(lines),
+    )
+    theme_lines = lines[t_start:t_end]
+
+    codes: list[str] = []
+    for ln in theme_lines:
+        for rx in _THEME_CODE_RES:
+            m = rx.match(ln)
+            if m and m.group(1) not in codes:
+                codes.append(m.group(1))
+                break
+    wanted = set(codes)
+
+    # 市場節の銘柄ブロックを切り出す（`### {コード}` から次の `###`/`##` 見出しの直前まで）。
+    blocks: dict[str, list[str]] = {}
+    i = t_end
+    while i < len(lines):
+        m = _DETAIL_HEAD_RE.match(lines[i])
+        if not m:
+            i += 1
+            continue
+        j = i + 1
+        while j < len(lines) and not lines[j].startswith("### ") and not lines[j].startswith("## "):
+            j += 1
+        code = m.group(1)
+        if code in wanted and code not in blocks:
+            blk: list[str] = []
+            skip = False
+            board = 0
+            for ln in lines[i:j]:
+                if ln.startswith("> {"):
+                    # 掲示板の投稿引用は 1 銘柄 3 件まで（10/2 実測で 36 銘柄 1,080 行＝縮小 raw の 4 割）
+                    board += 1
+                    if board > _THEME_BOARD_MAX:
+                        continue
+                if ln.startswith("**需給"):
+                    skip = True          # 需給の小節（見出し＋箇条書き）は themes で使わない
+                    continue
+                if skip:
+                    if ln.startswith("- "):
+                        continue
+                    skip = False
+                    if ln.strip() == "" and blk and blk[-1].strip() == "":
+                        continue
+                blk.append(ln)
+            blocks[code] = blk
+        i = j
+
+    out = list(header)
+    if len(out) > 1:
+        out.insert(1, "")
+        out.insert(2, "> テーマ欄枠（themes）専用の縮小 raw。全量 raw からテーマ用の節と、"
+                      "そこに出る銘柄の市場節ブロック（需給の小節を除く）だけを抜き出している。")
+    out += theme_lines
+    if blocks:
+        out += [
+            "## テーマ欄の参照銘柄ブロック（市場節から抜粋・誌面には出さない）",
+            "",
+        ]
+        for code in codes:
+            if code in blocks:
+                out += blocks[code]
+    return "\n".join(out).rstrip("\n") + "\n"
+
+
+# ---------------------------------------------------------------------------
 # ユーティリティ
 # ---------------------------------------------------------------------------
 
@@ -2901,6 +3009,16 @@ def main() -> None:
     raw_name_date = target if args.date_gate else today_dt
     out_path = out_dir / f"{raw_name_date}_movers_raw.md"
     out_path.write_text(report_md, encoding="utf-8")
+
+    # テーマ欄枠専用の縮小 raw（2026-10-04）。失敗しても全量 raw と配信は止めない（_cr §36）。
+    try:
+        themes_md = build_themes_raw(report_md)
+        if themes_md:
+            themes_path = out_dir / f"{raw_name_date}_movers_raw_themes.md"
+            themes_path.write_text(themes_md, encoding="utf-8")
+            print(f"テーマ欄用縮小 raw: {themes_path}（{themes_md.count(chr(10)):,} 行）")
+    except Exception as _e:
+        print(f"  [WARN] build_themes_raw: {_e}")
 
     tokens = estimate_tokens(report_md)
     log_token_usage(today_dt, "make_mover_report", tokens, len(report_md))
