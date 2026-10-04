@@ -102,6 +102,27 @@ jobs:
             jq -r '[ .[] | select(.type? == "system" and .subtype? == "init") ] | first | (.model // "n/a")' "$EXECUTION_FILE" || true
             echo "=== output-token-limit messages (exact):"
             jq -r '[ .. | strings | select(test("output token|max_tokens|maximum"; "i")) ] | unique | .[] | .[0:400]' "$EXECUTION_FILE" || true
+            echo "=== result usage (model別の出力トークン合計):"
+            jq -r '[ .[] | select(.type? == "result") ] | last | (.modelUsage // {}) | to_entries[] | "\(.key) outputTokens=\(.value.outputTokens // "n/a") inputTokens=\(.value.inputTokens // "n/a")"' "$EXECUTION_FILE" || true
+            echo "=== message trace (長い本文は文字数のみ):"
+            jq -r '
+              .[] | select(type == "object") |
+              if .type == "assistant" then
+                "assistant stop_reason=\(.message.stop_reason // "null") output_tokens=\(.message.usage.output_tokens // "n/a") blocks=" +
+                ( [ (.message.content // [])[] |
+                    if .type == "text" then "text:" + (.text | .[0:300])
+                    elif .type == "tool_use" then "tool_use:\(.name) input_chars=\(.input | tostring | length)"
+                    elif .type == "thinking" then "thinking:chars=\((.thinking // "") | length)"
+                    else .type end ] | join(" || ") )
+              elif .type == "user" then
+                "user " + ( [ (.message.content // [] | if type == "string" then [{type:"text",text:.}] else . end)[] |
+                    if .type == "tool_result" then "tool_result is_error=\(.is_error // false): " + ((.content | tostring) | .[0:400])
+                    elif .type == "text" then "text:" + (.text | .[0:400])
+                    else .type end ] | join(" || ") )
+              elif .type == "system" then "system subtype=\(.subtype // "") " + ((.message // .content // "") | tostring | .[0:300])
+              elif .type == "result" then "result subtype=\(.subtype) is_error=\(.is_error)"
+              else "other type=\(.type // "?")" end
+            ' "$EXECUTION_FILE" || true
           else
             echo "=== execution_file missing"
           fi
