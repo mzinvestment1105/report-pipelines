@@ -97,6 +97,7 @@ jobs:
           MY_RUN_ID: ${{ github.run_id }}
           EVENT: ${{ github.event_name }}
           UPSTREAM_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          UPSTREAM_TITLE: ${{ github.event.workflow_run.display_title }}
           FORCE_RERUN: ${{ github.event.inputs.force_rerun }}
           INPUT_DATE: ${{ github.event.inputs.target_date }}
           TEST_MODE: ${{ github.event.inputs.test_mode }}

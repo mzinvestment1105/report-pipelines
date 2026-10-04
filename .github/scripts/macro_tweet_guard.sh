@@ -18,7 +18,7 @@
 #
 # 入力（env）:
 #   必須: GH_TOKEN GITHUB_REPOSITORY GITHUB_OUTPUT MY_RUN_ID EVENT
-#   任意: UPSTREAM_CONCLUSION FORCE_RERUN INPUT_DATE
+#   任意: UPSTREAM_CONCLUSION UPSTREAM_TITLE FORCE_RERUN INPUT_DATE
 #   検証用: NOW_OVERRIDE  "YYYY-MM-DD HH:MM" 形式の疑似 JST 時刻（未指定なら実時刻）
 #           STATS_OVERRIDE  check_delivery.sh を呼ばずに使う JSON（単体検証用）
 #
@@ -30,6 +30,7 @@ set -euo pipefail
 EVENT="${EVENT:?EVENT is required}"
 MY_RUN_ID="${MY_RUN_ID:-0}"
 UPSTREAM_CONCLUSION="${UPSTREAM_CONCLUSION:-}"
+UPSTREAM_TITLE="${UPSTREAM_TITLE:-}"
 FORCE_RERUN="${FORCE_RERUN:-false}"
 INPUT_DATE="${INPUT_DATE:-}"
 
@@ -80,6 +81,14 @@ fi
 # workflow_run 起点は上流（夕刊マクロ）が success の時のみ先へ進む。
 # 夕刊本文がツイートの第一ソースであり、無ければ後段 precheck でどうせ止まるため
 # ここで打ち切って Claude を起動しない（＝トークンを使わない）。
+# 2026-10-04: 上流がテストモード（run-name に「[TEST]」）の夕刊なら本番ツイートを起動しない。
+# テストの夕刊は Private へコミットせず、ここで進むと本番の SNS チャンネルへ送ってしまうため。
+if [ "$EVENT" = "workflow_run" ] && [[ "$UPSTREAM_TITLE" == *"[TEST]"* ]]; then
+  emit proceed false
+  emit reason "skip (upstream macro_report_evening is a test_mode run)"
+  exit 0
+fi
+
 if [ "$EVENT" = "workflow_run" ] && [ "$UPSTREAM_CONCLUSION" != "success" ]; then
   emit proceed false
   emit reason "skip (upstream macro_report_evening conclusion=${UPSTREAM_CONCLUSION})"
