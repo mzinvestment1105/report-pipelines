@@ -2764,6 +2764,82 @@ def build_themes_raw(report_md: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# 市場レッグ（growth / standard / prime）専用の縮小 raw（2026-10-04）
+# ---------------------------------------------------------------------------
+# 10/2 のテスト実走で prime 枠は全量 raw（約 4,400 行）、growth 枠は `## グロース` 以降の全行
+# （Layer 5 バリュエーション・マクロコンテキスト等を含む約 1,650 行）を受け取っていた。
+# prompts/mover-report.md の市場レッグが raw から読むのは次の 3 つだけである。
+#   - ヘッダ（`## Layer 1` より前）: 対象日検証のアンカー（価格比較・対象日市場概況）と
+#     「本日の地合い」の唯一の引用元（実行手順 4 の対象日検証・地合い引用の項）
+#   - `## Layer 1: セクター別フロー`: 今日の注目の「セクター全面安／全面高」の事実確認用
+#     （誌面にセクター別フロー節は書かない＝削除済み一覧どおり）
+#   - 担当市場の節 `## {市場}` の銘柄ブロック（事業行・TDNet・ニュース・掲示板＝何の会社／なぜ動いた の素材）
+# テーマ用の節（themes 枠が書く）・Layer 5 バリュエーション（誌面に書かない）・マクロコンテキスト
+# （プロンプトがマクロレポートを別途 Read する）・需給の小節（需給ブロックは誌面に書かない）は渡さない。
+# 全量 raw はそのまま出力し、本関数の結果は `{date}_movers_raw_{market}.md` へ別出力する。
+MARKET_RAW_SECTIONS = {"growth": "グロース", "standard": "スタンダード", "prime": "プライム"}
+
+
+def build_market_raw(report_md: str, market: str) -> str | None:
+    """全量 raw の文字列から市場レッグ（growth / standard / prime）専用の縮小 raw を組み立てる。
+
+    構成: ヘッダ（`## Layer 1` より前）→ `## Layer 1: セクター別フロー` 節
+    → 担当市場の節（`## {市場}` から次の `## ` 見出しの直前まで・需給の小節は除く）。
+    担当市場の節が見つからない日は None を返す（呼び出し側は縮小版を出さず全量 raw に任せる）。
+    """
+    name = MARKET_RAW_SECTIONS.get(market)
+    if name is None:
+        return None
+    lines = report_md.split("\n")
+    head_re = re.compile(rf"^## {name}\s*$")
+    m_start = next((i for i, ln in enumerate(lines) if head_re.match(ln)), None)
+    if m_start is None:
+        return None
+    m_end = next(
+        (i for i in range(m_start + 1, len(lines)) if lines[i].startswith("## ")),
+        len(lines),
+    )
+
+    header: list[str] = []
+    for ln in lines:
+        if ln.startswith("## Layer 1"):
+            break
+        header.append(ln)
+
+    sector: list[str] = []
+    s_start = next((i for i, ln in enumerate(lines) if ln.startswith("## Layer 1")), None)
+    if s_start is not None:
+        s_end = next(
+            (i for i in range(s_start + 1, len(lines)) if lines[i].startswith("## ")),
+            len(lines),
+        )
+        sector = lines[s_start:s_end]
+
+    body: list[str] = []
+    skip = False
+    for ln in lines[m_start:m_end]:
+        if ln.startswith("**需給"):
+            skip = True              # 需給の小節（見出し＋箇条書き）は市場レッグの誌面に書かない
+            continue
+        if skip:
+            if ln.startswith("- "):
+                continue
+            skip = False
+            if ln.strip() == "" and body and body[-1].strip() == "":
+                continue
+        body.append(ln)
+
+    out = list(header)
+    if len(out) > 1:
+        out.insert(1, "")
+        out.insert(2, f"> {name}枠（{market}）専用の縮小 raw。全量 raw からヘッダ・セクター別フロー・"
+                      f"{name}の節（需給の小節を除く）だけを抜き出している。")
+    out += sector
+    out += body
+    return "\n".join(out).rstrip("\n") + "\n"
+
+
+# ---------------------------------------------------------------------------
 # ユーティリティ
 # ---------------------------------------------------------------------------
 
@@ -3019,6 +3095,17 @@ def main() -> None:
             print(f"テーマ欄用縮小 raw: {themes_path}（{themes_md.count(chr(10)):,} 行）")
     except Exception as _e:
         print(f"  [WARN] build_themes_raw: {_e}")
+
+    # 市場レッグ専用の縮小 raw（2026-10-04）。失敗しても全量 raw と配信は止めない（_cr §36）。
+    for _mkt in MARKET_RAW_SECTIONS:
+        try:
+            market_md = build_market_raw(report_md, _mkt)
+            if market_md:
+                market_path = out_dir / f"{raw_name_date}_movers_raw_{_mkt}.md"
+                market_path.write_text(market_md, encoding="utf-8")
+                print(f"{_mkt} 用縮小 raw: {market_path}（{market_md.count(chr(10)):,} 行）")
+        except Exception as _e:
+            print(f"  [WARN] build_market_raw({_mkt}): {_e}")
 
     tokens = estimate_tokens(report_md)
     log_token_usage(today_dt, "make_mover_report", tokens, len(report_md))
