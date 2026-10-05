@@ -73,7 +73,9 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install playwright python-dotenv pyyaml
+          # 2026-10-05: バズ収集の記事本文取得（fetch_x_buzz.py）が requests / bs4 / pypdf を使うため追加。
+          # 未導入のままでは検索が取れても本文取得の段階で異常終了し buzz JSON が保存されない（GHA 実測 2026-10-05・9/28 も exit 1 で JSON なし）。
+          pip install playwright python-dotenv pyyaml requests beautifulsoup4 pypdf
           # fingerprint 偽装。ローカル実装では import ガード付きの任意依存なので
           # 解決に失敗しても続行させる。
           pip install playwright-stealth || echo "[INFO] playwright-stealth 未導入（任意依存・続行）"
