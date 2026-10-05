@@ -49,6 +49,9 @@ from dotenv import load_dotenv
 
 from jq_client_utils import fetch_paginated_v2, normalize_code_4
 from edinetdb_client import EdinetDBClient
+# 「なぜ動いた」改修（2026-10-04 PM 承認）: 日別騰落表・四季報行・facts JSON の部品
+from lib import move_days as _md
+from lib.shikiho_client import fetch_shikiho_batch
 from theme_radar import (
     MAX_ROWS_TODAY_MAX,
     append_early_candidates,
@@ -221,7 +224,15 @@ _BBS_QUOTE = re.compile(r"^>>\d+")
 # 取得失敗の記録（呼び出し側が品質注記に使う）。
 # 例外を握り潰して空配列を返すだけだと無警告で材料が欠落するため、失敗理由をここに積む。
 # news: 銘柄別ニュース（Yahoo!ファイナンス ニュースタブ）の取得失敗・0件。
-FETCH_ERRORS: dict[str, list[str]] = {"news": [], "yahoo_disclosure": []}
+FETCH_ERRORS: dict[str, list[str]] = {"news": [], "yahoo_disclosure": [], "move_days": [],
+                                      "shikiho": [], "related": []}
+
+# 検証用（2026-10-04）: --asof 指定時、この時刻（JST naive）より後に公表されたニュース・開示・
+# 掲示板投稿を raw から除外する（生成時点に存在しなかった材料を混ぜない）。None なら無効。
+ASOF: datetime | None = None
+# 検証用（2026-10-04）: False のとき bi/outputs 配下の蓄積 parquet・token_usage_log.csv・
+# OHLC キャッシュへの書き込みを全て止める（--no-state-writes）。既定 True＝従来どおり。
+STATE_WRITES: bool = True
 
 JST = timezone(timedelta(hours=9))
 
@@ -318,6 +329,8 @@ def fetch_ohlc_history(
     """
     if cache_dir is None:
         cache_dir = BASE_DIR / ".." / "data" / "raw"
+        if not STATE_WRITES and os.environ.get("MOVER_RAW_OUT_DIR"):
+            cache_dir = Path(os.environ["MOVER_RAW_OUT_DIR"]) / "cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_path = cache_dir / f"ohlc_history_{today_date.isoformat()}.parquet"
 
@@ -891,7 +904,8 @@ def fetch_tdnet_atom(code4: str) -> tuple[list[dict], str]:
 
 
 def filter_by_days(entries: list[dict], days: int) -> list[dict]:
-    cutoff = datetime.now().astimezone() - timedelta(days=days)
+    base = ASOF.replace(tzinfo=JST) if ASOF is not None else datetime.now().astimezone()
+    cutoff = base - timedelta(days=days)
     result = []
     for e in entries:
         try:
@@ -927,13 +941,18 @@ def fetch_tdnet_batch(codes: list[str], no_pdf: bool = False) -> dict[str, dict]
         code4 = normalize_code_4(code)
         print(f"  TDNet [{i}/{total}] {code4}")
         entries, company_name = fetch_tdnet_atom(code4)
+        if ASOF is not None:
+            entries = [e for e in entries
+                       if (_md.parse_dt(e.get("published")) or datetime.min) <= ASOF]
+        # 直近 3 か月の日別騰落表（lib/move_days.py）用に全件を残す（30 日の絞り込み前）。
+        all_entries = list(entries)
         entries = filter_by_days(entries, DEFAULT_TDNET_DAYS)
         if not no_pdf:
             for e in entries[:3]:
                 if e["pdf_url"]:
                     e["pdf_text"] = fetch_pdf_text(e["pdf_url"])
                     time.sleep(REQUEST_SLEEP)
-        result[code4] = {"entries": entries, "company_name": company_name}
+        result[code4] = {"entries": entries, "company_name": company_name, "all_entries": all_entries}
         time.sleep(REQUEST_SLEEP)
     return result
 
@@ -1033,7 +1052,7 @@ def fetch_yahoo_news(code4: str, max_items: int = 20) -> list[dict]:
     items: list[dict] = []
     seen: set[str] = set()
 
-    def _add(title: str, when: str, media: str) -> None:
+    def _add(title: str, when: str, media: str, link: str = "") -> None:
         # source は「どこから取ったか」（＝Yahoo!ファイナンス）。media は記事の配信元。
         title = re.sub(r"\s+", " ", str(title)).strip()
         if not title or len(title) < 8 or title in seen:
@@ -1043,7 +1062,8 @@ def fetch_yahoo_news(code4: str, max_items: int = 20) -> list[dict]:
         if _is_market_wide_news(title):
             return
         seen.add(title)
-        items.append({"title": title, "date": when, "source": "Yahoo!ファイナンス", "media": media})
+        items.append({"title": title, "date": when, "source": "Yahoo!ファイナンス", "media": media,
+                      "link": link})
 
     try:
         chunks = []
@@ -1064,7 +1084,8 @@ def fetch_yahoo_news(code4: str, max_items: int = 20) -> list[dict]:
                 arts = []
             for a in arts:
                 if isinstance(a, dict) and a.get("headline"):
-                    _add(a["headline"], str(a.get("createTime", "")), str(a.get("mediaName", "")))
+                    _add(a["headline"], str(a.get("createTime", "")), str(a.get("mediaName", "")),
+                         str(a.get("link") or ""))
             if items:
                 break
     except Exception as e:
@@ -1081,9 +1102,9 @@ def fetch_yahoo_news(code4: str, max_items: int = 20) -> list[dict]:
                 # 「タイトル HH:MM 提供元」の並びから時刻・提供元を切り離す
                 m = re.search(r"^(.*?)\s+(\d{1,2}:\d{2})\s+(\S+)$", txt)
                 if m:
-                    _add(m.group(1), m.group(2), m.group(3))
+                    _add(m.group(1), m.group(2), m.group(3), a["href"])
                 else:
-                    _add(txt, "", "")
+                    _add(txt, "", "", a["href"])
         except Exception as e:
             print(f"  [WARN] {code4} yahoo news html parse failed: {e}")
 
@@ -1833,12 +1854,52 @@ def _reason_material_for(code4: str, tdnet_data: dict, yahoo_data: dict) -> list
     return out
 
 
+_NEWS_TIME_CACHE: dict[str, datetime | None] = {}
+
+
+def _cached_article_time(link: str) -> datetime | None:
+    """Yahoo ニュース記事の配信日時（記事ページの <time dateTime>）。同じ記事は 1 回だけ取りに行く。"""
+    if not link:
+        return None
+    if link not in _NEWS_TIME_CACHE:
+        _NEWS_TIME_CACHE[link] = _md.fetch_article_time(link, session=_get_yahoo_session())
+    return _NEWS_TIME_CACHE[link]
+
+
+def _news_when(n: dict) -> tuple[str, datetime | None, date | None]:
+    """既存ニュース項目の (表示ラベル, 配信日時 or None, 一覧上の日付 or None)。"""
+    dt = _NEWS_TIME_CACHE.get(n.get("link") or "")
+    raw = str(n.get("date") or "")
+    ref = ASOF.date() if ASOF is not None else date.today()
+    ld = None
+    m = re.fullmatch(r"(\d{1,2})/(\d{1,2})", raw)
+    if m:
+        ld = _md._year_for(int(m.group(1)), int(m.group(2)), ref)
+    elif re.fullmatch(r"\d{1,2}:\d{2}", raw):
+        ld = date.today()
+    if dt is not None:
+        return f"{dt.month}/{dt.day} {dt.hour:02d}:{dt.minute:02d}", dt, dt.date()
+    if ld is not None:
+        return (f"{ld.month}/{ld.day}" + (f" {raw}" if ":" in raw else "")), None, ld
+    return "", None, None
+
+
+def _after_asof(dt: datetime | None, d: date | None) -> bool:
+    if ASOF is None:
+        return False
+    if dt is not None:
+        return dt > ASOF
+    return d is not None and d > ASOF.date()
+
+
 def _append_detail(
     lines: list[str],
     row: pd.Series,
     tdnet_data: dict,
     yahoo_data: dict,
     hist_df: pd.DataFrame | None = None,
+    move_days_data: dict | None = None,
+    weekly_info: dict | None = None,
 ) -> None:
     code4   = normalize_code_4(row["Code"])
     _name   = row.get("CompanyName", code4)
@@ -1873,16 +1934,33 @@ def _append_detail(
     description = yahoo.get("description", "")
     research    = load_research_context(code4, sector)
 
-    ret_str = f"{ret:+.1f}%" if pd.notna(ret) else "IPO初日"
+    if bool(row.get("_no_trade_today", False)):
+        ret_str = "対象日の売買なし"
+    else:
+        ret_str = f"{ret:+.1f}%" if pd.notna(ret) else "IPO初日"
+    close_str = f"{close:,.0f}円" if pd.notna(close) else "対象日の売買なし"
     lines += [
         f"### {code4} {name}　{ret_str}　[{market}]",
         f"",
         f"- 市場: {market}　セクター: {sector}　時価総額: {cap_str}",
-        f"- 終値: {close:,.0f}円　出来高: {vol_str}{turnover_str}",
+        f"- 終値: {close_str}　出来高: {vol_str}{turnover_str}",
     ]
     if description:
         lines.append(f"- 事業: {description}")
+    wi = (weekly_info or {}).get(code4)
+    if wi:
+        lines.append(f"- 週間ランキング: {wi['label']}（週間騰落率 {wi['ret']:+.1f}%）")
     lines.append("")
+
+    # 日別騰落表 2 つ＋四季報行＋開示一覧（3 か月）＋報道（2026-10-04 PM 承認・lib/move_days.py）。
+    # 見出しは `**日別騰落` / `**直近3か月の大きく動いた日` で始め、`**需給` の小節より前に置く
+    # （build_market_raw の需給除外に巻き込まれない）。
+    if move_days_data is not None and code4 in move_days_data:
+        try:
+            lines += _md.render_move_days(move_days_data[code4], weekly=bool(weekly_info is not None))
+        except Exception as _e:
+            print(f"  [WARN] 日別騰落表 {code4}: {_e}")
+            lines += [f"**日別騰落:** 作成できず（{type(_e).__name__}）", ""]
 
     # PM 2026-05-22 確定: 需給（信用・株価水準）ブロックを必須セクションとして挿入
     # [prompts/_common_rules.md] [memory feedback_mover_supply_required.md]
@@ -1890,6 +1968,10 @@ def _append_detail(
 
     # 過去Deep Dive
     if research:
+        # 過去リサーチ本文の markdown 見出し（`## …`）を無害化する（2026-10-04）。本文の `## ` 行が
+        # build_market_raw / build_themes_raw の節の切れ目と誤認され、市場レッグ用の縮小 raw が
+        # その銘柄で途切れていた（10/4 作成の research/stocks/7256_2026-10-04_data.md で実測）。
+        research = re.sub(r"(?m)^(#{1,6})\s", lambda _m: "▸" * len(_m.group(1)) + " ", research)
         lines += ["**過去リサーチ:**", ""]
         lines.append(research)
         lines.append("")
@@ -1901,7 +1983,10 @@ def _append_detail(
         lines.append(f"**TDNet（直近{DEFAULT_TDNET_DAYS}日: {len(entries)}件）:**")
         lines.append("")
         for e in entries:
-            lines.append(f"- {e['published'][:10]}　{e['title']}")
+            # 公表時刻（HH:MM）付きで出す（2026-10-04・材料の日割当の確認用）。
+            _pub = str(e.get("published") or "")
+            _ts = _pub[:10] + (f" {_pub[11:16]}" if _md.has_time(_pub) else "")
+            lines.append(f"- {_ts}　{e['title']}")
             if e.get("pdf_text"):
                 lines.append(f"  > {e['pdf_text'][:600].replace(chr(10), ' ').strip()}")
         lines.append("")
@@ -1909,12 +1994,18 @@ def _append_detail(
         lines += [f"**TDNet（直近{DEFAULT_TDNET_DAYS}日）:** なし", ""]
 
     # 銘柄別ニュース（Yahoo!ファイナンス ニュースタブ）
-    news = yahoo.get("news", [])
+    news = []
+    for n in yahoo.get("news", []):
+        _lab, _dt, _d = _news_when(n)
+        if _after_asof(_dt, _d):
+            continue
+        news.append((n, _lab))
     if news:
-        lines.append(f"**{news_block_label(news)}（{len(news)}件）:**")
+        lines.append(f"**{news_block_label([n for n, _ in news])}（{len(news)}件・配信日時付き）:**")
         lines.append("")
-        for n in news:
-            lines.append(f"- {n['title']}")
+        for n, _lab in news:
+            _media = f" {n['media']}" if n.get("media") else ""
+            lines.append(f"- {_lab}{_media}　{n['title']}" if _lab else f"- {n['title']}")
         lines.append("")
     else:
         lines += ["**Yahoo!ファイナンス ニュース:** なし", ""]
@@ -1923,6 +2014,13 @@ def _append_detail(
     bbs       = yahoo.get("bbs", {})
     sentiment = bbs.get("sentiment", "")
     posts     = bbs.get("posts", [])
+    if ASOF is not None:
+        def _post_dt(p):
+            try:
+                return datetime.strptime(str(p.get("date", "")).strip(), "%Y/%m/%d %H:%M")
+            except Exception:
+                return None
+        posts = [p for p in posts if not (isinstance(p, dict) and _post_dt(p) and _post_dt(p) > ASOF)]
     if sentiment or posts:
         lines.append("**Yahoo掲示板:**")
         if sentiment:
@@ -2235,6 +2333,458 @@ def build_weekly_roster_section(friday: date) -> list[str]:
     )
 
 
+# ---------------------------------------------------------------------------
+# 「なぜ動いた」改修（2026-10-04 PM 承認・dev/drafts/2026-10-04_dev_mover_reason_fix_plan.md A・B）
+# ---------------------------------------------------------------------------
+# 週次は誌面の 50 銘柄（市場別 値上がり 5・値下がり 5・売買代金 5／グロースは 10）全てに銘柄
+# ブロックを付け、日次・週次とも銘柄ブロックのある全銘柄に「日別騰落表 2 つ・四季報行・開示一覧
+# （3 か月）・報道」を付ける。機械検査用の事実ファイル {date}_movers_facts.json を raw と同じ場所へ出す。
+
+PRICE_HISTORY_DIR = OUTPUTS_DIR / "price_history"
+PEERS_YML_PATH = RESEARCH_DIR / "stocks" / "peers.yml"
+WEEKLY_ROSTER_N = {
+    MARKET_GROWTH:   {"up": 5, "down": 5, "value": 10},
+    MARKET_STANDARD: {"up": 5, "down": 5, "value": 5},
+    MARKET_PRIME:    {"up": 5, "down": 5, "value": 5},
+}
+_ETF_NAME_RE = re.compile(
+    r"ETF|上場投信|上場投資信託|投信|NEXT FUNDS|iShares|MAXIS|ダイワ上場|日経連動|指数連動|TOPIX\s*連動"
+    r"|J-REIT|REIT|リート|不動産投資法人|インフラファンド|ETN"
+)
+RELATED_MAX = 3
+SECTOR_PSEUDO_PREFIX = "S33:"   # 関連銘柄が取れない銘柄へ補う「東証 33 業種の中央値」の疑似コード接頭辞
+_GROUP_LABEL = {"up": "値上がり", "down": "値下がり", "value": "売買代金"}
+
+
+def _week_value_from_price_history(target: date) -> dict[str, float]:
+    """対象週（月〜target）の売買代金合計（円）を price_history の Value 列から銘柄別に返す。"""
+    p = PRICE_HISTORY_DIR / f"{target.year}.parquet"
+    if not p.exists():
+        return {}
+    mon = target - timedelta(days=target.weekday())
+    try:
+        df = pd.read_parquet(p, columns=["Date", "Code", "Value"],
+                             filters=[("Date", ">=", pd.Timestamp(mon)), ("Date", "<=", pd.Timestamp(target))])
+    except Exception:
+        df = pd.read_parquet(p, columns=["Date", "Code", "Value"])
+        df = df[(df["Date"] >= pd.Timestamp(mon)) & (df["Date"] <= pd.Timestamp(target))]
+    if df.empty:
+        return {}
+    df["Code"] = df["Code"].astype(str).str[:4]
+    return df.groupby("Code")["Value"].sum(min_count=1).dropna().to_dict()
+
+
+def select_weekly_roster(path: Path, master_df: pd.DataFrame, target: date | None = None) -> list[dict]:
+    """週次誌面の 50 銘柄を sector_stock_weekly.parquet から選ぶ（prompts/mover-weekly.md Step 5 と同一規則）。
+
+    除外: 銘柄名＝コード／ETF・REIT 等の名称キーワード／セクター欠損かつ末尾 A／screening_master 未登録。
+    除外分は繰り上げて件数を揃える。Returns: [{"code","market","group"(up/down/value),"rank","ret","name"}]
+
+    週間売買代金は price_history の Value 列の対象週合計を優先する（2026-10-02 号の誌面の
+    週間売買代金はこの合計と一致し、同号の sector_stock_weekly.parquet の AvgDailyValue5d×5 とは
+    4440・7014・6227・338A・2702 で食い違ったため）。price_history が無い銘柄は AvgDailyValue5d×5。
+    """
+    if not path.exists():
+        print(f"  [WARN] 週次 50 銘柄: {path} が無く選べません")
+        FETCH_ERRORS["move_days"].append(f"週次 50 銘柄: {path.name} なし")
+        return []
+    wk = pd.read_parquet(path)
+    wk["Code"] = wk["Code"].astype(str).str[:4]
+    known = set(master_df["Code"].astype(str).str[:4])
+    name = wk["CompanyName"].astype(str)
+    bad = (
+        (name == wk["Code"]) | name.str.contains(_ETF_NAME_RE, na=False)
+        | (wk["Sector17CodeName"].isna() & wk["Code"].str.endswith("A"))
+        | ~wk["Code"].isin(known) | wk["CompanyName"].isna()
+    )
+    wk = wk[~bad].copy()
+    wv = _week_value_from_price_history(target) if target is not None else {}
+    wk["_wv"] = wk["Code"].map(wv).fillna(wk["AvgDailyValue5d"] * 5)
+    if wv:
+        print(f"  週次 50 銘柄: 週間売買代金は price_history の対象週合計（{len(wv)} 銘柄）を使用")
+    out: list[dict] = []
+    for market, n in WEEKLY_ROSTER_N.items():
+        mkt = wk[wk["MarketCodeName"].astype(str).str.contains(market, na=False)].dropna(subset=["Return_W01"])
+        picks = [
+            ("up", mkt.nlargest(n["up"], "Return_W01")),
+            ("down", mkt.nsmallest(n["down"], "Return_W01")),
+            ("value", mkt.dropna(subset=["_wv"]).nlargest(n["value"], "_wv")),
+        ]
+        for grp, df in picks:
+            for i, (_, r) in enumerate(df.iterrows(), 1):
+                out.append({"code": r["Code"], "market": market, "group": grp, "rank": i,
+                            "ret": float(r["Return_W01"]) * 100, "name": str(r["CompanyName"])})
+    print(f"  週次 50 銘柄: {len(out)} 枠（重複除き {len({o['code'] for o in out})} 銘柄）")
+    return out
+
+
+def weekly_info_map(roster: list[dict]) -> dict[str, dict]:
+    """銘柄ブロックへ添える「週間ランキング: 値下がり 3 位」等の行の素材。"""
+    out: dict[str, dict] = {}
+    for r in roster:
+        lab = f"{r['market']} {_GROUP_LABEL[r['group']]} {r['rank']}位"
+        if r["code"] in out:
+            out[r["code"]]["label"] += "・" + lab
+        else:
+            out[r["code"]] = {"label": lab, "ret": r["ret"], "market": r["market"]}
+    return out
+
+
+def _norm_company(s: str) -> str:
+    import unicodedata
+    t = unicodedata.normalize("NFKC", str(s or ""))
+    t = re.sub(r"株式会社|\(株\)|（株）|\s", "", t)
+    return t
+
+
+def _peers_relations(code4: str, text: str) -> list[dict]:
+    """peers.yml の当該銘柄ブロック（コメント含む）から 親会社・主要顧客（社名＋構成比）・同業を取る。"""
+    m = re.search(rf'^"{re.escape(code4)}":\s*$', text, re.M)
+    if not m:
+        return []
+    nxt = re.search(r'^"[0-9A-Z]{4}":\s*$', text[m.end():], re.M)
+    block = text[m.end(): m.end() + nxt.start()] if nxt else text[m.end():]
+    out: list[dict] = []
+    # 親会社（コメントの「親会社: X」）
+    for pm in re.finditer(r"親会社[^\n:：]{0,10}[:：]\s*([^\s（(・,、]+)", block):
+        out.append({"name": pm.group(1), "relation": "親会社"})
+    # 主要顧客（「主要顧客…:」行の直後の数行に「社名 N百万円（xx.x%）」）
+    cm = re.search(r"主要顧客[^\n]*\n((?:\s*#[^\n]*\n){1,3})", block)
+    if cm:
+        for mm in re.finditer(r"([^\s・:：、（(#]+?)\s*[\d,]+百万円（(\d+(?:\.\d+)?)%）", cm.group(1)):
+            out.append({"name": mm.group(1), "relation": f"主要顧客（売上の{mm.group(2)}%）",
+                        "share": float(mm.group(2))})
+    try:
+        import yaml
+        d = yaml.safe_load(text) or {}
+        for p in ((d.get(code4) or {}).get("peers") or []):
+            if isinstance(p, dict) and p.get("code"):
+                out.append({"code": str(p["code"])[:4], "name": str(p.get("name") or ""), "relation": "同業"})
+    except Exception as e:
+        FETCH_ERRORS["related"].append(f"peers.yml 解析失敗: {type(e).__name__}")
+    return out
+
+
+def _edinet_relations(client, code4: str) -> list[dict]:
+    """EDINET DB の親会社・主要顧客（10% 超）。上限到達等の例外は呼び出し側で処理する。"""
+    out: list[dict] = []
+    ec = client.code_to_edinet(code4)
+    if not ec:
+        return out
+
+    def _rows(data, *keys):
+        if isinstance(data, list):
+            return [r for r in data if isinstance(r, dict)]
+        if isinstance(data, dict):
+            for k in keys:
+                v = data.get(k)
+                if isinstance(v, list):
+                    return [r for r in v if isinstance(r, dict)]
+        return []
+
+    def _pick(r, *keys):
+        for k in keys:
+            v = r.get(k)
+            if v not in (None, ""):
+                return v
+        return None
+
+    for r in _rows(client._call("get_parent_companies", {"edinet_code": ec}), "data", "parents"):
+        nm = _pick(r, "parentName", "parent_name", "name", "companyName", "company_name")
+        sc = _pick(r, "secCode", "sec_code", "parentSecCode", "parent_sec_code")
+        if nm or sc:
+            out.append({"name": str(nm or ""), "code": str(sc)[:4] if sc else None, "relation": "親会社"})
+    custs = _rows(client._call("get_main_customers", {"edinet_code": ec}), "mainCustomers", "data", "customers")
+    years = [c.get("fiscalYear") for c in custs if c.get("fiscalYear") is not None]
+    if years:
+        custs = [c for c in custs if c.get("fiscalYear") == max(years)]
+    for r in sorted(custs, key=lambda c: -(c.get("salesSharePct") or c.get("salesSharePctFilled") or 0)):
+        nm = _pick(r, "customerName", "customer_name", "customerNameNormalized", "name")
+        sh = _pick(r, "salesSharePct", "salesSharePctFilled")
+        if nm:
+            out.append({"name": str(nm), "relation": f"主要顧客（売上の{float(sh):.1f}%）" if sh else "主要顧客",
+                        "share": float(sh) if sh else 0.0})
+    return out
+
+
+def _rel_order(x: dict) -> tuple:
+    rel = x.get("relation", "")
+    k = 0 if rel.startswith("親会社") else (1 if rel.startswith("主要顧客") else 2)
+    return (k, -x.get("share", 0))
+
+
+def resolve_related(codes: list[str], master_df: pd.DataFrame) -> dict[str, list[dict]]:
+    """各銘柄の関連銘柄（親会社 → 主要顧客 → 同業の順・最大 RELATED_MAX 社・上場銘柄のみ）。
+
+    出所: research/stocks/peers.yml（親会社・主要顧客・同業）＋ EDINET DB（環境変数のキーがある場合のみ）。
+    社名 → コードは screening_master の CompanyName で照合し、照合できない社（非上場等）は載せない。
+    """
+    name_to_code: dict[str, str] = {}
+    code_to_name: dict[str, str] = {}
+    for _, r in master_df[["Code", "CompanyName"]].dropna().iterrows():
+        c = str(r["Code"])[:4]
+        name_to_code.setdefault(_norm_company(r["CompanyName"]), c)
+        code_to_name[c] = str(r["CompanyName"])
+    text = PEERS_YML_PATH.read_text(encoding="utf-8") if PEERS_YML_PATH.exists() else ""
+    if not text:
+        FETCH_ERRORS["related"].append(f"peers.yml が無い（{PEERS_YML_PATH}）")
+    edinet = None
+    if os.environ.get("EDINETDB_API_KEYS", "").strip():
+        try:
+            edinet = EdinetDBClient()
+        except Exception as e:
+            FETCH_ERRORS["related"].append(f"EDINET DB 初期化失敗: {e}")
+    else:
+        FETCH_ERRORS["related"].append("EDINET DB: 環境変数 EDINETDB_API_KEYS なし（peers.yml のみで判定）")
+    out: dict[str, list[dict]] = {}
+    unmatched: list[str] = []
+    edinet_retried = False
+    n_edinet_ok = 0
+    for c in codes:
+        rels = _peers_relations(c, text) if text else []
+        if edinet is not None:
+            try:
+                rels = _edinet_relations(edinet, c) + rels
+                n_edinet_ok += 1
+            except Exception as e:
+                # 2026-10-05: 直前の事業概要取得（fetch_yahoo_batch）が同じキーを使い切った直後に 429 になることがあるため、
+                # 初回だけ 60 秒待って同じ銘柄を 1 回やり直す。2 回目も失敗したら以降は EDINET を呼ばない。
+                ok = False
+                if not edinet_retried:
+                    edinet_retried = True
+                    print(f"  [WARN] EDINET DB 関係会社 {c}: {str(e)[:80]} → 60 秒待って 1 回だけ再試行")
+                    time.sleep(60)
+                    try:
+                        rels = _edinet_relations(edinet, c) + rels
+                        n_edinet_ok += 1
+                        ok = True
+                    except Exception as e2:
+                        e = e2
+                if not ok:
+                    FETCH_ERRORS["related"].append(
+                        f"EDINET DB 関係会社 {c}: {str(e)[:80]}（以降の銘柄は EDINET を呼ばず peers.yml・業種補完のみ）")
+                    edinet = None
+        rels.sort(key=_rel_order)
+        picked: list[dict] = []
+        seen = {c}
+        for x in rels:
+            rc = x.get("code") or name_to_code.get(_norm_company(x.get("name", "")))
+            if not rc:
+                unmatched.append(f"{c}:{x.get('name')}")
+                continue
+            rc = str(rc)[:4]
+            if rc in seen:
+                continue
+            seen.add(rc)
+            picked.append({"code": rc, "name": code_to_name.get(rc, x.get("name", rc)), "relation": x["relation"]})
+            if len(picked) >= RELATED_MAX:
+                break
+        out[c] = picked
+    if unmatched:
+        FETCH_ERRORS["related"].append(f"社名をコードに照合できず載せない {len(unmatched)} 件: {', '.join(unmatched[:10])}")
+    # 2026-10-05: peers.yml・EDINET DB のどちらでも関連銘柄が取れなかった銘柄は、screening_master の
+    # 東証 33 業種が同じ全銘柄の同日騰落率の中央値（業種中央値）を 1 列だけ補う。code は疑似コード
+    # 「S33:{業種名}」で、株価は build_all_move_days が sector_median_metrics で作る（GHA でも状態を持たずに動く
+    # 無料の経路。個別の他社名を「同業」と称して並べると取引関係があるように読めるため、業種全体の値にとどめる）。
+    n_direct = sum(1 for v in out.values() if v)
+    n_ind = 0
+    if "Sector33CodeName" in master_df.columns:
+        sec_of = {str(c): str(s) for c, s in zip(master_df["Code"], master_df["Sector33CodeName"])
+                  if isinstance(s, str) and s.strip() not in ("", "-")}
+        for c in codes:
+            if out.get(c):
+                continue
+            sec = sec_of.get(c)
+            if not sec:
+                continue
+            out[c] = [{"code": f"{SECTOR_PSEUDO_PREFIX}{sec}", "name": f"{sec}（業種中央値）",
+                       "relation": f"業種全体（東証33業種「{sec}」の全銘柄の同日騰落率の中央値）", "sector33": sec}]
+            n_ind += 1
+    else:
+        FETCH_ERRORS["related"].append("screening_master に Sector33CodeName が無く業種中央値で補えず")
+    n_none = sum(1 for v in out.values() if not v)
+    if n_none:
+        FETCH_ERRORS["related"].append(
+            f"関連銘柄なし {n_none}/{len(codes)} 銘柄（peers.yml 未定義・EDINET DB で取得できず・業種補完もできず）")
+    print(f"  関連銘柄: {len(codes) - n_none}/{len(codes)} 銘柄に付与（peers.yml・EDINET DB {n_direct}・"
+          f"業種中央値で補完 {n_ind}・EDINET DB 成功 {n_edinet_ok} 銘柄）")
+    return out
+
+
+def sector_median_metrics(sectors: list[str], master_df: pd.DataFrame, target: date) -> dict[str, pd.DataFrame]:
+    """東証 33 業種ごとに、全構成銘柄の日次騰落率（調整後終値・前営業日の終値が無い銘柄は除く）の中央値を返す。
+
+    Returns: {"S33:{業種名}": DataFrame(index=date, columns=["ret", "n"])}（ret は %）
+    """
+    out: dict[str, pd.DataFrame] = {}
+    if not sectors:
+        return out
+    m = master_df.dropna(subset=["Sector33CodeName"])
+    members = {s: sorted(set(m.loc[m["Sector33CodeName"] == s, "Code"].astype(str).str[:4])) for s in sectors}
+    allc = sorted({c for v in members.values() for c in v})
+    px = _md.load_price_history(PRICE_HISTORY_DIR, allc, target, lookback_days=120)
+    if px.empty:
+        return out
+    wide = px.pivot(index="Date", columns="Code", values="close").sort_index()
+    ret = wide.pct_change(fill_method=None) * 100.0
+    for s, cs in members.items():
+        cs = [c for c in cs if c in ret.columns]
+        if not cs:
+            continue
+        sub = ret[cs]
+        out[f"{SECTOR_PSEUDO_PREFIX}{s}"] = pd.DataFrame({"ret": sub.median(axis=1, skipna=True),
+                                                          "n": sub.notna().sum(axis=1)})
+    return out
+
+
+def _jq_day_fetcher(client):
+    def _f(d: date):
+        return fetch_paginated_v2(client, "/equities/bars/daily",
+                                  params={"date": d.strftime("%Y-%m-%d")}, sleep_seconds=0.5)
+    return _f
+
+
+def fetch_index_metrics(client, target: date, lookback_days: int = 270) -> dict[str, pd.DataFrame]:
+    """日経平均（yfinance ^N225・終値と前日比の円の値幅）と TOPIX（J-Quants /indices/bars/daily・コード 0000）の
+    日次騰落率を 1 回だけ取得し、全銘柄の表で使い回す（2026-10-05 追加。deep_dive.py と同じ経路）。
+
+    Returns: {"日経平均": DataFrame(index=date, ret[%], chg[円]), "TOPIX": DataFrame(index=date, ret[%])}。
+    取れなかった指数は入れない（0 埋めしない）。
+    """
+    out: dict[str, pd.DataFrame] = {}
+    start = target - timedelta(days=lookback_days)
+    try:
+        import yfinance as yf
+        h = yf.download("^N225", start=start.isoformat(), end=(target + timedelta(days=1)).isoformat(),
+                        interval="1d", progress=False, auto_adjust=False)
+        if h is not None and not h.empty:
+            if isinstance(h.columns, pd.MultiIndex):
+                h.columns = h.columns.get_level_values(0)
+            c = h["Close"].astype(float).dropna()
+            c.index = [pd.Timestamp(x).date() for x in c.index]
+            c = c[[d <= target for d in c.index]]
+            out["日経平均"] = pd.DataFrame({"ret": c.pct_change() * 100.0, "chg": c.diff()})
+    except Exception as e:
+        FETCH_ERRORS["move_days"].append(f"指数 日経平均（yfinance）取得失敗: {type(e).__name__} {e}")
+    try:
+        rows = fetch_paginated_v2(client, "/indices/bars/daily",
+                                  params={"code": "0000", "from": start.isoformat(), "to": target.isoformat()})
+        ser = {}
+        for r in rows or []:
+            if str(r.get("Code", "")) != "0000" or r.get("C") is None:
+                continue
+            try:
+                ser[date.fromisoformat(str(r.get("Date", ""))[:10])] = float(r["C"])
+            except (TypeError, ValueError):
+                continue
+        if ser:
+            s = pd.Series(ser).sort_index()
+            out["TOPIX"] = pd.DataFrame({"ret": s.pct_change() * 100.0})
+    except Exception as e:
+        FETCH_ERRORS["move_days"].append(f"指数 TOPIX（J-Quants）取得失敗: {type(e).__name__} {e}")
+    for lbl in ("日経平均", "TOPIX"):
+        if lbl not in out:
+            FETCH_ERRORS["move_days"].append(f"指数 {lbl}: 取得できず（表の指数欄に出さない）")
+    print(f"  指数: {', '.join(f'{k} {len(v)} 日' for k, v in out.items()) or '取得できず'}")
+    return out
+
+
+def build_all_move_days(block_codes: list[str], name_map: dict[str, str], target: date,
+                        weekly: bool, tdnet_data: dict, client) -> dict:
+    """銘柄ブロックのある全銘柄の facts を組む（失敗した銘柄は errors に理由を残して空表）。"""
+    t0 = time.time()
+    master_df = pd.read_parquet(SCREENING_MASTER_PATH, columns=["Code", "CompanyName", "Sector33CodeName"])
+    master_df["Code"] = master_df["Code"].astype(str).str[:4]
+    related = resolve_related(block_codes, master_df)
+    rel_codes = sorted({r["code"] for v in related.values() for r in v
+                        if not str(r["code"]).startswith(SECTOR_PSEUDO_PREFIX)})
+    sec_needed = sorted({r["sector33"] for v in related.values() for r in v if r.get("sector33")})
+    px = _md.load_price_history(PRICE_HISTORY_DIR, block_codes + rel_codes, target)
+    print(f"  price_history: {len(px)} 行（{px['Code'].nunique() if not px.empty else 0} 銘柄）")
+    px, filled = _md.fill_gaps(px, block_codes + rel_codes, target, _jq_day_fetcher(client))
+    if filled:
+        FETCH_ERRORS["move_days"].append("price_history の欠落営業日を J-Quants で補完: " + ", ".join(filled))
+    cal = sorted(px["Date"].unique()) if not px.empty else []
+    metrics = {c: _md.compute_metrics(g) for c, g in px.groupby("Code")} if not px.empty else {}
+    if sec_needed:
+        try:
+            sm = sector_median_metrics(sec_needed, master_df, target)
+            metrics.update(sm)
+            print(f"  業種中央値: {len(sm)}/{len(sec_needed)} 業種")
+        except Exception as e:
+            FETCH_ERRORS["related"].append(f"業種中央値の計算失敗: {type(e).__name__} {e}")
+
+    index_metrics = fetch_index_metrics(client, target)
+
+    print(f"  四季報（{len(block_codes)} 銘柄）取得中...")
+    shk = fetch_shikiho_batch(block_codes)
+    FETCH_ERRORS["shikiho"].extend(shk["errors"])
+
+    ref = ASOF.date() if ASOF is not None else target
+    m3_start = (pd.Timestamp(target) - pd.DateOffset(months=_md.MONTHS)).date()
+    out: dict = {}
+    for i, c in enumerate(block_codes, 1):
+        news, nerr = _md.fetch_news_list(c, ref, session=_get_yahoo_session(), stop_before=m3_start)
+        if nerr:
+            FETCH_ERRORS["move_days"].append(f"{c}: ニュース一覧 {nerr}")
+        try:
+            f = _md.build_move_days(
+                c, name_map.get(c, c), metrics.get(c), cal, target, weekly=weekly,
+                tdnet_entries=(tdnet_data.get(c) or {}).get("all_entries", []),
+                news_items=news, related=related.get(c, []), related_metrics=metrics,
+                index_metrics=index_metrics,
+                shikiho=shk["stocks"].get(c), asof=ASOF,
+                news_time_fetcher=_cached_article_time, news_noise=_is_market_wide_news,
+            )
+        except Exception as e:
+            print(f"  [WARN] 日別騰落 {c}: {type(e).__name__} {e}")
+            f = {"name": name_map.get(c, c), "errors": [f"作成失敗 {type(e).__name__}: {e}"],
+                 "week_days": [], "month3_days": [], "sigma2_days": [], "max_move_day": None}
+        if f.get("errors"):
+            FETCH_ERRORS["move_days"].extend(f"{c}: {e}" for e in f["errors"])
+        out[c] = f
+        if i % 10 == 0:
+            print(f"  日別騰落 [{i}/{len(block_codes)}] {time.time() - t0:.0f} 秒")
+    print(f"  日別騰落: {len(out)} 銘柄・{time.time() - t0:.0f} 秒")
+    return {"stocks": out, "shikiho_meta": {k: shk[k] for k in (
+        "release_mode", "release_mode_issue", "store_issue", "store_release", "store_check")}}
+
+
+def write_facts_json(path: Path, target: date, weekly: bool, md_all: dict,
+                     weekly_roster: list[dict] | None) -> None:
+    """機械検査用の事実ファイル {date}_movers_facts.json（lib/reason_check.py が読む）。"""
+    import json
+    roster_map: dict[str, list[dict]] = {}
+    for r in (weekly_roster or []):
+        roster_map.setdefault(r["code"], []).append({"market": r["market"], "group": r["group"],
+                                                     "rank": r["rank"], "weekly_ret_pct": round(r["ret"], 2)})
+    stocks = {}
+    for c, f in md_all["stocks"].items():
+        f = dict(f)
+        if c in roster_map:
+            f["weekly_roster"] = roster_map[c]
+        stocks[c] = f
+    doc = {
+        "date": target.isoformat(), "kind": "weekly" if weekly else "daily",
+        "close_boundary": "15:30",
+        "asof": ASOF.strftime("%Y-%m-%dT%H:%M") if ASOF is not None else None,
+        "generated_at": datetime.now(JST).strftime("%Y-%m-%dT%H:%M"),
+        "definitions": {
+            "sigma2": "|当日騰落率| > 前60営業日の日次騰落率の標準偏差×2（当日を含まない）",
+            "vol_ratio_20d": "当日出来高 ÷ 前20営業日平均（当日を含まない）",
+            "assigned_date": "前営業日15:30以降〜当日15:30前の公表をその日に割当",
+            "max_move_day": "週次=当週で騰落率の絶対値が最大の日／日次=対象日",
+            "table_max_day": "表1（週次=当週・日次=直近5営業日）で騰落率の絶対値が最大の日",
+            "price": "price_history の調整後終値（欠落営業日は J-Quants で補完）",
+        },
+        "shikiho_meta": md_all.get("shikiho_meta"),
+        "fetch_errors": {k: v for k, v in FETCH_ERRORS.items() if k in ("move_days", "shikiho", "related")},
+        "stocks": stocks,
+    }
+    path.write_text(json.dumps(doc, ensure_ascii=False, indent=1, default=str), encoding="utf-8")
+    print(f"facts: {path}（{len(stocks)} 銘柄）")
+
+
 def build_report(
     full_df: pd.DataFrame,
     detail_df: pd.DataFrame,
@@ -2250,6 +2800,9 @@ def build_report(
     quality_note: str = "",
     radar_df: pd.DataFrame | None = None,
     weekly_roster: bool = False,
+    move_days_data: dict | None = None,
+    weekly_info: dict | None = None,
+    weekly_extra: dict | None = None,
 ) -> str:
     lines = [
         f"# 動意銘柄レポート 生データ ({today.strftime('%Y-%m-%d')})",
@@ -2399,6 +2952,8 @@ def build_report(
         # yahoo_data のキーは detail + 売買代金 + 材料蓄積母集団の和集合であり、
         # ここを絞ると遡り材料の裾野がそのまま狭まる（当日テーマが1〜2件へ張り付く原因）。
         try:
+            if not STATE_WRITES:
+                raise RuntimeError("--no-state-writes のため stock_context_daily への追記をスキップ")
             _ctx_path = append_stock_context(
                 [
                     {
@@ -2487,6 +3042,8 @@ def build_report(
                     _today_res.get("rows") or [], lit_history=_lit_hist,
                     code_to_themes=_s_c2t,
                 )
+                if not STATE_WRITES:
+                    raise RuntimeError("--no-state-writes のため early_candidates_daily への追記をスキップ")
                 _rec = append_early_candidates(
                     _pool, today, shown_themes={r.get("theme") for r in _early}
                 )
@@ -2507,6 +3064,8 @@ def build_report(
                     _all_rows, lit_history=_lit_hist, top_pool=len(_all_rows),
                     code_to_themes=_s_c2t,
                 )
+                if not STATE_WRITES:
+                    raise RuntimeError("--no-state-writes のため theme_score_daily への追記をスキップ")
                 _dpath = append_theme_score_daily(_full, today)
                 if _dpath:
                     print(f"テーマ点数の日次台帳: {_dpath}（全{len(_full)}件）")
@@ -2551,13 +3110,14 @@ def build_report(
         top_df    = mdf[mdf["_direction"] == "up"].sort_values("DailyReturn", ascending=False)
         bottom_df = mdf[mdf["_direction"] == "down"].sort_values("DailyReturn")
 
+        _kw = {"hist_df": hist_df, "move_days_data": move_days_data, "weekly_info": weekly_info}
         lines += [f"### 値上がり Top {cfg['top']}", ""]
         for _, row in top_df.iterrows():
-            _append_detail(lines, row, tdnet_data, yahoo_data, hist_df=hist_df)
+            _append_detail(lines, row, tdnet_data, yahoo_data, **_kw)
 
         lines += [f"### 値下がり Bottom {cfg['bottom']}", ""]
         for _, row in bottom_df.iterrows():
-            _append_detail(lines, row, tdnet_data, yahoo_data, hist_df=hist_df)
+            _append_detail(lines, row, tdnet_data, yahoo_data, **_kw)
 
         # 売買代金
         n = TURNOVER_CONFIG[market]
@@ -2567,7 +3127,17 @@ def build_report(
             turnover_oku = row.get("Turnover", 0) / 1e8
             row = row.copy()
             row["_turnover_label"] = f"{turnover_oku:.0f}億円"
-            _append_detail(lines, row, tdnet_data, yahoo_data, hist_df=hist_df)
+            _append_detail(lines, row, tdnet_data, yahoo_data, **_kw)
+
+        # 週次（--weekly-roster）: 週間ランキング（値上がり・値下がり・売買代金）に載るが金曜の
+        # 日次ブロックが無い銘柄を、この市場節の末尾へ足す（2026-10-04 PM 承認・計画書 A-4）。
+        # 見出しの騰落率は金曜 1 日の値。週間騰落率は「- 週間ランキング:」行に出す。
+        _extra = (weekly_extra or {}).get(market) or []
+        if _extra:
+            lines += ["### 週間ランキング追加銘柄", "",
+                      "> 週間ランキングに載り、金曜の日次上位に入らなかった銘柄。見出しの騰落率は金曜 1 日の値。", ""]
+            for row in _extra:
+                _append_detail(lines, row, tdnet_data, yahoo_data, **_kw)
 
     # ---- Layer 5: グロース スイング候補バリュエーション ----
     recent_codes = load_recent_mover_codes(today)
@@ -2868,8 +3438,11 @@ TOKEN_LOG_PATH = OUTPUTS_DIR / "token_usage_log.csv"
 
 
 def log_token_usage(today: date, script: str, tokens: int, chars: int) -> None:
-    """bi/outputs/token_usage_log.csv にトークン使用量を追記する。"""
+    """bi/outputs/token_usage_log.csv にトークン使用量を追記する（--no-state-writes 時は書かない）。"""
     import csv
+    if not STATE_WRITES:
+        print("  [no-state-writes] token_usage_log.csv への追記をスキップ")
+        return
     TOKEN_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     write_header = not TOKEN_LOG_PATH.exists()
     with TOKEN_LOG_PATH.open("a", newline="", encoding="utf-8") as f:
@@ -2909,7 +3482,31 @@ def main() -> None:
                              "（動意週次の `## 今週のテーマ` 用・週次 workflow 専用。日次 raw には出さない）")
     parser.add_argument("--probe-date-only", action="store_true",
                         help="対象日 EOD の着信確認のみ行い exit 0/3 を返す（workflow の待機リトライ用・生成しない）")
+    # ---- 2026-10-04 追加（「なぜ動いた」改修・検証用） ----
+    parser.add_argument("--asof", default=None,
+                        help="検証用 YYYY-MM-DDTHH:MM（JST）。この時刻より後に公表されたニュース・開示・掲示板投稿を除外する")
+    parser.add_argument("--out-dir", default=None,
+                        help="raw・facts・品質フラグの出力先（既定は環境変数 MOVER_RAW_OUT_DIR、無ければ market/daily/）")
+    parser.add_argument("--no-state-writes", action="store_true",
+                        help="検証用。bi/outputs 配下の蓄積 parquet（テーマ蓄積等）・token_usage_log.csv・"
+                             "OHLC キャッシュへ一切書かない")
+    parser.add_argument("--weekly-parquet", default=None,
+                        help="sector_stock_weekly.parquet の場所（既定 bi/outputs/sector_stock_weekly.parquet・検証で GHA アーティファクトを使う時に指定）")
+    parser.add_argument("--no-move-days", action="store_true",
+                        help="日別騰落表・四季報行・facts JSON を作らない（従来の raw のみ）")
     args = parser.parse_args()
+
+    global ASOF, STATE_WRITES, WEEKLY_PARQUET_PATH
+    if args.asof:
+        ASOF = datetime.strptime(args.asof, "%Y-%m-%dT%H:%M")
+        print(f"[asof] {ASOF:%Y-%m-%d %H:%M} より後に公表されたニュース・開示・掲示板投稿を除外します")
+    if args.no_state_writes:
+        STATE_WRITES = False
+        print("[no-state-writes] 蓄積 parquet・token_usage_log.csv・OHLC キャッシュへの書き込みを止めます")
+    if args.out_dir:
+        os.environ["MOVER_RAW_OUT_DIR"] = str(Path(args.out_dir).resolve())
+    if args.weekly_parquet:
+        WEEKLY_PARQUET_PATH = Path(args.weekly_parquet)
 
     api_key = os.environ.get("JQUANTS_API_KEY", "").strip()
     if not api_key:
@@ -3005,7 +3602,9 @@ def main() -> None:
 
     # --- テーマレーダー母集団を日次蓄積（同一日付は上書き・冪等） ---
     try:
-        if radar_df is None or radar_df.empty:
+        if not STATE_WRITES:
+            print("  [no-state-writes] movers_top100_daily への蓄積をスキップ")
+        elif radar_df is None or radar_df.empty:
             print("  [WARN] テーマレーダー母集団が空。当日の蓄積をスキップ。")
         else:
             _hist_path = append_movers_history(radar_df, today_dt)
@@ -3018,6 +3617,8 @@ def main() -> None:
     # 前日までの完成レポートから自前括りテーマを回収して蓄積（改修4）。
     # 失敗しても本体レポートは止めない（配信絶対の原則）。
     try:
+        if not STATE_WRITES:
+            raise RuntimeError("--no-state-writes のため own_themes_daily への回収をスキップ")
         _n_own = ingest_own_themes(today_dt)
         if _n_own == 0:
             print("自前括りテーマ: 直近レポートに OWN_THEMES_JSON ブロックなし")
@@ -3034,8 +3635,13 @@ def main() -> None:
     detail_codes  = detail_df["Code"].astype(str).str[:4].unique().tolist()
     volume_codes  = volume_df["Code"].astype(str).str[:4].unique().tolist()
     context_codes = context_df["Code"].astype(str).str[:4].unique().tolist()
+    # 週次（--weekly-roster）: 誌面の 50 銘柄（週間ランキング）も取得対象へ入れる（2026-10-04・計画書 A-4）。
+    weekly_roster_list: list[dict] = []
+    if args.weekly_roster and not args.no_move_days:
+        weekly_roster_list = select_weekly_roster(WEEKLY_PARQUET_PATH, master_df, today_dt)
+    weekly_codes = list(dict.fromkeys(r["code"] for r in weekly_roster_list))
     fetch_codes   = list(
-        dict.fromkeys(detail_codes + volume_codes + context_codes)
+        dict.fromkeys(detail_codes + volume_codes + weekly_codes + context_codes)
     )  # 順序保持・重複除去
     print(
         f"TDNet+Yahoo対象（出来高・材料蓄積母集団{len(context_codes)}件含む）: "
@@ -3054,6 +3660,51 @@ def main() -> None:
     print(f"60営業日 OHLC 履歴取得中（対象 {len(fetch_codes)} 銘柄）...")
     hist_df = fetch_ohlc_history(client, set(fetch_codes), today_dt, n_days=60)
     print(f"  履歴: {len(hist_df)} 行（{hist_df['Code'].nunique() if not hist_df.empty else 0} 銘柄カバー）")
+
+    # --- 日別騰落表・四季報・関連銘柄（2026-10-04 PM 承認・lib/move_days.py） ---
+    move_days_all = None
+    weekly_extra: dict[str, list] = {}
+    weekly_info = weekly_info_map(weekly_roster_list) if args.weekly_roster else None
+    if not args.no_move_days:
+        have_block = set(detail_codes) | set(volume_codes)
+        _fd = full_df.copy()
+        _fd["_c4"] = _fd["Code"].astype(str).str[:4]
+        for r in weekly_roster_list:
+            c = r["code"]
+            if c in have_block or any(normalize_code_4(x["Code"]) == c
+                                      for xs in weekly_extra.values() for x in xs):
+                continue
+            hit = _fd[_fd["_c4"] == c]
+            if hit.empty:
+                # 対象日に売買が無い銘柄（売買停止・最終売買日が週の途中等）も週間ランキングに載るため
+                # ブロックは作る。金曜の騰落率は欠損のまま（推計しない）。
+                _m = master_df[master_df["Code"].astype(str).str[:4] == c]
+                row = pd.Series({
+                    "Code": c, "CompanyName": r.get("name") or c, "MarketCodeName": r["market"],
+                    "Sector17CodeName": (_m["Sector17CodeName"].iloc[0]
+                                         if not _m.empty and "Sector17CodeName" in _m.columns else ""),
+                    "DailyReturn": float("nan"), "Close_T": float("nan"), "Volume_T": float("nan"),
+                    "MarketCapOku": float("nan"), "_no_trade_today": True,
+                })
+                FETCH_ERRORS["move_days"].append(f"{c}: 対象日 {today_dt} の売買なし（週間ランキング銘柄・ブロックは作成）")
+                weekly_extra.setdefault(r["market"], []).append(row)
+                continue
+            weekly_extra.setdefault(r["market"], []).append(hit.iloc[0].drop(labels=["_c4"]))
+        block_codes = list(dict.fromkeys(
+            detail_codes + volume_codes
+            + [normalize_code_4(x["Code"]) for xs in weekly_extra.values() for x in xs]))
+        name_map = {normalize_code_4(r["Code"]): (r.get("CompanyName") if isinstance(r.get("CompanyName"), str)
+                                                  else normalize_code_4(r["Code"]))
+                    for _, r in full_df.iterrows()}
+        print(f"日別騰落表の対象（銘柄ブロックのある全銘柄）: {len(block_codes)} 銘柄"
+              + (f"（うち週間ランキング追加 {sum(len(v) for v in weekly_extra.values())}）" if weekly_extra else ""))
+        try:
+            move_days_all = build_all_move_days(block_codes, name_map, today_dt, bool(args.weekly_roster),
+                                                tdnet_data, client)
+        except Exception as e:
+            # 配信絶対の原則（_cr §36）: 表が作れなくても raw 本体は止めない
+            print(f"  [WARN] 日別騰落表: {type(e).__name__} {e}")
+            FETCH_ERRORS["move_days"].append(f"日別騰落表の作成全体が失敗: {type(e).__name__} {e}")
 
     # --- マクロレポート ---
     macro_snippet = load_latest_macro_report()
@@ -3074,7 +3725,27 @@ def main() -> None:
         quality_note=quality_note,
         radar_df=radar_df,
         weekly_roster=args.weekly_roster,
+        move_days_data=(move_days_all or {}).get("stocks"),
+        weekly_info=weekly_info,
+        weekly_extra=weekly_extra,
     )
+
+    # 日別騰落表の前提（四季報の最新号・発売日照合・取得できなかったもの）を raw 冒頭へ（計画書 B-3）。
+    if move_days_all is not None:
+        _sm = move_days_all.get("shikiho_meta") or {}
+        _hdr = [
+            f"- **日別騰落表**: 銘柄ブロックごとに `**日別騰落`（{'当週' if args.weekly_roster else '直近5営業日'}）・"
+            f"`**直近3か月の大きく動いた日`・`- 四季報:` を付与（材料は前営業日15:30〜当日15:30の公表をその日に割当）"
+            + (f"。検証用 asof={ASOF:%Y-%m-%d %H:%M}（以降の公表は除外）" if ASOF is not None else ""),
+            f"- **四季報 最新号**: {_sm.get('release_mode_issue') or '取得できず'}（API の発売日の最頻値 "
+            f"{_sm.get('release_mode') or '取得できず'}・東洋経済 STORE 照合: {_sm.get('store_check')}）",
+        ]
+        _nerr = {k: len(FETCH_ERRORS.get(k) or []) for k in ("move_days", "shikiho", "related")}
+        if any(_nerr.values()):
+            _hdr.append("- **日別騰落表の取得ログ**: " + "・".join(f"{k} {v}件" for k, v in _nerr.items() if v)
+                        + "（詳細は facts JSON の fetch_errors）")
+        _anchor = f"- **TDNet対象期間**: 直近{DEFAULT_TDNET_DAYS}日"
+        report_md = report_md.replace(_anchor, _anchor + "\n" + "\n".join(_hdr), 1)
 
     # 検証時に本番 raw を上書きしないための逃がし口。未設定なら従来どおり market/daily/。
     out_dir = Path(os.environ["MOVER_RAW_OUT_DIR"]) if os.environ.get("MOVER_RAW_OUT_DIR") else MARKET_DAILY_DIR
@@ -3106,6 +3777,19 @@ def main() -> None:
                 print(f"{_mkt} 用縮小 raw: {market_path}（{market_md.count(chr(10)):,} 行）")
         except Exception as _e:
             print(f"  [WARN] build_market_raw({_mkt}): {_e}")
+
+    # 機械検査用の事実ファイル（2026-10-04・lib/reason_check.py が読む）。失敗しても raw と配信は止めない。
+    if move_days_all is not None:
+        try:
+            write_facts_json(out_dir / f"{raw_name_date}_movers_facts.json", today_dt,
+                             bool(args.weekly_roster), move_days_all, weekly_roster_list)
+        except Exception as _e:
+            print(f"  [WARN] facts JSON: {_e}")
+    for _k in ("move_days", "shikiho", "related"):
+        if FETCH_ERRORS.get(_k):
+            print(f"[取得ログ:{_k}] {len(FETCH_ERRORS[_k])} 件")
+            for _m in FETCH_ERRORS[_k][:40]:
+                print(f"  - {_m}")
 
     tokens = estimate_tokens(report_md)
     log_token_usage(today_dt, "make_mover_report", tokens, len(report_md))
