@@ -222,9 +222,17 @@ jobs:
         # theme_master_snapshot_index.parquet を書くが、これらは Private .gitignore の
         # bi/outputs/**/*.parquet に該当するため -f が無いと push されない
         # （辞書更新は月次のため、内容が変わらない月はファイルが増えない）。
+        # 2026-10-05 修正: d0f7f85 で対象が theme_radar だけに絞られ、
+        # screening_master.parquet / .xlsx 等の本体が 9/4 以降 push されていなかった。
+        # 1 回目 = 変更前と同じ bi/outputs（-f なし・追跡済み / gitignore 例外の本体ファイル）、
+        # 2 回目 = theme_radar のスナップショット（-f）。-f は指定パス配下の ignored も
+        # 拾うため bi/outputs 全体には付けない（キャッシュ類の混入防止）。
         run: |
           bash ../report-pipelines/bi/pipelines/ops/ci_commit_push.sh \
             -m "data: screening master $(TZ=Asia/Tokyo date +'%Y-%m-%d')" \
+            bi/outputs
+          bash ../report-pipelines/bi/pipelines/ops/ci_commit_push.sh \
+            -m "data: theme_master snapshots $(TZ=Asia/Tokyo date +'%Y-%m-%d')" \
             -f bi/outputs/analysis/theme_radar
 
       - name: Discord 通知（✅ 完了）

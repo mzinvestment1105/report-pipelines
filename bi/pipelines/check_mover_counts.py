@@ -17,6 +17,10 @@ PM 2026-07-12 絶対配信原則: workflow は exit 3 でも送信を中止し�
 lib/crossref_check.py で機械検出する（_common_rules.md §40・PM 2026-09-05 指示）。
 これも警告のみで exit code を変えない（絶対配信原則）。重複銘柄は各セクションで
 「何の会社」「なぜ動いた」を独立して書き切る運用とし、検出はログで次回生成へ回す。
+--facts（ETL の {date}_movers_facts.json）指定時は lib/reason_check.py で「なぜ動いた」の
+事実照合（最大変動日・開示の割当日・推測語等。PM 2026-10-04 承認）も行い結果をログへ出す。
+これもログのみで exit code は 0/1/3 の規約を変えない（修正試行・機械差し替えは workflow 側が
+reason_check.py を単体実行して exit 4 で分岐する）。
 
 規定数（日次・週次共通）:
   プライム  : 値上がり 5 / 値下がり 5 / 売買代金 5
@@ -28,6 +32,7 @@ lib/crossref_check.py で機械検出する（_common_rules.md §40・PM 2026-09
   python check_mover_counts.py --file market/daily/movers/2026-06-26.md --date 2026-06-26
   （--date 指定時はタイトル行の対象日一致も検査＝日付品質ゲート。省略時は従来動作。
     2026-07-09 に 7/8 データを「本日」として配信した日付品質事故の再発防止・PM 2026-07-12）
+  python check_mover_counts.py --file market/daily/movers/2026-10-02_weekly.md       --facts market/daily/2026-10-02_movers_facts.json   （理由ゲートのログを追加）
 """
 from __future__ import annotations
 
@@ -39,6 +44,7 @@ from pathlib import Path
 # lib/ を import path へ（bi/pipelines をどこから実行しても効くよう自ファイル基準）
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lib.crossref_check import report_cross_references  # noqa: E402
+from lib.reason_check import check_reasons, load_facts, report_reasons  # noqa: E402
 
 # Windows コンソール（cp932）でも日本語・記号で落ちないよう utf-8 へ寄せる
 for _s in (sys.stdout, sys.stderr):
@@ -143,6 +149,8 @@ def main() -> int:
     ap.add_argument("--file", required=True, help="統合 md ファイルパス")
     ap.add_argument("--date", default="",
                     help="対象日 YYYY-MM-DD（指定時はタイトル行の日付一致も検査・省略時は従来動作＝検証スキップ）")
+    ap.add_argument("--facts", default="",
+                    help="ETL の {date}_movers_facts.json（指定時は「なぜ動いた」の事実照合をログへ出す・exit code は不変）")
     args = ap.parse_args()
 
     try:
@@ -210,6 +218,14 @@ def main() -> int:
     # 相互参照ゲート（_common_rules.md §40・PM 2026-09-05）: 警告のみ・exit code は変えない。
     # 「→ 値下がり N 位を参照」等の省略表記を検知してログへ出し、次回生成で是正させる。
     report_cross_references(text)
+
+    # 理由ゲート（PM 2026-10-04・計画書 D-2）: ログのみ・exit code は件数ゲートの規約 0/1/3 のまま。
+    # facts が読めない場合も件数ゲートを止めない（警告して飛ばす）。
+    if args.facts:
+        try:
+            report_reasons(check_reasons(text, load_facts(args.facts)))
+        except Exception as e:  # noqa: BLE001 — 補助ゲートの失敗で件数ゲートを落とさない
+            print(f"[理由ゲート] [警告] facts の読込・照合に失敗（検査を飛ばす）: {e}", file=sys.stderr)
 
     if failures:
         print("\n[件数ゲート] [NG] 品質ゲート不合格 (exit 3)。workflow が冒頭に品質注記を挿入して"

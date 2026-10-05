@@ -240,7 +240,7 @@ TDNET_PDF_MAX   = 30000
 # 表示件数の上限。400日窓では開示が数百件になるため、一覧は直近30件へ絞る。
 TDNET_MAX_ITEMS = 30
 # 誌面の「TDNet 適時開示」セクションに載せる直近日数（従来と同じ体裁を保つ）。
-TDNET_RECENT_DISPLAY_DAYS = 30
+TDNET_RECENT_DISPLAY_DAYS = 92   # 直近3ヶ月（PM 2026-10-04 指示で 30 → 92）
 BBS_MAX_POSTS   = 30
 REQUEST_SLEEP   = 0.5
 
@@ -2703,113 +2703,6 @@ def _fmt_segments(segments: list[dict], max_years: int = 3) -> list[str]:
                 f"{_ratio_pct(s.get('revenueYoy'))} | {_ratio_pct(s.get('oiYoy'))} |"
             )
         lines.append("")
-
-    if len(periods) >= 2:
-        lines += [
-            "> 上の2期は基準日が異なる。比率の差は売買だけでなく発行済株式数の変動"
-            "（合併・増資・自己株式の消却等）でも生じるため、"
-            "株数と比率の両方を見て増減を判断すること。",
-            "",
-        ]
-
-    # --- 役員一覧（株主名との突合材料） ---
-    if directors:
-        fy_d = directors[0].get("fiscalYear")
-        lines += [
-            f"### 役員一覧（{('FY' + str(fy_d)) if fy_d is not None else '年度不明'}"
-            "・有価証券報告書「役員の状況」）",
-            "",
-            "| 役職 | 氏名 | 保有株数 |",
-            "|------|------|----------|",
-        ]
-        for d in directors:
-            lines.append(
-                f"| {d.get('officialTitle') or ''} | {d.get('officerName') or ''} | "
-                f"{_shares(d.get('sharesHeld'), '未開示')} |"
-            )
-        lines += [
-            "",
-            "> 保有株数の「未開示」は有報原文が「－」の行"
-            "（未開示か非保有かを区別できない）。ゼロと断定しないこと。",
-            "",
-        ]
-
-    # --- 資本関係 ---
-    parents = relations.get("parents", [])
-    subs    = relations.get("subsidiaries", [])
-    if parents or subs:
-        lines += ["### 資本関係（親会社・関係会社）", ""]
-        if parents:
-            lines += [
-                "| 報告元 | 関係 | 議決権比率 | 出典 |",
-                "|--------|------|------------|------|",
-            ]
-            for p in parents:
-                lines.append(
-                    f"| {p.get('reportingCompanyName') or ''} | "
-                    f"{p.get('relationType') or ''} | "
-                    f"{_pct_pt(p.get('votingRightsPct'))} | {p.get('source') or ''} |"
-                )
-            lines.append("")
-        if subs:
-            lines += [
-                "| 会社名 | 関係区分 | 議決権比率 | 事業内容 |",
-                "|--------|----------|------------|----------|",
-            ]
-            for s in subs:
-                lines.append(
-                    f"| {s.get('subsidiaryName') or ''} | {s.get('relationType') or ''} | "
-                    f"{_pct_pt(s.get('votingRightsPct'))} | "
-                    f"{s.get('subsidiaryBusiness') or ''} |"
-                )
-            lines.append("")
-
-    # --- 主要販売先 ---
-    customers = relations.get("customers", [])
-    if customers:
-        lines += [
-            "### 主要販売先（有報「主要な顧客ごとの情報」）", "",
-            "| 年度 | 顧客名 | セグメント | 売上高 | 売上構成比 | 確度 |",
-            "|------|--------|------------|--------|------------|------|",
-        ]
-        for c in customers:
-            share = c.get("salesSharePct")
-            if share is None:
-                share = c.get("salesSharePctFilled")
-            share_s = f"{float(share):.1f}%" if isinstance(share, (int, float)) else "N/A"
-            lines.append(
-                f"| {c.get('fiscalYear') or ''} | {c.get('customerName') or ''} | "
-                f"{c.get('segment') or ''} | {_yen_to_mn(c.get('salesAmountYen'))} | "
-                f"{share_s} | {c.get('confidence') or ''} |"
-            )
-        lines += [
-            "",
-            "> 主要販売先が空でも「大口顧客なし」を意味しない"
-            "（10%超の顧客がない場合や記載省略の場合がある）。",
-            "",
-        ]
-
-    # --- 大量保有報告書（保有目的のみ・比率は参考外） ---
-    if large_holdings:
-        lines += [
-            "### 大量保有報告書（保有目的の参考・⚠️ 比率は使用しないこと）", "",
-            "| 提出日 | 書類種別 | 提出者 | 保有者 | 提出時点の比率 | 提出時点の株数 | 保有目的 |",
-            "|--------|----------|--------|--------|----------------|----------------|----------|",
-        ]
-        for h in large_holdings:
-            lines.append(
-                f"| {h.get('submit_date') or ''} | {h.get('doc_type') or ''} | "
-                f"{h.get('filer_name') or ''} | {h.get('holder_name') or ''} | "
-                f"{_ratio_frac_pct(h.get('holding_ratio'))} | "
-                f"{_shares(h.get('shares_held'))} | {h.get('purpose') or ''} |"
-            )
-        lines += [
-            "",
-            "> **この表の比率・株数は提出日時点で固定された値であり、現在の持株比率ではない。**"
-            "レポート本文の持株比率には必ず上の「大株主の状況」の値を使うこと。"
-            "保有目的（安定株主・純投資・経営参画等）を読む目的でのみ参照する。",
-            "",
-        ]
 
     return lines
 
@@ -5794,6 +5687,270 @@ def _fmt_bbs_posts(bbs_data: dict) -> list:
 
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# 直近3ヶ月の大きく動いた日（PM 2026-10-04 指示: 「直近1週間のハイライト」→「直近3ヶ月のハイライト」）
+#
+# 採録する日 = 直近 HL3M_DAYS 営業日のうち、
+#   ① 日次騰落率の絶対値が過去 HL3M_SIGMA_WIN 営業日の標準偏差の 2 倍以上（当日を含まない）
+#   ② 自社の TDNet 開示があった日（15:30 以降の開示は翌営業日に寄せる）
+# のいずれか。値動きだけの日に理由を後付けさせないため、同日の TDNet 開示と
+# Yahoo ファイナンスのニュース見出し（1 日 3 件まで）を機械で並べる。
+# ---------------------------------------------------------------------------
+HL3M_DAYS            = 63    # 直近3ヶ月 = 63 営業日
+HL3M_SIGMA_WIN       = 60    # 2σ 判定に使う過去営業日数
+HL3M_NEWS_DAYS       = 95    # Yahoo ニュースを遡る暦日数（63 営業日 + 余白）
+HL3M_NEWS_MAX_PAGES  = 25    # Yahoo ニュース一覧の最大ページ数（1 ページ約 20 件・?page=N）
+HL3M_NEWS_PER_DAY    = 3     # 1 日に並べる見出しの上限
+HL3M_TSE_CLOSE_MIN   = 15 * 60 + 30   # 東証の大引け 15:30（以降の開示・配信は翌営業日の材料）
+# 銘柄名を含まない市場全体のランキング記事（S高一覧・値上がり率ランキング等）は優先度を下げる
+_HL3M_NOISE = re.compile(r"ランクイン|ランキング|値上がり率|値下がり率|S高|ストップ高|＝\s*\d+\s*銘柄|特集")
+_WD_JA = "月火水木金土日"
+
+
+def fetch_yahoo_news_range(code4: str, days: int = HL3M_NEWS_DAYS,
+                           max_pages: int = HL3M_NEWS_MAX_PAGES) -> list[dict]:
+    """Yahoo ファイナンスのニュース一覧を ?page=N で遡り、直近 days 日分を日付つきで返す。
+
+    一覧の日付は「M/D」（年なし）または当日分の「HH:MM」。年は実行日から逆算し、
+    実行日より未来になる M/D は前年とみなす。日付を解釈できない見出しは落とす。
+    Returns: [{"date": date, "time": "HH:MM" or "", "title": str, "source": str}]（新しい順）
+    """
+    from bs4 import BeautifulSoup
+    today = date.today()
+    cutoff = today - timedelta(days=days)
+    out: list[dict] = []
+    seen: set = set()
+    for page in range(1, max_pages + 1):
+        url = f"https://finance.yahoo.co.jp/quote/{code4}.T/news" + (f"?page={page}" if page > 1 else "")
+        r, err = None, None
+        for k in range(BBS_LIST_RETRIES):   # 一覧ページは 500 を返すことがあるため再試行する
+            try:
+                r = requests.get(url, headers=_YAHOO_HEADERS, timeout=15)
+                r.raise_for_status()
+                break
+            except Exception as e:
+                r, err = None, e
+                time.sleep(BBS_LIST_RETRY_SLEEP * (k + 1))
+        if r is None:
+            print(f"  → 取得失敗: fetch_yahoo_news_range({code4}) page {page}: {err}", file=sys.stderr)
+            break
+        soup = BeautifulSoup(r.text, "html.parser")
+        n_new, oldest = 0, None
+        for a in soup.find_all("a", href=True):
+            href = a.get("href", "")
+            if "/news/detail/" not in href or href in seen:
+                continue
+            text = a.get_text(strip=True)
+            if not text or len(text) < 10:
+                continue
+            seen.add(href)
+            n_new += 1
+            m = re.search(r"(\d{1,2})/(\d{1,2})([^\d].{1,20})$", text)
+            t = re.search(r"(\d{1,2}):(\d{2})([^\d].{1,20})$", text)
+            if m:
+                try:
+                    d = date(today.year, int(m.group(1)), int(m.group(2)))
+                except ValueError:
+                    continue
+                if d > today:
+                    d = date(today.year - 1, d.month, d.day)
+                title, source, tm = text[: m.start()].strip(), m.group(3).strip(), ""
+            elif t:
+                d, title, source = today, text[: t.start()].strip(), t.group(3).strip()
+                tm = f"{int(t.group(1)):02d}:{t.group(2)}"
+            else:
+                continue
+            if not title:
+                continue
+            oldest = d if oldest is None or d < oldest else oldest
+            if d >= cutoff:
+                out.append({"date": d, "time": tm, "title": title, "source": source})
+        if n_new == 0 or (oldest is not None and oldest < cutoff):
+            break
+        time.sleep(REQUEST_SLEEP)
+    return out
+
+
+def _fetch_jq_index_range(codes: dict, start, end) -> dict:
+    """J-Quants v2 /indices/bars/daily を指数コード＋期間指定で取得する（1 指数 1 リクエスト）。
+
+    Returns: {表示名: {date: 終値}}。キーが無い・失敗した指数は落とす（0 埋めしない）。
+    """
+    api_key = os.environ.get("JQUANTS_API_KEY", "").strip()
+    if not api_key or not codes:
+        return {}
+    try:
+        import jquantsapi
+        from jq_client_utils import fetch_paginated_v2
+        client = jquantsapi.ClientV2(api_key=api_key)
+    except Exception as e:
+        print(f"  → 取得失敗: J-Quants クライアント生成（3ヶ月ハイライト）: {e}", file=sys.stderr)
+        return {}
+    out: dict = {}
+    for label, code in codes.items():
+        try:
+            rows = fetch_paginated_v2(client, "/indices/bars/daily",
+                                      params={"code": code, "from": start.isoformat(), "to": end.isoformat()})
+        except Exception as e:
+            print(f"  → 取得失敗: J-Quants 指数 {label}: {e}", file=sys.stderr)
+            continue
+        ser: dict = {}
+        for r in rows:
+            if str(r.get("Code", "")) != code or r.get("C") is None:
+                continue
+            try:
+                ser[date.fromisoformat(str(r.get("Date", ""))[:10])] = float(r["C"])
+            except (TypeError, ValueError):
+                continue
+        if ser:
+            out[label] = ser
+    return out
+
+
+def build_highlight_3m(code4: str, price_df, tdnet_entries: list, news_3m: list,
+                       company_name: str = "", market: str = "") -> dict:
+    """「直近3ヶ月の大きく動いた日」の行データを作る。算出できなければ status に理由を入れて返す。"""
+    res: dict = {"status": "ok", "rows": [], "note": []}
+    if price_df is None or len(price_df) < HL3M_DAYS + HL3M_SIGMA_WIN + 2:
+        res["status"] = f"株価日足が不足（{0 if price_df is None else len(price_df)} 営業日）"
+        return res
+    df = price_df.copy()
+    df.index = [i.date() if hasattr(i, "date") else i for i in df.index]
+    c = df["Close"].astype(float)
+    r = c.pct_change() * 100.0
+    thr = r.rolling(HL3M_SIGMA_WIN).std().shift(1) * 2.0   # 当日を含まない過去 60 営業日
+    win = list(df.index[-HL3M_DAYS:])
+    base = df.index[-HL3M_DAYS - 1]
+    hi_d = df.loc[win, "High"].astype(float).idxmax()
+    lo_d = df.loc[win, "Low"].astype(float).idxmin()
+    res["summary"] = {
+        "chg": _pct_change(c.iloc[-1], c.loc[base]), "base_d": base, "base_c": float(c.loc[base]),
+        "last_d": win[-1], "last_c": float(c.iloc[-1]),
+        "hi": float(df.loc[hi_d, "High"]), "hi_d": hi_d, "lo": float(df.loc[lo_d, "Low"]), "lo_d": lo_d,
+    }
+
+    def to_tday(d0):
+        for t in win:
+            if t >= d0:
+                return t
+        return None
+
+    # 指数: TOPIX（全銘柄）＋ グロース市場の銘柄は東証グロース市場250
+    idx_codes = {"TOPIX": REACTION_JQ_INDEX_CODES["TOPIX"]}
+    if "グロース" in (market or ""):
+        idx_codes["東証グロース市場250"] = REACTION_JQ_INDEX_CODES["東証グロース市場250"]
+    idx = _fetch_jq_index_range(idx_codes, base - timedelta(days=10), win[-1])
+    res["idx_labels"] = [k for k in idx_codes if k in idx]
+    if len(res["idx_labels"]) < len(idx_codes):
+        res["note"].append("指数の一部を取得できませんでした（J-Quants: "
+                           + "・".join(k for k in idx_codes if k not in idx) + "）")
+
+    # TDNet（15:30 以降の開示は翌営業日に寄せる）
+    td: dict = {}
+    oldest_td = None
+    for e in (tdnet_entries or []):
+        dt = _parse_pub_datetime(e.get("published", ""))
+        if dt is None:
+            continue
+        oldest_td = dt.date() if oldest_td is None or dt.date() < oldest_td else oldest_td
+        if dt.date() < win[0] - timedelta(days=4):
+            continue
+        d0 = dt.date() + (timedelta(days=1) if dt.hour * 60 + dt.minute >= HL3M_TSE_CLOSE_MIN else timedelta(0))
+        t = to_tday(d0)
+        if t is not None:
+            td.setdefault(t, []).append(f"{dt.strftime('%m/%d %H:%M')} {e.get('title', '')}")
+    if len(tdnet_entries or []) >= TDNET_MAX_ITEMS and oldest_td is not None and oldest_td > win[0]:
+        res["note"].append(f"TDNet は取得上限 {TDNET_MAX_ITEMS} 件のため {oldest_td} より前の開示を含みません")
+
+    # ニュース（当日分の 15:30 以降の配信は翌営業日。M/D のみの見出しは配信日の行に置く）
+    short = re.sub(r"^(株式会社|\(株\)|（株）)|(株式会社|ホールディングス|\(株\)|（株）)$", "",
+                   company_name or "").strip()
+    keys = [k for k in (code4, short[:3] if len(short) >= 3 else short) if k]
+
+    def rank(n):
+        t = n["title"]
+        own = any(k in t for k in keys)
+        return (0 if own else 1, 1 if _HL3M_NOISE.search(t) else 0)
+    nw: dict = {}
+    for n in (news_3m or []):
+        d0 = n["date"]
+        if n.get("time"):
+            hh, mm = (int(x) for x in n["time"].split(":"))
+            if hh * 60 + mm >= HL3M_TSE_CLOSE_MIN:
+                d0 = d0 + timedelta(days=1)
+        t = to_tday(d0)
+        if t is not None:
+            nw.setdefault(t, []).append(n)
+    if news_3m:
+        od = min(n["date"] for n in news_3m)
+        if od > win[0]:
+            res["note"].append(f"Yahoo ニュースは {od} 以降のみ取得（一覧を {HL3M_NEWS_MAX_PAGES} ページまで遡った範囲）")
+    else:
+        res["note"].append("Yahoo ニュースを取得できませんでした")
+
+    n_sig = 0
+    for d in win:
+        rv, th = r.loc[d], thr.loc[d]
+        sig = bool(rv == rv and th == th and abs(rv) >= th)
+        n_sig += sig
+        if not (sig or d in td):
+            continue
+        idx_ch = {}
+        for lab in res["idx_labels"]:
+            ser = idx[lab]
+            _pd, pv = _prev_available(ser, d)
+            idx_ch[lab] = _pct_change(ser.get(d), pv) if d in ser else None
+        heads = sorted(nw.get(d, []), key=rank)[:HL3M_NEWS_PER_DAY]
+        res["rows"].append({
+            "date": d, "close": float(c.loc[d]), "chg": float(rv) if rv == rv else None,
+            "sig": sig, "thr": float(th) if th == th else None, "idx": idx_ch,
+            "tdnet": td.get(d, []),
+            "news": [f"{h['date'].strftime('%m/%d')}{(' ' + h['time']) if h.get('time') else ''} "
+                     f"{h['title']}（{h['source']}）" for h in heads],
+        })
+    res["n_sig"] = n_sig
+    res["n_news"] = len(news_3m or [])
+    return res
+
+
+def _fmt_highlight_3m(h: dict | None) -> list[str]:
+    lines = ["## 直近3ヶ月の大きく動いた日", ""]
+    if not h or h.get("status") != "ok":
+        lines += [f"*算出できませんでした（{(h or {}).get('status') or '未実行'}）*", ""]
+        return lines
+    s = h["summary"]
+    lines.append(
+        f"> 3 か月（{HL3M_DAYS} 営業日）騰落率 {_signed_pct(s['chg'])}（{s['base_d']} 終値 {s['base_c']:,.0f}円 → "
+        f"{s['last_d']} 終値 {s['last_c']:,.0f}円）・期間高値 {s['hi']:,.0f}円（{s['hi_d']}）・"
+        f"期間安値 {s['lo']:,.0f}円（{s['lo_d']}）")
+    lines.append("")
+    lines.append(
+        f"> 採録条件: 直近 {HL3M_DAYS} 営業日のうち、①日次騰落率の絶対値が過去 {HL3M_SIGMA_WIN} 営業日の標準偏差の 2 倍以上"
+        f"（★・該当 {h.get('n_sig', 0)} 日）②自社の TDNet 開示があった日 のいずれかに当たる日（{len(h['rows'])} 行）。"
+        "値動きだけの日（★のみで開示・ニュースなし）に理由を後付けしない。")
+    lines.append("")
+    lines.append(
+        "> 騰落率は終値の前日比（yfinance・分割調整済み）。TDNet 開示・ニュースは 15:30 以降の公表分を翌営業日の行に寄せる"
+        f"（ニュースは Yahoo ファイナンス一覧 {h.get('n_news', 0)} 件から 1 日 {HL3M_NEWS_PER_DAY} 件まで・"
+        "銘柄名を含む見出しを優先し、市場全体のランキング記事は後回し）。指数は J-Quants の終値前日比。")
+    for n in h.get("note") or []:
+        lines += ["", f"> 注記: {n}"]
+    lines.append("")
+    labs = h.get("idx_labels") or []
+    lines.append("| 日付 | 終値 | 騰落率 | 2σ 超え | 2σ 閾値 | "
+                 + "".join(f"{lab} | " for lab in labs) + "同日の TDNet 開示 | 同日のニュース見出し（最大 3 件） |")
+    lines.append("|" + "---|" * (7 + len(labs)))
+    for row in h["rows"]:
+        d = row["date"]
+        cells = [f"{d}（{_WD_JA[d.weekday()]}）", f"{row['close']:,.0f}", _signed_pct(row["chg"], "N/A"),
+                 "★" if row["sig"] else "−", f"{row['thr']:.2f}%" if row["thr"] is not None else "N/A"]
+        cells += [_signed_pct(row["idx"].get(lab), "N/A") for lab in labs]
+        cells += [" / ".join(row["tdnet"]) or "−", " / ".join(row["news"]) or "−"]
+        lines.append("| " + " | ".join(str(x).replace("|", "｜").replace("\n", " ") for x in cells) + " |")
+    lines.append("")
+    return lines
+
+
 def build_data_markdown(
     code: str,
     company_data: dict,
@@ -5821,6 +5978,7 @@ def build_data_markdown(
     guidance: dict | None = None,
     reaction_ctx: dict | None = None,
     margin_alert: dict | None = None,
+    highlight_3m: dict | None = None,
 ) -> str:
     company_name = (
         company_data.get("companyName")
@@ -6025,6 +6183,11 @@ def build_data_markdown(
     price_lines = _fmt_price_levels(price_stats)
     if price_lines:
         lines += price_lines
+        lines += ["---", ""]
+
+    # 直近3ヶ月の大きく動いた日（2σ 超えの日・TDNet 開示日。PM 2026-10-04 指示）
+    if highlight_3m is not None:
+        lines += _fmt_highlight_3m(highlight_3m)
         lines += ["---", ""]
 
     # 反応スコア対象日の外部環境（自社開示・国内指数・米国指数・為替・同業）。
@@ -6389,6 +6552,19 @@ def main() -> None:
               f" / 最古 {_oldest.isoformat() if _oldest else '不明'}"
               f"  感情: {bbs_data.get('sentiment', 'なし')}")
 
+    # 7-4) 直近3ヶ月の大きく動いた日（2σ 超えの日・TDNet 開示日 × 指数・開示・ニュース）
+    print("[9/9] 直近3ヶ月の大きく動いた日を算出中（Yahoo ニュース一覧を遡る・J-Quants 指数）...")
+    try:
+        news_3m = fetch_yahoo_news_range(code)
+        highlight_3m = build_highlight_3m(code, price_df, tdnet_entries, news_3m,
+                                          company_name=company_name,
+                                          market=str(supply_demand.get("market", "") or ""))
+    except Exception as e:  # 失敗しても他の章は出す
+        print(f"  → 取得失敗: build_highlight_3m: {e}", file=sys.stderr)
+        highlight_3m = {"status": f"{type(e).__name__}: {e}"}
+    print(f"  → {highlight_3m.get('status')} / 行 {len(highlight_3m.get('rows') or [])}"
+          f" / 2σ 超え {highlight_3m.get('n_sig', 0)} 日 / ニュース {highlight_3m.get('n_news', 0)} 件")
+
     # Markdown 生成・保存
     print("Markdown を生成・保存中...")
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -6418,6 +6594,7 @@ def main() -> None:
         sd_axes=sd_axes,
         guidance=guidance,
         reaction_ctx=reaction_ctx,
+        highlight_3m=highlight_3m,
         margin_alert=margin_alert,
     )
     out_path.write_text(md, encoding="utf-8")
