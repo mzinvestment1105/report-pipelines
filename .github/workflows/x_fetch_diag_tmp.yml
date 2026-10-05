@@ -1,0 +1,93 @@
+name: tmp X search diag
+# 一時診断用（このブランチでのみ動く）。出力は HTTP ステータス・件数・画面状態の分類のみ。
+"on":
+  push:
+    branches: ["diag/x-fetch-20261005"]
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Setup SSH
+        env:
+          PRIVATE_REPO_DEPLOY_KEY: ${{ secrets.PRIVATE_REPO_DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$PRIVATE_REPO_DEPLOY_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - name: Clone private
+        run: git clone -q --depth 1 git@github.com:mzinvestment1105/mizuki-fund.git private-repo
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install
+        run: |
+          pip install -q playwright python-dotenv pyyaml
+          pip install -q playwright-stealth || true
+          playwright install chromium --with-deps > /dev/null 2>&1
+          pip show playwright playwright-stealth 2>/dev/null | grep -E "^(Name|Version)"
+      - name: Diag
+        working-directory: ./private-repo/bi/pipelines
+        env:
+          X_BURNER_AUTH_TOKEN: ${{ secrets.X_BURNER_AUTH_TOKEN }}
+          X_BURNER_CT0: ${{ secrets.X_BURNER_CT0 }}
+          PYTHONIOENCODING: utf-8
+        run: |
+          cat > /tmp/diag.py <<'PY'
+          import asyncio, sys, re
+          from urllib.parse import quote_plus, urlparse
+          sys.path.insert(0, ".")
+          import fetch_x_posts as fx
+          from playwright.async_api import async_playwright
+          KEYS = ["Something went wrong", "Try reloading", "Retry", "Log in", "Sign in", "Sign up",
+                  "rate limit", "Rate limit", "問題が発生", "やりなおす", "再読み込み", "ログイン",
+                  "No results", "結果はありません", "Search timeline", "検索タイムライン"]
+          async def run(label, stealth, q):
+              fx._STEALTH_AVAILABLE = stealth
+              async with async_playwright() as p:
+                  browser, ctx = await fx._new_context(p, False)
+                  page = await ctx.new_page()
+                  stat = {}
+                  async def on_resp(r):
+                      u = r.url
+                      if "graphql" in u or "/i/api/" in u:
+                          op = u.split("?")[0].split("/")[-1]
+                          n = "-"
+                          try:
+                              d = await r.json(); n = len(fx._extract_tweets_from_graphql(d))
+                              if op == "SearchTimeline" and n == 0:
+                                  s = str(d)
+                                  n = "0 keys=" + ",".join(list(d.keys())[:3]) + (" errors" if "errors" in d else "")
+                                  m = re.search(r"'message': '([^']{0,80})", s)
+                                  if m: n += " msg=" + m.group(1)
+                          except Exception:
+                              n = "nojson"
+                          if op in ("SearchTimeline",) or r.status != 200:
+                              print(f"[{label}] resp {r.status} {op} tweets={n}")
+                  page.on("response", on_resp)
+                  try:
+                      await page.goto(f"https://x.com/search?q={quote_plus(q)}&src=typed_query&f=live", wait_until="domcontentloaded", timeout=60000)
+                  except Exception as e:
+                      print(f"[{label}] goto error {type(e).__name__}")
+                  for i in range(5):
+                      await asyncio.sleep(3)
+                      try:
+                          await page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
+                      except Exception:
+                          pass
+                  print(f"[{label}] final_path={urlparse(page.url).path}")
+                  try:
+                      t = await page.evaluate("document.body.innerText")
+                  except Exception:
+                      t = ""
+                  hits = [k for k in KEYS if k in t]
+                  print(f"[{label}] body_len={len(t)} keywords={hits}")
+                  await browser.close()
+          async def main():
+              q = "AI min_faves:500 lang:en -filter:replies -filter:retweets"
+              await run("stealth_on", True, q)
+              await run("stealth_off", False, q)
+          asyncio.run(main())
+          PY
+          python /tmp/diag.py 2>&1 | grep -E "^\[(stealth_on|stealth_off)\]" || true
