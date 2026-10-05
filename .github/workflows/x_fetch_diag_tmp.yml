@@ -42,44 +42,51 @@ jobs:
           import fetch_x_posts as fx
           from playwright.async_api import async_playwright
           CHAL = "しばらくお待ちください"
-          async def visit(ctx, url, tag, wait=24):
-              page = await ctx.new_page()
-              n = {"gql": 0, "tw": 0, "ops": set()}
+          Q1 = "AI min_faves:500 lang:en -filter:replies -filter:retweets"
+          Q2 = "(AI OR LLM) filter:links min_faves:100 lang:ja -filter:replies -filter:retweets"
+          def counter(page):
+              n = {"st": 0, "tw": 0}
               async def on_resp(r):
-                  if "/graphql/" in r.url:
-                      n["gql"] += 1; n["ops"].add(r.url.split("?")[0].split("/")[-1])
+                  if "SearchTimeline" in r.url:
+                      n["st"] += 1
                       try: n["tw"] += len(fx._extract_tweets_from_graphql(await r.json()))
                       except Exception: pass
               page.on("response", on_resp)
-              t0 = time.time(); cleared = None; status = None
-              try:
-                  resp = await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                  status = resp.status if resp else None
-              except Exception as e:
-                  print(f"[d] {tag} goto_error {type(e).__name__}")
-              for i in range(wait // 3):
-                  await asyncio.sleep(3)
-                  try: title = await page.title()
-                  except Exception: title = CHAL
-                  if CHAL not in title:
-                      cleared = round(time.time() - t0, 1)
-                      await page.mouse.move(640, 500)
-                      for _ in range(2):
-                          await page.mouse.wheel(0, 1600); await asyncio.sleep(2)
-                      break
-              print(f"[d] {tag} http={status} cleared_after={cleared} gql={n['gql']} tweets={n['tw']} ops={sorted(n['ops'])[:8]}")
-              await page.close()
-          async def main():
-              tgt = (os.environ.get("X_DAILY_TARGETS") or "").split(",")[0].strip()
-              q = "AI min_faves:500 lang:en -filter:replies -filter:retweets"
-              s = f"https://x.com/search?q={quote_plus(q)}&src=typed_query&f=live"
+              return n
+          async def first(tag, url):
               async with async_playwright() as p:
                   browser, ctx = await fx._new_context(p, False)
-                  await visit(ctx, f"https://x.com/{tgt}/followers", "followers")
-                  await visit(ctx, s, "search_after_followers")
-                  await visit(ctx, f"https://x.com/{tgt}", "user_tl")
-                  await visit(ctx, "https://x.com/explore", "explore")
+                  page = await ctx.new_page()
+                  resp = await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                  await asyncio.sleep(5)
+                  print(f"[d] fresh_first {tag} http={resp.status if resp else None} challenged={CHAL in await page.title()}")
                   await browser.close()
+          async def spa(tag, entry):
+              async with async_playwright() as p:
+                  browser, ctx = await fx._new_context(p, False)
+                  page = await ctx.new_page()
+                  n = counter(page)
+                  resp = await page.goto(entry, wait_until="domcontentloaded", timeout=60000)
+                  await asyncio.sleep(6)
+                  print(f"[d] spa {tag} entry_http={resp.status if resp else None} challenged={CHAL in await page.title()}")
+                  for qn, q in (("q1", Q1), ("q2", Q2)):
+                      b = dict(n)
+                      path = f"/search?q={quote_plus(q)}&src=typed_query&f=live"
+                      await page.evaluate("p => { window.history.pushState({}, '', p); window.dispatchEvent(new PopStateEvent('popstate', {state: {}})); }", path)
+                      await asyncio.sleep(4)
+                      for _ in range(4):
+                          await page.evaluate("window.scrollBy(0, document.body.scrollHeight)"); await asyncio.sleep(2)
+                      print(f"[d] spa {tag} {qn} search_resp={n['st']-b['st']} tweets={n['tw']-b['tw']}")
+                  await browser.close()
+          async def main():
+              tgt = (os.environ.get("X_DAILY_TARGETS") or "").split(",")[0].strip()
+              await first("search", f"https://x.com/search?q={quote_plus(Q1)}&src=typed_query&f=live")
+              await first("explore", "https://x.com/explore")
+              await first("home", "https://x.com/home")
+              await first("user_tl", f"https://x.com/{tgt}")
+              await first("followers", f"https://x.com/{tgt}/followers")
+              await spa("via_followers", f"https://x.com/{tgt}/followers")
+              await spa("via_explore", "https://x.com/explore")
           asyncio.run(main())
           PY
-          python /tmp/diag.py 2>&1 | grep -E "^\[d\]" | sed -E 's#(ops=.*)#\1#' || true
+          python /tmp/diag.py 2>&1 | grep -E "^\[d\]|Error" | head -40 || true
