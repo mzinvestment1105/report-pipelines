@@ -35,58 +35,20 @@ jobs:
           X_DAILY_TARGETS: ${{ secrets.X_DAILY_TARGETS }}
           PYTHONIOENCODING: utf-8
         run: |
-          cat > /tmp/diag.py <<'PY'
-          import asyncio, sys, os, time
-          from urllib.parse import quote_plus
-          sys.path.insert(0, ".")
-          import fetch_x_posts as fx
-          from playwright.async_api import async_playwright
-          CHAL = "しばらくお待ちください"
-          Q1 = "AI min_faves:500 lang:en -filter:replies -filter:retweets"
-          Q2 = "(AI OR LLM) filter:links min_faves:100 lang:ja -filter:replies -filter:retweets"
-          def counter(page):
-              n = {"st": 0, "tw": 0}
-              async def on_resp(r):
-                  if "SearchTimeline" in r.url:
-                      n["st"] += 1
-                      try: n["tw"] += len(fx._extract_tweets_from_graphql(await r.json()))
-                      except Exception: pass
-              page.on("response", on_resp)
-              return n
-          async def first(tag, url):
-              async with async_playwright() as p:
-                  browser, ctx = await fx._new_context(p, False)
-                  page = await ctx.new_page()
-                  resp = await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                  await asyncio.sleep(5)
-                  print(f"[d] fresh_first {tag} http={resp.status if resp else None} challenged={CHAL in await page.title()}")
-                  await browser.close()
-          async def spa(tag, entry):
-              async with async_playwright() as p:
-                  browser, ctx = await fx._new_context(p, False)
-                  page = await ctx.new_page()
-                  n = counter(page)
-                  resp = await page.goto(entry, wait_until="domcontentloaded", timeout=60000)
-                  await asyncio.sleep(6)
-                  print(f"[d] spa {tag} entry_http={resp.status if resp else None} challenged={CHAL in await page.title()}")
-                  for qn, q in (("q1", Q1), ("q2", Q2)):
-                      b = dict(n)
-                      path = f"/search?q={quote_plus(q)}&src=typed_query&f=live"
-                      await page.evaluate("p => { window.history.pushState({}, '', p); window.dispatchEvent(new PopStateEvent('popstate', {state: {}})); }", path)
-                      await asyncio.sleep(4)
-                      for _ in range(4):
-                          await page.evaluate("window.scrollBy(0, document.body.scrollHeight)"); await asyncio.sleep(2)
-                      print(f"[d] spa {tag} {qn} search_resp={n['st']-b['st']} tweets={n['tw']-b['tw']}")
-                  await browser.close()
-          async def main():
-              tgt = (os.environ.get("X_DAILY_TARGETS") or "").split(",")[0].strip()
-              await first("search", f"https://x.com/search?q={quote_plus(Q1)}&src=typed_query&f=live")
-              await first("explore", "https://x.com/explore")
-              await first("home", "https://x.com/home")
-              await first("user_tl", f"https://x.com/{tgt}")
-              await first("followers", f"https://x.com/{tgt}/followers")
-              await spa("via_followers", f"https://x.com/{tgt}/followers")
-              await spa("via_explore", "https://x.com/explore")
-          asyncio.run(main())
+          set +e
+          # 本番と同じ順序（プロフィール取得 → タイムライン → バズ収集）で同じランナー IP から実行する
+          python fetch_x_profile.py --users "$X_DAILY_TARGETS" --followers --followers-max 1000 --following --following-max 500 --slug daily --out-dir /tmp/xo > /tmp/profile.log 2>&1
+          echo "profile_exit=$?"
+          python fetch_x_posts.py --user "${X_DAILY_TARGETS%%,*}" --count 40 --slug tl_daily --out-dir /tmp/xo > /tmp/tl.log 2>&1
+          echo "timeline_exit=$?"
+          python fetch_x_buzz.py --out-dir /tmp/xo > /tmp/buzz.log 2>&1
+          echo "buzz_exit=$?"
+          grep -E '^\[(entry|cf|stats)\]' /tmp/buzz.log
+          grep -E '^\[search\].*取得 [0-9]+ 件' /tmp/buzz.log | sed -E 's/.*(取得 [0-9]+ 件)/search: \1/'
+          python - <<'PY'
+          import json, glob
+          f = sorted(glob.glob("/tmp/xo/buzz_*.json"))[-1]
+          d = json.load(open(f, encoding="utf-8"))
+          n = sum(1 for l in ("top_articles_ja", "top_articles_en") for p in d[l] if len(p.get("article_text") or "") >= 120 and p.get("article_url"))
+          print("article_candidates", n, "fetch_diag", d["meta"].get("fetch_diag"))
           PY
-          python /tmp/diag.py 2>&1 | grep -E "^\[d\]|Error" | head -40 || true
