@@ -3000,12 +3000,8 @@ def run_gate(
             info.append(f"[{name}] ヒットなし")
 
     # 2. 反応スコアの欠落（errors）
-    #    PM 2026-10-04 に誌面の「株価が反応した上位 3 件」を撤廃したため、
-    #    旧形式の見出しが残る誌面にだけ適用する（新形式の誌面では検査しない）。
     n_score = len(re.findall("反応スコア", md))
-    if not _REACTION_SECTION_HEAD.search(md):
-        info.append("[反応スコア] 「株価が反応した上位N件」の見出しなし → 検査スキップ（2026-10-04 撤廃）")
-    elif n_score < 3:
+    if n_score < 3:
         errors.append(
             f"[反応スコアの欠落] 「反応スコア」の出現が {n_score} 回（3 回未満）。"
             " → 対処: 直近材料の上位 3 件それぞれに反応スコア"

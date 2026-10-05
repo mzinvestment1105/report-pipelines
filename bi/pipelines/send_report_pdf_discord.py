@@ -9,8 +9,6 @@ PM 2026-06-27: 縦長 JPEG を廃し、商品レベルの A4 PDF（日本語フ�
     python send_report_pdf_discord.py --kind macro --date 2026-06-27
     python send_report_pdf_discord.py --kind sector --date 2026-06-27
     python send_report_pdf_discord.py --kind earnings --month 2026-06
-    python send_report_pdf_discord.py --kind us_stock --ticker AMZN --date 2026-09-28
-    python send_report_pdf_discord.py --kind us_stock --ticker AMZN --date 2026-09-28 --dry-run
 """
 from __future__ import annotations
 
@@ -56,15 +54,6 @@ DIGEST_CONFIG = {
     "label": "個別銘柄レポート まとめ版",
 }
 
-# 米国株 Deep Dive（PM 2026-09-28 承認・Phase 1）。KIND_CONFIG は send_report_jpeg_discord.py
-# 側の共有定義のため触らず本ファイルだけで追加し、既存 kind の解決ロジックへ影響させない。
-# 送信先は日本株の個別銘柄レポートと同じ research チャンネル（未設定時のフォールバックなし）。
-US_STOCK_CONFIG = {
-    "md_path": "research/stocks_us/{ticker}/{date}.md",
-    "webhook_env": "DISCORD_WEBHOOK_RESEARCH",
-    "label": "米国株 個別銘柄レポート",
-}
-
 # 送信種別 → md_to_pdf のテーマ kind（アクセント色・キッカー）
 _PDF_KIND = {
     "macro": "macro", "macro_evening": "macro",
@@ -72,7 +61,7 @@ _PDF_KIND = {
     "movers": "movers", "movers_weekly": "movers", "pts_movers": "movers",
     "ideas": "ideas", "scout": "ideas",
     "themes": "themes", "earnings": "earnings", "stock": "stock",
-    "largecap_weekly": "largecap_weekly", "us_stock": "stock",
+    "largecap_weekly": "largecap_weekly",
 }
 
 
@@ -237,35 +226,13 @@ def _send_digest(args) -> int:
     return 0 if _post_pdf(webhook, pdf_path, content) else 1
 
 
-def _us_company_name(md_path: Path, ticker: str) -> str:
-    """米国株レポートの題名（`# AMZN Amazon.com, Inc. Deep Dive レポート（…）` または
-    `# Amazon.com, Inc.（AMZN）Deep Dive レポート（…）`）から会社名を返す。取れなければ空文字。"""
-    if not md_path.exists():
-        return ""
-    for line in md_path.read_text(encoding="utf-8").splitlines():
-        m = re.match(r"^#\s+(.+?)\s*Deep Dive", line)
-        if not m:
-            continue
-        head = m.group(1).strip()
-        if head.startswith(ticker + " "):
-            return head[len(ticker):].strip()
-        return re.sub(r"[（(]\s*" + re.escape(ticker) + r"\s*[）)]$", "", head).strip()
-    return ""
-
-
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--kind", choices=list(KIND_CONFIG) + ["digest", "us_stock"], required=True)
+    parser.add_argument("--kind", choices=list(KIND_CONFIG) + ["digest"], required=True)
     parser.add_argument("--date", help="YYYY-MM-DD（JST・日次レポート用）")
     parser.add_argument("--month", help="YYYY-MM（月次レポート用・earnings 等）")
     parser.add_argument("--code", help="銘柄コード（stock 用）")
-    parser.add_argument("--ticker", help="米国株ティッカー（us_stock 用・省略時は --code を流用）")
     parser.add_argument("--skip-send", action="store_true")
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="md・PDF のパスと webhook の環境変数名を解決して表示するだけで終了する（ゲート・PDF 生成・送信をしない）",
-    )
     parser.add_argument(
         "--skip-gate",
         action="store_true",
@@ -276,15 +243,9 @@ def main() -> int:
     # まとめ版は既に PDF として存在するため、md 解決・表ゲート・レンダリングを通さず
     # そのまま添付送信して早期 return する（既存 kind の処理経路には触れない）。
     if args.kind == "digest":
-        if args.dry_run:
-            d = args.date or datetime.now(JST).strftime("%Y-%m-%d")
-            print(f"DRY-RUN: pdf={REPO_ROOT / DIGEST_CONFIG['pdf_path'].format(date=d)}"
-                  f"  webhook_env={DIGEST_CONFIG['webhook_env']}"
-                  f"（設定: {'あり' if os.getenv(DIGEST_CONFIG['webhook_env']) else 'なし'}）")
-            return 0
         return _send_digest(args)
 
-    cfg = US_STOCK_CONFIG if args.kind == "us_stock" else KIND_CONFIG[args.kind]
+    cfg = KIND_CONFIG[args.kind]
     pdf_kind = _PDF_KIND.get(args.kind, "macro")
 
     # Markdown パス解決（JPEG 版と同一規則）
@@ -300,30 +261,10 @@ def main() -> int:
         date_str = args.date or datetime.now(JST).strftime("%Y-%m-%d")
         md_path = REPO_ROOT / cfg["md_path"].format(code=args.code, date=date_str)
         identifier = f"{args.code}_{date_str}"
-    elif args.kind == "us_stock":
-        ticker = (args.ticker or args.code or "").upper()
-        if not ticker:
-            print("ERROR: --ticker is required for us_stock kind")
-            return 1
-        date_str = args.date or datetime.now(JST).strftime("%Y-%m-%d")
-        md_path = REPO_ROOT / cfg["md_path"].format(ticker=ticker, date=date_str)
-        identifier = f"{ticker}_{date_str}"
     else:
         date_str = args.date or datetime.now(JST).strftime("%Y-%m-%d")
         md_path = REPO_ROOT / cfg["md_path"].format(date=date_str)
         identifier = date_str
-
-    if args.dry_run:
-        # 解決結果だけを表示して終了する（webhook の値は出さず、環境変数名と設定有無のみ）。
-        print(f"DRY-RUN: kind={args.kind}")
-        print(f"  md          : {md_path}（存在: {'あり' if md_path.exists() else 'なし'}）")
-        print(f"  pdf         : {REPO_ROOT / 'bi' / 'outputs' / 'report_pdfs' / f'{args.kind}_{identifier}.pdf'}")
-        print(f"  webhook_env : {cfg['webhook_env']}（設定: {'あり' if os.getenv(cfg['webhook_env']) else 'なし'}）")
-        if args.kind == "us_stock":
-            company = _us_company_name(md_path, ticker)
-            shown = f"{ticker} {company}　{date_str}" if company else identifier
-            print(f"  message     : **{cfg['label']}** {shown}")
-        return 0
 
     if not md_path.exists():
         print(f"ERROR: report not found: {md_path}")
@@ -373,24 +314,6 @@ def main() -> int:
                 return 1
             print("GATE: PASS")
 
-    # 米国株 Deep Dive の送信前機械ゲート（gate_us_stock_report.py）。stock と同じく errors で中止。
-    if args.kind == "us_stock":
-        if args.skip_gate:
-            print("GATE: --skip-gate 指定のため送信前機械ゲートを飛ばしました（緊急バイパス）")
-        else:
-            from gate_us_stock_report import run_gate_us  # noqa: E402  （us_stock 以外へ影響させない遅延 import）
-            data_md = md_path.parent / f"{date_str}_data.md"
-            data_text = data_md.read_text(encoding="utf-8") if data_md.exists() else None
-            errors, warnings, _info = run_gate_us(md_text, ticker, date_str, data_text)
-            for f in warnings:
-                print("  WARN " + f.render(warn=True))
-            for f in errors:
-                print("  NG   " + f.render())
-            if errors:
-                print("GATE: FAIL（送信中止・PDF は生成しません）")
-                return 1
-            print("GATE: PASS")
-
     # 品質確定処理（非ブロッキング・PM 2026-06-28）: 「配信を止めない・token を使わない」を最優先
     # するため、送信のブロック（失敗）も自動再生成（token 増）も行わない。生成 LLM が無視する
     # ソフト指示に頼らず、Python で必ず効く確定除去のみで品質を担保する:
@@ -425,9 +348,6 @@ def main() -> int:
     if args.kind == "stock" and args.code:
         company = _lookup_company_name(args.code, md_path)
         display_id = f"{args.code} {company}　{date_str}" if company else identifier
-    elif args.kind == "us_stock":
-        company = _us_company_name(md_path, ticker)
-        display_id = f"{ticker} {company}　{date_str}" if company else identifier
     else:
         display_id = identifier
 
