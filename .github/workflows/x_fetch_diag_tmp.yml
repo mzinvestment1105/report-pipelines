@@ -84,7 +84,8 @@ jobs:
                   hits = [k for k in KEYS if k in t]
                   print(f"[{label}] body_len={len(t)} keywords={hits}")
                   print(f"[{label}] title={await page.title()!r}")
-                  print(f"[{label}] body={t[:300]!r}")
+                  if len(t) < 600:
+                      print(f"[{label}] body={re.sub(r'@[A-Za-z0-9_]+', '@***', t)[:300]!r}")
                   ua = await page.evaluate("navigator.userAgent")
                   print(f"[{label}] ua_chrome={re.findall(r'Chrome/[0-9.]+', ua)} headless_in_ua={'Headless' in ua}")
                   await browser.close()
