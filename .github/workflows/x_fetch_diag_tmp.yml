@@ -23,7 +23,7 @@ jobs:
           python-version: '3.11'
       - name: Install
         run: |
-          pip install -q playwright python-dotenv pyyaml
+          pip install -q playwright python-dotenv pyyaml requests beautifulsoup4 pypdf
           pip install -q playwright-stealth || true
           playwright install chromium --with-deps > /dev/null 2>&1
           sudo apt-get install -y -q xvfb > /dev/null 2>&1 || true
