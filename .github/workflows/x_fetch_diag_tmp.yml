@@ -63,11 +63,11 @@ jobs:
                                   if m: n += " msg=" + m.group(1)
                           except Exception:
                               n = "nojson"
-                          if op in ("SearchTimeline",) or r.status != 200:
-                              print(f"[{label}] resp {r.status} {op} tweets={n}")
+                          print(f"[{label}] resp {r.status} {op} tweets={n}")
                   page.on("response", on_resp)
                   try:
-                      await page.goto(f"https://x.com/search?q={quote_plus(q)}&src=typed_query&f=live", wait_until="domcontentloaded", timeout=60000)
+                      url = f"https://x.com/search?q={quote_plus(q)}&src=typed_query&f=live" if q else "https://x.com/home"
+                      await page.goto(url, wait_until="domcontentloaded", timeout=60000)
                   except Exception as e:
                       print(f"[{label}] goto error {type(e).__name__}")
                   for i in range(5):
@@ -83,11 +83,19 @@ jobs:
                       t = ""
                   hits = [k for k in KEYS if k in t]
                   print(f"[{label}] body_len={len(t)} keywords={hits}")
+                  print(f"[{label}] title={await page.title()!r}")
+                  print(f"[{label}] body={t[:300]!r}")
+                  ua = await page.evaluate("navigator.userAgent")
+                  print(f"[{label}] ua_chrome={re.findall(r'Chrome/[0-9.]+', ua)} headless_in_ua={'Headless' in ua}")
                   await browser.close()
           async def main():
               q = "AI min_faves:500 lang:en -filter:replies -filter:retweets"
               await run("stealth_on", True, q)
               await run("stealth_off", False, q)
+              await run("profile_page", True, "")
           asyncio.run(main())
           PY
-          python /tmp/diag.py 2>&1 | grep -E "^\[(stealth_on|stealth_off)\]" || true
+          python /tmp/diag.py 2>&1 | grep -E "^\[(stealth_on|stealth_off|profile_page)\]" || true
+          echo "=== playwright 1.60.0 ==="
+          pip install -q playwright==1.60.0 && playwright install chromium > /dev/null 2>&1
+          python /tmp/diag.py 2>&1 | grep -E "^\[(stealth_on|stealth_off|profile_page)\]" | sed 's/^/[pw160]/' || true
