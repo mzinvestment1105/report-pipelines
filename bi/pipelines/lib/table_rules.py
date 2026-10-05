@@ -41,6 +41,9 @@
     from table_rules import check_tables
     for v in check_tables(md_text):
         print(v["line"], v["message"])
+
+    # 銘柄コードだけで社名の無い表の検査（PM 2026-10-05）を含む送信前の表ゲートを md 1 本へ当てる
+    python bi/pipelines/lib/table_rules.py research/themes/xxx.md --kind themes
 """
 from __future__ import annotations
 
@@ -374,6 +377,174 @@ def check_tables(md_text: str) -> list[dict]:
             )
 
     return violations
+
+
+# ---------------------------------------------------------------------------
+# 銘柄コードだけで社名の無い表の検査（PM 2026-10-05 指示・_cr §7）
+#
+# 背景: 2026-10-05 のテーマ調査レポートで、指示書が 10 列の表を求め、執筆側が表を
+# 2 つに分けた際に 2 表目を「コード | 合致度 | 終値 | …」とコードだけで組んだため、
+# 何の銘柄か読めない表が送信された。§7（銘柄名はコードとセット）の既存の検査は
+# 「社名にコードが付いているか」だけを見ており、「コードに社名が付いているか」を
+# 見ていなかった。
+#
+# 判定（表ごと）:
+#   (1) 本体セルの 6 割以上（3 行以上）が銘柄コードだけ（4 桁・末尾英字可・先頭は
+#       1〜9。太字・バッククォート・`.T` 付きは許容）の列がある。先頭 0 の指数コード
+#       （0086 等）は銘柄コードではないため拾わない
+#   (2) その列が年・年度・決算期・金額・株数などの列ではない。列見出しと値の分布の
+#       両方で判定し、見出しに「コード」「銘柄」等が無い列は、値に英字付きコード
+#       （338A 等）がある場合か、1 列目で年号らしい値（1900〜2099）が無い場合だけ拾う
+#   (3) 同じ表に社名が無い（見出しが 社名・銘柄名・銘柄・会社・企業・名称・name を含む
+#       別の列も、「コード 社名」形式のセルが 6 割以上の列も無い）
+# ---------------------------------------------------------------------------
+
+# セル全体が銘柄コードだけ（装飾を外した後に判定する）。
+_CODE_ONLY_CELL = re.compile(r"^([1-9]\d{2}[0-9A-Z])(?:\.T)?$")
+# 先頭が銘柄コードのセル。名称の判定は _code_with_name() が行う
+# （\s は全角空白も含む）。
+_CODE_HEAD_CELL = re.compile(
+    r"^[1-9]\d{2}[0-9A-Z](?:\.T)?\s*[（(「]?"
+    r"([^\s\d０-９,，.．/／|（）()「」+＋▼▲△▽%％〜～~→\-]+)"
+)
+# コード列とみなす見出し語。末尾が数量語（銘柄数・コード比 等）の見出しは除く。
+_CODE_HDR = re.compile(r"コード|銘柄|証券|code|ticker|ティッカー", re.IGNORECASE)
+_CODE_HDR_QTY_TAIL = re.compile(r"(?:数|率|額|比|価格?|順位)[）)]?$")
+# 年・期間・金額・株数などの列見出し（コード列から外す）。
+_NOT_CODE_HDR = re.compile(
+    r"年|期|月|日|FY|year|date|時|数|率|額|価|円|株|億|万|千|%|％|比|高|量|残|倍|値|益"
+    r"|売上|利益|PER|PBR|時価|点|順位|位",
+    re.IGNORECASE,
+)
+# 社名の列とみなす見出し語（強い語は除外語の一部を問わない）。
+_NAME_HDR_STRONG = re.compile(r"社名|銘柄名|会社名|企業名|名称|name|company", re.IGNORECASE)
+_NAME_HDR_WEAK = re.compile(r"銘柄|会社|企業")
+_NAME_HDR_EXCL = re.compile(r"何の|概要|関係|説明|事業|内容")
+_NAME_HDR_WEAK_EXCL = re.compile(r"コード|code|数|率|額|比", re.IGNORECASE)
+# 「コード＋名称」の名称側が単位だけ（2025年・1200億円・500万株 等）なら名称とみなさない。
+_UNIT_CHARS = set("年月日期度億万千百兆円株倍人件回台個枚本点週時分秒歳社名口")
+_UNIT_TOKENS = {"pt", "bp", "bps", "x"}
+
+CODE_ONLY_REMEDY = "第 1 列を『コード 社名』にしてください"
+
+
+def _plain(cell: str) -> str:
+    return _DECOR.sub("", cell).strip()
+
+
+def _is_code_only(cell: str) -> bool:
+    return bool(_CODE_ONLY_CELL.match(_plain(cell)))
+
+
+def _code_with_name(cell: str) -> bool:
+    """セルが「コード 社名」形式（コードの直後に和文・英字の名称が続く）か。"""
+    m = _CODE_HEAD_CELL.match(_plain(cell))
+    if not m:
+        return False
+    tok = m.group(1)
+    if tok.lower() in _UNIT_TOKENS:
+        return False
+    for ch in tok:
+        o = ord(ch)
+        if (
+            0x3041 <= o <= 0x3096  # ひらがな
+            or 0x30A1 <= o <= 0x30FA  # カタカナ（中黒・長音を除く）
+            or 0xFF66 <= o <= 0xFF9D  # 半角カタカナ
+            or ch.isascii() and ch.isalpha()
+            or 0xFF21 <= o <= 0xFF3A or 0xFF41 <= o <= 0xFF5A  # 全角英字
+        ):
+            return True
+        if (0x4E00 <= o <= 0x9FFF or 0x3400 <= o <= 0x4DBF or ch == "々") and ch not in _UNIT_CHARS:
+            return True
+    return False
+
+
+def _hdr(header: list[str], j: int) -> str:
+    return re.sub(r"\s+", "", _plain(header[j])) if j < len(header) else ""
+
+
+def _is_name_header(h: str) -> bool:
+    if not h or _NAME_HDR_EXCL.search(h):
+        return False
+    if _NAME_HDR_STRONG.search(h):
+        return True
+    return bool(_NAME_HDR_WEAK.search(h)) and not _NAME_HDR_WEAK_EXCL.search(h)
+
+
+def _col(rows: list[list[str]], j: int) -> list[str]:
+    return [(r[j] if j < len(r) else "") for r in rows]
+
+
+def _is_code_column(header: list[str], rows: list[list[str]], j: int) -> bool:
+    """j 列目が「銘柄コードだけ」の列か（年・年度・決算期・金額・株数の列は拾わない）。"""
+    cells = _col(rows, j)
+    codes = [_plain(c) for c in cells if _is_code_only(c)]
+    if len(rows) < 3 or len(codes) < 3 or len(codes) < 0.6 * len(rows):
+        return False
+    h = _hdr(header, j)
+    if h and _CODE_HDR.search(h) and not _CODE_HDR_QTY_TAIL.search(h):
+        return True
+    if h and _NOT_CODE_HDR.search(h):
+        return False
+    # 見出しで決まらない列（空見出し・無関係な語）は値で判定し、迷う値は拾わない。
+    vals = [_CODE_ONLY_CELL.match(c).group(1) for c in codes]
+    if any(v[-1].isalpha() for v in vals):
+        return True  # 338A のような英字付きコードは年・金額になり得ない
+    if j == 0 and not any(1900 <= int(v) <= 2099 for v in vals):
+        return True
+    return False
+
+
+def check_code_only_tables(md_text: str) -> list[dict]:
+    """銘柄コードだけで社名の無い表を検出する（PM 2026-10-05・_cr §7）。
+
+    各違反 dict のキー:
+      table    … 文書内の表の通し番号（1 始まり）
+      line     … ヘッダ行の行番号（1 始まり）
+      column   … コードだけの列の見出し
+      examples … コードの例（先頭 3 件）
+      message  … 人が読む 1 行メッセージ（対処文込み）
+    """
+    out: list[dict] = []
+    for n, t in enumerate(_extract_tables(md_text), start=1):
+        header, rows = t["header"], t["rows"]
+        if len(rows) < 3:
+            continue
+        ncols = max([len(header)] + [len(r) for r in rows])
+        code_cols = [j for j in range(ncols) if _is_code_column(header, rows, j)]
+        if not code_cols:
+            continue
+        has_name = False
+        for j in range(ncols):
+            cells = _col(rows, j)
+            if sum(_code_with_name(c) for c in cells) >= 0.6 * len(rows):
+                has_name = True
+                break
+            if j in code_cols:
+                continue
+            if _is_name_header(_hdr(header, j)) and sum(_is_code_only(c) for c in cells) < 0.6 * len(rows):
+                has_name = True
+                break
+        if has_name:
+            continue
+        j = code_cols[0]
+        col_name = _plain(header[j]) if j < len(header) else ""
+        examples = [_plain(c) for c in _col(rows, j) if _is_code_only(c)][:3]
+        out.append(
+            {
+                "table": n,
+                "line": t["header_line"],
+                "column": col_name,
+                "examples": examples,
+                "message": (
+                    f"表 {n}: 銘柄コードだけで社名がありません。{CODE_ONLY_REMEDY}"
+                    f"（L{t['header_line']}・列「{col_name}」・例 {'／'.join(examples)}）"
+                ),
+            }
+        )
+    return out
+
+
 # ---------------------------------------------------------------------------
 # 全レポート種別横断の表ゲート（PM 2026-09-06 指示）
 #
@@ -393,24 +564,98 @@ def check_tables(md_text: str) -> list[dict]:
 # 送信を止めてよい種別（PM が都度受け取るレポート）。
 BLOCKING_KINDS = frozenset({"stock"})
 
+# 銘柄コードだけの表（check_code_only_tables）を送信時に error として止める種別
+# （PM 2026-10-05 指示）。ローカルで生成し送信前に直せる個別銘柄レポートだけに限る。
+# 定期の自動配信の種別（マクロ・セクター・動意・夜間PTS・テーマ・決算・大型株・
+# アイデア・スカウト等）と未登録の種別は _cr §36 配信絶対の原則により送信を止めず
+# warning とする。書き手が保存前に使うコマンド検査（_main）は種別を問わず、
+# コードだけの表が 1 つでもあれば FAIL を返す（違反 0 件が保存の必須条件）。
+CODE_ONLY_BLOCKING_KINDS = frozenset({"stock", "us_stock"})
+
 
 def gate_report_tables(md_text: str, kind: str) -> tuple[list[str], list[str]]:
     """レポート種別を問わず表を検査し (errors, warnings) を返す。
 
-    kind が BLOCKING_KINDS に含まれる場合のみ違反を errors へ入れる。
+    折り返す表（check_tables）は kind が BLOCKING_KINDS に含まれる場合のみ errors へ入れ、
     それ以外の種別は warnings へ入れて送信を継続させる（_cr §36）。
+    銘柄コードだけの表（check_code_only_tables）は kind が CODE_ONLY_BLOCKING_KINDS に
+    含まれる場合に errors へ入れ、それ以外は warnings へ入れる（PM 2026-10-05）。
     呼び出し元は errors が非空なら PDF を生成せず中止する。
     """
+    errors: list[str] = []
+    warnings: list[str] = []
     violations = check_tables(md_text)
-    if not violations:
-        return [], []
-    msgs = [f"表の折り返し: {v['message']}" for v in violations]
-    if kind in BLOCKING_KINDS:
-        return msgs, []
-    head = (
-        f"表の折り返し違反が {len(violations)} 件あります"
-        f"（種別 {kind} は配信絶対の原則により送信は継続します。"
-        "カード自動変換は 2026-09-07 に廃止しており誌面上の救済はありません。"
-        "次回の生成で本文を直してください）"
+    if violations:
+        msgs = [f"表の折り返し: {v['message']}" for v in violations]
+        if kind in BLOCKING_KINDS:
+            errors.extend(msgs)
+        else:
+            head = (
+                f"表の折り返し違反が {len(violations)} 件あります"
+                f"（種別 {kind} は配信絶対の原則により送信は継続します。"
+                "カード自動変換は 2026-09-07 に廃止しており誌面上の救済はありません。"
+                "次回の生成で本文を直してください）"
+            )
+            warnings.extend([head] + msgs)
+    code_only = check_code_only_tables(md_text)
+    if code_only:
+        msgs = [f"コードだけの表: {v['message']}" for v in code_only]
+        if kind in CODE_ONLY_BLOCKING_KINDS:
+            errors.extend(msgs)
+        else:
+            warnings.append(
+                f"銘柄コードだけで社名の無い表が {len(code_only)} 件あります"
+                f"（種別 {kind} は配信絶対の原則により送信は継続します。"
+                "次回の生成で第 1 列を『コード 社名』に直してください）"
+            )
+            warnings.extend(msgs)
+    return errors, warnings
+
+
+def _main(argv: list[str] | None = None) -> int:
+    """md 1 本を書き手の保存前検査として検査する（送信・PDF 生成はしない）。
+
+    折り返す表は送信前の表ゲートと同じ判定（種別ごとに error / warning）で表示する。
+    銘柄コードだけの表は種別を問わず 1 つでもあれば FAIL を返す（PM 2026-10-05。
+    送信時ゲートは自動配信の種別を止めないため、書き手側で必ず直させる）。
+
+    例: python bi/pipelines/lib/table_rules.py research/themes/xxx.md --kind themes
+    """
+    import argparse
+    import sys
+    from pathlib import Path
+
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
+        except (AttributeError, OSError):
+            pass
+    ap = argparse.ArgumentParser(description="誌面 md の表を保存前に検査する（コードだけの表は種別を問わず FAIL）")
+    ap.add_argument("md", help="検査する md のパス")
+    ap.add_argument(
+        "--kind",
+        default="themes",
+        help="レポート種別（send_report_pdf_discord.py の --kind と同じ。既定 themes）",
     )
-    return [], [head] + msgs
+    args = ap.parse_args(argv)
+    text = Path(args.md).read_text(encoding="utf-8")
+    errors, warnings = gate_report_tables(text, args.kind)
+    code_only = check_code_only_tables(text)
+    # 保存前検査では、コードだけの表を種別を問わず NG として表示し FAIL にする。
+    warnings = [m for m in warnings if not m.startswith(("コードだけの表: ", "銘柄コードだけで社名の無い表が"))]
+    errors = [m for m in errors if not m.startswith("コードだけの表: ")]
+    errors += [f"コードだけの表: {v['message']}" for v in code_only]
+    for m in warnings:
+        print("WARN " + m)
+    for m in errors:
+        print("NG   " + m)
+    print(
+        f"銘柄コードだけの表: {len(code_only)} 件 / "
+        f"折り返す表: {len(check_tables(text))} 件 / "
+        f"判定: {'FAIL' if errors else 'PASS'}（種別 {args.kind}）"
+    )
+    return 1 if errors else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())

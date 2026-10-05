@@ -36,7 +36,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 
-from table_rules import check_tables  # noqa: E402
+from table_rules import check_code_only_tables, check_tables  # noqa: E402
 from verify_report_numbers import verify as verify_numbers  # noqa: E402
 
 # --- 必須セクション見出し（正本 = agents/stock_analyst.md §レポート構成）-----------
@@ -3066,6 +3066,15 @@ def run_gate(
             errors.append(f"[折り返す表] 他 {len(tbl_violations) - 8} 件")
     else:
         info.append("[折り返す表] なし")
+
+    # 5-B. 銘柄コードだけで社名の無い表（errors・PM 2026-10-05 指示・_cr §7）
+    #      送信時の表ゲート（table_rules.gate_report_tables）と同じ判定を執筆後の事前検査でも当てる。
+    code_only = check_code_only_tables(md)
+    if code_only:
+        for v in code_only:
+            errors.append(f"[コードだけの表] {v['message']}")
+    else:
+        info.append("[コードだけの表] なし")
 
     # 6. 必須セクション見出しの欠落（errors）
     req = _required_sections()
