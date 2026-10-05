@@ -320,8 +320,6 @@ jobs:
         # フォールバックするため、ここでは欠けても失敗させない＝if-no-files-found は全パス不在時のみ効く）。
         # 2026-10-04: 市場レッグ専用の縮小 raw（{date}_movers_raw_{growth,standard,prime}.md）も同梱する。
         # 欠けた日は各枠が従来のスライスへフォールバックする。
-        # 2026-10-04: 理由ゲート用の事実ファイル（{date}_movers_facts.json・make_mover_report.py が raw と同じ場所へ出す）
-        # も同梱する。欠けた日（ETL 失敗）は理由ゲートが検査を飛ばして BI へ警告する（配信は止めない）。
         uses: actions/upload-artifact@v4
         with:
           name: movers-raw-${{ steps.date.outputs.value }}
@@ -332,7 +330,6 @@ jobs:
             private-repo/market/daily/${{ steps.date.outputs.value }}_movers_raw_standard.md
             private-repo/market/daily/${{ steps.date.outputs.value }}_movers_raw_prime.md
             private-repo/market/daily/${{ steps.date.outputs.value }}_quality_flags.txt
-            private-repo/market/daily/${{ steps.date.outputs.value }}_movers_facts.json
           retention-days: 7
           if-no-files-found: error
 
@@ -637,71 +634,6 @@ jobs:
           fi
           echo "生成成功: $F ($(wc -l < "$F") lines)"
 
-      # 2026-10-04 追加（PM 承認・計画書 dev/drafts/2026-10-04_dev_mover_reason_fix_plan.md §3-D）: 理由ゲート。
-      # 「なぜ動いた」を ETL の事実ファイル（{date}_movers_facts.json・setup-raw の artifact に同梱）と
-      # bi/pipelines/lib/reason_check.py で機械照合し、不合格の銘柄の「なぜ動いた」の行だけを Claude に
-      # 1 回書き直させる（既存の再試行と同じ「生成 step ＋ check_attempt.sh」の形・手順は scripts/reason_gate.sh）。
-      # 修正試行は gen2 を使わなかった時だけ行う（gen2 まで使った最悪ケース 前段 10 分＋1 回目 40 分＋待機 1 分＋2 回目 30 分＋検証 2 分＝83 分 に
-      # 修正試行 15 分を足すとジョブ枠 90 分を超え、枠ごと落ちて誌面が欠けるため）。
-      # 直らなかった銘柄・修正試行を飛ばした銘柄は merge-and-send の機械差し替えが拾う（絶対配信原則）。
-      # 事実ファイルが無い日（ETL 失敗）は検査を飛ばす。BI への警告は merge-and-send が 1 回だけ出す。
-      # テーマ欄枠は銘柄別の「なぜ動いた」を持たないため対象外。
-      - name: 理由ゲート（なぜ動いた の事実照合・修正試行の要否判定）
-        id: rgate
-        if: matrix.market != 'themes'
-        continue-on-error: true
-        env:
-          MODE: check
-          LEG: ${{ matrix.market }}
-          MD: ${{ github.workspace }}/private-repo/market/daily/movers/${{ needs.setup-raw.outputs.target_date }}_${{ matrix.market }}.md
-          FACTS: /tmp/movers-raw/${{ needs.setup-raw.outputs.target_date }}_movers_facts.json
-          RULE_FILE: report-pipelines/prompts/mover-report.md
-          ALLOW_FIX: ${{ steps.gen2.outcome == 'skipped' && 'true' || 'false' }}
-          PYTHONIOENCODING: utf-8
-        run: bash report-pipelines/.github/scripts/reason_gate.sh
-
-      - name: なぜ動いた の修正試行（不合格銘柄のみ・1 回）
-        id: genfix
-        if: steps.rgate.outputs.need_fix == 'true'
-        continue-on-error: true
-        timeout-minutes: 15
-        uses: anthropics/claude-code-base-action@57607815d5d9678acb18dae0e5033d87d4dd4177
-        with:
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          prompt_file: ${{ steps.rgate.outputs.fix_prompt }}
-          # 不合格銘柄の行だけを直すため Write（全体の書き直し）・Bash は渡さない
-          claude_args: --model claude-opus-5-5 --allowedTools Read,Edit,Grep,Glob
-        env:
-          CLAUDE_CODE_EFFORT_LEVEL: high
-          CLAUDE_CODE_MAX_OUTPUT_TOKENS: "64000"
-          TARGET_DATE: ${{ needs.setup-raw.outputs.target_date }}
-          TARGET_MARKET: ${{ matrix.market }}
-          PRIVATE_REPO_ROOT: private-repo
-
-      - name: Check reason fix attempt (成果物と出力上限到達の確認)
-        id: chkfix
-        if: steps.rgate.outputs.need_fix == 'true'
-        continue-on-error: true
-        env:
-          ATTEMPT: 'reason-fix'
-          OUTCOME: ${{ steps.genfix.outcome }}
-          EXECUTION_FILE: ${{ steps.genfix.outputs.execution_file }}
-          OUT_FILES: private-repo/market/daily/movers/${{ needs.setup-raw.outputs.target_date }}_${{ matrix.market }}.md
-          MISSING_NOUN: '誌面なし'
-        run: bash report-pipelines/.github/scripts/check_attempt.sh
-
-      - name: 理由ゲート（修正試行後の再検査・壊れていれば修正前へ戻す）
-        id: rgate2
-        if: steps.rgate.outputs.need_fix == 'true'
-        continue-on-error: true
-        env:
-          MODE: recheck
-          LEG: ${{ matrix.market }}
-          MD: ${{ github.workspace }}/private-repo/market/daily/movers/${{ needs.setup-raw.outputs.target_date }}_${{ matrix.market }}.md
-          FACTS: /tmp/movers-raw/${{ needs.setup-raw.outputs.target_date }}_movers_facts.json
-          PYTHONIOENCODING: utf-8
-        run: bash report-pipelines/.github/scripts/reason_gate.sh
-
       - name: Upload market section as artifact
         uses: actions/upload-artifact@v4
         with:
@@ -939,22 +871,6 @@ jobs:
           name: movers-raw-${{ needs.setup-raw.outputs.target_date }}
           path: /tmp/movers-raw
 
-      - name: 理由ゲート（なぜ動いた の機械差し替え・不合格でも送信は止めない）
-        # 2026-10-04 追加（PM 承認・計画書 §3-D・PM 判断事項 3）: 生成枠の修正試行の後も不合格の銘柄
-        # （または時間枠の都合で修正試行を飛ばした銘柄）の「なぜ動いた」を、facts だけで組んだ 1 文
-        # （例 `10/2（金）▼13.7%：材料は確認できず。同日、日産自動車▼5.0%。`）へ機械で差し替える。
-        # 誤った理由は誌面に残さず、配信は止めない（絶対配信原則）。差し替えた件数と銘柄コードは
-        # 送信後に BI へ通知する。事実ファイルが無い日（ETL 失敗）は差し替えずに配信し、BI へ警告する。
-        id: reasonfix
-        continue-on-error: true
-        env:
-          MODE: fallback
-          LEG: merge
-          MD: ${{ github.workspace }}/private-repo/market/daily/movers/${{ needs.setup-raw.outputs.target_date }}.md
-          FACTS: /tmp/movers-raw/${{ needs.setup-raw.outputs.target_date }}_movers_facts.json
-          PYTHONIOENCODING: utf-8
-        run: bash report-pipelines/.github/scripts/reason_gate.sh
-
       - name: 品質検査（件数/タイトル日付/相互参照・不合格でも送信は止めない）
         # PM 2026-07-12 改定（絶対配信原則）: check_mover_counts の exit 3（品質不合格）で送信を
         # 中止する旧設計は PM 却下。exit 3 は検知シグナルとして受けて step は成功で通し、次の
@@ -1141,37 +1057,6 @@ jobs:
           # 2026-10-04: 枠の欠落は別通知（上）に分離。ここは品質注記の中身を原因行に載せる。
           cause: ${{ steps.annotate.outputs.note }}
           detail: '動意銘柄レポート 配信済み（品質注記あり）｜レポートは配信済みです。品質注記（${{ steps.annotate.outputs.note }}）を各市場の冒頭に付けています。'
-
-      - name: Discord 通知（⚠️ 配信済み・なぜ動いた を機械差し替え）
-        # 2026-10-04 追加（計画書 §3-D）: 理由ゲートが差し替えた件数と銘柄コードを BI へ出す。
-        if: steps.reasonfix.outputs.status == 'replaced' && steps.send.outcome == 'success'
-        uses: ./report-pipelines/.github/actions/notify-discord
-        with:
-          kind: status
-          bi_webhook: ${{ secrets.DISCORD_WEBHOOK_BI }}
-          test_mode: ${{ github.event.inputs.test_mode || 'false' }}
-          state: partial
-          label: '動意レポート'
-          date: ${{ needs.setup-raw.outputs.target_date }}
-          meaning: '配信しました。「なぜ動いた」が事実照合に通らなかった ${{ steps.reasonfix.outputs.replaced_count }} 銘柄（${{ steps.reasonfix.outputs.replaced_codes }}）は、確認できた事実だけの 1 文へ差し替えています。'
-          cause: '理由ゲート不合格 ${{ steps.reasonfix.outputs.replaced_count }} 銘柄（${{ steps.reasonfix.outputs.replaced_codes }}）・生成枠の修正試行の後も不合格'
-          detail: '動意銘柄レポート 配信済み（なぜ動いた を機械差し替え）｜差し替え ${{ steps.reasonfix.outputs.replaced_count }} 銘柄（${{ steps.reasonfix.outputs.replaced_codes }}）・差し替え後の不合格 ${{ steps.reasonfix.outputs.after_fail_count }} 件。'
-
-      - name: Discord 通知（⚠️ 配信済み・理由ゲート未実施）
-        # 2026-10-04 追加（計画書 §3-D）: 事実ファイルが無い（ETL 失敗）・照合スクリプトが失敗した日は
-        # 照合を飛ばして配信し、BI へ警告する（絶対配信原則）。
-        if: (steps.reasonfix.outputs.status == 'no_facts' || steps.reasonfix.outputs.status == 'error') && steps.send.outcome == 'success'
-        uses: ./report-pipelines/.github/actions/notify-discord
-        with:
-          kind: status
-          bi_webhook: ${{ secrets.DISCORD_WEBHOOK_BI }}
-          test_mode: ${{ github.event.inputs.test_mode || 'false' }}
-          state: partial
-          label: '動意レポート'
-          date: ${{ needs.setup-raw.outputs.target_date }}
-          meaning: '配信しました。「なぜ動いた」の事実照合は実施できていません。'
-          cause: ${{ steps.reasonfix.outputs.status == 'no_facts' && '元データ作成で照合用の事実ファイル（movers_facts.json）が出力されていない' || '照合スクリプト（reason_check.py）の実行失敗' }}
-          detail: '動意銘柄レポート 配信済み（理由ゲート未実施）｜status=${{ steps.reasonfix.outputs.status }}。'
 
       - name: Discord 通知（⚠️ 配信済み・後処理のみ失敗）
         if: (failure() || cancelled()) && steps.send.outcome == 'success'
