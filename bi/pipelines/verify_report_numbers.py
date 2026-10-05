@@ -18,7 +18,9 @@ exit 0 = 合格 / exit 1 = 不整合あり（送信を止める）
 from __future__ import annotations
 
 import argparse
+import datetime as _dt
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -34,12 +36,20 @@ except Exception:  # noqa: BLE001
     pass
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+MASTER_PATH = REPO_ROOT / "bi" / "outputs" / "screening_master.parquet"
+JST = _dt.timezone(_dt.timedelta(hours=9))
 
 # 許容誤差（レポートは四捨五入した値を載せるため、丸め分は通す）
 TOL_SHARES = 0.01   # 発行済株式総数 1%
 TOL_MCAP = 0.02     # 時価総額 2%
+TOL_MCAP_REF = 0.05  # 検査2b: 時価総額 vs 照合先（master または再取得値）5%
 TOL_BPS = 0.05      # BPS × 発行済 = 自己資本 5%
 TOL_RATIO = 0.15    # 大株主の保有比率 0.15pt
+
+# 検査2b: screening_master の時価総額は更新時点の株価基準のため、対象日から
+# この暦日数を超えて離れていたら「古い」とみなし、対象日の終値で取り直して照合する
+# （2026-10-04 に master が 3 週間古く、正しい誌面値が偽 error になった事例への対処）。
+MASTER_STALE_DAYS = 3
 
 
 def _to_float(s: str) -> float:
@@ -66,7 +76,7 @@ def _load_master(code: str) -> dict:
         import pandas as pd
     except ImportError:
         return {}
-    p = REPO_ROOT / "bi" / "outputs" / "screening_master.parquet"
+    p = MASTER_PATH
     if not p.exists():
         return {}
     df = pd.read_parquet(p)
@@ -87,15 +97,86 @@ def _load_master(code: str) -> dict:
     return out
 
 
-def verify(md: str, code: str) -> tuple[list[str], list[str]]:
+def _target_date_from_md(md: str) -> _dt.date | None:
+    """誌面の冒頭（タイトル・ヘッダ）にある YYYY-MM-DD を対象日とみなす。"""
+    head = "\n".join(md.splitlines()[:5])
+    m = re.search(r"(20[0-9]{2})-([0-9]{2})-([0-9]{2})", head)
+    if not m:
+        return None
+    try:
+        return _dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    except ValueError:
+        return None
+
+
+def _master_date() -> _dt.date | None:
+    """screening_master の鮮度基準日。
+
+    git の最終コミット日を優先する（checkout では mtime が取得時刻になり鮮度を表さないため）。
+    shallow clone では履歴が切れてコミット日が当てにならないので使わない。
+    取れなければ mtime（JST）、それも無理なら None。
+    """
+    try:
+        shallow = subprocess.run(
+            ["git", "rev-parse", "--is-shallow-repository"],
+            cwd=REPO_ROOT, capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+        if shallow == "false":
+            out = subprocess.run(
+                ["git", "log", "-1", "--format=%cs", "--",
+                 MASTER_PATH.relative_to(REPO_ROOT).as_posix()],
+                cwd=REPO_ROOT, capture_output=True, text=True, timeout=10,
+            ).stdout.strip()
+            if re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", out):
+                return _dt.date.fromisoformat(out)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        return _dt.datetime.fromtimestamp(MASTER_PATH.stat().st_mtime, JST).date()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _fetch_mcap_oku(code: str, shares: float, target_date: _dt.date) -> float | None:
+    """yfinance で対象日（休場なら直前の営業日）の終値を取り、× 誌面の発行済株式数 で
+    時価総額（億円）を返す。取れなければ None。"""
+    try:
+        import yfinance as yf
+        start = target_date - _dt.timedelta(days=10)
+        end = target_date + _dt.timedelta(days=1)
+        hist = yf.Ticker(f"{code}.T").history(
+            start=start.isoformat(), end=end.isoformat(), auto_adjust=False,
+        )
+        if hist is None or hist.empty or "Close" not in hist.columns:
+            return None
+        closes = hist["Close"].dropna()
+        closes = closes[[d.date() <= target_date for d in closes.index]]
+        if closes.empty:
+            return None
+        return float(closes.iloc[-1]) * shares / 1e8
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def verify(md: str, code: str, target_date: _dt.date | str | None = None) -> tuple[list[str], list[str]]:
     """(errors, warnings) を返す。errors が空なら送信可。
 
     errors  = 送信を止める（誌面の数値が一次データと矛盾している＝事故）
     warnings= ログに出すだけ（分母の取り方など、正当な理由で差が出うる項目）
+
+    target_date = 誌面の対象日（検査2b の取り直しに使う）。None なら誌面冒頭の
+    YYYY-MM-DD、取れなければ今日（JST）。
     """
     errors: list[str] = []
     warnings: list[str] = []
     master = _load_master(code)
+    if isinstance(target_date, str):
+        try:
+            target_date = _dt.date.fromisoformat(target_date)
+        except ValueError:
+            target_date = None
+    if target_date is None:
+        target_date = _target_date_from_md(md) or _dt.datetime.now(JST).date()
 
     shares_hits = _find_shares(md)
     # 最頻値を「その銘柄の発行済株式総数」とみなす（合併前の株数などを本文が併記するため）
@@ -128,20 +209,48 @@ def verify(md: str, code: str) -> tuple[list[str], list[str]]:
     mcap_oku = _find_one(md, r"\|\s*時価総額[^|\n]*\|\s*\**([0-9][0-9,]*\.?[0-9]*)\s*\**\s*億円")
 
     # 検査2: 時価総額 ÷ 株価 = 発行済株式総数
+    check2 = "未実施"  # 検査2b の warning 文に結果を添えるため保持する
     if price and mcap_oku and shares:
         implied = mcap_oku * 1e8 / price
+        check2 = "通過"
         if abs(implied - shares) / shares > TOL_MCAP + TOL_SHARES:
+            check2 = "不整合"
             errors.append(
                 f"[検査2] 時価総額÷株価が発行済株式総数と不整合: "
                 f"{mcap_oku}億円÷{price:,.0f}円={implied:,.0f}株 vs 誌面 {shares:,.0f}株"
             )
 
     # 検査2b: 時価総額が screening_master と一致するか
+    # master が対象日から MASTER_STALE_DAYS 暦日を超えて離れていれば、対象日の終値 ×
+    # 誌面の発行済株式数（検査1で master と照合済み）で取り直して照合する。取り直しにも
+    # 失敗したら比較が成立しないため warning にとどめる（PM 2026-10-05 承認・選択肢 1）。
     if mcap_oku and master.get("mcap"):
-        ref_oku = master["mcap"] / 1e8
-        if abs(mcap_oku - ref_oku) / ref_oku > 0.05:
+        ref_oku: float | None = master["mcap"] / 1e8
+        src = "screening_master"
+        m_date = _master_date()
+        age = abs((target_date - m_date).days) if m_date else None
+        if age is not None and age > MASTER_STALE_DAYS:
+            live = _fetch_mcap_oku(code, shares, target_date) if shares else None
+            if live is not None:
+                ref_oku, src = live, "yfinance 再取得"
+                warnings.append(
+                    f"[検査2b] master が {age} 日古いため yfinance 再取得"
+                    f"（{target_date}以前の直近終値×誌面株数={live:.1f}億円）と照合"
+                )
+            else:
+                ref_oku = None
+                note = {
+                    "通過": "検査2 の誌面内整合は通過",
+                    "不整合": "検査2 の誌面内整合も不一致",
+                    "未実施": "検査2 は株価等が読めず未実施",
+                }[check2]
+                warnings.append(
+                    f"[検査2b] master が {age} 日古く再取得も失敗のため時価総額照合をスキップ"
+                    f"（{note}）"
+                )
+        if ref_oku and abs(mcap_oku - ref_oku) / ref_oku > TOL_MCAP_REF:
             errors.append(
-                f"[検査2b] 時価総額が screening_master と不一致: "
+                f"[検査2b] 時価総額が {src} と不一致: "
                 f"誌面 {mcap_oku}億円 vs 実値 {ref_oku:.1f}億円"
             )
 
@@ -229,7 +338,7 @@ def main() -> int:
         print(f"ERROR: report not found: {md_path}")
         return 1
 
-    errors, warnings = verify(md_path.read_text(encoding="utf-8"), args.code)
+    errors, warnings = verify(md_path.read_text(encoding="utf-8"), args.code, args.date)
     for w in warnings:
         print("NUMBER VERIFY WARNING: " + w)
     if errors:
