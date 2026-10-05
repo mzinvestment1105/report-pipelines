@@ -60,15 +60,36 @@ jobs:
                   except Exception: t = CHAL
                   print(f"[d] {time.strftime('%H:%M:%S')} {tag} http={st} challenged={CHAL in t} host={pg.url.split('/')[2]}")
                   await b.close()
+          async def spa(url):
+              from urllib.parse import quote_plus, urlparse
+              async with async_playwright() as p:
+                  b, c = await fx._new_context(p, False)
+                  pg = await c.new_page()
+                  n = {"tw": 0}
+                  async def on_resp(r):
+                      if "SearchTimeline" in r.url:
+                          try: n["tw"] += len(fx._extract_tweets_from_graphql(await r.json()))
+                          except Exception: pass
+                  pg.on("response", on_resp)
+                  r = await pg.goto(url, wait_until="domcontentloaded", timeout=60000)
+                  await asyncio.sleep(6)
+                  ch = CHAL in await pg.title()
+                  u = urlparse(pg.url)
+                  q = "AI min_faves:500 lang:en -filter:replies -filter:retweets"
+                  if not ch:
+                      await pg.evaluate("p => { window.history.pushState({}, '', p); window.dispatchEvent(new PopStateEvent('popstate', {state: {}})); }", f"/search?q={quote_plus(q)}&src=typed_query&f=live")
+                      await asyncio.sleep(4)
+                      for _ in range(3):
+                          await pg.evaluate("window.scrollBy(0, document.body.scrollHeight)"); await asyncio.sleep(2)
+                  print(f"[d] spa_via {url} http={r.status if r else None} challenged={ch} landed={u.path} qkeys={list(dict(x.split('=')[0:1]*2 for x in u.query.split('&') if x).keys())} tweets={n['tw']}")
+                  await b.close()
           async def main():
-              await one("x_explore", "https://x.com/explore")
-              await one("mobile_x", "https://mobile.x.com/explore")
-              await one("twitter_com", "https://twitter.com/explore")
-              await one("x_i_flow", "https://x.com/i/flow/login")
-              await one("x_tos", "https://x.com/tos")
-              for w in (60, 120, 180):
-                  await asyncio.sleep(w - (0 if w == 60 else 60))
-                  await one(f"x_explore_after_{w}s", "https://x.com/explore")
+              for i in range(4):
+                  await one(f"r{i} x_explore", "https://x.com/explore")
+                  await one(f"r{i} twitter_com", "https://twitter.com/explore")
+                  await one(f"r{i} x_i_flow", "https://x.com/i/flow/login")
+              await spa("https://twitter.com/explore")
+              await spa("https://x.com/i/flow/login")
           asyncio.run(main())
           PY
           python /tmp/diag.py 2>&1 | grep -E "^\[d\]"
