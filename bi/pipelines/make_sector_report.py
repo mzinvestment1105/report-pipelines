@@ -117,6 +117,14 @@ def load_price_from_history(*, lookback_years: int = LOOKBACK_YEARS) -> pd.DataF
     for year in range(today.year - lookback_years, today.year + 1):
         p = hist_dir / f"{year}.parquet"
         if p.exists():
+            # 日次売買代金（Value・円）は週間売買代金の算出に使う（2026-10-05・週次ランキングの
+            # 売買代金を screening_master の古い 5 日平均から対象週の実値へ切り替え）。
+            # Value 列が無い年ファイルは欠損のまま（推計しない）。
+            try:
+                frames.append(pd.read_parquet(p, columns=cols + ["Value"]))
+                continue
+            except Exception:
+                pass
             try:
                 frames.append(pd.read_parquet(p, columns=cols))
             except Exception:
@@ -125,16 +133,18 @@ def load_price_from_history(*, lookback_years: int = LOOKBACK_YEARS) -> pd.DataF
                 df_y["AdjustmentFactor"] = 1.0
                 frames.append(df_y)
     if not frames:
-        return pd.DataFrame(columns=["Date", "Code", "O", "H", "L", "C", "V", "AdjFactor"])
+        return pd.DataFrame(columns=["Date", "Code", "O", "H", "L", "C", "V", "Val", "AdjFactor"])
     out = pd.concat(frames, ignore_index=True).rename(
         columns={"Open": "O", "High": "H", "Low": "L", "Close": "C", "Volume": "V",
-                 "AdjustmentFactor": "AdjFactor"}
+                 "Value": "Val", "AdjustmentFactor": "AdjFactor"}
     )
+    if "Val" not in out.columns:
+        out["Val"] = float("nan")
     out["Date"] = pd.to_datetime(out["Date"])
     out["Code"] = out["Code"].astype("string").str.strip().str[:4]
     cutoff = pd.Timestamp(today - timedelta(days=lookback_years * 365 + 30))
     out = out[out["Date"] >= cutoff]
-    keep = ["Date", "Code", "O", "H", "L", "C", "V", "AdjFactor"]
+    keep = ["Date", "Code", "O", "H", "L", "C", "V", "Val", "AdjFactor"]
     return out[keep].sort_values(["Code", "Date"]).reset_index(drop=True)
 
 
@@ -224,12 +234,13 @@ def fetch_price_history(codes: list[str], *, limit_codes: int = 0, lookback_days
         elif cl in ("low", "l"):          col_map[col] = "L"
         elif cl in ("close", "c"):        col_map[col] = "C"
         elif cl in ("volume", "vo", "v"): col_map[col] = "V"
+        elif cl in ("va", "turnovervalue", "value"): col_map[col] = "Val"  # 売買代金（円・2026-10-05）
         elif cl == "adjfactor":           col_map[col] = "AdjFactor"  # 分割調整係数（PM 2026-07-12）
         elif cl == "date":                col_map[col] = "Date"
         elif cl == "code":                col_map[col] = "Code"
     df = df.rename(columns=col_map)
 
-    for col in ["O", "H", "L", "C", "V", "AdjFactor"]:
+    for col in ["O", "H", "L", "C", "V", "Val", "AdjFactor"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
         else:
@@ -238,7 +249,7 @@ def fetch_price_history(codes: list[str], *, limit_codes: int = 0, lookback_days
     df["Code"] = df["Code"].astype("string").str.strip().str[:4]
     df["Date"] = pd.to_datetime(df["Date"])
 
-    keep = [c for c in ["Date", "Code", "O", "H", "L", "C", "V", "AdjFactor"] if c in df.columns]
+    keep = [c for c in ["Date", "Code", "O", "H", "L", "C", "V", "Val", "AdjFactor"] if c in df.columns]
     new_data = df[keep].copy()
 
     combined = pd.concat([cache, new_data], ignore_index=True)
@@ -447,6 +458,21 @@ def compute_stock_metrics(prices: pd.DataFrame, today: date, anchor: str = "frid
         else:
             row["Volume_W01_Avg"] = row["Volume_Change_W1vsW4"] = row["Volume_Avg5d_Price"] = float("nan")
 
+        # --- 週別売買代金（2026-10-05） ---
+        # 週次ランキングの週間売買代金（AvgDailyValue5d×5）と売買代金の前週比（ValAvg5d_BlkSeq）は、
+        # 以前は screening_master をそのまま結合した値で、screening_master の生成日の直近5営業日だった。
+        # screening_master が更新されない週は対象週と別の週の値になる（2026-10-02 号: 9/3 生成の値が
+        # 載り、3103 が 1,815 億円・日足合計 340 億円）。ここで対象週の窓（Return_W01 と同じ
+        # スロット境界）ごとに日次売買代金を集計し、build_stock_table で上書きする。
+        # 一時列（_ValSum_Wxx / _ValMean_Wxx）は build_stock_table が上書き後に落とす。
+        val = (pd.to_numeric(sub["Val"], errors="coerce") if "Val" in sub.columns
+               else pd.Series(dtype=float))
+        for w in range(1, WEEKLY_SLOTS + 1):
+            win = val[(val.index > pd.Timestamp(_week_target(w))) &
+                      (val.index <= pd.Timestamp(_week_target(w - 1)))]
+            row[f"_ValSum_W{w:02d}"] = win.sum(min_count=1)
+            row[f"_ValMean_W{w:02d}"] = win.mean()
+
         results.append(row)
 
         if i % 500 == 0 or i == total:
@@ -476,6 +502,26 @@ def build_stock_table(
     master_df = master_df.drop(columns=[c for c in drop_meta if c in master_df.columns])
 
     merged = metrics_df.merge(master_df, on="Code", how="left")
+
+    # 売買代金を対象週の実値へ置き換える（2026-10-05・compute_stock_metrics の週別売買代金を参照）。
+    # - AvgDailyValue5d = 対象週（W01 窓）の日次売買代金の合計 ÷ 5。下流（prompts/mover-weekly.md・
+    #   make_mover_report.py・theme_radar.py）は「週間売買代金 = AvgDailyValue5d × 5」で読むため、
+    #   祝日で 4 営業日の週でも ×5 が週の合計と一致するよう合計 ÷ 5 で持つ。
+    # - ValAvg5d_BlkSeqNN = 週ごとの 1 日平均売買代金（BlkSeq08 が対象週・BlkSeq07 が前週 …
+    #   screening_master と同じ向き）。make_sector_rich_md.py の売買代金の前週比が使う。
+    # 対象週の売買代金が取れない銘柄は欠損のまま（screening_master の古い値で埋めない）。
+    _val_sum_cols = [f"_ValSum_W{w:02d}" for w in range(1, WEEKLY_SLOTS + 1)]
+    _val_mean_cols = [f"_ValMean_W{w:02d}" for w in range(1, WEEKLY_SLOTS + 1)]
+    if "_ValSum_W01" in merged.columns:
+        merged["AvgDailyValue5d"] = pd.to_numeric(merged["_ValSum_W01"], errors="coerce") / 5
+        for w in range(1, WEEKLY_SLOTS + 1):
+            blk = f"ValAvg5d_BlkSeq{WEEKLY_SLOTS + 1 - w:02d}"
+            merged[blk] = pd.to_numeric(merged[f"_ValMean_W{w:02d}"], errors="coerce")
+        n_ok = int(merged["AvgDailyValue5d"].notna().sum())
+        print(f"週間売買代金: 対象週の日次売買代金から {n_ok}/{len(merged)} 銘柄を算出")
+        if n_ok == 0:
+            print("[WARN] 週間売買代金: 価格データに売買代金（Val）が無く全銘柄欠損です（screening_master の値では埋めません）")
+    merged = merged.drop(columns=[c for c in _val_sum_cols + _val_mean_cols if c in merged.columns])
 
     # 時価総額ウェイト（セクター内）
     merged["MarketCap"] = pd.to_numeric(merged.get("MarketCap", pd.Series(dtype=float)), errors="coerce")

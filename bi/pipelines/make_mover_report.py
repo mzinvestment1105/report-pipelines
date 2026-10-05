@@ -2255,7 +2255,9 @@ def build_weekly_roster_section(friday: date) -> list[str]:
                 ret_map[c] = float(v) * 100
             v = r.get("AvgDailyValue5d")
             if pd.notna(v):
-                # 週間売買代金 = 5営業日平均売買代金 × 5（prompts/mover-weekly.md と同一定義）
+                # 週間売買代金 = 5営業日平均売買代金 × 5（prompts/mover-weekly.md と同一定義）。
+                # AvgDailyValue5d は make_sector_report.py が対象週の日次売買代金の合計 ÷ 5 で作る
+                # （2026-10-05 以前は screening_master の古い 5 日平均が入っていた）。
                 turn_map[c] = float(v) * 5
             # 時価総額は**対象日（金曜）EOD** で判定する（_cr §31）。parquet の MarketCap 列は
             # 週初（Close）基準で算出されており、動意週次の誌面が使う金曜終値基準と食い違う
@@ -2383,6 +2385,9 @@ def select_weekly_roster(path: Path, master_df: pd.DataFrame, target: date | Non
     週間売買代金は price_history の Value 列の対象週合計を優先する（2026-10-02 号の誌面の
     週間売買代金はこの合計と一致し、同号の sector_stock_weekly.parquet の AvgDailyValue5d×5 とは
     4440・7014・6227・338A・2702 で食い違ったため）。price_history が無い銘柄は AvgDailyValue5d×5。
+    食い違いの原因は make_sector_report.py が screening_master の古い 5 日平均を結合していたことで、
+    2026-10-05 に同スクリプトが対象週の日次売買代金から AvgDailyValue5d を作る形へ直したため、
+    以後は両者が一致する（AvgDailyValue5d×5 が週の合計）。
     """
     if not path.exists():
         print(f"  [WARN] 週次 50 銘柄: {path} が無く選べません")
