@@ -37,6 +37,14 @@
   レイアウトが本文幅を超える表は md_to_pdf.py 側の安全弁が table-layout:fixed へ戻し、
   レイアウト監査 JS が overflow として記録する（フォント縮小はしない）。
 
+列幅の自動配分（2026-10-06 PM 承認・_cr §39）:
+  個別銘柄以外のレポートでは、等幅で収まらない 4 列以上の表と、等幅だと 3 行以上に折れる
+  セルを持つ表に、表の内容から決めた列幅をレンダラ（md_to_pdf._apply_colfit）が当てる。
+  配分はどちらも colfit_plan()（下の「列幅の自動配分」節）が決める。check_tables(md, kind=...)
+  はその配分で全セルが収まる表を合格とする（列は 7 列以内・2 行まで折り返してよい長い和文の
+  列は 2 列まで・ほかの列は 1 行・見出しは 2 行まで）。kind を渡さない呼び出し（個別銘柄の
+  ゲート）と stock / us_stock は従来の基準のまま。現行の基準に合格する表は常に合格のまま。
+
 使い方:
     from table_rules import check_tables
     for v in check_tables(md_text):
@@ -272,7 +280,103 @@ def _extract_tables(md_text: str) -> list[dict]:
     return tables
 
 
-def check_tables(md_text: str) -> list[dict]:
+def _table_violation(t: dict) -> dict | None:
+    """表 1 つを現行の基準（等幅の字数上限・5 列以上の禁止）で検査し、違反なら dict を返す。
+
+    check_tables() の判定本体を表 1 つ単位へ切り出したもの（2026-10-06。判定は変えていない）。
+    列幅の自動配分（colfit_plan）も「現行の検査に合格するか」をこの関数で判定する。
+    t は _extract_tables() の 1 要素（header / rows / header_line）。
+    """
+    header = t["header"]
+    rows = t["rows"]
+    ncols = len(header)
+    line = t["header_line"]
+
+    # 本文セル（ヘッダを除く全セル）を集める。
+    body_cells = [c for r in rows for c in r]
+    if not body_cells:
+        return None
+
+    # 除外: 本文セルが全て数値・記号のみの表（業績推移表・比較表など）。
+    # ラベル列（1 列目）は文字列でも許すため、2 列目以降で判定する。
+    # PM 2026-09-05 改定: 本文セルが空欄・記号ばかりでも、テキスト列
+    # （「割当先」「備考」「関係」等）を持つ表は数値表ではないため除外しない。
+    # 旧実装は本文セルだけを見ていたため、埋まっていないテキスト列を含む表が
+    # 「数値のみ」と誤判定されて列数・字数の検査を素通りしていた。
+    non_label = [c for r in rows for c in r[1:]] if ncols >= 2 else []
+    text_cols = [h for h in (header[1:] if ncols >= 2 else []) if _TEXT_COL.search(h)]
+    if non_label and all(_is_numeric_cell(c) for c in non_label) and not text_cols:
+        return None
+
+    # (a) 列数 5 以上
+    # 例外: 誌面骨格（agents/stock_analyst.md「誌面骨格」節）が列名・列順を固定した表は、
+    # PM 2026-09-07 承認の骨格が列数まで含めて確定させているため列数検査から外す
+    # （レンダラは cols-5/6/7 のクラスで font-size を自動縮小して折り返しを防ぐ）。
+    # 字数の検査（(b)(c)）は骨格固定表にもそのまま適用する。
+    if ncols >= 5 and not _is_skeleton_fixed_table(header):
+        longest = max(body_cells, key=_visible_len)
+        return (
+            {
+                "line": line,
+                "ncols": ncols,
+                "kind": "columns",
+                "longest": _DECOR.sub("", longest).strip()[:40],
+                "length": _visible_len(longest),
+                "limit": None,
+                "remedy": REMEDY,
+                "message": (
+                    f"L{line}: {ncols}列の表（5列以上は禁止）。"
+                    f"最長セル {_visible_len(longest)}字「"
+                    f"{_DECOR.sub('', longest).strip()[:40]}」 → 対処: {REMEDY}"
+                ),
+            }
+        )
+
+    # (b)(c) 字数上限。レンダラの誌面幅からの逆算値（2026-09-07 改定）。
+    # 本文幅 612px ÷ 列数 − 左右 padding 20px を全角 1 字 14px（10.5pt）で割る。
+    # 旧値（4 列 15 字 / 3 列以下 25 字）は誌面の実容量（4 列 9 字 / 3 列 13 字）を
+    # 超えており、規律を守った表でも折り返していた。
+    # 列幅を明示指定した表（§7 大株主表・§8 需給分析表）は列位置ごとに上限が違う。
+    limits = cell_limits(ncols, header)
+    widthed_table = (header[0].strip() if header else "", ncols) in COLUMN_WIDTHS
+    over: list[tuple[str, int]] = []  # (セル, その列の上限)
+    for r in rows:
+        for i, c in enumerate(r):
+            # 数値セルは字数の制限を受けない（PM 2026-09-10）。レンダラが
+            # class="num" を付けて white-space:nowrap にし、table-layout:auto が
+            # 内容ぶんの幅を配分するため折り返さない。旧実装は `2,000〜2,500`
+            # のような数値レンジを違反として報告していた。
+            # 列幅を % で明示指定した表は fixed のままで数値も折り返しうるため除外しない。
+            if not widthed_table and i > 0 and _is_numeric_cell(c):
+                continue
+            lim_i = limits[i] if i < len(limits) else limits[-1]
+            if _visible_len(c) > lim_i:
+                over.append((c, lim_i))
+    if over:
+        # 「上限をどれだけ超えたか」が最も大きいセルを代表として報告する。
+        longest, limit = max(over, key=lambda x: _visible_len(x[0]) - x[1])
+        widthed = (header[0].strip() if header else "", ncols) in COLUMN_WIDTHS
+        note = "・列幅指定表のため列位置ごとの上限" if widthed else ""
+        return (
+            {
+                "line": line,
+                "ncols": ncols,
+                "kind": "cell_length",
+                "longest": _DECOR.sub("", longest).strip()[:40],
+                "length": _visible_len(longest),
+                "limit": limit,
+                "remedy": REMEDY,
+                "message": (
+                    f"L{line}: {ncols}列の表に字数上限超の本文セルが{len(over)}件"
+                    f"（この列の上限{limit}字{note}）。最長 {_visible_len(longest)}字「"
+                    f"{_DECOR.sub('', longest).strip()[:40]}」 → 対処: {REMEDY}"
+                ),
+            }
+        )
+    return None
+
+
+def check_tables(md_text: str, kind: str | None = None) -> list[dict]:
     """markdown 本文の表を検査し、違反のリストを返す。
 
     各違反 dict のキー:
@@ -284,99 +388,402 @@ def check_tables(md_text: str) -> list[dict]:
       limit    … 適用した字数上限（kind == "cell_length" のとき）
       message  … 人が読む 1 行メッセージ（対処文込み）
       remedy   … 対処文
+
+    kind（2026-10-06 追加）: 送信種別名（send_report_pdf_discord.py の --kind）。
+      None（既定）… 従来どおり等幅の基準だけで判定する（個別銘柄ゲートが使う）。
+      それ以外 … 現行の基準に不合格でも、列幅の自動配分（colfit_plan）で全セルが収まる表は
+        合格とする（レンダラも同じ配分で組むため）。stock / us_stock は自動配分の対象外。
+      現行の基準に合格する表は kind に関係なく合格のまま（合格→違反の変化は起きない）。
     """
     violations: list[dict] = []
-
     for t in _extract_tables(md_text):
-        header = t["header"]
-        rows = t["rows"]
-        ncols = len(header)
-        line = t["header_line"]
-
-        # 本文セル（ヘッダを除く全セル）を集める。
-        body_cells = [c for r in rows for c in r]
-        if not body_cells:
+        v = _table_violation(t)
+        if v is None:
             continue
-
-        # 除外: 本文セルが全て数値・記号のみの表（業績推移表・比較表など）。
-        # ラベル列（1 列目）は文字列でも許すため、2 列目以降で判定する。
-        # PM 2026-09-05 改定: 本文セルが空欄・記号ばかりでも、テキスト列
-        # （「割当先」「備考」「関係」等）を持つ表は数値表ではないため除外しない。
-        # 旧実装は本文セルだけを見ていたため、埋まっていないテキスト列を含む表が
-        # 「数値のみ」と誤判定されて列数・字数の検査を素通りしていた。
-        non_label = [c for r in rows for c in r[1:]] if ncols >= 2 else []
-        text_cols = [h for h in (header[1:] if ncols >= 2 else []) if _TEXT_COL.search(h)]
-        if non_label and all(_is_numeric_cell(c) for c in non_label) and not text_cols:
-            continue
-
-        # (a) 列数 5 以上
-        # 例外: 誌面骨格（agents/stock_analyst.md「誌面骨格」節）が列名・列順を固定した表は、
-        # PM 2026-09-07 承認の骨格が列数まで含めて確定させているため列数検査から外す
-        # （レンダラは cols-5/6/7 のクラスで font-size を自動縮小して折り返しを防ぐ）。
-        # 字数の検査（(b)(c)）は骨格固定表にもそのまま適用する。
-        if ncols >= 5 and not _is_skeleton_fixed_table(header):
-            longest = max(body_cells, key=_visible_len)
-            violations.append(
-                {
-                    "line": line,
-                    "ncols": ncols,
-                    "kind": "columns",
-                    "longest": _DECOR.sub("", longest).strip()[:40],
-                    "length": _visible_len(longest),
-                    "limit": None,
-                    "remedy": REMEDY,
-                    "message": (
-                        f"L{line}: {ncols}列の表（5列以上は禁止）。"
-                        f"最長セル {_visible_len(longest)}字「"
-                        f"{_DECOR.sub('', longest).strip()[:40]}」 → 対処: {REMEDY}"
-                    ),
-                }
-            )
-            continue
-
-        # (b)(c) 字数上限。レンダラの誌面幅からの逆算値（2026-09-07 改定）。
-        # 本文幅 612px ÷ 列数 − 左右 padding 20px を全角 1 字 14px（10.5pt）で割る。
-        # 旧値（4 列 15 字 / 3 列以下 25 字）は誌面の実容量（4 列 9 字 / 3 列 13 字）を
-        # 超えており、規律を守った表でも折り返していた。
-        # 列幅を明示指定した表（§7 大株主表・§8 需給分析表）は列位置ごとに上限が違う。
-        limits = cell_limits(ncols, header)
-        widthed_table = (header[0].strip() if header else "", ncols) in COLUMN_WIDTHS
-        over: list[tuple[str, int]] = []  # (セル, その列の上限)
-        for r in rows:
-            for i, c in enumerate(r):
-                # 数値セルは字数の制限を受けない（PM 2026-09-10）。レンダラが
-                # class="num" を付けて white-space:nowrap にし、table-layout:auto が
-                # 内容ぶんの幅を配分するため折り返さない。旧実装は `2,000〜2,500`
-                # のような数値レンジを違反として報告していた。
-                # 列幅を % で明示指定した表は fixed のままで数値も折り返しうるため除外しない。
-                if not widthed_table and i > 0 and _is_numeric_cell(c):
-                    continue
-                lim_i = limits[i] if i < len(limits) else limits[-1]
-                if _visible_len(c) > lim_i:
-                    over.append((c, lim_i))
-        if over:
-            # 「上限をどれだけ超えたか」が最も大きいセルを代表として報告する。
-            longest, limit = max(over, key=lambda x: _visible_len(x[0]) - x[1])
-            widthed = (header[0].strip() if header else "", ncols) in COLUMN_WIDTHS
-            note = "・列幅指定表のため列位置ごとの上限" if widthed else ""
-            violations.append(
-                {
-                    "line": line,
-                    "ncols": ncols,
-                    "kind": "cell_length",
-                    "longest": _DECOR.sub("", longest).strip()[:40],
-                    "length": _visible_len(longest),
-                    "limit": limit,
-                    "remedy": REMEDY,
-                    "message": (
-                        f"L{line}: {ncols}列の表に字数上限超の本文セルが{len(over)}件"
-                        f"（この列の上限{limit}字{note}）。最長 {_visible_len(longest)}字「"
-                        f"{_DECOR.sub('', longest).strip()[:40]}」 → 対処: {REMEDY}"
-                    ),
-                }
-            )
-
+        if kind is not None:
+            plan = colfit_plan(t["header"], t["rows"], kind)
+            if plan["switch"]:
+                continue  # 自動配分で全セルが収まる（PDF もこの配分で組まれる）
+            if plan["problem"] and kind not in STOCK_LAYOUT_KINDS:
+                v["colfit_problem"] = plan["problem"]
+                v["message"] = (
+                    v["message"].replace("（5列以上は禁止）", "（列幅を自動配分しても収まらない）")
+                    + f"（自動配分できない理由: {plan['problem']}）"
+                )
+        violations.append(v)
     return violations
+
+
+# ---------------------------------------------------------------------------
+# 列幅の自動配分（PM 2026-10-06 承認・_cr §39）
+#
+# 背景: 個別銘柄以外のレポートのレンダラ（md_to_pdf.py の v5 組版）は table-layout:fixed で
+# 列を等幅に割るため、4 列以上の表では第 1 列の社名（「4417 グローバルセキュリティエキスパート」）
+# が 3〜4 行に折れ、数値の列は幅が余っていた。そのため _cr §39 は「和文セルを含む表は 3 列以内」
+# と定め、銘柄比較の表が 3 列ずつに細切れになっていた（PM 指摘 2026-10-05）。
+#
+# 本節は表の内容（各セルの表示幅）から列幅の配分（%）を決める唯一の関数 colfit_plan() を持つ。
+# PDF 生成（md_to_pdf._apply_colfit）と表ゲート（check_tables(kind=...)）の両方がこの関数を
+# 呼ぶため、生成と検査の判定はずれない。
+#
+# 切り替える表（後方互換を最優先・PM 承認）:
+#   等幅で現行の検査に合格する表は出力を 1 バイトも変えない。切り替えるのは
+#   (a) 4 列以上で、現行の検査（_table_violation）に不合格の表
+#   (b) 等幅だと 3 行以上に折れる本文セルがある表
+#   のうち、下の配分で全セルが収まる表だけである。個別銘柄レポート（kind stock / us_stock。
+#   v6 組版で列幅は既に内容依存）と、列幅を個別に固定した表（テーマ系の主導銘柄表・大株主表・
+#   需給分析表）は対象外。
+#
+# 配分: 数値・短い語の列は最長の値が 1 行に収まる最小幅（white-space:nowrap）を確保し、
+#   残りを長い和文の列（2 行まで折り返してよい列・最大 2 列）へ内容量に比例して配る。
+#   社名の列（「コード 社名」の列。無ければ第 1 列）には下限と上限を設ける。列見出しは 2 行まで
+#   折り返してよい。表幅は常に本文幅ちょうど（100%）。
+#
+# 等幅（table-layout:fixed）にした経緯（git b38817a7・8ed5271d）: 2026-08-30、auto レイアウトで
+#   和文の長いセルが列幅を押し広げ表の実幅が本文幅 612px を超え、Chromium がページ全体を縮小して
+#   本文 12pt が実測 8pt まで潰れた。2026-09-10 に v6 の auto ＋ nowrap を全種別へ当てた際は
+#   7〜8 列の表でセルが隣列へ重なった。本方式は fixed を保ったまま列ごとの % を与えるため表幅は
+#   本文幅を超えず、nowrap は内容幅＋余裕を確保した列にだけ当てる（どちらの不具合も再発しない）。
+# ---------------------------------------------------------------------------
+
+# 自動配分の上限（_cr §39 の数字と一致させる。片方だけを変えることを禁止する）。
+COLFIT_MAX_COLS = 7          # 列数の上限
+COLFIT_MAX_WRAP_COLS = 2     # 2 行まで折り返してよい長い和文の列の数（第 1 列を含む）
+COLFIT_WRAP_LINES = 2        # 長い和文の列のセルの行数の上限（ほかの列は 1 行）
+COLFIT_HEADER_LINES = 2      # 列見出しの行数の上限
+COLFIT_HEADER_MIN_CHARS = 4  # 見出しを折る時も 1 行に全角 4 字ぶんを残す（「順／位」の 1 字折れを防ぐ）
+COLFIT_NAME_MIN_PCT = 20.0   # 社名の列の下限（1 行で収まる幅がこれ未満ならその幅）
+COLFIT_NAME_MAX_PCT = 45.0   # 社名の列の上限
+COLFIT_SLACK_PX = 4.0        # 1 列あたりの推定誤差の余裕
+
+# 自動配分を当てない種別（v6 組版 = table-layout:auto で列幅が既に内容依存・凍結フォーマット）。
+# send_report_pdf_discord.py の送信種別名と md_to_pdf.py の組版種別名の両方を持つ。
+STOCK_LAYOUT_KINDS = frozenset({"stock", "us_stock"})
+
+# md_to_pdf.py の v5 組版（個別銘柄以外）の実寸。片方だけを変えることを禁止する。
+#   table { font-size:10.5pt }・cols-5 { 9.5pt }・cols-6 { 9pt }・cols-7 { 8.5pt }・cols-8plus { 8pt }
+#   tbody td { padding:5px 8px }・cols-5 以上は { padding:5px 6px }
+#   thead th { padding:6px 9px }・cols-5 以上は { padding:6px 7px }
+#   body { letter-spacing:.04em }（本文 12pt=16px で計算され 0.64px が表へ継承される）
+_V5_FONT_PT = {5: 9.5, 6: 9.0, 7: 8.5}
+_V5_FONT_PT_DEFAULT = 10.5
+_V5_FONT_PT_8PLUS = 8.0
+_LETTER_SPACING_PX = 0.64
+# 字面の幅（em）。上の Playwright 実測（_W_* の元の px 値）から字間 0.64px を除き 14px で割った値。
+_EM_DIGIT = (9.34 - 0.64) / 14.0
+_EM_ALPHA = (8.72 - 0.64) / 14.0
+_EM_SYM = (8.39 - 0.64) / 14.0
+_EM_SPACE = (3.9 - 0.64) / 14.0
+_HEADER_BOLD = 1.04  # 列見出しは太字のため 4% 広く見積もる
+# 符号はレンダラが全角の ＋／▼ へ正規化するため全角で見積もる（md 上の + - のままでも同じ幅になる）。
+_SIGN_CHARS = frozenset("+-−–—")
+# 行頭に来られない字（line-break:strict の禁則。直前の塊へ寄せる）と行末に来られない字（直後へ寄せる）。
+_NO_START = frozenset(
+    "）)」』】〕〉》］]｝}、。，．,.・：；:;！？!?ー〜～%％"
+    "ぁぃぅぇぉっゃゅょゎゕゖァィゥェォッャュョヮヵヶ々ゝゞヽヾ"
+)
+_NO_END = frozenset("（(「『【〔〈《［[｛{＋+▼▲△▽−-￥¥$＄#＃")
+_MD_LINK = re.compile(r"\[([^\]]*)\]\([^)]*\)")
+
+
+def colfit_plain(cell: str) -> str:
+    """md のセル文字列・HTML のセル内容のどちらからも同じ表示文字列を作る。"""
+    import html as _html
+
+    s = _MD_LINK.sub(r"\1", cell or "")
+    s = _DECOR.sub("", s)
+    s = _html.unescape(s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _v5_metrics(ncols: int) -> tuple[float, float, float]:
+    """(表の文字 px, 本文セルの左右 padding 合計, 見出しセルの左右 padding 合計)。"""
+    if ncols >= 8:
+        pt = _V5_FONT_PT_8PLUS
+    else:
+        pt = _V5_FONT_PT.get(ncols, _V5_FONT_PT_DEFAULT)
+    small = ncols >= 5
+    return pt * 4.0 / 3.0, (12.0 if small else 16.0), (14.0 if small else 18.0)
+
+
+def _glyph_px(ch: str, font_px: float) -> float:
+    if ch in _SIGN_CHARS:
+        em = 1.0
+    elif ch == " ":
+        em = _EM_SPACE
+    elif ord(ch) < 128:
+        em = _EM_DIGIT if ch.isdigit() else (_EM_ALPHA if ch.isalpha() else _EM_SYM)
+    else:
+        em = 1.0
+    return em * font_px + _LETTER_SPACING_PX
+
+
+def _is_word_char(ch: str) -> bool:
+    """改行できない語を作る字（半角の英数記号・ギリシャ文字・全角数字）。"""
+    o = ord(ch)
+    return (o < 128 and ch != " ") or 0x0370 <= o <= 0x03FF or 0xFF10 <= o <= 0xFF19
+
+
+def _atoms(text: str, font_px: float, scale: float = 1.0) -> list[list]:
+    """改行してよい位置で区切った塊 [幅px, 空白か] の列（禁則は保守的に塊へ寄せる）。"""
+    atoms: list[list] = []
+    glue_next = False
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch in (" ", "　"):
+            atoms.append([_glyph_px(ch, font_px) * scale, True])
+            glue_next = False
+            i += 1
+            continue
+        if _is_word_char(ch):
+            j = i
+            while j < n and _is_word_char(text[j]):
+                j += 1
+        else:
+            j = i + 1
+        seg = text[i:j]
+        w = sum(_glyph_px(c, font_px) for c in seg) * scale
+        if atoms and not atoms[-1][1] and (glue_next or seg[0] in _NO_START):
+            atoms[-1][0] += w
+        else:
+            atoms.append([w, False])
+        glue_next = seg[-1] in _NO_END
+        i = j
+    return atoms
+
+
+def _one_line_px(atoms: list[list]) -> float:
+    """1 行に収めた時の幅（先頭・末尾の空白を除く）。"""
+    idx = [k for k, a in enumerate(atoms) if not a[1]]
+    if not idx:
+        return 0.0
+    return sum(a[0] for a in atoms[idx[0]: idx[-1] + 1])
+
+
+def _count_lines(atoms: list[list], avail: float) -> int:
+    """幅 avail に左から詰めた時の行数（ブラウザの行分割と同じ先頭からの詰め方）。"""
+    import math
+
+    if not any(not a[1] for a in atoms):
+        return 0
+    avail = max(avail, 1.0)
+    lines, cur, pend, started = 1, 0.0, 0.0, False
+    for w, sp in atoms:
+        if sp:
+            if started:
+                pend += w
+            continue
+        if started and cur + pend + w <= avail + 1e-6:
+            cur += pend + w
+        else:
+            if started:
+                lines += 1
+            if w > avail + 1e-6:  # 1 塊が行幅を超える（overflow-wrap で塊の途中で折れる）
+                extra = math.ceil(w / avail - 1e-9) - 1
+                lines += extra
+                cur = w - extra * avail
+            else:
+                cur = w
+            started = True
+        pend = 0.0
+    return lines
+
+
+def _min_px(atoms: list[list], lines: int) -> float:
+    """lines 行以内に収まる最小の内容幅（px）。"""
+    one = _one_line_px(atoms)
+    if lines <= 1 or one == 0.0:
+        return one
+    lo = max(a[0] for a in atoms if not a[1])
+    hi = one
+    if _count_lines(atoms, lo) <= lines:
+        return lo
+    for _ in range(40):
+        mid = (lo + hi) / 2
+        if _count_lines(atoms, mid) <= lines:
+            hi = mid
+        else:
+            lo = mid
+    return hi
+
+
+def fixed_width_table(header: list[str]) -> str | None:
+    """列幅を個別に固定した表なら、その表のクラス名を返す（自動配分の対象外）。
+
+    md_to_pdf.py の _tag_theme_tables（テーマ系）と _TABLE_COLS_CLASS_JS（大株主表・需給分析表）の
+    判定と同じ条件である。片方だけを変えることを禁止する。
+    """
+    hs = [colfit_plain(h) for h in header]
+    n = len(hs)
+    head = "".join(hs)
+    if n == 5 and "コード" in head and "何の会社" in head and "時価総額" in head and "材料" not in head:
+        return "theme-lead"
+    if n == 6 and "コード" in head and "何の会社" in head and "材料" in head:
+        return "theme-solo"
+    if "動いた理由" in head and "主導銘柄" in head and ((n >= 6 and "局面" in head) or n == 3):
+        return "theme-heat" if n >= 6 else "theme-today"
+    if n and hs[0] == "株主名" and "会社との関係" in hs and n in (3, 4):
+        return "shareholders" if n == 4 else "shareholders3"
+    if n == 4 and hs[:3] == ["軸", "指標", "現状"]:
+        return "demand"
+    return None
+
+
+def colfit_plan(header: list[str], rows: list[list[str]], kind: str | None) -> dict:
+    """表 1 つの列幅の配分を決める（PDF 生成と表ゲートが共有する唯一の判定）。
+
+    header / rows は md のセル文字列。kind は送信種別名（send_report_pdf_discord.py の --kind）
+    または組版種別名（md_to_pdf の kind）。
+
+    返り値のキー:
+      switch    … True なら自動配分を当てる（PDF はこの配分で組み、表ゲートは合格とする）
+      widths    … 列幅（%・合計 100）。switch のときだけ値を持つ
+      wrap_cols … 2 行まで折り返してよい列の位置（0 始まり）。ほかの列は 1 行（nowrap）
+      problem   … 自動配分を当てない理由（人が読む 1 文）
+      trigger   … "4cols_fail"（4 列以上で現行の検査に不合格）/ "equal_3lines"（等幅で 3 行以上）/ None
+      equal_max_lines … 等幅で組んだ時の本文セルの最大行数（推定）
+    """
+    ncols = len(header)
+    plan: dict = {
+        "ncols": ncols, "switch": False, "widths": None, "wrap_cols": [],
+        "problem": None, "trigger": None, "equal_max_lines": None, "old_ok": None,
+    }
+    if not kind or kind in STOCK_LAYOUT_KINDS:
+        plan["problem"] = "個別銘柄レポートは自動配分の対象外"
+        return plan
+    if ncols < 2:
+        return plan
+    fixed = fixed_width_table(header)
+    if fixed:
+        plan["problem"] = f"列幅を個別に固定した表（{fixed}）"
+        return plan
+    body = [[colfit_plain(r[j]) if j < len(r) else "" for j in range(ncols)] for r in rows]
+    if not any(c for r in body for c in r):
+        return plan
+    old_ok = _table_violation({"header": header, "rows": rows, "header_line": 0}) is None
+    plan["old_ok"] = old_ok
+    font_px, td_pad, th_pad = _v5_metrics(ncols)
+    W = float(BODY_WIDTH_PX)
+
+    cell_atoms = [[_atoms(c, font_px) for c in r] for r in body]
+    eq_avail = W / ncols - td_pad
+    eq_lines = max((_count_lines(a, eq_avail) for r in cell_atoms for a in r), default=0)
+    plan["equal_max_lines"] = eq_lines
+    if eq_lines >= 3:
+        plan["trigger"] = "equal_3lines"
+    elif ncols >= 4 and not old_ok:
+        plan["trigger"] = "4cols_fail"
+    else:
+        if not old_ok:
+            plan["problem"] = "3 列以下の表は等幅で組むため従来の字数上限が当たる"
+        return plan
+    if ncols > COLFIT_MAX_COLS:
+        plan["problem"] = f"{ncols} 列（上限 {COLFIT_MAX_COLS} 列）"
+        return plan
+
+    slack = COLFIT_SLACK_PX
+    need1 = [max((_one_line_px(r[j]) for r in cell_atoms), default=0.0) + td_pad + slack
+             for j in range(ncols)]
+    need2 = [max((_min_px(r[j], COLFIT_WRAP_LINES) for r in cell_atoms), default=0.0) + td_pad + slack
+             for j in range(ncols)]
+    numeric = [all(_is_numeric_cell(r[j]) for r in body) for j in range(ncols)]
+    hmin = []
+    for j in range(ncols):
+        ha = _atoms(colfit_plain(header[j]), font_px, _HEADER_BOLD)
+        h1 = _one_line_px(ha) + th_pad + slack
+        h2 = _min_px(ha, COLFIT_HEADER_LINES) + th_pad + slack
+        hcap = COLFIT_HEADER_MIN_CHARS * (font_px + _LETTER_SPACING_PX) * _HEADER_BOLD + th_pad + slack
+        hmin.append(min(h1, max(h2, hcap)))
+    name_col = None
+    for j in range(ncols):
+        if sum(_code_with_name(r[j]) for r in body) >= 0.6 * len(body):
+            name_col = j
+            break
+    if name_col is None and not numeric[0]:
+        name_col = 0
+    name_lo = name_hi = 0.0
+    if name_col is not None:
+        name_lo = min(need1[name_col], W * COLFIT_NAME_MIN_PCT / 100)
+        name_hi = W * COLFIT_NAME_MAX_PCT / 100
+
+    def _mins(wrap: tuple) -> list | None:
+        m = []
+        for j in range(ncols):
+            v = max(need2[j] if j in wrap else need1[j], hmin[j])
+            if j == name_col:
+                v = max(v, name_lo)
+                if v > name_hi + 1e-6:
+                    return None
+            m.append(v)
+        return m
+
+    from itertools import combinations
+
+    cands = [j for j in range(ncols) if not numeric[j]]
+    best = None
+    for k in range(0, COLFIT_MAX_WRAP_COLS + 1):
+        for combo in combinations(cands, k):
+            m = _mins(combo)
+            if m is None or sum(m) > W + 1e-6:
+                continue
+            if best is None or sum(m) < sum(best[1]) - 1e-9:
+                best = (combo, m)
+        if best is not None:
+            break
+    if best is None:
+        n_long = sum(1 for j in cands if need1[j] > W / ncols)
+        if n_long > COLFIT_MAX_WRAP_COLS:
+            plan["problem"] = (
+                f"1 行に収まらない文字の列が {n_long} 列ある（{COLFIT_WRAP_LINES} 行まで折り返せるのは"
+                f" {COLFIT_MAX_WRAP_COLS} 列まで）"
+            )
+        else:
+            plan["problem"] = (
+                f"長い列（最大 {COLFIT_MAX_WRAP_COLS} 列）を {COLFIT_WRAP_LINES} 行・ほかの列を 1 行に"
+                "収めると本文幅を超える"
+            )
+        return plan
+
+    wrap, widths = best[0], list(best[1])
+    caps = [W] * ncols
+    if name_col is not None:
+        caps[name_col] = name_hi
+    left = W - sum(widths)
+    # 余りはまず折り返す列を 1 行に収まる幅まで（内容量に比例して）広げ、残りを全列へ幅に比例して配る。
+    grow = {j: min(need1[j], caps[j]) - widths[j] for j in wrap}
+    grow = {j: g for j, g in grow.items() if g > 0}
+    tot = sum(grow.values())
+    if tot > 0:
+        take = min(left, tot)
+        for j, g in grow.items():
+            widths[j] += take * g / tot
+        left -= take
+    for _ in range(ncols + 1):
+        if left <= 1e-6:
+            break
+        room = [j for j in range(ncols) if widths[j] < caps[j] - 1e-6]
+        if not room:
+            break
+        base = sum(widths[j] for j in room)
+        given = 0.0
+        for j in room:
+            add = min(left * widths[j] / base, caps[j] - widths[j])
+            widths[j] += add
+            given += add
+        left -= given
+    pct = [round(w / W * 100, 1) for w in widths]
+    diff = round(100.0 - sum(pct), 1)
+    if diff:
+        j = max(range(ncols), key=lambda k: (k in wrap, pct[k]))
+        pct[j] = round(pct[j] + diff, 1)
+    plan.update(switch=True, widths=pct, wrap_cols=list(wrap))
+    return plan
+
+
+def extract_tables(md_text: str) -> list[dict]:
+    """md の表を抽出する（公開名。md_to_pdf.py が自動配分の判定に使う）。"""
+    return _extract_tables(md_text)
 
 
 # ---------------------------------------------------------------------------
@@ -576,6 +983,7 @@ CODE_ONLY_BLOCKING_KINDS = frozenset({"stock", "us_stock"})
 def gate_report_tables(md_text: str, kind: str) -> tuple[list[str], list[str]]:
     """レポート種別を問わず表を検査し (errors, warnings) を返す。
 
+    折り返す表（check_tables）は kind を渡して判定する（列幅の自動配分で収まる表は合格。2026-10-06）。
     折り返す表（check_tables）は kind が BLOCKING_KINDS に含まれる場合のみ errors へ入れ、
     それ以外の種別は warnings へ入れて送信を継続させる（_cr §36）。
     銘柄コードだけの表（check_code_only_tables）は kind が CODE_ONLY_BLOCKING_KINDS に
@@ -584,7 +992,7 @@ def gate_report_tables(md_text: str, kind: str) -> tuple[list[str], list[str]]:
     """
     errors: list[str] = []
     warnings: list[str] = []
-    violations = check_tables(md_text)
+    violations = check_tables(md_text, kind)
     if violations:
         msgs = [f"表の折り返し: {v['message']}" for v in violations]
         if kind in BLOCKING_KINDS:
@@ -651,7 +1059,7 @@ def _main(argv: list[str] | None = None) -> int:
         print("NG   " + m)
     print(
         f"銘柄コードだけの表: {len(code_only)} 件 / "
-        f"折り返す表: {len(check_tables(text))} 件 / "
+        f"折り返す表: {len(check_tables(text, args.kind))} 件 / "
         f"判定: {'FAIL' if errors else 'PASS'}（種別 {args.kind}）"
     )
     return 1 if errors else 0

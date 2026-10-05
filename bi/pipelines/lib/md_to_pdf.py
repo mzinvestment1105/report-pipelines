@@ -1036,6 +1036,104 @@ def _tag_theme_tables(html: str) -> str:
     return re.sub(r"<table>.*?</table>", _repl, html, flags=re.DOTALL)
 
 
+# ── 列幅の自動配分（PM 2026-10-06 承認・_cr §39）──────────────────────
+# v5 組版（個別銘柄以外）の table-layout:fixed は列を等幅に割るため、4 列以上の表では
+# 「コード 社名」の列が 3〜4 行に折れ、数値の列は幅が余っていた。等幅で収まらない表だけ、
+# 表の内容から決めた列幅（%）を与える。どの表に当てるか・何 % にするかは表ゲートと同じ
+# bi/pipelines/lib/table_rules.py の colfit_plan() が唯一の正（生成と検査の判定がずれない）。
+# 等幅で収まる表・個別銘柄レポート（kind=stock）・列幅を個別に固定した表（theme-lead 等）は
+# 一切変えない（HTML も CSS も 1 バイトも変わらない。CSS は自動配分した表がある号だけに足す）。
+# table-layout:fixed は保つため表幅は本文幅を超えず（2026-08-30 のページ全体縮小を再発させない）、
+# nowrap は内容幅＋余裕を確保した 1 行の列にだけ当てる（2026-09-10 の隣列への重なりを再発させない）。
+_COLFIT_BASE_CSS = """
+/* 列幅の自動配分（PM 2026-10-06・_cr §39）。等幅で収まらない表だけに付く。
+   列幅は table_rules.colfit_plan() が内容から決める。1 行に収める列（数値・短い語）は nowrap。
+   2 行に折れる本文セルは行の長さを揃え（balance）、見出しは 2 行目に 1 字だけ残る折れ方を避ける（pretty）。
+   どちらも行数は変えない。 */
+table.colfit { table-layout:fixed; }
+table.colfit thead th { text-wrap:pretty; }
+table.colfit tbody td { text-wrap:balance; }
+"""
+_RE_HTML_TABLE = re.compile(r"<table\b[^>]*>.*?</table>", re.S)
+_RE_HTML_TH = re.compile(r"<th\b[^>]*>(.*?)</th>", re.S)
+
+
+def _apply_colfit(html_body: str, body_md: str, kind: str) -> tuple[str, str]:
+    """等幅で収まらない表へ列幅の自動配分を当て、(html_body, 追加する CSS) を返す。
+
+    判定は md の表（body_md）に対して table_rules.colfit_plan() で行い（表ゲートと同じ入力）、
+    HTML の表とは「列見出しと行数の一致」で先頭から順に対応づける（一致しない表は触らない）。
+    対象の表は開始タグを `<table class="colfit colfit-N" data-colfit-wrap="…">` へ替えるだけで、
+    セルの中身は変えない。data-colfit-wrap は 2 行まで折り返してよい列（0 始まり）で、
+    誌面の実測検査（_LAYOUT_AUDIT_JS）がその列だけ 2 行を許すために読む。
+    """
+    if kind == "stock":
+        return html_body, ""
+    try:
+        try:
+            from . import table_rules as _tr
+        except ImportError:  # lib をパッケージとして経由せず単体で import された場合
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            import table_rules as _tr  # type: ignore[no-redef]
+        md_tables = _tr.extract_tables(body_md)
+        md_heads = [[_tr.colfit_plain(c) for c in t["header"]] for t in md_tables]
+    except Exception as e:  # noqa: BLE001
+        print(f"[md_to_pdf] colfit skipped: {e}", file=sys.stderr)
+        return html_body, ""
+    rules: list[str] = []
+    state = {"ptr": 0, "n": 0}
+
+    def _repl(m: "re.Match[str]") -> str:
+        table_html = m.group(0)
+        if "</thead>" not in table_html:
+            return table_html
+        head_html, rest = table_html.split("</thead>", 1)
+        heads = [_tr.colfit_plain(h) for h in _RE_HTML_TH.findall(head_html)]
+        n_rows = rest.count("<tr")
+        hit = None
+        for i in range(state["ptr"], len(md_tables)):
+            if md_heads[i] == heads and len(md_tables[i]["rows"]) == n_rows:
+                hit = i
+                break
+        if hit is None:
+            return table_html
+        state["ptr"] = hit + 1
+        if not table_html.startswith("<table>"):
+            return table_html  # 既にクラスを持つ表（テーマ系の列幅固定の表）は触らない
+        t = md_tables[hit]
+        try:
+            plan = _tr.colfit_plan(t["header"], t["rows"], kind)
+        except Exception as e:  # noqa: BLE001
+            print(f"[md_to_pdf] colfit plan failed: {e}", file=sys.stderr)
+            return table_html
+        if not plan.get("switch") or len(plan.get("widths") or []) != len(heads):
+            return table_html
+        state["n"] += 1
+        n = state["n"]
+        sel = f"table.colfit-{n}"
+        for k, pct in enumerate(plan["widths"], start=1):
+            rules.append(f"{sel} th:nth-child({k}), {sel} td:nth-child({k}) {{ width:{pct:.1f}%; }}")
+        nowrap = [k + 1 for k in range(len(heads)) if k not in plan["wrap_cols"]]
+        if nowrap:
+            rules.append(
+                ", ".join(f"table.colfit.colfit-{n} tbody td:nth-child({k})" for k in nowrap)
+                + " { white-space:nowrap; }"
+            )
+        wrap_attr = ",".join(str(j) for j in plan["wrap_cols"])
+        return table_html.replace(
+            "<table>", f'<table class="colfit colfit-{n}" data-colfit-wrap="{wrap_attr}">', 1
+        )
+
+    new_html = _RE_HTML_TABLE.sub(_repl, html_body)
+    if not state["n"]:
+        return html_body, ""
+    print(
+        f"[md_to_pdf] colfit tables: {state['n']}（等幅で収まらない表へ列幅の自動配分を当てた）",
+        file=sys.stderr,
+    )
+    return new_html, _COLFIT_BASE_CSS + "\n".join(rules) + "\n"
+
+
 # ── 折り返し表のカード変換（2026-09-07 廃止・定義のみ残置）────────────────────
 # 【廃止】本 JS は render_markdown_to_pdf() から呼ばれない（PM 2026-09-07）。
 # PM がカード形式を承認していないため、レンダラは表を常に表として出力する。
@@ -1315,6 +1413,8 @@ _TABLE_CARDIFY_JS = r"""
 _LAYOUT_AUDIT_JS = r"""
 () => {
   const WRAP_FACTOR = 1.6;
+  // 列幅の自動配分（table.colfit・2026-10-06）の表で 2 行まで折り返してよい列の上限（3 行目で違反）。
+  const WRAP_FACTOR_COLFIT = 2.6;
   const NUMERIC = /^[\s0-9,.+\-±%％〜～~/（）()円株倍日年月期件回名口万億兆千百人時分秒中間予想末初pt―ー—–−]*$/;
   const lineHeightOf = (el) => {
     const cs = getComputedStyle(el);
@@ -1345,6 +1445,11 @@ _LAYOUT_AUDIT_JS = r"""
         refit: t.classList.contains('overflow-fixed'),
       });
     }
+    // 列幅の自動配分の表: data-colfit-wrap の列だけ 2 行を許し、1 行の列（nowrap）は
+    // 枠からのはみ出し（隣列への重なり）を overflow として記録する（2026-10-06）。
+    const isColfit = t.classList.contains('colfit');
+    const colfitWrap = (t.getAttribute('data-colfit-wrap') || '')
+      .split(',').filter((s) => s !== '').map(Number);
     // 1 列目（i=0）も含めて全ての本文セルを測る（PM 2026-09-10）。
     for (const tr of bodyRowsOf(t)) {
       for (let i = 0; i < tr.cells.length; i++) {
@@ -1356,7 +1461,8 @@ _LAYOUT_AUDIT_JS = r"""
         while (c.firstChild) sp.appendChild(c.firstChild);
         c.appendChild(sp);
         const r = sp.getBoundingClientRect().height / lineHeightOf(c);
-        if (r > WRAP_FACTOR) {
+        const wrapOk = isColfit && colfitWrap.indexOf(i) >= 0;
+        if (r > (wrapOk ? WRAP_FACTOR_COLFIT : WRAP_FACTOR)) {
           wrapped.push({
             table: heads[0] || '',
             col: heads[i] || String(i),
@@ -1364,6 +1470,16 @@ _LAYOUT_AUDIT_JS = r"""
             text: txt.slice(0, 40),
             lines: Math.round(r * 100) / 100,
             numeric: NUMERIC.test(txt),
+          });
+        }
+        if (isColfit && !wrapOk && sp.scrollWidth > sp.clientWidth + 1) {
+          overflow.push({
+            table: heads[0] || '',
+            cols: heads.length,
+            width_px: sp.scrollWidth,
+            avail_px: sp.clientWidth,
+            refit: false,
+            cell: txt.slice(0, 40),
           });
         }
       }
@@ -1434,8 +1550,12 @@ def render_markdown_to_pdf(
   <div class="meta"><span class="brand">{brand}</span>{('　｜　' + date_label) if date_label else ''}</div>
 </header>"""
 
+    # 列幅の自動配分（PM 2026-10-06・_cr §39）。等幅で収まらない表だけ、列幅を内容から配分する。
+    # 判定は表ゲートと同じ table_rules.colfit_plan()。対象の表が無い号は HTML・CSS とも変わらない。
+    html_body, colfit_css = _apply_colfit(html_body, body_md, kind)
+
     full_html = f"""<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"/>
-<style>{_font_face_css()}{_layout_css(accent, sans_stack, serif_stack, kind)}</style></head>
+<style>{_font_face_css()}{_layout_css(accent, sans_stack, serif_stack, kind)}{colfit_css}</style></head>
 <body>{masthead}{html_body}</body></html>"""
 
     footer_tpl = (
