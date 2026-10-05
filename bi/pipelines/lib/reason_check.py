@@ -18,6 +18,7 @@ PM 2026-10-04 承認（dev/drafts/2026-10-04_dev_mover_reason_fix_plan.md §3-D�
         直近 3 か月の表 2 にだけある過去の開示は、最大変動日の理由に流用した場合だけ検査する（経緯としての
         言及は許す。PM 承認済みサンプル mover_sample_7256_v2.md §4 の 8/14 決算の言及がこれに当たる）。
       ※ 割当日の 2σ 閾値が facts に無い日（上場から日が浅い銘柄等）は (b-1) を判定せず警告にする（2026-10-05 追加）。
+      ※ 場中開示の post_new_extreme が null（5 分足が取れず判定不能）の開示は (b-3) を判定せず警告にする（2026-10-05 追加）。
   (c) 推測語が出所付き引用 `{媒体}は「…」` の外にある                        … 不合格
   (d) 「材料は確認できず」を含む文（と直後の 1 文）で、創作理由の典型語が
       出所付き引用の外に出る                                              … 不合格
@@ -335,6 +336,11 @@ def _check_entry(ent: dict, st: dict, fs: list[Failure]) -> None:
                 if d.get("intraday"):
                     if "post_new_extreme" not in d:
                         add("b", "warn", f"開示「{title[:20]}」に post_new_extreme が無い（(b-3) を飛ばす）")
+                    elif d.get("post_new_extreme") is None:
+                        # 2026-10-05: 場中の 5 分足が取れず ETL が更新の有無を判定できなかった開示（値 null。
+                        # 終日値幅制限に張り付いた日など）は「更新していない」と扱わず警告に回す（402A の誤検知対策）。
+                        add("b", "warn", f"開示「{title[:20]}」（{_md(adate)}）: 場中の値動きが取れず (b-3) を判定できず",
+                            title=title, assigned_date=adate)
                     elif not d.get("post_new_extreme"):
                         pe = d.get("pre_extreme")
                         pt = d.get("pre_extreme_time")
