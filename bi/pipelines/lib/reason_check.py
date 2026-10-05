@@ -19,6 +19,8 @@ PM 2026-10-04 承認（dev/drafts/2026-10-04_dev_mover_reason_fix_plan.md §3-D�
         言及は許す。PM 承認済みサンプル mover_sample_7256_v2.md §4 の 8/14 決算の言及がこれに当たる）。
       ※ 割当日の 2σ 閾値が facts に無い日（上場から日が浅い銘柄等）は (b-1) を判定せず警告にする（2026-10-05 追加）。
       ※ 場中開示の post_new_extreme が null（5 分足が取れず判定不能）の開示は (b-3) を判定せず警告にする（2026-10-05 追加）。
+      ※ 似た表題の開示（同じ案件の続報・前期の決算短信等）が同じ文に当たる場合は、全文が出た方、または
+        一致度が高い方の開示だけを「触れた」とする（2026-10-05 追加・`_mentions_disclosure`）。
   (c) 推測語が出所付き引用 `{媒体}は「…」` の外にある                        … 不合格
   (d) 「材料は確認できず」を含む文（と直後の 1 文）で、創作理由の典型語が
       出所付き引用の外に出る                                              … 不合格
@@ -184,6 +186,45 @@ def _mentions_title(title: str, text: str) -> bool:
     return hit / len(grams) >= 0.6
 
 
+def _verbatim_title(title: str, text: str) -> bool:
+    """表題の全文（NFKC・空白除去）がそのまま本文に出ているか。"""
+    tt = re.sub(r"\s+", "", _norm(title))
+    return len(tt) >= 6 and tt in re.sub(r"\s+", "", _norm(text))
+
+
+def _mentions_disclosure(title: str, text: str, all_titles: list[str]) -> bool:
+    """`_mentions_title` に、似た表題の別開示との取り違えの除外を足したもの（2026-10-05 追加）。
+
+    本表題と似た表題の別開示（同じ案件の続報・前期の決算短信など）について、文がその表題を全文そのまま
+    引いている、または言い換えでもそちらの方が一致度（中核語の 2 文字連なりの一致割合）が高い場合は、
+    文が指しているのはそちらの開示とみなし、本表題には触れていない扱いにする
+    （4004 の「パーシャル・スピンオフの実行完了」・3549 の第 1 四半期決算短信の誤検知対策）。
+    """
+    if _verbatim_title(title, text):
+        return True
+    if not _mentions_title(title, text):
+        return False
+    my_score = _title_score(title, text)
+    for other in all_titles:
+        if other == title or not _mentions_title(title, other):
+            continue
+        # 似た表題の別開示が全文で出ている、または言い換えでもそちらの方が一致度が高い
+        if _verbatim_title(other, text) or (
+                _mentions_title(other, text) and _title_score(other, text) > my_score):
+            return False
+    return True
+
+
+def _title_score(title: str, text: str) -> float:
+    """表題の中核語の 2 文字連なりのうち本文に出る割合（似た表題どうしの比較用）。"""
+    core = _title_core(title)
+    if len(core) < 2:
+        return 0.0
+    t_core = "".join(ch for ch in _norm(text) if ch not in "のとおよびにをはがでへや及並")
+    grams = {core[i:i + 2] for i in range(len(core) - 1)}
+    return sum(1 for g in grams if g in t_core) / len(grams)
+
+
 # --- facts の読込・参照 -----------------------------------------------------
 def load_facts(path: str | Path) -> dict:
     with open(path, encoding="utf-8") as f:
@@ -288,6 +329,8 @@ def _check_entry(ent: dict, st: dict, fs: list[Failure]) -> None:
     if not week and not m3:
         add("b", "warn", "facts に week_days / month3_days が無い（(b)(e) を飛ばす）")
     seen: set[tuple[str, str]] = set()
+    all_titles = sorted({d.get("title") or "" for rr in (week, m3) for r in rr
+                         for d in (r.get("disclosures") or []) if d.get("title")})
     for scope, rows in (("week", week), ("month3", m3)):
         for r in rows:
             for d in (r.get("disclosures") or []):
@@ -296,10 +339,10 @@ def _check_entry(ent: dict, st: dict, fs: list[Failure]) -> None:
                 if not title or (title, adate) in seen:
                     continue
                 seen.add((title, adate))
-                hit_sents = [s for s in sents if _mentions_title(title, s)]
+                hit_sents = [s for s in sents if _mentions_disclosure(title, s, all_titles)]
                 if not hit_sents:
                     continue
-                in_lead = any(_mentions_title(title, s) for s in lead_segs)
+                in_lead = any(_mentions_disclosure(title, s, all_titles) for s in lead_segs)
                 if scope == "month3" and adate not in week_dates:
                     # 過去の開示は「最大変動日の理由」に流用した場合だけ検査する
                     # （冒頭の 1 文、または `{最大変動日}（曜）±X%：` に続く材料欄に出た場合）
