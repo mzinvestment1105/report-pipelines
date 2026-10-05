@@ -314,6 +314,9 @@ jobs:
           ec=$?
           set -e
           echo "exit_code=${ec}"
+          # 2026-10-05: 入口ページの成否（Cloudflare のボット検証画面に当たったか）と件数だけを出す。
+          # [entry]/[cf]/[stats] 行は試行回数・HTTP ステータス・件数のみでアカウント名を含まない。
+          grep -E '^\[(entry|cf|stats)\]' buzz.log || true
           if ls ../outputs/x_posts/gha/buzz_*.json >/dev/null 2>&1; then
             echo "buzz_json_exists=true"
           else

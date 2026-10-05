@@ -175,8 +175,9 @@ jobs:
 
       - name: Check prerequisite (バズ収集素材の存在と記事レーンの中身)
         id: precheck
-        # 素材が無い日・記事レーンが空の日は生成しない。夕刊マクロと同じく warning で skip し
-        # ジョブは成功扱いで終える（素材欠落は daily_data_sync 側の問題であり二重通知しない）。
+        # 素材が無い日・記事レーンが空の日は生成しない（ジョブは成功扱いで終える）。
+        # 2026-10-05: 記事候補 0 件のまま成功扱いで黙って何も出さない状態が 9/6 から続いていたため、
+        # 生成しない日は直後の「Discord 通知（🚨 素材の記事候補 0 件）」で BI へ状態通知する（cause を渡す）。
         env:
           TARGET_DATE: ${{ steps.date.outputs.value }}
           PYTHONIOENCODING: utf-8
@@ -188,10 +189,12 @@ jobs:
           else
             echo "::warning::当日のバズ収集 JSON が無いため AI レーンツイート生成をスキップします: ${TARGET_DATE}"
             echo "ready=false" >> $GITHUB_OUTPUT
+            echo "cause=当日のバズ収集データ（記事候補の素材）が保存されていません。" >> $GITHUB_OUTPUT
             exit 0
           fi
           # 記事本文が 120 字以上ある候補が 1 件以上あるか（無ければ書けない・ルール #22）
-          N=$(python - "$BUZZ" <<'PY'
+          # 2 行目は X 検索の取得件数（raw）の合計。0 なら取得段階の失敗、1 以上なら本文取得・絞り込み段階で 0 件。
+          OUT=$(python - "$BUZZ" <<'PY'
           import json, sys
           d = json.load(open(sys.argv[1], encoding="utf-8"))
           n = 0
@@ -199,16 +202,41 @@ jobs:
               for p in d.get(lane, []):
                   if len(p.get("article_text") or "") >= 120 and p.get("article_url"):
                       n += 1
+          c = (d.get("meta") or {}).get("counts") or {}
+          raw = sum((c.get(k) or {}).get("raw", 0) for k in ("domestic", "overseas", "article_ja", "article_en"))
           print(n)
+          print(raw)
           PY
           )
-          echo "article_candidates=${N}"
-          if [ "${N}" -lt 1 ]; then
+          N=$(echo "$OUT" | sed -n 1p)
+          RAW=$(echo "$OUT" | sed -n 2p)
+          echo "article_candidates=${N} search_raw_total=${RAW}"
+          if [ "${N:-0}" -lt 1 ]; then
             echo "::warning::本文取得済みの記事候補が 0 件のため AI レーンツイート生成をスキップします: ${TARGET_DATE}"
             echo "ready=false" >> $GITHUB_OUTPUT
+            if [ "${RAW:-0}" -lt 1 ]; then
+              echo "cause=朝のバズ収集で X 検索の取得が 0 件でした（記事候補 0 件）。" >> $GITHUB_OUTPUT
+            else
+              echo "cause=X 検索は ${RAW} 件取れましたが、本文を読める記事候補が 0 件でした。" >> $GITHUB_OUTPUT
+            fi
             exit 0
           fi
           echo "ready=true" >> $GITHUB_OUTPUT
+
+      - name: Discord 通知（🚨 素材の記事候補 0 件）
+        # 2026-10-05: 入力の候補が 0 件で生成しない日は、成功扱いのまま黙らず BI へ状態通知する。
+        if: steps.precheck.outputs.ready == 'false'
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          kind: status
+          bi_webhook: ${{ secrets.DISCORD_WEBHOOK_BI }}
+          test_mode: ${{ github.event.inputs.test_mode || 'false' }}
+          state: alert
+          label: 'AIツイート'
+          date: ${{ steps.date.outputs.value }}
+          meaning: '素材の記事候補が 0 件のため、本日のツイート案を作れませんでした。'
+          cause: ${{ steps.precheck.outputs.cause }}
+          detail: 'AI レーンツイート 素材 0 件｜precheck が ready=false を返したため生成をスキップしました。'
 
       # ============================================================================
       # 生成: 最大 3 試行。一時障害（529 等・実測 0 トークン）の時だけ粘る。

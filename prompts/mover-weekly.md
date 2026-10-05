@@ -345,7 +345,7 @@ raw / parquet の各銘柄を機械チェックし、該当したら**全セク�
 
 6. **【`themes` レッグのみ必須】raw の `## 今週の動意母集団` を読み、`## 今週のテーマ` を作る**（市場レッグはこの step を飛ばす）：`${PRIVATE_REPO_ROOT}/market/daily/${TARGET_DATE}_movers_raw.md` 内の `## 今週の動意母集団（材料一覧・Claude がここからテーマを括る）` セクション（対象週 5 営業日の動意母集団を和集合し、週間騰落率・週間売買代金・金曜EOD時価総額へ置き換えた 1 銘柄 1 行の表・実測 110〜140 行）を読む。**このセクションが無い週はテーマ2部を書かない**（セクションごと省略する）。判定手順は上の「テーマ2部」節に従う。
 
-6-b. **当日 TDNet の補完参照**（任意）：同じ `${TARGET_DATE}_movers_raw.md`（**`themes` と `prime` レッグは全市場を含む無加工の全量**・実測 2,000〜2,500 行。`growth` / `standard` は担当市場の節のみ）を材料補完に使う。**読み方（PM 2026-08-26 確定）**：`Read(file, offset=1, limit=1200)` → `Read(file, offset=1201, limit=1200)` の**通し 2〜3 回で読み切る**。**一度読んだ範囲を再 Read しない。市場ごとに raw を読み直すことを禁止**する。各銘柄の材料は最初の通読で 3 市場分まとめてメモし、以後は自分のメモを参照する。引数なし Read 禁止。
+6-b. **当日 TDNet の補完参照**（任意）：同じ `${TARGET_DATE}_movers_raw.md`（**yml が担当枠ごとに縮小済み**。`growth`／`standard`／`prime` にはヘッダ＋セクター別フロー＋担当市場の節（需給の小節を除く）だけに縮小した raw（`make_mover_report.py` が出す `{date}_movers_raw_{market}.md`）、`themes` にはテーマ用の節と参照銘柄ブロックだけに縮小した raw（`{date}_movers_raw_themes.md`）が渡る。縮小 raw が無い日は従来の切り出し（`growth` / `standard` は担当市場の節のみ・`prime` と `themes` は全市場を含む全量・実測 2,000〜2,500 行）へ戻る・2026-10-04）を材料補完に使う。**読み方（PM 2026-08-26 確定）**：`Read(file, offset=1, limit=1200)` → `Read(file, offset=1201, limit=1200)` の**通し 2〜3 回で読み切る**。**一度読んだ範囲を再 Read しない。市場ごとに raw を読み直すことを禁止**する。各銘柄の材料は最初の通読で 3 市場分まとめてメモし、以後は自分のメモを参照する。引数なし Read 禁止。
 
 7. **担当枠（`TARGET_MARKET`）のセクションだけ**を新フォーマットで生成し、`${PRIVATE_REPO_ROOT}/market/daily/movers/${TARGET_DATE}_weekly_${TARGET_MARKET}.md` へ保存する（`themes` レッグはテーマ 2 部＋`---`＋`OWN_THEMES_JSON` だけ、市場レッグは担当市場のブロックだけ）。**保存は後述の「分割 Write 手順」に従い、前半を Write → 残りを Edit で追記**の 2 回以上に分けて行う（1 応答あたりの出力を 32,000 トークン上限へ近づけないため・`_cr` §49）。担当外市場のセクションは書かない。
 
