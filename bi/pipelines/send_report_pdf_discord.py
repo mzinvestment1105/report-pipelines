@@ -65,9 +65,21 @@ US_STOCK_CONFIG = {
     "label": "米国株 個別銘柄レポート",
 }
 
+# マクロ昼刊（2026-10-05 追加）。KIND_CONFIG は send_report_jpeg_discord.py 側の共有定義の
+# ため触らず、US_STOCK_CONFIG と同じく本ファイルだけで追加する（既存 kind の解決へ影響させない）。
+# md の置き場は朝刊 {date}.md・夕刊 {date}_evening.md と同じ命名規則で {date}_midday.md とし、
+# 送信先は朝刊・夕刊と同じマクロチャンネル（未設定時のフォールバックなし）。
+# PDF の出力名は他種別と同じ規則で bi/outputs/report_pdfs/macro_midday_{date}.pdf になる。
+MACRO_MIDDAY_CONFIG = {
+    "md_path": "market/daily/macro/{date}_midday.md",
+    "webhook_env": "DISCORD_WEBHOOK_MACRO",
+    "label": "マクロ経済レポート（昼刊）",
+}
+
 # 送信種別 → md_to_pdf のテーマ kind（アクセント色・キッカー）
+# macro_midday は KIND_META["macro_midday"]（見た目は "macro" と同一・代替表題だけ昼刊表記）。
 _PDF_KIND = {
-    "macro": "macro", "macro_evening": "macro",
+    "macro": "macro", "macro_evening": "macro", "macro_midday": "macro_midday",
     "sector": "sector", "sector_full": "sector",
     "movers": "movers", "movers_weekly": "movers", "pts_movers": "movers",
     "ideas": "ideas", "scout": "ideas",
@@ -255,7 +267,9 @@ def _us_company_name(md_path: Path, ticker: str) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--kind", choices=list(KIND_CONFIG) + ["digest", "us_stock"], required=True)
+    parser.add_argument(
+        "--kind", choices=list(KIND_CONFIG) + ["digest", "us_stock", "macro_midday"], required=True
+    )
     parser.add_argument("--date", help="YYYY-MM-DD（JST・日次レポート用）")
     parser.add_argument("--month", help="YYYY-MM（月次レポート用・earnings 等）")
     parser.add_argument("--code", help="銘柄コード（stock 用）")
@@ -284,7 +298,12 @@ def main() -> int:
             return 0
         return _send_digest(args)
 
-    cfg = US_STOCK_CONFIG if args.kind == "us_stock" else KIND_CONFIG[args.kind]
+    if args.kind == "us_stock":
+        cfg = US_STOCK_CONFIG
+    elif args.kind == "macro_midday":
+        cfg = MACRO_MIDDAY_CONFIG
+    else:
+        cfg = KIND_CONFIG[args.kind]
     pdf_kind = _PDF_KIND.get(args.kind, "macro")
 
     # Markdown パス解決（JPEG 版と同一規則）
@@ -397,7 +416,7 @@ def main() -> int:
     #   (1) VIX / 日経 VI の表行を機械除去（PM: 出力に不要・両方外す。LLM が ─ 行を再追加するため）
     #   (2) 同一注釈 （…） の 2 回目以降を機械除去（注釈は一度で十分・反復は重複説明。語は残す）
     # 除去結果は GHA ログに残す。除去後の残重複は find_duplication で監視のみ（配信は継続）。
-    if args.kind in ("macro", "macro_evening"):
+    if args.kind in ("macro", "macro_evening", "macro_midday"):
         md_text = strip_vix_rows(md_text)
         md_text, removed = strip_repeated_annotations(md_text)
         if removed:

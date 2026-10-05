@@ -1,0 +1,622 @@
+name: マクロレポート昼刊
+# 2026-10-06 配備（試験発行: リポジトリ変数 MACRO_MIDDAY_TRIAL を 'false' にするまで誌面は BI チャンネルへ送る）
+# 土台: macro_report_evening.yml（guard／529 再試行／出力上限の検知／テストモード／通知の作法をそのまま継承）
+# 誌面は夕刊と同じ全 6 セクション構成の単独完結版（prompts/macro-report-midday.md）。数値だけを前場引けに差し替える。
+# 夕刊からの主な違い:
+#   1. 前場引け（11:30）の値で作る。生データは generate_macro_midday.py（市況スナップショット・市場別サマリー・
+#      セクター強弱・日経225先物の数値関係・ニュースを 11:30 時点の値で作る。値が揃うまで最大 12:05 まで待つ）
+#      取得元: 場中の指標＝Yahoo chart 1 分足／個別株＝Yahoo spark 5 分足（20 銘柄×185 回）／市場別指数＝TradingView
+#      の公開 websocket（未ログイン・遅延 20 分）／前営業日の確定値＝J-Quants。J-Quants の前場四本値・分足は
+#      現契約で HTTP 403 のため使わない（2026-10-06 実測）。
+#   2. 後場が始まる 12:30 を過ぎたら誌面を送らず、BI へ状態通知だけを送る（送信期限の確認ステップ）
+#   3. 試験発行の切り替え（リポジトリ変数 MACRO_MIDDAY_TRIAL・'false' を明示するまでは誌面を BI へ送る）
+#   4. 東証の休場日は作らない（Worker の dayType=tradingday と同じ判定を guard でも行う）
+#   5. 期限があるため Claude の生成は 1 回あたり 20 分・再試行は 1 回まで（12:15 を過ぎたら再試行しない）
+# 2026-10-04: テストモードの run は run-name に「[TEST]」を付ける（check_delivery.sh が配信判定から除外する目印）
+run-name: ${{ github.event.inputs.test_mode == 'true' && format('🧪 [TEST] {0}（{1}）', github.workflow, github.event.inputs.target_date) || github.workflow }}
+
+"on":
+  # 本線: Cloudflare Worker (mizuki-fund-scheduler-1) が JST 11:33（東証営業日のみ）に workflow_dispatch で起動する。
+  # 予備: GHA cron JST 11:45（UTC 02:45 月-金）。Worker の発火が届かなかった日だけ guard を通る。
+  #       GHA cron は遅れて着火することがあるため、12:15 を過ぎた着火は guard が作らずに止める。
+  workflow_dispatch:
+    inputs:
+      target_date:
+        description: '対象日付 (YYYY-MM-DD・空欄で当日)'
+        required: false
+        default: ''
+      force_rerun:
+        description: 'true で当日重複ガードを無視して強制実行（修正後の再テスト用）'
+        required: false
+        default: 'false'
+      test_mode:
+        description: 'テストモード（配信先を BI チャンネルへ切替・配信済み判定を無視・Private へコミットしない・成果物は artifact へ）'
+        type: boolean
+        required: false
+        default: false
+      enforce_deadline:
+        description: 'テストモードでも「午後0時30分を過ぎたら送らない」判定を有効にする（期限の判定そのものを試す時だけ true）'
+        type: boolean
+        required: false
+        default: false
+  schedule:
+    - cron: '45 2 * * 1-5'
+
+concurrency:
+  group: macro_report_midday-daily
+  cancel-in-progress: false
+
+env:
+  # 試験発行の切り替え。リポジトリ変数 MACRO_MIDDAY_TRIAL が 'false' でない限り試験発行（誌面 PDF を BI へ送る）。
+  # 本番（マクロ用チャンネル）へ切り替える時: gh variable set MACRO_MIDDAY_TRIAL --body false -R mzinvestment1105/report-pipelines
+  MIDDAY_TRIAL: ${{ vars.MACRO_MIDDAY_TRIAL != 'false' }}
+  # 後場の開始（これを過ぎたら送らない）／生成を始めてよい最終時刻／11:30 の足を待つ上限（いずれも JST）
+  MIDDAY_SEND_DEADLINE: '12:30'
+  MIDDAY_LAST_START: '12:15'
+  MIDDAY_WAIT_UNTIL: '12:05'
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      proceed: ${{ steps.check.outputs.proceed }}
+      reason: ${{ steps.check.outputs.reason }}
+    steps:
+      - name: Checkout report-pipelines (通知 action・判定スクリプト用)
+        uses: actions/checkout@v4
+
+      - name: Check today's runs
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.test_mode }}" = "true" ]; then
+            echo "proceed=true" >> $GITHUB_OUTPUT
+            echo "reason=test_mode (BI 宛てテスト配信)" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          MY_RUN_ID=${{ github.run_id }}
+          EVENT="${{ github.event_name }}"
+          NOW_HM=$((10#$(TZ=Asia/Tokyo date +%H%M)))
+          LAST_START_HM=$((10#${MIDDAY_LAST_START//:/}))
+          echo "now_jst=$(TZ=Asia/Tokyo date +%H:%M)" >> $GITHUB_OUTPUT
+
+          # 東証の休場日（土日・祝日・jp_holidays.txt）は作らない。Worker の dayType=tradingday と同じ判定。
+          CHECK_DATE="${{ github.event.inputs.target_date }}"
+          if TD_LINE=$(bash .github/scripts/is_tradingday.sh ${CHECK_DATE}); then
+            echo "${TD_LINE}"
+          else
+            TD_RC=$?
+            if [ "$TD_RC" -eq 1 ]; then
+              echo "proceed=false" >> $GITHUB_OUTPUT
+              echo "reason=skip (market closed: ${TD_LINE##*reason=})" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            echo "is_tradingday.sh failed (rc=${TD_RC}); continuing as a trading day" >&2
+          fi
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.force_rerun }}" = "true" ]; then
+            echo "proceed=true" >> $GITHUB_OUTPUT
+            echo "reason=force_rerun (manual guard bypass)" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          STATS=$(bash .github/scripts/check_delivery.sh macro_report_midday.yml generate "${MY_RUN_ID}")
+          DONE_OK=$(echo "$STATS" | jq -r '.delivered')
+          DONE_FAIL=$(echo "$STATS" | jq -r '.failed')
+          ACTIVE=$(( $(echo "$STATS" | jq -r '.sending') + $(echo "$STATS" | jq -r '.dispatch_pending') + $(echo "$STATS" | jq -r '.schedule_pending') ))
+          echo "active=${ACTIVE}" >> $GITHUB_OUTPUT
+          echo "done_ok=${DONE_OK}" >> $GITHUB_OUTPUT
+          echo "done_fail=${DONE_FAIL}" >> $GITHUB_OUTPUT
+          echo "today: active=${ACTIVE} done_ok=${DONE_OK} done_fail=${DONE_FAIL} event=${EVENT} now=${NOW_HM}"
+
+          if [ "$NOW_HM" -ge "$LAST_START_HM" ]; then
+            # 12:15 以降の起動は後場の開始に間に合わないため作らない。
+            # 当日まだ何も走っていない（Worker の起動も届いていない）時だけ 🚨 を出す。
+            # 失敗が既にある日は ❌ 通知が出ているため重ねて鳴らさない。
+            echo "proceed=false" >> $GITHUB_OUTPUT
+            if [ "$DONE_OK" -eq 0 ] && [ "$ACTIVE" -eq 0 ] && [ "$DONE_FAIL" -eq 0 ]; then
+              echo "reason=late_undelivered (started after ${MIDDAY_LAST_START} JST)" >> $GITHUB_OUTPUT
+            else
+              echo "reason=skip (started after ${MIDDAY_LAST_START} JST)" >> $GITHUB_OUTPUT
+            fi
+          elif [ "$DONE_OK" -gt 0 ]; then
+            echo "proceed=false" >> $GITHUB_OUTPUT
+            echo "reason=skip (already succeeded today: done_ok=${DONE_OK})" >> $GITHUB_OUTPUT
+          elif [ "$ACTIVE" -gt 0 ]; then
+            echo "proceed=false" >> $GITHUB_OUTPUT
+            echo "reason=skip (active run exists: active=${ACTIVE})" >> $GITHUB_OUTPUT
+          elif [ "$EVENT" = "schedule" ] && [ "$DONE_FAIL" -ge 2 ]; then
+            echo "proceed=false" >> $GITHUB_OUTPUT
+            echo "reason=retry_cap (cron stopped: done_fail=${DONE_FAIL} >= 2)" >> $GITHUB_OUTPUT
+          else
+            echo "proceed=true" >> $GITHUB_OUTPUT
+            if [ "$DONE_FAIL" -gt 0 ]; then
+              echo "reason=recovery (done_fail=${DONE_FAIL})" >> $GITHUB_OUTPUT
+            else
+              echo "reason=initial" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: Discord 通知（⏱ 予備タイマー起動）
+        if: github.event_name == 'schedule' && steps.check.outputs.proceed == 'true'
+        uses: ./.github/actions/notify-discord
+        with:
+          kind: status
+          bi_webhook: ${{ secrets.DISCORD_WEBHOOK_BI }}
+          test_mode: ${{ github.event.inputs.test_mode || 'false' }}
+          state: timer
+          label: 'マクロ昼刊'
+          meaning: '通常の時刻に届かなかったため、予備の仕組みで作り直しています。後場の開始前に届く見込みです。'
+          detail: 'マクロレポート昼刊 予備タイマー起動｜本日の生成がまだ成功していないため GHA 側の予備タイマーが救援起動しました（本日: 成功 ${{ steps.check.outputs.done_ok }} 件・失敗 ${{ steps.check.outputs.done_fail }} 件・実行中 ${{ steps.check.outputs.active }} 件）。'
+
+      - name: Discord 通知（🚨 後場の開始に間に合わないため作らない）
+        if: contains(steps.check.outputs.reason, 'late_undelivered')
+        uses: ./.github/actions/notify-discord
+        with:
+          kind: status
+          bi_webhook: ${{ secrets.DISCORD_WEBHOOK_BI }}
+          test_mode: ${{ github.event.inputs.test_mode || 'false' }}
+          state: alert
+          label: 'マクロ昼刊'
+          meaning: '後場の開始（午後0時30分）に間に合う時刻を過ぎたため、本日の昼刊は作りません。'
+          cause: '起動が ${{ steps.check.outputs.now_jst }}（生成を始められる最終時刻 ${{ env.MIDDAY_LAST_START }} より後）で、11:33 の定時起動も届いていない'
+          detail: 'マクロレポート昼刊 期限切れ｜当日の run が 1 件もないまま、生成を始められる最終時刻を過ぎて起動されました。'
+
+      - name: Discord 通知（🚨 自動リトライ停止）
+        if: contains(steps.check.outputs.reason, 'retry_cap')
+        uses: ./.github/actions/notify-discord
+        with:
+          kind: status
+          bi_webhook: ${{ secrets.DISCORD_WEBHOOK_BI }}
+          test_mode: ${{ github.event.inputs.test_mode || 'false' }}
+          state: alert
+          label: 'マクロ昼刊'
+          meaning: '本日分を自動では作れませんでした（再試行の上限）。'
+          detail: 'マクロレポート昼刊 自動リトライ停止｜当日 2 回以上失敗したため cron の自動再実行を停止しました。本日未配信です。'
+
+      - name: Discord 通知（guard 失敗）
+        if: failure() || cancelled()
+        uses: ./.github/actions/notify-discord
+        with:
+          kind: status
+          bi_webhook: ${{ secrets.DISCORD_WEBHOOK_BI }}
+          test_mode: ${{ github.event.inputs.test_mode || 'false' }}
+          state: failed
+          label: 'マクロ昼刊'
+          meaning: '内部エラーで作成を開始できませんでした。'
+          detail: 'マクロレポート昼刊 guard 失敗｜実行前チェック（当日重複判定）自体がエラーになり、生成ジョブが起動していません。'
+
+  generate:
+    needs: guard
+    if: needs.guard.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    # 11:33 起動 → 12:30 の送信期限があるため、夕刊（120 分）より短くする。
+    # 実測（夕刊 10/1・10/2・10/5）: 起動〜raw 取得完了 4〜6 分・Claude 生成 8〜9 分・送信 5 秒。
+    timeout-minutes: 60
+
+    steps:
+      - name: Determine target date
+        id: date
+        run: |
+          if [ -n "${{ github.event.inputs.target_date }}" ]; then
+            echo "value=${{ github.event.inputs.target_date }}" >> $GITHUB_OUTPUT
+          else
+            echo "value=$(TZ=Asia/Tokyo date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+          fi
+          # 期限の判定を効かせるか（本番 run は常に効かせる・テストモードは enforce_deadline=true の時だけ）
+          if [ "${{ github.event.inputs.test_mode }}" = "true" ] && [ "${{ github.event.inputs.enforce_deadline }}" != "true" ]; then
+            echo "enforce=false" >> $GITHUB_OUTPUT
+          else
+            echo "enforce=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout report-pipelines
+        uses: actions/checkout@v4
+        with:
+          path: report-pipelines
+
+      - name: Setup SSH for private repo
+        env:
+          PRIVATE_REPO_DEPLOY_KEY: ${{ secrets.PRIVATE_REPO_DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$PRIVATE_REPO_DEPLOY_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+      - name: Clone private repo (mizuki-fund)
+        run: |
+          git clone git@github.com:mzinvestment1105/mizuki-fund.git private-repo
+
+      - name: Copy pipelines and static files from Public into private working tree
+        run: |
+          cp -f report-pipelines/bi/pipelines/*.py private-repo/bi/pipelines/
+          cp -f report-pipelines/bi/pipelines/requirements.txt private-repo/bi/pipelines/
+          mkdir -p private-repo/bi/pipelines/lib
+          cp -rf report-pipelines/bi/pipelines/lib/*.py private-repo/bi/pipelines/lib/ 2>/dev/null || true
+          mkdir -p private-repo/bi/pipelines/assets/fonts
+          cp -rf report-pipelines/bi/pipelines/assets/fonts/* private-repo/bi/pipelines/assets/fonts/ 2>/dev/null || true
+          mkdir -p private-repo/agents private-repo/playbook
+          cp -f report-pipelines/agents/*.md private-repo/agents/ 2>/dev/null || true
+          cp -f report-pipelines/playbook/*.md private-repo/playbook/ 2>/dev/null || true
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: report-pipelines/bi/pipelines/requirements.txt
+
+      - name: Install dependencies
+        # websocket-client は市場別指数（TradingView）の取得用。requirements.txt に未収載のため個別に入れる
+        # （配備時に requirements.txt へ追記したらこの 1 行は外す）。
+        run: |
+          pip install -r report-pipelines/bi/pipelines/requirements.txt
+          pip install "websocket-client>=1.6"
+
+      - name: Install Japanese fonts (Noto Sans CJK JP)
+        # 夕刊と同じ（失敗してもジョブを落とさない・PDF は埋め込みフォントで描画する）
+        timeout-minutes: 8
+        continue-on-error: true
+        run: |
+          set -u
+          DEADLINE=$(( $(date +%s) + 280 ))
+          for i in 1 2 3; do
+            if [ "$i" -gt 1 ] && [ "$(date +%s)" -ge "$DEADLINE" ]; then
+              echo "時間予算を超過したため再試行を打ち切ります"
+              break
+            fi
+            if timeout 75 sudo apt-get update -qq \
+               && timeout 120 sudo apt-get install -y -qq fonts-noto-cjk fonts-noto-cjk-extra; then
+              echo "日本語フォント導入に成功しました（${i} 回目）"
+              exit 0
+            fi
+            echo "日本語フォント導入に失敗またはハングしました（${i}/3 回目）"
+            if [ "$i" -lt 3 ]; then
+              sleep $((i * 15))
+            fi
+          done
+          echo "::warning::日本語フォントの apt 導入をスキップしました。PDF は埋め込みフォントで描画するため誌面に影響はなく、配信を続行します"
+          exit 0
+
+      - name: Install Playwright Chromium
+        run: |
+          playwright install chromium --with-deps
+
+      - name: Fetch raw data (立花証券 e支店 API ニュース)
+        # 夕刊と同じ経路。認証情報未設定なら skip（後方互換）。昼刊 raw は時刻 11:30 以前の行だけを使う。
+        working-directory: ./private-repo/bi/pipelines
+        env:
+          TACHIBANA_DEMO_AUTH_ID: ${{ secrets.TACHIBANA_DEMO_AUTH_ID }}
+          TACHIBANA_DEMO_PRIVATE_KEY_PEM: ${{ secrets.TACHIBANA_DEMO_PRIVATE_KEY_PEM }}
+          TACHIBANA_DEMO_API_BASE: ${{ secrets.TACHIBANA_DEMO_API_BASE }}
+          PYTHONIOENCODING: utf-8
+        continue-on-error: true
+        run: |
+          if [ -z "$TACHIBANA_DEMO_AUTH_ID" ]; then
+            echo "[INFO] 立花証券 Secrets 未設定・skip"
+            exit 0
+          fi
+          python fetch_tachibana_news.py --date ${{ steps.date.outputs.value }} --limit 500
+
+      - name: Build midday raw (generate_macro_midday.py)
+        # 夕刊の raw と同じブロック一式（市況スナップショット・市場別サマリー・セクター強弱・日経225先物の数値関係・
+        # 寄り付き前の news/finnhub raw・前営業日 15:30〜11:30 の記事・直近の発行号の冒頭）を前場引けの値で 1 本の raw へ。
+        # 当日分は日経平均の 11:30 の足（Yahoo・遅延申告 20 分）→ 個別株の 11:30 の足（プライムの半数以上）→
+        # 市場別指数の 11:29 の足（TradingView・遅延申告 1,200 秒）が揃うまで、最大 MIDDAY_WAIT_UNTIL まで 60 秒ごとに再取得する。
+        # 過去日（テストモードの再現）は待たない。ログの「取得 HH:MM:SS: 日経平均の前場の最後の足 = HH:MM」が遅延の実測値、
+        # [TIME] 行が取得の所要時間（2026-10-06 ローカル実測: 合計 20〜24 秒・うち個別株 3,696 銘柄 6〜7 秒）。
+        # exit 0 = 生成 / 2 = 東証休場日 / 3 = 日経平均の前場の足が取れない / 1 = エラー
+        id: build
+        working-directory: ./private-repo/bi/pipelines
+        env:
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+          JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
+          PYTHONIOENCODING: utf-8
+        continue-on-error: true
+        run: |
+          set +e
+          D="${{ steps.date.outputs.value }}"
+          WAIT_ARGS=""
+          if [ "$D" = "$(TZ=Asia/Tokyo date +%F)" ]; then
+            WAIT_ARGS="--wait-until ${MIDDAY_WAIT_UNTIL} --poll-sec 60"
+          fi
+          python generate_macro_midday.py --date "$D" $WAIT_ARGS
+          ec=$?
+          echo "exit_code=$ec" >> $GITHUB_OUTPUT
+          if [ "$ec" = "1" ] || [ "$ec" = "3" ]; then exit 1; fi
+          exit 0
+
+      - name: Discord 通知（⏭ 発行なし・東証休場日）
+        if: steps.build.outputs.exit_code == '2'
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          kind: status
+          bi_webhook: ${{ secrets.DISCORD_WEBHOOK_BI }}
+          test_mode: ${{ github.event.inputs.test_mode || 'false' }}
+          state: none
+          label: 'マクロ昼刊'
+          date: ${{ steps.date.outputs.value }}
+          meaning: '東証が休場のため、本日の昼刊は発行しません。'
+          detail: 'マクロレポート昼刊 発行なし｜対象日が土日・祝日のため前場がありません（正常動作）。'
+
+      - name: 既存のマクロ昼刊ファイルを退避（前回の不良ファイルを読み込ませない）
+        if: success() && steps.build.outputs.exit_code == '0'
+        working-directory: ./private-repo
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+        run: |
+          F="market/daily/macro/${TARGET_DATE}_midday.md"
+          if [ -f "$F" ]; then
+            mv "$F" "/tmp/${TARGET_DATE}_macro_midday.previous.md"
+            echo "既存の $F を /tmp へ退避しました"
+          fi
+
+      - name: 生成の時間予算（1 回目）
+        id: budget1
+        if: success() && steps.build.outputs.exit_code == '0'
+        run: |
+          NOW_HM=$((10#$(TZ=Asia/Tokyo date +%H%M)))
+          LAST=$((10#${MIDDAY_LAST_START//:/}))
+          if [ "${{ steps.date.outputs.enforce }}" = "true" ] && [ "$NOW_HM" -ge "$LAST" ]; then
+            echo "ok=false" >> $GITHUB_OUTPUT
+            echo "生成を始められる最終時刻 ${MIDDAY_LAST_START} を過ぎたため生成しません"
+          else
+            echo "ok=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Generate macro midday report via Claude Code (Opus 5.5 + effort high)
+        id: gen1
+        if: success() && steps.build.outputs.exit_code == '0' && steps.budget1.outputs.ok == 'true'
+        continue-on-error: true
+        timeout-minutes: 20
+        uses: anthropics/claude-code-base-action@57607815d5d9678acb18dae0e5033d87d4dd4177
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt_file: report-pipelines/prompts/macro-report-midday.md
+          claude_args: --model claude-opus-5-5 --allowedTools Read,Write,Edit,Bash,Grep,Glob
+        env:
+          CLAUDE_CODE_EFFORT_LEVEL: high
+          CLAUDE_CODE_MAX_OUTPUT_TOKENS: "64000"
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+          PRIVATE_REPO_ROOT: private-repo
+          REPORT_EDITION: midday
+
+      - name: Check attempt 1 (成果物と出力上限到達の確認)
+        id: chk1
+        if: steps.gen1.outcome != 'skipped'
+        env:
+          ATTEMPT: '1'
+          OUTCOME: ${{ steps.gen1.outcome }}
+          EXECUTION_FILE: ${{ steps.gen1.outputs.execution_file }}
+          PROMPT_FILE: report-pipelines/prompts/macro-report-midday.md
+          OUT_FILES: private-repo/market/daily/macro/${{ steps.date.outputs.value }}_midday.md
+        run: bash report-pipelines/.github/scripts/check_attempt.sh
+
+      - name: Detect spending cap (attempt 1)
+        id: cap1
+        if: success() && steps.gen1.outcome == 'failure'
+        env:
+          EXECUTION_FILE: ${{ steps.gen1.outputs.execution_file }}
+          ATTEMPT: '1'
+        run: bash report-pipelines/.github/scripts/detect_spending_cap.sh
+
+      - name: 生成の時間予算（再試行）
+        id: budget2
+        if: success() && steps.gen1.outcome != 'skipped' && steps.chk1.outputs.ok != 'true' && steps.cap1.outputs.capped != 'true'
+        run: |
+          # 再試行は「60 秒待機＋最大 20 分」かかるため、12:15 を過ぎていたら再試行しない（送信期限 12:30）。
+          NOW_HM=$((10#$(TZ=Asia/Tokyo date +%H%M)))
+          LAST=$((10#${MIDDAY_LAST_START//:/}))
+          if [ "${{ steps.date.outputs.enforce }}" = "true" ] && [ "$NOW_HM" -ge "$LAST" ]; then
+            echo "ok=false" >> $GITHUB_OUTPUT
+            echo "::warning::1 回目が失敗しましたが、${MIDDAY_LAST_START} を過ぎたため再試行しません"
+          else
+            echo "ok=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Wait before retry 2 (Claude overloaded 等の一時エラー)
+        if: success() && steps.budget2.outputs.ok == 'true'
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+        run: |
+          F="private-repo/market/daily/macro/${TARGET_DATE}_midday.md"
+          if [ -f "$F" ]; then
+            mv "$F" "/tmp/${TARGET_DATE}_macro_midday.attempt1.partial.md"
+            echo "1 回目の不完全な出力を /tmp へ退避しました"
+          fi
+          echo "1 回目が失敗しました。60 秒待機して再試行します"
+          sleep 60
+
+      - name: Generate macro midday report via Claude Code (retry 2)
+        id: gen2
+        if: success() && steps.budget2.outputs.ok == 'true'
+        continue-on-error: true
+        timeout-minutes: 20
+        uses: anthropics/claude-code-base-action@57607815d5d9678acb18dae0e5033d87d4dd4177
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt_file: ${{ steps.chk1.outputs.next_prompt || 'report-pipelines/prompts/macro-report-midday.md' }}
+          claude_args: --model claude-opus-5-5 --allowedTools Read,Write,Edit,Bash,Grep,Glob
+        env:
+          CLAUDE_CODE_EFFORT_LEVEL: high
+          CLAUDE_CODE_MAX_OUTPUT_TOKENS: "64000"
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+          PRIVATE_REPO_ROOT: private-repo
+          REPORT_EDITION: midday
+
+      - name: Check attempt 2 (成果物と出力上限到達の確認)
+        id: chk2
+        if: steps.gen2.outcome != 'skipped'
+        env:
+          ATTEMPT: '2'
+          OUTCOME: ${{ steps.gen2.outcome }}
+          EXECUTION_FILE: ${{ steps.gen2.outputs.execution_file }}
+          PROMPT_FILE: report-pipelines/prompts/macro-report-midday.md
+          OUT_FILES: private-repo/market/daily/macro/${{ steps.date.outputs.value }}_midday.md
+        run: bash report-pipelines/.github/scripts/check_attempt.sh
+
+      - name: Summarize generation attempts (成果物と出力上限到達の集計)
+        id: gensum
+        if: always()
+        continue-on-error: true
+        env:
+          MODE: summary
+          LABEL: マクロ昼刊
+        run: bash report-pipelines/.github/scripts/check_attempt.sh
+
+      - name: Verify generated macro midday report (成否の一元判定)
+        # 時間予算切れ（budget1=false）で生成しなかった run は失敗扱いにせず、下の送信期限の確認で 🚨 を出す。
+        if: success() && steps.build.outputs.exit_code == '0' && steps.budget1.outputs.ok == 'true'
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+        run: |
+          F="private-repo/market/daily/macro/${TARGET_DATE}_midday.md"
+          echo "attempt outcomes: gen1=${{ steps.gen1.outcome }} gen2=${{ steps.gen2.outcome }} budget1=${{ steps.budget1.outputs.ok }}"
+          if [ ! -s "$F" ]; then
+            echo "::error::マクロレポート昼刊が生成されませんでした: $F"
+            exit 1
+          fi
+          echo "生成成功: $F ($(wc -m < "$F") chars)"
+
+      - name: 相互参照ゲート（警告のみ・配信は止めない）
+        continue-on-error: true
+        working-directory: ./private-repo
+        env:
+          PYTHONIOENCODING: utf-8
+        run: |
+          python bi/pipelines/lib/crossref_check.py --file market/daily/macro/${{ steps.date.outputs.value }}_midday.md || true
+
+      - name: 送信期限の確認（午後0時30分＝後場の開始）
+        id: deadline
+        if: success() && steps.build.outputs.exit_code == '0'
+        run: |
+          NOW_TXT=$(TZ=Asia/Tokyo date +%H:%M)
+          NOW_HM=$((10#$(TZ=Asia/Tokyo date +%H%M)))
+          DL=$((10#${MIDDAY_SEND_DEADLINE//:/}))
+          echo "finished_at=${NOW_TXT}" >> $GITHUB_OUTPUT
+          if [ "${{ steps.budget1.outputs.ok }}" != "true" ]; then
+            # 生成を始められる最終時刻を過ぎていたため生成していない（送るものが無い）
+            echo "late=true" >> $GITHUB_OUTPUT
+            echo "::warning::生成を始められる最終時刻 ${MIDDAY_LAST_START} を過ぎていたため生成していません"
+          elif [ "${{ steps.date.outputs.enforce }}" = "true" ] && [ "$NOW_HM" -ge "$DL" ]; then
+            echo "late=true" >> $GITHUB_OUTPUT
+            echo "::warning::誌面の完成が ${NOW_TXT} で送信期限 ${MIDDAY_SEND_DEADLINE} を過ぎたため、誌面は送らず BI へ状態通知だけを送ります"
+          else
+            echo "late=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: テスト配信・試験発行の見出し（🧪 BI へ）
+        # テストモード、または試験発行の間（MIDDAY_TRIAL）は、誌面 PDF を BI へ送る前に見出しを 1 通送る（既存のテストの作法）。
+        if: success() && steps.build.outputs.exit_code == '0' && steps.deadline.outputs.late != 'true' && (github.event.inputs.test_mode == 'true' || env.MIDDAY_TRIAL == 'true')
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          kind: report
+          bi_webhook: ${{ secrets.DISCORD_WEBHOOK_BI }}
+          test_mode: 'true'
+          label: 'マクロ昼刊'
+          date: ${{ steps.date.outputs.value }}
+          meaning: ${{ github.event.inputs.test_mode == 'true' && '次の PDF はテスト配信です（本番のレポート用チャンネルへは送っていません）。' || '次の PDF は試験発行です（マクロ用チャンネルへはまだ送っていません）。' }}
+
+      - name: Send Discord (PDF)
+        id: send
+        if: success() && steps.build.outputs.exit_code == '0' && steps.deadline.outputs.late != 'true'
+        working-directory: ./private-repo/bi/pipelines
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
+          # テストモードと試験発行の間は誌面の送り先を BI チャンネルへ切り替える。
+          # 送り先はシェルで 1 つだけ選び、選んだ先の webhook が空なら送らずに失敗させる
+          # （式の `a && b || c` は b が空だと c へ落ちるため使わない＝フォールバックの webhook を持たない）。
+          ROUTE_TO_BI: ${{ github.event.inputs.test_mode == 'true' || env.MIDDAY_TRIAL == 'true' }}
+          WEBHOOK_BI: ${{ secrets.DISCORD_WEBHOOK_BI }}
+          WEBHOOK_MACRO: ${{ secrets.DISCORD_WEBHOOK_MACRO }}
+          PYTHONIOENCODING: utf-8
+        run: |
+          if [ "$ROUTE_TO_BI" = "true" ]; then
+            export DISCORD_WEBHOOK_MACRO="$WEBHOOK_BI"
+            echo "送り先: BI チャンネル（テストモードまたは試験発行）"
+          else
+            export DISCORD_WEBHOOK_MACRO="$WEBHOOK_MACRO"
+            echo "送り先: マクロ用チャンネル"
+          fi
+          unset WEBHOOK_BI WEBHOOK_MACRO
+          if [ -z "$DISCORD_WEBHOOK_MACRO" ]; then
+            echo "::error::送り先の webhook が未設定のため送信しません（他のチャンネルへは送りません）"
+            exit 1
+          fi
+          python send_report_pdf_discord.py --kind macro_midday --date ${{ steps.date.outputs.value }}
+
+      - name: Discord 通知（🚨 後場の開始に間に合わず送信しない）
+        if: success() && steps.deadline.outputs.late == 'true'
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          kind: status
+          bi_webhook: ${{ secrets.DISCORD_WEBHOOK_BI }}
+          test_mode: ${{ github.event.inputs.test_mode || 'false' }}
+          state: alert
+          label: 'マクロ昼刊'
+          date: ${{ steps.date.outputs.value }}
+          meaning: '後場の開始（午後0時30分）に間に合わなかったため、昼刊は送っていません。'
+          cause: ${{ steps.budget1.outputs.ok != 'true' && format('生成に入れる状態になったのが {0}（生成を始められる最終時刻 {1} より後）', steps.deadline.outputs.finished_at, env.MIDDAY_LAST_START) || format('誌面の完成が {0}（送信期限 {1}）', steps.deadline.outputs.finished_at, env.MIDDAY_SEND_DEADLINE) }}
+          detail: 'マクロレポート昼刊 期限切れ｜Discord へは送っていません（生成済みの場合は Private へは保存します）。'
+
+      - name: テスト成果物を artifact へ保存（🧪 テストモードのみ）
+        if: always() && github.event.inputs.test_mode == 'true'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-output-macro-midday-${{ steps.date.outputs.value }}-${{ github.run_id }}
+          path: |
+            private-repo/market/daily/macro/${{ steps.date.outputs.value }}_midday.md
+            private-repo/market/daily/${{ steps.date.outputs.value }}_macro_midday_raw.md
+            private-repo/bi/outputs/report_pdfs/macro_midday_${{ steps.date.outputs.value }}.pdf
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Rotate report archives (5 件超過分を archive/ へ退避)
+        if: success() && steps.build.outputs.exit_code == '0' && github.event.inputs.test_mode != 'true'
+        working-directory: ./private-repo
+        env:
+          PYTHONIOENCODING: utf-8
+        run: |
+          mkdir -p bi/pipelines/ops
+          cp -f ../report-pipelines/bi/pipelines/ops/rotate_report_archives.py bi/pipelines/ops/
+          python bi/pipelines/ops/rotate_report_archives.py
+
+      - name: Commit and push to private repo
+        if: success() && steps.build.outputs.exit_code == '0' && github.event.inputs.test_mode != 'true'
+        working-directory: ./private-repo
+        run: |
+          bash ../report-pipelines/bi/pipelines/ops/ci_commit_push.sh \
+            -m "data: macro midday report ${{ steps.date.outputs.value }}" market/daily market/archive
+
+      - name: Discord 通知（⚠️ 配信済み・後処理のみ失敗）
+        if: (failure() || cancelled()) && steps.send.outcome == 'success'
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          kind: status
+          bi_webhook: ${{ secrets.DISCORD_WEBHOOK_BI }}
+          test_mode: ${{ github.event.inputs.test_mode || 'false' }}
+          state: partial
+          label: 'マクロ昼刊'
+          date: ${{ steps.date.outputs.value }}
+          meaning: '配信は完了しています。保存処理だけ失敗しましたが誌面に影響はありません。'
+          detail: 'マクロレポート昼刊 後処理のみ失敗｜レポート本体は配信済みです。配信後のアーカイブ整理または commit だけが失敗しました。'
+
+      - name: Discord 通知（❌ 失敗）
+        if: (failure() || cancelled()) && steps.send.outcome != 'success'
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          kind: status
+          bi_webhook: ${{ secrets.DISCORD_WEBHOOK_BI }}
+          test_mode: ${{ github.event.inputs.test_mode || 'false' }}
+          state: failed
+          label: 'マクロ昼刊'
+          date: ${{ steps.date.outputs.value }}
+          meaning: '内部エラーで本日分を作れませんでした。'
+          cause: ${{ steps.build.outputs.exit_code == '3' && '日経平均の前場の値が配信元から取得できなかった' || steps.gensum.outputs.cause }}
+          detail: 'マクロレポート昼刊 失敗｜生成または送信が完了せず、本日未配信です。'

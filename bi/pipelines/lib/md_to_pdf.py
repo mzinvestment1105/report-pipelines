@@ -25,6 +25,13 @@ from pathlib import Path
 import markdown as md
 from playwright.sync_api import sync_playwright
 
+# テーマ早見図（動意・夜間PTS の冒頭ブロック・2026-10-05 見本）。md に目印行が無ければ何もしない。
+try:
+    from . import theme_figure as _theme_figure
+except ImportError:  # lib をパッケージとして経由せず単体で import された場合
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import theme_figure as _theme_figure  # type: ignore[no-redef]
+
 _FONT_DIR = Path(__file__).resolve().parent.parent / "assets" / "fonts"
 
 # レポート種別 → (英語キッカー, 日本語ラベル, アクセント色)
@@ -35,6 +42,10 @@ _FONT_DIR = Path(__file__).resolve().parent.parent / "assets" / "fonts"
 # 3 要素タプルの形は呼び出し元（send_report_pdf_discord.py 等）が依存するため変えない。
 KIND_META = {
     "macro":    ("MACRO REPORT",   "マクロレポート",     "#1A1A1A"),
+    # マクロ昼刊（2026-10-05 追加）。誌面の見た目は夕刊（macro_evening → "macro"）と同一で、
+    # 違いは md に H1 が無い時の代替表題だけ（昼刊と分かる表記にする）。
+    # _layout_css の分岐は kind == "stock" のみのため、組版は "macro" と完全に同じになる。
+    "macro_midday": ("MACRO REPORT", "マクロレポート（昼刊）", "#1A1A1A"),
     "sector":   ("SECTOR REPORT",  "セクターレポート",   "#1A1A1A"),
     "movers":   ("MARKET MOVERS",  "動意銘柄レポート",   "#1A1A1A"),
     "ideas":    ("INVESTMENT IDEAS","投資アイデア",      "#1A1A1A"),
@@ -1403,11 +1414,18 @@ def render_markdown_to_pdf(
     # 内部メタ表現の確定除去（PM 2026-06-27・LLM が本文に書いても renderer 側で必ず削除する）
     body_md = re.sub(r"（記事ベース[^）]*）", "", body_md)
     body_md = _inject_size_tags(body_md)
+    # テーマ早見図（2026-10-05 見本）: 目印行 `<!-- THEME_FIGURE -->` がある md だけ、
+    # `## 本日のテーマ` 節を解析して図を差し込む。目印が無い md は body_md を一切変えない
+    # （週次動意・グロース短縮版・目印の無い日次／PTS は従来と同じ PDF になる）。
+    body_md, theme_fig = _theme_figure.prepare(body_md)
 
     html_body = md.markdown(body_md, extensions=["tables", "fenced_code", "sane_lists"])
     html_body = _colorize_numbers(html_body)
     html_body = _tag_theme_tables(html_body)
     html_body = _wrap_theme_blocks(html_body)
+    # 図は着色・表クラス付与の後に差し込む（図の CSS を本文の符号正規化へ通さないため）。
+    # 騰落率などの文字は本文と同じ着色関数で塗る。theme_fig が None なら何もしない。
+    html_body = _theme_figure.inject(html_body, theme_fig, colorize=_colorize_cell_text)
 
     date_label = _date_label(target_date)
     masthead = f"""<header class="masthead">

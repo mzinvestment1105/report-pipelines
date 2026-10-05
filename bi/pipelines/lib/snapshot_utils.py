@@ -356,3 +356,467 @@ def get_latest_close(ticker: str, target_date=None) -> Quote | None:
                 return Quote(close=c_last, prev=c_prev, date=cd, source="cnbc", market_state=None)
 
     return yahoo_quote
+
+
+# ---------------------------------------------------------------------------
+# 場中の足（マクロ昼刊・2026-10-05 追加）
+#
+# 以下は追加のみ。上の既存関数（get_latest_close 等）の挙動・引数・戻り値は一切変えない。
+# 昼刊は「11:30 の前場引け時点で、日経平均・日経先物・ドル円が朝の気配に対してどう動いたか」を
+# 載せるため、日足ではなく場中の足（1 分足など）が要る。取得経路は既存と同じ Yahoo chart API を
+# 主とし、Yahoo が落ちた時だけ yfinance（同じ Yahoo の別経路）を使う。
+# 取得元の遅延（Yahoo の quoteSummary が返す exchangeDataDelayedBy・分）は別関数で取り、
+# 呼び出し側が「最後の足の時刻」と並べて記録できるようにする（遅延の実測に使う）。
+# ---------------------------------------------------------------------------
+
+_JST = _timezone(_timedelta(hours=9))
+
+
+@dataclass
+class IntradayBar:
+    """場中の足 1 本。ts は足の開始時刻（JST の aware datetime）。"""
+
+    ts: _datetime
+    open: float | None
+    high: float | None
+    low: float | None
+    close: float
+
+
+@dataclass
+class IntradaySeries:
+    """場中の足の系列と、取得時の付帯情報。
+
+    bars        : 足の開始時刻の昇順。close が欠けた足は含めない
+    interval    : 実際に取れた足の長さ（"1m" / "2m" / "5m"）
+    fetched_at  : 取得した時刻（JST）
+    source      : "yahoo_chart" / "yfinance"
+    meta        : 取得元の付帯情報（exchangeName・previousClose・regularMarketTime(JST)・
+                  regularMarketPrice・取引時間帯 等。取れたものだけ）
+    """
+
+    ticker: str
+    interval: str
+    bars: list
+    fetched_at: _datetime
+    source: str
+    meta: dict
+
+
+def _interval_minutes(interval: str) -> int:
+    try:
+        return int(interval.rstrip("m"))
+    except ValueError:
+        return 1
+
+
+def _chart_intraday(ticker: str, start: _datetime, end: _datetime, interval: str, host: str):
+    """Yahoo chart API を period1/period2 指定で叩き (bars, meta) を返す。失敗時 None。"""
+    sym = _up.quote(ticker, safe="")
+    p1 = int(start.timestamp())
+    p2 = int(end.timestamp())
+    url = (
+        f"https://{host}/v8/finance/chart/{sym}"
+        f"?period1={p1}&period2={p2}&interval={interval}&includePrePost=false"
+    )
+    try:
+        req = _ur.Request(url, headers={"User-Agent": _UA})
+        with _ur.urlopen(req, timeout=20) as resp:
+            data = _json.loads(resp.read().decode("utf-8", "replace"))
+        res = data["chart"]["result"][0]
+    except Exception:
+        return None
+    meta_raw = res.get("meta", {}) or {}
+    ts = res.get("timestamp") or []
+    q = ((res.get("indicators") or {}).get("quote") or [{}])[0]
+    opens = q.get("open") or [None] * len(ts)
+    highs = q.get("high") or [None] * len(ts)
+    lows = q.get("low") or [None] * len(ts)
+    closes = q.get("close") or [None] * len(ts)
+    bars = []
+    for i, t in enumerate(ts):
+        c = closes[i] if i < len(closes) else None
+        if c is None:
+            continue
+        bars.append(
+            IntradayBar(
+                ts=_datetime.fromtimestamp(int(t), tz=_JST),
+                open=float(opens[i]) if i < len(opens) and opens[i] is not None else None,
+                high=float(highs[i]) if i < len(highs) and highs[i] is not None else None,
+                low=float(lows[i]) if i < len(lows) and lows[i] is not None else None,
+                close=float(c),
+            )
+        )
+    bars.sort(key=lambda b: b.ts)
+    meta: dict = {}
+    for k in (
+        "exchangeName", "fullExchangeName", "instrumentType", "exchangeTimezoneName",
+        "dataGranularity", "regularMarketPrice", "previousClose", "chartPreviousClose",
+    ):
+        if k in meta_raw:
+            meta[k] = meta_raw[k]
+    rmt = meta_raw.get("regularMarketTime")
+    if rmt:
+        try:
+            meta["regularMarketTime_jst"] = _datetime.fromtimestamp(int(rmt), tz=_JST).isoformat()
+        except Exception:
+            pass
+    reg = ((meta_raw.get("currentTradingPeriod") or {}).get("regular") or {})
+    if reg.get("start") and reg.get("end"):
+        try:
+            meta["regular_period_jst"] = (
+                _datetime.fromtimestamp(int(reg["start"]), tz=_JST).isoformat()
+                + " -> "
+                + _datetime.fromtimestamp(int(reg["end"]), tz=_JST).isoformat()
+            )
+        except Exception:
+            pass
+    return bars, meta
+
+
+def _yf_intraday(ticker: str, start: _datetime, end: _datetime, interval: str):
+    """yfinance で場中の足を取る（Yahoo chart API 直叩きが全滅した時だけ使う）。失敗時 None。"""
+    try:
+        import yfinance as yf
+
+        hist = yf.Ticker(ticker).history(
+            start=start, end=end, interval=interval, auto_adjust=False, prepost=False
+        )
+        if hist is None or hist.empty:
+            return None
+        hist = hist.dropna(subset=["Close"])
+        bars = []
+        for idx, row in hist.iterrows():
+            ts = idx.to_pydatetime()
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=_timezone.utc)
+            bars.append(
+                IntradayBar(
+                    ts=ts.astimezone(_JST),
+                    open=float(row["Open"]) if row.get("Open") == row.get("Open") else None,
+                    high=float(row["High"]) if row.get("High") == row.get("High") else None,
+                    low=float(row["Low"]) if row.get("Low") == row.get("Low") else None,
+                    close=float(row["Close"]),
+                )
+            )
+        bars.sort(key=lambda b: b.ts)
+        return bars, {}
+    except Exception:
+        return None
+
+
+def get_intraday_bars(
+    ticker: str,
+    start: _datetime,
+    end: _datetime,
+    intervals: tuple = ("1m", "2m", "5m"),
+    use_yfinance: bool = True,
+) -> IntradaySeries | None:
+    """ticker の場中の足を [start, end) で返す（start / end は aware datetime）。取得不能なら None。
+
+    取得順: Yahoo chart API（query1 → query2）を intervals の短い足から順に試し、
+    足が 1 本以上取れた最初の組み合わせを採用する。全滅した時だけ yfinance で同じ順に試す。
+    足の時刻は足の開始時刻（JST）。end より後の足は返さない（as-of 再現で未来の足を混ぜない）。
+    例外は内部で握りつぶす（呼び出し側レポートを 1 銘柄の失敗で止めない）。
+    """
+    fetched_at = _datetime.now(_JST)
+    for interval in intervals:
+        for host in ("query1.finance.yahoo.com", "query2.finance.yahoo.com"):
+            got = _chart_intraday(ticker, start, end, interval, host)
+            if got is None:
+                continue
+            bars, meta = got
+            bars = [b for b in bars if start <= b.ts < end]
+            if bars:
+                return IntradaySeries(
+                    ticker=ticker, interval=interval, bars=bars,
+                    fetched_at=fetched_at, source="yahoo_chart", meta=meta,
+                )
+    if not use_yfinance:
+        return None
+    for interval in intervals:
+        got = _yf_intraday(ticker, start, end, interval)
+        if got is None:
+            continue
+        bars, meta = got
+        bars = [b for b in bars if start <= b.ts < end]
+        if bars:
+            return IntradaySeries(
+                ticker=ticker, interval=interval, bars=bars,
+                fetched_at=fetched_at, source="yfinance", meta=meta,
+            )
+    return None
+
+
+def get_exchange_delay_minutes(ticker: str) -> int | None:
+    """取得元（Yahoo）が自ら申告する配信遅延（分）を返す。取れなければ None。
+
+    yfinance の Ticker.info（Yahoo の quoteSummary）に含まれる exchangeDataDelayedBy を読む。
+    chart API の meta にはこの項目が無い（2026-10-05 実測）ため、別経路で取る。
+    """
+    try:
+        import yfinance as yf
+
+        info = yf.Ticker(ticker).info or {}
+        v = info.get("exchangeDataDelayedBy")
+        return int(v) if v is not None else None
+    except Exception:
+        return None
+
+
+def get_cnbc_session_quote(yahoo_ticker: str) -> dict | None:
+    """CNBC quote API から当日の始値・高値・安値・現在値・最終時刻・リアルタイム区分を返す。
+
+    Yahoo の場中の足が全滅した時の第二ソース（既存の _CNBC_MAP を使う・マップは変えない）。
+    戻り値: {"open","high","low","last","prev","last_time"(ISO),"realtime"(bool|None)}。失敗時 None。
+    CNBC は「今この瞬間」の値しか返さないため、過去時点の再現には使えない（呼び出し側で判定する）。
+    """
+    sym = _CNBC_MAP.get(yahoo_ticker)
+    if not sym:
+        return None
+    base = "https://quote.cnbc.com/quote-html-webservice/restQuote/symbolType/symbol"
+    q = _up.urlencode(
+        {
+            "symbols": sym, "requestMethod": "itv", "noform": "1", "partnerId": "2",
+            "fund": "1", "exthrs": "1", "output": "json", "events": "1",
+        }
+    )
+    try:
+        req = _ur.Request(f"{base}?{q}", headers={"User-Agent": _UA})
+        with _ur.urlopen(req, timeout=20) as resp:
+            data = _json.loads(resp.read().decode("utf-8", "replace"))
+        quotes = (data.get("FormattedQuoteResult") or {}).get("FormattedQuote") or []
+        if not quotes:
+            return None
+        d = quotes[0]
+        rt = str(d.get("realTime", "")).lower()
+        return {
+            "open": _to_float(d.get("open")),
+            "high": _to_float(d.get("high")),
+            "low": _to_float(d.get("low")),
+            "last": _to_float(d.get("last")),
+            "prev": _to_float(d.get("previous_day_closing")),
+            "last_time": d.get("last_time"),
+            "realtime": True if rt == "true" else False if rt == "false" else None,
+        }
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# マクロ昼刊の市況ブロック用（2026-10-06 追加・追加のみ・上の既存関数は変えない）
+#
+# 昼刊は朝刊・夕刊と同じ「市況スナップショット・市場別サマリー・セクター強弱」を
+# 11:30 の前場引け時点の値で作る。そのために次の 3 つの取得口を足す。
+#   get_daily_closes_window : 日足の (取引所ローカル日付, 終値) を期間指定で返す（前日比の基準・米国指標の直近終値）
+#   get_spark_morning_closes: 個別株の場中の足を Yahoo spark API で 20 銘柄ずつ一括取得し、基準時刻までの最後の約定値を返す
+#   get_tradingview_bars    : TradingView の公開チャート用 websocket（未ログイン＝遅延配信）から場中の足を返す
+#                             （東証の市場別指数 TSE:I0500 等は Yahoo に無いため・2026-10-06 実測で取得可）
+# ---------------------------------------------------------------------------
+
+
+def get_daily_closes_window(ticker: str, start: _datetime, end: _datetime) -> list[tuple]:
+    """Yahoo chart API の日足を [start, end] で取り、[(取引所ローカル日付, 終値)] を日付昇順で返す。
+
+    日付は meta.gmtoffset（取引所の時差）で確定する。Yahoo は period2 より後でも当日の途中の足を
+    返すことがある（2026-10-06 実測: BTC・ドル円）ため、呼び出し側が「基準日より前の日付」で絞ること。
+    失敗時は []。
+    """
+    sym = _up.quote(ticker, safe="")
+    url = (
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}"
+        f"?period1={int(start.timestamp())}&period2={int(end.timestamp())}&interval=1d"
+    )
+    for host in ("query1.finance.yahoo.com", "query2.finance.yahoo.com"):
+        try:
+            req = _ur.Request(url.replace("query1.finance.yahoo.com", host), headers={"User-Agent": _UA})
+            with _ur.urlopen(req, timeout=20) as resp:
+                data = _json.loads(resp.read().decode("utf-8", "replace"))
+            res = data["chart"]["result"][0]
+            gmt = int((res.get("meta") or {}).get("gmtoffset") or 0)
+            ex_tz = _timezone(_timedelta(seconds=gmt))
+            ts = res.get("timestamp") or []
+            closes = (((res.get("indicators") or {}).get("quote") or [{}])[0]).get("close") or []
+            pairs = [
+                (_datetime.fromtimestamp(int(t), tz=ex_tz).date(), float(c))
+                for t, c in zip(ts, closes)
+                if c is not None
+            ]
+            pairs.sort(key=lambda p: p[0])
+            if pairs:
+                return pairs
+        except Exception:
+            continue
+    return []
+
+
+def get_spark_morning_closes(
+    symbols: list,
+    start: _datetime,
+    asof: _datetime,
+    interval: str = "5m",
+    chunk: int = 20,
+    workers: int = 4,
+    retries: int = 3,
+) -> tuple[dict, dict]:
+    """Yahoo spark API で複数銘柄の場中の足を一括取得し、start〜asof（asof の足を含む）の最後の約定値を返す。
+
+    spark は 1 回 20 銘柄まで（2026-10-06 実測: 50 銘柄で HTTP 400）。約定の無い足は close が null で
+    返るため、null を除いた最後の足を「基準時刻までの最後の約定値」とする。期間内に約定が 1 本も無い
+    銘柄は結果に含めない（朝刊の集計で終値の無い銘柄を除くのと同じ扱い）。
+
+    戻り値: (closes, stats)
+      closes: {symbol: (最後の約定値, その足の時刻 JST)}
+      stats : {"requested", "returned", "with_price", "at_asof"(asof の足に約定がある銘柄数),
+               "failed_chunks", "seconds"}
+    """
+    import time as _time
+    from concurrent.futures import ThreadPoolExecutor
+
+    t0 = _time.time()
+    syms = list(dict.fromkeys(symbols))
+    chunks = [syms[i:i + chunk] for i in range(0, len(syms), chunk)]
+    p1 = int(start.timestamp())
+    p2 = int((asof + _timedelta(minutes=1)).timestamp())
+
+    def _one(batch: list):
+        q = _up.urlencode({"symbols": ",".join(batch), "period1": p1, "period2": p2, "interval": interval})
+        for attempt in range(retries):
+            for host in ("query1.finance.yahoo.com", "query2.finance.yahoo.com"):
+                try:
+                    req = _ur.Request(f"https://{host}/v8/finance/spark?{q}", headers={"User-Agent": _UA})
+                    with _ur.urlopen(req, timeout=30) as resp:
+                        return _json.loads(resp.read().decode("utf-8", "replace"))
+                except Exception:
+                    continue
+            _time.sleep(2 * (attempt + 1))
+        return None
+
+    closes: dict = {}
+    returned = 0
+    failed = 0
+    at_asof = 0
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+        for res in ex.map(_one, chunks):
+            if not isinstance(res, dict):
+                failed += 1
+                continue
+            for sym, v in res.items():
+                if not isinstance(v, dict):
+                    continue
+                returned += 1
+                ts = v.get("timestamp") or []
+                cl = v.get("close") or []
+                last = None
+                for t, c in zip(ts, cl):
+                    if c is None:
+                        continue
+                    dt = _datetime.fromtimestamp(int(t), tz=_JST)
+                    if start <= dt <= asof:
+                        if last is None or dt >= last[1]:
+                            last = (float(c), dt)
+                if last is not None:
+                    closes[sym] = last
+                    if last[1] >= asof:
+                        at_asof += 1
+    stats = {
+        "requested": len(syms), "returned": returned, "with_price": len(closes), "at_asof": at_asof,
+        "failed_chunks": failed, "chunks": len(chunks), "seconds": round(_time.time() - t0, 1),
+    }
+    return closes, stats
+
+
+def get_tradingview_bars(symbol: str, resolution: str = "1", n_bars: int = 1000, timeout: float = 25.0):
+    """TradingView の公開チャート用 websocket から足を取り (bars, meta) を返す。失敗時 None。
+
+    未ログインの接続（unauthorized_user_token）は遅延配信で、東証の指数は meta["delay"]=1200 秒
+    （20 分）と申告される（2026-10-06 実測）。bars は IntradayBar（ts は足の開始時刻 JST）の昇順。
+    websocket-client（import websocket）が無い環境では None を返す。
+    """
+    try:
+        import random as _random
+        import string as _string
+
+        import websocket as _websocket
+    except Exception:
+        return None
+
+    def _frame(obj: dict) -> str:
+        s = _json.dumps(obj, separators=(",", ":"))
+        return f"~m~{len(s)}~m~{s}"
+
+    def _split(raw: str) -> list:
+        out, i = [], 0
+        while raw.startswith("~m~", i):
+            j = raw.index("~m~", i + 3)
+            n = int(raw[i + 3:j])
+            out.append(raw[j + 3:j + 3 + n])
+            i = j + 3 + n
+        return out
+
+    import time as _time
+
+    try:
+        ws = _websocket.create_connection(
+            "wss://data.tradingview.com/socket.io/websocket?from=chart%2F&type=chart",
+            header=["Origin: https://jp.tradingview.com"], timeout=timeout,
+        )
+    except Exception:
+        return None
+    bars: dict = {}
+    meta: dict = {}
+    ok = False
+    try:
+        cs = "cs_" + "".join(_random.choices(_string.ascii_lowercase, k=12))
+        sym_json = _json.dumps({"symbol": symbol, "adjustment": "splits", "session": "regular"})
+        for m, p in (
+            ("set_auth_token", ["unauthorized_user_token"]),
+            ("chart_create_session", [cs, ""]),
+            ("resolve_symbol", [cs, "sds_sym_1", "=" + sym_json]),
+            ("create_series", [cs, "sds_1", "s1", "sds_sym_1", resolution, n_bars, ""]),
+        ):
+            ws.send(_frame({"m": m, "p": p}))
+        deadline = _time.time() + timeout
+        while _time.time() < deadline and not ok:
+            raw = ws.recv()
+            for body in _split(raw):
+                if body.startswith("~h~"):
+                    ws.send(f"~m~{len(body)}~m~{body}")
+                    continue
+                try:
+                    js = _json.loads(body)
+                except ValueError:
+                    continue
+                m = js.get("m")
+                if m == "symbol_resolved":
+                    p = js["p"][2] or {}
+                    meta = {k: p.get(k) for k in ("name", "description", "exchange", "timezone", "session", "delay", "type")}
+                elif m in ("timescale_update", "du"):
+                    for x in ((js["p"][1].get("sds_1") or {}).get("s") or []):
+                        v = x.get("v") or []
+                        if len(v) >= 5 and v[4] is not None:
+                            bars[int(v[0])] = v
+                elif m == "series_completed":
+                    ok = True
+                elif m in ("symbol_error", "series_error", "critical_error", "protocol_error"):
+                    return None
+    except Exception:
+        return None
+    finally:
+        try:
+            ws.close()
+        except Exception:
+            pass
+    if not bars:
+        return None
+    out = [
+        IntradayBar(
+            ts=_datetime.fromtimestamp(t, tz=_JST),
+            open=float(v[1]) if v[1] is not None else None,
+            high=float(v[2]) if v[2] is not None else None,
+            low=float(v[3]) if v[3] is not None else None,
+            close=float(v[4]),
+        )
+        for t, v in sorted(bars.items())
+    ]
+    return out, meta
