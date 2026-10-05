@@ -208,16 +208,26 @@ def verify(md: str, code: str, target_date: _dt.date | str | None = None) -> tup
         price = _find_one(md, r"株価（[^）]*終値[^）]*）[^0-9\n]{0,10}([0-9][0-9,]*)\s*円")
     mcap_oku = _find_one(md, r"\|\s*時価総額[^|\n]*\|\s*\**([0-9][0-9,]*\.?[0-9]*)\s*\**\s*億円")
 
+    # 検査2 専用の株価: 上の 2 パターンで読めない「4,060円（10/2終値）」「**999円**（前日比 +9円）」
+    # のように数値の後ろに括弧書き（全角・半角）の注記が続くセルも読む（読めないと検査2 が
+    # 未実施になるため・2026-10-05）。検査3 は従来の price のまま使う（検査3 の EPS は本文の
+    # 最初の「EPS ○円」を拾うため、四半期 EPS が先に出る誌面で偽 error になる。3103 で確認）。
+    price_c2 = price
+    if price_c2 is None:
+        price_c2 = _find_one(
+            md, r"\|\s*株価[^|\n]*\|\s*\**([0-9][0-9,]*)\s*\**\s*(?:円)?\s*\**\s*(?:[（(][^|\n]*)?\|"
+        )
+
     # 検査2: 時価総額 ÷ 株価 = 発行済株式総数
     check2 = "未実施"  # 検査2b の warning 文に結果を添えるため保持する
-    if price and mcap_oku and shares:
-        implied = mcap_oku * 1e8 / price
+    if price_c2 and mcap_oku and shares:
+        implied = mcap_oku * 1e8 / price_c2
         check2 = "通過"
         if abs(implied - shares) / shares > TOL_MCAP + TOL_SHARES:
             check2 = "不整合"
             errors.append(
                 f"[検査2] 時価総額÷株価が発行済株式総数と不整合: "
-                f"{mcap_oku}億円÷{price:,.0f}円={implied:,.0f}株 vs 誌面 {shares:,.0f}株"
+                f"{mcap_oku}億円÷{price_c2:,.0f}円={implied:,.0f}株 vs 誌面 {shares:,.0f}株"
             )
 
     # 検査2b: 時価総額が screening_master と一致するか
