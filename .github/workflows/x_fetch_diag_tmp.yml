@@ -36,60 +36,19 @@ jobs:
           PYTHONIOENCODING: utf-8
         run: |
           set +e
+          # 本番と同じ順序（プロフィール取得 → タイムライン → バズ収集）で同じランナー IP から実行する
           python fetch_x_profile.py --users "$X_DAILY_TARGETS" --followers --followers-max 1000 --following --following-max 500 --slug daily --out-dir /tmp/xo > /tmp/profile.log 2>&1
           echo "profile_exit=$?"
           python fetch_x_posts.py --user "${X_DAILY_TARGETS%%,*}" --count 40 --slug tl_daily --out-dir /tmp/xo > /tmp/tl.log 2>&1
           echo "timeline_exit=$?"
-          cat > /tmp/diag.py <<'PY'
-          import asyncio, sys, time
-          sys.path.insert(0, ".")
-          import fetch_x_posts as fx
-          from playwright.async_api import async_playwright
-          CHAL = "しばらくお待ちください"
-          async def one(tag, url):
-              async with async_playwright() as p:
-                  b, c = await fx._new_context(p, False)
-                  pg = await c.new_page()
-                  st = None
-                  try:
-                      r = await pg.goto(url, wait_until="domcontentloaded", timeout=60000); st = r.status if r else None
-                  except Exception as e:
-                      st = type(e).__name__
-                  await asyncio.sleep(6)
-                  try: t = await pg.title()
-                  except Exception: t = CHAL
-                  print(f"[d] {time.strftime('%H:%M:%S')} {tag} http={st} challenged={CHAL in t} host={pg.url.split('/')[2]}")
-                  await b.close()
-          async def spa(url):
-              from urllib.parse import quote_plus, urlparse
-              async with async_playwright() as p:
-                  b, c = await fx._new_context(p, False)
-                  pg = await c.new_page()
-                  n = {"tw": 0}
-                  async def on_resp(r):
-                      if "SearchTimeline" in r.url:
-                          try: n["tw"] += len(fx._extract_tweets_from_graphql(await r.json()))
-                          except Exception: pass
-                  pg.on("response", on_resp)
-                  r = await pg.goto(url, wait_until="domcontentloaded", timeout=60000)
-                  await asyncio.sleep(6)
-                  ch = CHAL in await pg.title()
-                  u = urlparse(pg.url)
-                  q = "AI min_faves:500 lang:en -filter:replies -filter:retweets"
-                  if not ch:
-                      await pg.evaluate("p => { window.history.pushState({}, '', p); window.dispatchEvent(new PopStateEvent('popstate', {state: {}})); }", f"/search?q={quote_plus(q)}&src=typed_query&f=live")
-                      await asyncio.sleep(4)
-                      for _ in range(3):
-                          await pg.evaluate("window.scrollBy(0, document.body.scrollHeight)"); await asyncio.sleep(2)
-                  print(f"[d] spa_via {url} http={r.status if r else None} challenged={ch} landed={u.path} qkeys={list(dict(x.split('=')[0:1]*2 for x in u.query.split('&') if x).keys())} tweets={n['tw']}")
-                  await b.close()
-          async def main():
-              for i in range(4):
-                  await one(f"r{i} x_explore", "https://x.com/explore")
-                  await one(f"r{i} twitter_com", "https://twitter.com/explore")
-                  await one(f"r{i} x_i_flow", "https://x.com/i/flow/login")
-              await spa("https://twitter.com/explore")
-              await spa("https://x.com/i/flow/login")
-          asyncio.run(main())
+          python fetch_x_buzz.py --out-dir /tmp/xo > /tmp/buzz.log 2>&1
+          echo "buzz_exit=$?"
+          grep -E '^\[(entry|cf|stats)\]' /tmp/buzz.log
+          grep -E '^\[search\].*取得 [0-9]+ 件' /tmp/buzz.log | sed -E 's/.*(取得 [0-9]+ 件)/search: \1/'
+          python - <<'PY'
+          import json, glob
+          f = sorted(glob.glob("/tmp/xo/buzz_*.json"))[-1]
+          d = json.load(open(f, encoding="utf-8"))
+          n = sum(1 for l in ("top_articles_ja", "top_articles_en") for p in d[l] if len(p.get("article_text") or "") >= 120 and p.get("article_url"))
+          print("article_candidates", n, "fetch_diag", d["meta"].get("fetch_diag"))
           PY
-          python /tmp/diag.py 2>&1 | grep -E "^\[d\]"
