@@ -2,8 +2,10 @@
 
 2026-10-05 見本（PM 承認済みの冒頭ブロック案）。誌面 md の「## 本日のテーマ」節を
 プログラムが解析し、上位テーマ（最大 3 位）ごとに
-  テーマ名 / 起点の材料（テーマ見出しの括弧書き）/ 主導銘柄の騰落率の横棒
+  テーマ名 / テーマ見出しの括弧書き（副題として括弧ごと表示）/ 主導銘柄の騰落率の横棒
 を 1 つの図（HTML/CSS のベクタ描画）にまとめる。モデルが数値を書き写す工程は無い。
+括弧書きは材料（「大口受注と需要見通し引き上げ」）の号も業種の列挙（「衣料・外食・家具」）の号も
+あるため、「起点の材料：」等の欄名を付けず、見出しと同じ括弧書きのまま副題に出す（2026-10-06）。
 
 ■ 動作条件（後方互換）
   誌面 md に目印行 `<!-- THEME_FIGURE -->`（単独の 1 行）がある時だけ働く。
@@ -40,7 +42,7 @@ MAX_ROWS = 6     # 1 テーマあたりの棒の上限（1 ページ目に収め
 
 _RE_SECTION = re.compile(r"^##\s+本日のテーマ\s*$")
 _RE_SECTION_END = re.compile(r"^#{1,2}\s")
-# `**1位 テーマ名（起点の材料）**` ＋ 任意の後続（点灯日数などの注記）
+# `**1位 テーマ名（括弧書き）**` ＋ 任意の後続（点灯日数などの注記）
 _RE_THEME_HEAD = re.compile(r"^\*\*\s*(\d+)\s*位\s*(.+?)\s*\*\*")
 
 
@@ -64,7 +66,7 @@ class _Theme:
 
 
 def _split_title(title: str) -> tuple[str, str]:
-    """`テーマ名（材料）` を (テーマ名, 材料) に分ける。末尾の全角括弧を対応付けて外す。"""
+    """`テーマ名（括弧書き）` を (テーマ名, 括弧書き) に分ける。末尾の全角括弧を対応付けて外す。"""
     t = title.strip()
     if not t.endswith("）"):
         return t, ""
@@ -232,7 +234,8 @@ def render_html(themes: list[_Theme], colorize: Callable[[str], str] | None = No
         parts.append(f'<div class="tf-head">{_esc(t.rank)}位　{name}</div>')
         if t.material:
             mat = paint(_esc(_label_text(t.material)))
-            parts.append(f'<div class="tf-mat">起点の材料：{mat}</div>')
+            # 欄名を付けず、見出しの括弧書きを括弧ごと副題にする（内容が材料でも業種名でも誤表示にならない）
+            parts.append(f'<div class="tf-mat">（{mat}）</div>')
         rows = sorted(t.rows[:MAX_ROWS], key=lambda r: r.value, reverse=True)
         for r in rows:
             label = _esc(f"{r.code} {_label_text(r.name)}")

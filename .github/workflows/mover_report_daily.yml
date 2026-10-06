@@ -881,15 +881,23 @@ jobs:
           # 結合後の最終行へ移す（翌日の make_mover_report.py の ingest_own_themes が回収する）。
           JSON_BLOCK="/tmp/own_themes_json.txt"
           : > "$JSON_BLOCK"
+          # 2026-10-06（PM 承認・冒頭ブロック）: themes 枠が先頭に書く見出しと要点 3 行のブロック
+          # （<!-- MOVERS_LEAD … MOVERS_LEAD -->・HTML コメント）を本文から外して退避する。
+          # 表題行・要点の引用ブロック・図の目印は後段の「冒頭ブロックの機械組み立て」が置く。
+          LEAD_BLOCK="/tmp/movers_lead.txt"
+          : > "$LEAD_BLOCK"
           for m in themes growth standard prime; do
             SRC="/tmp/market-artifacts/${TARGET_DATE}_${m}.md"
             if [ -s "$SRC" ]; then
               if [ "$m" = "themes" ]; then
                 awk '/^<!-- OWN_THEMES_JSON/{f=1} f{print} f && /OWN_THEMES_JSON -->/{exit}' "$SRC" > "$JSON_BLOCK"
+                awk '/^<!-- MOVERS_LEAD/{f=1} f{print} f && /MOVERS_LEAD -->/{exit}' "$SRC" > "$LEAD_BLOCK"
               fi
-              # 本文から OWN_THEMES_JSON を外し、末尾の空行を落としてから結合する
+              # 本文から OWN_THEMES_JSON と MOVERS_LEAD を外し、末尾の空行を落としてから結合する
               BODY="/tmp/${TARGET_DATE}_${m}.body.md"
               awk '/^<!-- OWN_THEMES_JSON/{f=1} !f{print} /OWN_THEMES_JSON -->/{f=0}' "$SRC" \
+                | awk '/^<!-- MOVERS_LEAD/{f=1} f{if (/MOVERS_LEAD -->/){f=0; s=1}; next} s && /^[[:space:]]*$/{s=0; next} {s=0; print}' \
+                | awk 'NF{s=1} s' \
                 | awk '/^[[:space:]]*$/{b=b $0 "\n"; next} {printf "%s", b; b=""; print}' > "$BODY"
               if [ -n "$FOUND" ]; then printf '\n' >> "$OUTPUT"; fi
               cat "$BODY" >> "$OUTPUT"
@@ -1016,7 +1024,8 @@ jobs:
               esac
               NAMES="${NAMES}${NAMES:+・}${JP}"
             done
-            # 先頭へ置く（send_report_pdf_discord.py が文書タイトルを先頭へ足すため、マストヘッド直下に来る）
+            # 先頭へ置く（send_report_pdf_discord.py が文書タイトルを先頭へ足すため、マストヘッド直下に来る）。
+            # 2026-10-06: 冒頭ブロックがある号は、後段の組み立てが表題・要点・図の目印をこの 1 行より上へ置く。
             { printf '%s\n\n' "> ${NAMES}: 本号未掲載（原因は BI へ通知済み）"; cat "$F"; } > "${F}.tmp" && mv "${F}.tmp" "$F"
             echo "欠落注記を挿入: ${NAMES}: 本号未掲載（原因は BI へ通知済み）"
           fi
@@ -1039,6 +1048,22 @@ jobs:
             echo "annotated=false" >> $GITHUB_OUTPUT
             echo "品質フラグなし・注記挿入なし"
           fi
+
+      - name: 冒頭ブロックの機械組み立て（表題・要点 3 行・テーマ早見図の目印・欠けても送信は止めない）
+        # 2026-10-06（PM 承認 2026-10-05）: themes 枠が書いた見出しと要点 3 行（place で退避した /tmp/movers_lead.txt）を
+        # lib/mover_lead.py が検査し、合格なら md の先頭へ「# 動意銘柄レポート {date}（曜）— {見出し}」・要点の引用ブロック・
+        # 図の目印 <!-- THEME_FIGURE --> を置く（日付・曜日・目印は機械が組み立て、生成枠には書かせない）。図は送信時の
+        # レンダラ（lib/theme_figure.py）が「本日のテーマ」節から描く。ブロックが無い・形式不備・本文に無い数値やコードを
+        # 含む時は md を変えず従来の形式で送り、下の通知で BI へ知らせる（絶対配信原則・スクリプトは常に exit 0）。
+        id: lead
+        continue-on-error: true
+        working-directory: ./private-repo
+        env:
+          TARGET_DATE: ${{ needs.setup-raw.outputs.target_date }}
+          PYTHONIOENCODING: utf-8
+        run: |
+          python bi/pipelines/lib/mover_lead.py --kind movers --date "${TARGET_DATE}" \
+            --file "market/daily/movers/${TARGET_DATE}.md" --lead-file /tmp/movers_lead.txt
 
       - name: テスト配信の見出し（🧪 テストモードのみ・BI へ）
         # 2026-10-04: テストモードでは誌面 PDF の送り先を BI チャンネルへ切り替える。
@@ -1156,6 +1181,22 @@ jobs:
           meaning: '配信しました。「なぜ動いた」が事実照合に通らなかった ${{ steps.reasonfix.outputs.replaced_count }} 銘柄（${{ steps.reasonfix.outputs.replaced_codes }}）は、確認できた事実だけの 1 文へ差し替えています。'
           cause: '理由ゲート不合格 ${{ steps.reasonfix.outputs.replaced_count }} 銘柄（${{ steps.reasonfix.outputs.replaced_codes }}）・生成枠の修正試行の後も不合格'
           detail: '動意銘柄レポート 配信済み（なぜ動いた を機械差し替え）｜差し替え ${{ steps.reasonfix.outputs.replaced_count }} 銘柄（${{ steps.reasonfix.outputs.replaced_codes }}）・差し替え後の不合格 ${{ steps.reasonfix.outputs.after_fail_count }} 件。'
+
+      - name: Discord 通知（⚠️ 配信済み・冒頭ブロックなし）
+        # 2026-10-06 追加: テーマ欄がある号で冒頭ブロック（表題の見出し・要点 3 行・テーマ早見図）を載せられなかった時。
+        # テーマ欄の枠そのものが欠けた号は「一部市場が欠けたまま配信」の通知が出るため重ねない。
+        if: (steps.lead.outputs.notify == 'true' || steps.lead.outcome == 'failure') && !contains(steps.place.outputs.missing_markets, 'themes') && steps.send.outcome == 'success'
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          kind: status
+          bi_webhook: ${{ secrets.DISCORD_WEBHOOK_BI }}
+          test_mode: ${{ github.event.inputs.test_mode || 'false' }}
+          state: partial
+          label: '動意レポート'
+          date: ${{ needs.setup-raw.outputs.target_date }}
+          meaning: '配信しました。冒頭の見出し・要点 3 行・テーマ早見図は載せず、従来の形式で送っています。'
+          cause: ${{ steps.lead.outputs.reason || '冒頭ブロックの組み立て処理（mover_lead.py）の実行失敗' }}
+          detail: '動意銘柄レポート 配信済み（冒頭ブロックなし）｜status=${{ steps.lead.outputs.status }}。'
 
       - name: Discord 通知（⚠️ 配信済み・理由ゲート未実施）
         # 2026-10-04 追加（計画書 §3-D）: 事実ファイルが無い（ETL 失敗）・照合スクリプトが失敗した日は

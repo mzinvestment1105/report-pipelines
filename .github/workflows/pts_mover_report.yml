@@ -668,6 +668,23 @@ jobs:
             echo "annotated=false" >> $GITHUB_OUTPUT
           fi
 
+      - name: 冒頭ブロックの機械組み立て（表題・要点 3 行・テーマ早見図の目印・欠けても送信は止めない）
+        # 2026-10-06（PM 承認 2026-10-05）: 生成枠が表題行の直後に書いた見出しと要点 3 行（<!-- MOVERS_LEAD … -->・
+        # HTML コメント）を lib/mover_lead.py が検査し、合格なら表題行を「# 夜間PTS動意レポート {M/D}（曜）— {見出し}」へ
+        # 組み直し、その直後へ要点の引用ブロックと図の目印 <!-- THEME_FIGURE --> を置く（日付・曜日・目印は機械が組み立てる）。
+        # 品質注記の挿入（上）の後に置くため、注記は要点と図の下に来る。ブロックが無い・形式不備の時はコメントだけ外して
+        # 従来の形式で送り、末尾の通知で BI へ知らせる（絶対配信原則・スクリプトは常に exit 0）。
+        if: steps.raw.outputs.skipped != 'true'
+        id: lead
+        continue-on-error: true
+        working-directory: ./private-repo
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.value }}
+          PYTHONIOENCODING: utf-8
+        run: |
+          python bi/pipelines/lib/mover_lead.py --kind pts_movers --date "${TARGET_DATE}" \
+            --file "market/daily/pts_movers/${TARGET_DATE}.md"
+
       - name: Install Japanese fonts (Noto Sans CJK JP)
         if: steps.raw.outputs.skipped != 'true'
         # PM 2026-08-19 承認（動意日次 mover_report_daily.yml からの横展開）: `sudo apt-get update -qq`
@@ -800,6 +817,21 @@ jobs:
           date: ${{ steps.date.outputs.value }}
           meaning: '配信しました。一部に注意点があるため、誌面の冒頭に注記があります。'
           detail: '夜間PTS動意レポート 配信済み（品質注記あり）｜レポートは配信済みです。品質注記（${{ steps.annotate.outputs.note }}）を冒頭に付けています。'
+
+      - name: Discord 通知（⚠️ 配信済み・冒頭ブロックなし）
+        # 2026-10-06 追加: 冒頭ブロック（表題の見出し・要点 3 行・テーマ早見図）を載せられなかった時。
+        if: steps.raw.outputs.skipped != 'true' && (steps.lead.outputs.notify == 'true' || steps.lead.outcome == 'failure') && steps.send.outcome == 'success'
+        uses: ./report-pipelines/.github/actions/notify-discord
+        with:
+          kind: status
+          bi_webhook: ${{ secrets.DISCORD_WEBHOOK_BI }}
+          test_mode: ${{ github.event.inputs.test_mode || 'false' }}
+          state: partial
+          label: '夜間PTS動意レポート'
+          date: ${{ steps.date.outputs.value }}
+          meaning: '配信しました。冒頭の見出し・要点 3 行・テーマ早見図は載せず、従来の形式で送っています。'
+          cause: ${{ steps.lead.outputs.reason || '冒頭ブロックの組み立て処理（mover_lead.py）の実行失敗' }}
+          detail: '夜間PTS動意レポート 配信済み（冒頭ブロックなし）｜status=${{ steps.lead.outputs.status }}。'
 
       - name: Discord 通知（⚠️ 配信済み・後処理のみ失敗）
         if: steps.raw.outputs.skipped != 'true' && ((failure() || cancelled()) && steps.send.outcome == 'success')
