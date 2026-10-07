@@ -1539,6 +1539,11 @@ def render_markdown_to_pdf(
     html_body = _colorize_numbers(html_body)
     html_body = _tag_theme_tables(html_body)
     html_body = _wrap_theme_blocks(html_body)
+    # 列幅の自動配分（PM 2026-10-06・_cr §39）。等幅で収まらない表だけ、列幅を内容から配分する。
+    # 判定は表ゲートと同じ table_rules.colfit_plan()。対象の表が無い号は HTML・CSS とも変わらない。
+    # 図の差し込み（_theme_figure.inject）より前に置き、markdown 由来の表にだけ作用させる
+    # （差し込まれた図の HTML には列幅の処理を掛けない・2026-10-07）。
+    html_body, colfit_css = _apply_colfit(html_body, body_md, kind)
     # 図は着色・表クラス付与の後に差し込む（図の CSS を本文の符号正規化へ通さないため）。
     # 騰落率などの文字は本文と同じ着色関数で塗る。theme_fig が None なら何もしない。
     html_body = _theme_figure.inject(html_body, theme_fig, colorize=_colorize_cell_text)
@@ -1549,10 +1554,6 @@ def render_markdown_to_pdf(
   <h1>{title}</h1>
   <div class="meta"><span class="brand">{brand}</span>{('　｜　' + date_label) if date_label else ''}</div>
 </header>"""
-
-    # 列幅の自動配分（PM 2026-10-06・_cr §39）。等幅で収まらない表だけ、列幅を内容から配分する。
-    # 判定は表ゲートと同じ table_rules.colfit_plan()。対象の表が無い号は HTML・CSS とも変わらない。
-    html_body, colfit_css = _apply_colfit(html_body, body_md, kind)
 
     full_html = f"""<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"/>
 <style>{_font_face_css()}{_layout_css(accent, sans_stack, serif_stack, kind)}{colfit_css}</style></head>
