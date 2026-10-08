@@ -52,6 +52,9 @@ from edinetdb_client import EdinetDBClient
 # 「なぜ動いた」改修（2026-10-04 PM 承認）: 日別騰落表・四季報行・facts JSON の部品
 from lib import move_days as _md
 from lib.shikiho_client import fetch_shikiho_batch
+# テーマ欄の材料の並び（当日優先）と当日の個別解説（2026-10-05 PM 承認・テーマ欄改修 A）
+from lib import theme_materials as _tm
+from lib import cross_news as _xn  # 当日の横断ニュース（2026-10-06 PM 承認・テーマ欄改修 B）
 from theme_radar import (
     MAX_ROWS_TODAY_MAX,
     append_early_candidates,
@@ -1835,13 +1838,19 @@ def _row_basic(row: pd.Series) -> str:
             f"| {vol_str} | {cap_str} | {sector} |")
 
 
-def _reason_material_for(code4: str, tdnet_data: dict, yahoo_data: dict) -> list[str]:
+def _reason_material_for(code4: str, tdnet_data: dict, yahoo_data: dict,
+                         today: date | None = None, prev: date | None = None) -> list[str]:
     """テーマ表の主導銘柄について、raw 内に既にある動意理由テキストを集めて返す。
 
     出典は raw の各銘柄ブロックと同一（TDNet 適時開示タイトル・Yahoo!ファイナンス
     ニュース見出し）であり、新たな取得は行わない。Claude が「動いた理由」列を
     1文で書くための素材として `### 理由素材` へ別掲する。
+    today を渡すと当日優先の並び（当日の開示 → 当日の個別解説 → 当日のニュース → 過去の開示）
+    にする（2026-10-05 PM 承認・lib/theme_materials.py）。
     """
+    if today is not None:
+        return _tm.order_daily_materials(code4, tdnet_data, yahoo_data, today, prev,
+                                         asof=ASOF, news_when=_news_when)
     out: list[str] = []
     for e in (tdnet_data.get(code4, {}) or {}).get("entries", [])[:3]:
         title = str(e.get("title") or "").strip()
@@ -2910,7 +2919,8 @@ def build_report(
         _today_res = detect_today(_codes_today)
         _heat_res = compute_theme_heat_v2(_codes_today, trade_date=today)
         # 当日 raw から取れる素材（一次情報のみ）。
-        _material_today = lambda code: _reason_material_for(code, tdnet_data, yahoo_data)
+        _material_today = lambda code: _reason_material_for(code, tdnet_data, yahoo_data,
+                                                            today=today, prev=prev)
         # 2026-09-03 PM 承認: 本日のテーマ「roster」の掲載母集団のみ拡張する
         # （detect_today / compute_theme_heat_v2 / select_early_candidates / 2週間蓄積は
         # 従来どおり radar_df ベースの _codes_today を使い、一切変更しない）。
@@ -2930,7 +2940,7 @@ def build_report(
                 _ec = normalize_code_4(_r["Code"])
                 if _ec in _radar_codes_today:
                     continue
-                if not _reason_material_for(_ec, tdnet_data, yahoo_data):
+                if not _reason_material_for(_ec, tdnet_data, yahoo_data, today=today, prev=prev):
                     continue
                 _roster_records.append({
                     "code": _ec,
@@ -3660,6 +3670,8 @@ def main() -> None:
     # --- Yahoo取得 ---
     print("Yahoo Finance 取得中...")
     yahoo_data = fetch_yahoo_batch(fetch_codes)
+    # 当日の個別解説（立花 QUICK）をテーマ欄の材料へ（2026-10-05 PM 承認・取れなければ何もしない）
+    print(_tm.attach_quick_commentary(yahoo_data, today_dt, ASOF))
 
     # --- 60営業日 OHLC 履歴（株価水準ブロック用・PM 2026-05-22 確定） ---
     print(f"60営業日 OHLC 履歴取得中（対象 {len(fetch_codes)} 銘柄）...")
@@ -3765,6 +3777,13 @@ def main() -> None:
     # テーマ欄枠専用の縮小 raw（2026-10-04）。失敗しても全量 raw と配信は止めない（_cr §36）。
     try:
         themes_md = build_themes_raw(report_md)
+        if themes_md and not args.weekly_roster:
+            # 当日の横断ニュース（他社の事故・政策等・前営業日 15:30〜当日 16:30）をテーマ欄へ（2026-10-06 PM 承認・改修 B）
+            try:
+                _xsec = _xn.build_section(today_dt, prev_dt, "16:30")
+            except Exception as _xe:  # 失敗でも縮小 raw は止めない・節は失敗を明示して残す
+                _xsec = f"{_xn.HEADING}\n\n取得失敗（{type(_xe).__name__}）。\n"
+            themes_md = _xn.insert_section(themes_md, _xsec, before="## テーマ欄の参照銘柄ブロック")
         if themes_md:
             themes_path = out_dir / f"{raw_name_date}_movers_raw_themes.md"
             themes_path.write_text(themes_md, encoding="utf-8")

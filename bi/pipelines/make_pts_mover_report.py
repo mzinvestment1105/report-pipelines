@@ -771,6 +771,14 @@ def main() -> None:
         internal_flags.append(f"- テーマスコアラーの生成に失敗: {str(e)[:200]}")
         print(f"  [WARN] theme_radar: {e}")
 
+    # 当日の横断ニュース（他社の事故・政策等・前営業日 15:30〜当日 21:00）をテーマ判定の入力へ（2026-10-06 PM 承認・改修 B）
+    try:
+        from lib import cross_news as _xn
+        _prev = next(target - timedelta(days=k) for k in range(1, 15) if is_trading_day(target - timedelta(days=k)))
+        lines += [_xn.build_section(target, _prev, "21:00")]
+    except Exception as e:  # 横断ニュースの失敗で本体を止めない（_cr §36）・節は失敗を明示して残す
+        lines += ["## 当日の横断ニュース（テーマのきっかけ候補）", "", f"取得失敗（{type(e).__name__}）。", ""]
+
     # 値上がり（主役）は必ず出す。値下がりは取得できた時だけセクションを出す
     # （空セクションも⚠️も出さない）。売買代金 Top セクションは廃止済み。
     lines += [f"## 夜間PTS 値上がり（当日終値比 +{UP_PCT_MIN:.0f}%以上・上位{UP_MAX}件）", ""]
