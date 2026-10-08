@@ -8,7 +8,7 @@
 
 仕様:
 - 認証 I/F (CLMAuthLoginRequest) でログイン → 仮想 URL を秘密鍵で復号
-- マスタ機能の CLMMfdsGetNewsHead で最大 500 件取得（100件 × 5ページ）
+- マスタ機能の CLMMfdsGetNews（日付指定・v4r10）で当日から遡って最大 500 件取得（2026-10-08 に旧 CLMMfdsGetNewsHead から切替）
 - ヘッドラインは Shift-JIS の URL エンコード文字列を Base64 化したもの → 復号
 - カテゴリ別（マクロ系 / 個別銘柄 AI 速報 / AI 市況）に整形して保存
 
@@ -33,6 +33,10 @@ import requests
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from dotenv import load_dotenv
+
+from lib.tachibana_client import TachibanaApiError, _get_json, normalize_api_base
+from lib.tachibana_client import fetch_news as _fetch_news
+from lib.tachibana_client import _now_str as _jst_now_str
 
 BASE_DIR = Path(__file__).resolve().parent
 REPO_ROOT = BASE_DIR.parent.parent
@@ -76,12 +80,16 @@ GNL_LABEL = {
 
 
 def now_str() -> str:
-    n = datetime.now()
-    return n.strftime("%Y.%m.%d-%H:%M:%S.") + f"{n.microsecond // 1000:03d}"
+    """要求時刻（p_sd_date）。日本時間で作る（GHA ランナーは UTC・2026-10-08 修正・lib/tachibana_client と共通）。"""
+    return _jst_now_str()
 
 
 def login(api_base: str, auth_id: str, private_key) -> dict[str, str]:
-    """ログインして仮想URLを取得・復号して返す。"""
+    """ログインして仮想URLを取得・復号して返す。
+
+    api_base の版は lib.tachibana_client.API_VERSION へ揃える。HTTP 状態・結果コードを検査し、
+    失敗時は TachibanaApiError（`login failed: ...`・URL と認証 ID を含まない）を送出する。
+    """
     payload = {
         "p_no": "1",
         "p_sd_date": now_str(),
@@ -89,33 +97,16 @@ def login(api_base: str, auth_id: str, private_key) -> dict[str, str]:
         "sJsonOfmt": "4",
         "sAuthId": auth_id,
     }
-    url = f"{api_base}/auth/?{urllib.parse.quote(json.dumps(payload, ensure_ascii=False))}"
-    r = requests.get(url, timeout=20)
-    r.encoding = "shift_jis"
-    resp = json.loads(r.text)
+    url = f"{normalize_api_base(api_base)}/auth/?{urllib.parse.quote(json.dumps(payload, ensure_ascii=False))}"
+    resp = _get_json(url, 20, "login")
     if resp.get("p_errno") != "0" or resp.get("sResultCode") != "0":
-        raise RuntimeError(f"login failed: {resp.get('p_err')} / {resp.get('sResultText')}")
+        raise TachibanaApiError(f"login failed: errno={resp.get('p_errno')} err={resp.get('p_err')} / {resp.get('sResultText')}")
     oaep = padding.OAEP(mgf=padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
     return {
         "request": private_key.decrypt(base64.b64decode(resp["sUrlRequest"]), oaep).decode("utf-8"),
         "master": private_key.decrypt(base64.b64decode(resp["sUrlMaster"]), oaep).decode("utf-8"),
         "price": private_key.decrypt(base64.b64decode(resp["sUrlPrice"]), oaep).decode("utf-8"),
     }
-
-
-def fetch_news_page(master_url: str, offset: int, limit: int, p_no: int) -> dict:
-    payload = {
-        "p_no": str(p_no),
-        "p_sd_date": now_str(),
-        "sCLMID": "CLMMfdsGetNewsHead",
-        "sJsonOfmt": "4",
-        "p_REC_OFST": str(offset),
-        "p_REC_LIMT": str(limit),
-    }
-    url = f"{master_url}?{urllib.parse.quote(json.dumps(payload, ensure_ascii=False))}"
-    r = requests.get(url, timeout=30)
-    r.encoding = "shift_jis"
-    return json.loads(r.text)
 
 
 def decode_headline(b64: str) -> str:
@@ -127,16 +118,13 @@ def decode_headline(b64: str) -> str:
 
 
 def fetch_all_news(master_url: str, total_limit: int) -> list[dict]:
-    """直近 total_limit 件のニュースを取得。100件/ページで複数回叩く。"""
-    all_news: list[dict] = []
-    page_size = 100
-    for ofst in range(0, total_limit, page_size):
-        d = fetch_news_page(master_url, ofst, page_size, p_no=ofst + 10)
-        items = d.get("aCLMMfdsNewsHead", [])
-        if not items:
-            break
-        all_news.extend(items)
-    return all_news
+    """直近 total_limit 件のニュースを新しい順に取得する。
+
+    2026-10-08: v4r10 で旧 CLMMfdsGetNewsHead（100 件/ページ）が使えなくなったため、
+    日付指定の CLMMfdsGetNews を日本時間の当日から遡って取得する lib.tachibana_client.fetch_news に切り替えた。
+    """
+    counter = iter(range(10, 10_000))
+    return _fetch_news(master_url, lambda: next(counter), limit=total_limit)
 
 
 def format_markdown(news: list[dict], target_date: str) -> str:
@@ -209,12 +197,21 @@ def main() -> None:
     with open(key_abs, "rb") as f:
         private_key = serialization.load_pem_private_key(f.read(), password=None)
 
-    print(f"[INFO] login to {api_base} ...")
-    urls = login(api_base, auth_id, private_key)
+    # URL は表示しない（版を揃えた後の URL は GHA の secret マスクに一致せず、そのままログに出るため）
+    print("[INFO] login ...")
+    try:
+        urls = login(api_base, auth_id, private_key)
+    except TachibanaApiError as e:
+        print(f"[ERROR] 立花証券 API ログイン失敗: {e}", file=sys.stderr)
+        sys.exit(1)
     print(f"[OK] 仮想URL 取得済")
 
     print(f"[INFO] 最大 {args.limit} 件のニュース取得中 ...")
-    news = fetch_all_news(urls["master"], args.limit)
+    try:
+        news = fetch_all_news(urls["master"], args.limit)
+    except TachibanaApiError as e:
+        print(f"[ERROR] 立花証券 API ニュース取得失敗: {e}", file=sys.stderr)
+        sys.exit(1)
     print(f"[OK] {len(news)} 件取得")
 
     md = format_markdown(news, args.date)

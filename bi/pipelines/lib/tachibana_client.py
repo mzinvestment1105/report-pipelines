@@ -18,9 +18,10 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import urllib.parse
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -28,19 +29,141 @@ import requests
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
+# 日本時間（夏時間が無いため +9 時間固定。tzdata に依存しない）
+_JST = timezone(timedelta(hours=9))
+
+# API の版（2026-10-08 修正）。設定値（GHA secret・.env）の版が古くても、コード側でこの版へ揃える。
+# v4r9 は 2026-09-28 以降ログインが HTTP 404・本文 0 バイト。立花証券公式サンプルの版は v4r10。
+API_VERSION = "v4r10"
+_API_VERSION_RE = re.compile(r"e_api_v\d+r\d+")
+
+
+class TachibanaApiError(RuntimeError):
+    """立花 API の失敗。文言に要求 URL・認証 ID・仮想 URL を含めない（ログへそのまま出せる）。"""
+
+
+def normalize_api_base(api_base: str) -> str:
+    """設定値の base URL の版（パスの `e_api_v{N}r{M}`）を API_VERSION に揃える。版の部分が無ければそのまま返す。"""
+    base = (api_base or "").strip().rstrip("/")
+    return _API_VERSION_RE.sub(f"e_api_{API_VERSION}", base)
+
 
 def _now_str() -> str:
-    n = datetime.now()
+    """要求時刻（p_sd_date）。実行機の時計ではなく日本時間で作る。
+
+    GHA ランナーは UTC のため datetime.now() では 9 時間古い時刻になり、
+    サーバーが errno=8（exceed time limit）で拒否する（2026-09-10〜09-25 の GHA ログで確認）。
+    """
+    n = datetime.now(_JST)
     return n.strftime("%Y.%m.%d-%H:%M:%S.") + f"{n.microsecond // 1000:03d}"
+
+
+def _get_json(url: str, timeout: int, what: str) -> dict[str, Any]:
+    """GET して Shift-JIS の JSON を返す。HTTP 状態・JSON 解析・p_errno を検査し、失敗理由を例外の文言に残す。
+
+    url は認証 ID・仮想 URL を含むため例外の文言へ入れない（通信例外も型名だけにし、元の例外は連結しない）。
+    """
+    try:
+        r = requests.get(url, timeout=timeout)
+    except requests.RequestException as e:
+        raise TachibanaApiError(f"{what} failed: 通信エラー（{type(e).__name__}）") from None
+    if r.status_code != 200:
+        raise TachibanaApiError(
+            f"{what} failed: HTTP {r.status_code}（本文 {len(r.content)} バイト。API の版・URL を確認）")
+    r.encoding = "shift_jis"
+    try:
+        data = json.loads(r.text)
+    except ValueError:
+        raise TachibanaApiError(
+            f"{what} failed: 応答が JSON ではない（HTTP {r.status_code}・本文 {len(r.content)} バイト）") from None
+    if not isinstance(data, dict):
+        raise TachibanaApiError(f"{what} failed: 応答の形が想定外（{type(data).__name__}）")
+    errno = data.get("p_errno")
+    if errno is not None and str(errno) != "0":
+        raise TachibanaApiError(f"{what} failed: errno={errno} err={data.get('p_err')}")
+    return data
 
 
 def _decode_headline(b64: str) -> str:
     """ニュースヘッドライン文字列を復号（Base64 → URL エンコード → Shift-JIS）。"""
     try:
         url_str = base64.b64decode(b64).decode("ascii")
-        return urllib.parse.unquote(url_str, encoding="shift_jis")
+        return urllib.parse.unquote(url_str, encoding="cp932")  # 公式サンプルと同じ cp932（Shift-JIS の上位互換）
     except Exception as e:
         return f"[decode error: {e}]"
+
+
+def _news_of_day(master_url: str, ymd: str, p_no: str) -> list[dict[str, Any]]:
+    """ニュース問合取得（v4r10 の CLMMfdsGetNews）。指定日（YYYYMMDD）の全件を返す（本文 p_TX 付き）。
+
+    応答の各要素には日付が無いため p_DT を補う。
+    """
+    payload = {
+        "p_no": p_no,
+        "p_sd_date": _now_str(),
+        "sCLMID": "CLMMfdsGetNews",
+        "sJsonOfmt": "4",
+        "p_DT": ymd,
+    }
+    url = f"{master_url}?{urllib.parse.quote(json.dumps(payload, ensure_ascii=False))}"
+    data = _get_json(url, 60, "news")
+    items = data.get("aCLMMfdsNews") or []
+    for n in items:
+        n.setdefault("p_DT", ymd)
+    return items
+
+
+def fetch_news(
+    master_url: str,
+    next_no,
+    limit: int = 100,
+    offset: int = 0,
+    category: str | None = None,
+    issue_code: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    max_days: int = 7,
+) -> list[dict[str, Any]]:
+    """ニュースを新しい順に返す（各要素に p_DT と復号済みの見出し `_decoded_title` を付ける）。
+
+    2026-10-08: v4r10 で旧 CLMMfdsGetNewsHead（ページング・期間指定）は errno=-1（引数エラー）となり、
+    日付指定で 1 日分を一括で返す CLMMfdsGetNews（立花証券公式サンプルの方式）に替わったため、日ごとに取得して手元で絞り込む。
+
+    引数:
+        master_url: ログインで得た仮想 URL（sUrlMaster）
+        next_no: 要求番号 p_no を返す関数（呼ぶたびに増える）
+        limit / offset: 新しい順に並べた後の取得件数・開始位置
+        category: p_CGL（カテゴリ）に含まれるものだけ
+        issue_code: p_ISL（関連銘柄）に含まれるものだけ
+        date_from / date_to: YYYYMMDD。片方だけなら 1 日分（最大 31 日分）。
+            どちらも無い時は日本時間の当日から遡り、limit 件に達するか max_days 日分を取得するまで続ける（旧 API の「直近 N 件」に相当）。
+    """
+    if date_from or date_to:
+        start = datetime.strptime(date_from or date_to, "%Y%m%d").date()
+        end = datetime.strptime(date_to or date_from, "%Y%m%d").date()
+        if end < start:
+            start, end = end, start
+        n_days = min((end - start).days + 1, 31)
+    else:
+        end = datetime.now(_JST).date()
+        n_days = max(1, max_days)
+    out: list[dict[str, Any]] = []
+    for k in range(n_days):
+        ymd = (end - timedelta(days=k)).strftime("%Y%m%d")
+        items = _news_of_day(master_url, ymd, str(next_no()))
+        items.sort(key=lambda n: (str(n.get("p_TM") or ""), str(n.get("p_ID") or "")), reverse=True)
+        for n in items:
+            if category and category not in str(n.get("p_CGL") or "").split("|"):
+                continue
+            if issue_code and issue_code not in str(n.get("p_ISL") or "").split("|"):
+                continue
+            out.append(n)
+        if len(out) >= offset + limit:
+            break
+    out = out[offset:offset + limit]
+    for n in out:
+        n["_decoded_title"] = _decode_headline(n.get("p_HDL", ""))
+    return out
 
 
 @dataclass
@@ -75,7 +198,7 @@ class TachibanaClient:
                 repo_root = Path(__file__).resolve().parent.parent.parent.parent
                 inst = cls.__new__(cls)
                 inst.auth_id = auth_id
-                inst.api_base = api_base
+                inst.api_base = normalize_api_base(api_base)
                 inst._request_url = None
                 inst._master_url = None
                 inst._price_url = None
@@ -97,6 +220,7 @@ class TachibanaClient:
         )
 
     def __post_init__(self) -> None:
+        self.api_base = normalize_api_base(self.api_base)
         # from_env 経由（__new__ ベース）の場合は _private_key 設定済でスキップ
         if self._private_key is not None:
             return
@@ -108,7 +232,11 @@ class TachibanaClient:
         return str(self._request_no)
 
     def login(self) -> dict[str, Any]:
-        """ログイン → 仮想URL を取得・復号化してインスタンス変数に保存。"""
+        """ログイン → 仮想URL を取得・復号化してインスタンス変数に保存。
+
+        HTTP 状態・応答の結果コード（p_errno・sResultCode）を検査し、失敗時は
+        TachibanaApiError（文言 `login failed: ...`・URL と認証 ID を含まない）を送出する。
+        """
         payload = {
             "p_no": "1",
             "p_sd_date": _now_str(),
@@ -117,15 +245,18 @@ class TachibanaClient:
             "sAuthId": self.auth_id,
         }
         url = f"{self.api_base}/auth/?{urllib.parse.quote(json.dumps(payload, ensure_ascii=False))}"
-        r = requests.get(url, timeout=20)
-        r.encoding = "shift_jis"
-        resp = json.loads(r.text)
+        resp = _get_json(url, 20, "login")
         if resp.get("p_errno") != "0" or resp.get("sResultCode") != "0":
-            raise RuntimeError(f"login failed: errno={resp.get('p_errno')} err={resp.get('p_err')} text={resp.get('sResultText')}")
+            raise TachibanaApiError(
+                f"login failed: errno={resp.get('p_errno')} err={resp.get('p_err')} "
+                f"result={resp.get('sResultCode')} text={resp.get('sResultText')}")
         oaep = padding.OAEP(mgf=padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
-        self._request_url = self._private_key.decrypt(base64.b64decode(resp["sUrlRequest"]), oaep).decode("utf-8")
-        self._master_url = self._private_key.decrypt(base64.b64decode(resp["sUrlMaster"]), oaep).decode("utf-8")
-        self._price_url = self._private_key.decrypt(base64.b64decode(resp["sUrlPrice"]), oaep).decode("utf-8")
+        try:
+            self._request_url = self._private_key.decrypt(base64.b64decode(resp["sUrlRequest"]), oaep).decode("utf-8")
+            self._master_url = self._private_key.decrypt(base64.b64decode(resp["sUrlMaster"]), oaep).decode("utf-8")
+            self._price_url = self._private_key.decrypt(base64.b64decode(resp["sUrlPrice"]), oaep).decode("utf-8")
+        except Exception as e:  # 鍵の不一致・応答の欠け
+            raise TachibanaApiError(f"login failed: 仮想 URL の復号に失敗（{type(e).__name__}）") from None
         return resp
 
     def _ensure_logged_in(self) -> None:
@@ -140,54 +271,13 @@ class TachibanaClient:
         issue_code: str | None = None,
         date_from: str | None = None,
         date_to: str | None = None,
+        max_days: int = 7,
     ) -> list[dict[str, Any]]:
-        """ニュースヘッダー取得。100件/ページの上限あり・limit > 100 ならページング。
-
-        引数:
-            limit: 取得最大件数（複数ページに渡る）
-            offset: 開始オフセット
-            category: p_CG（カテゴリコード絞り込み）
-            issue_code: p_IS（銘柄コード絞り込み）
-            date_from / date_to: YYYYMMDD 形式
-        """
+        """ニュースを新しい順に返す（中身は fetch_news。引数の意味も同じ）。"""
         self._ensure_logged_in()
-        out: list[dict[str, Any]] = []
-        page_size = 100
-        cur = offset
-        remaining = limit
-        while remaining > 0:
-            take = min(page_size, remaining)
-            payload: dict[str, str] = {
-                "p_no": self._next_no(),
-                "p_sd_date": _now_str(),
-                "sCLMID": "CLMMfdsGetNewsHead",
-                "sJsonOfmt": "4",
-                "p_REC_OFST": str(cur),
-                "p_REC_LIMT": str(take),
-            }
-            if category:
-                payload["p_CG"] = category
-            if issue_code:
-                payload["p_IS"] = issue_code
-            if date_from:
-                payload["p_DT_FROM"] = date_from
-            if date_to:
-                payload["p_DT_TO"] = date_to
-            url = f"{self._master_url}?{urllib.parse.quote(json.dumps(payload, ensure_ascii=False))}"
-            r = requests.get(url, timeout=30)
-            r.encoding = "shift_jis"
-            data = json.loads(r.text)
-            items = data.get("aCLMMfdsNewsHead", [])
-            if not items:
-                break
-            for n in items:
-                n["_decoded_title"] = _decode_headline(n.get("p_HDL", ""))
-            out.extend(items)
-            if len(items) < take:
-                break
-            cur += take
-            remaining -= take
-        return out
+        return fetch_news(self._master_url, self._next_no, limit=limit, offset=offset,
+                          category=category, issue_code=issue_code,
+                          date_from=date_from, date_to=date_to, max_days=max_days)
 
     def get_news_body(self, news_id: str) -> str:
         """ニュース本文取得（ヘッダーの p_ID で指定）。Shift-JIS デコード済テキストを返す。"""
@@ -200,9 +290,7 @@ class TachibanaClient:
             "p_ID": news_id,
         }
         url = f"{self._master_url}?{urllib.parse.quote(json.dumps(payload, ensure_ascii=False))}"
-        r = requests.get(url, timeout=30)
-        r.encoding = "shift_jis"
-        data = json.loads(r.text)
+        data = _get_json(url, 30, "news_body")
         body_b64 = data.get("p_BODY", "")
         if not body_b64:
             return ""
@@ -221,9 +309,7 @@ class TachibanaClient:
             "sTargetIssueCode": ",".join(issue_codes),
         }
         url = f"{self._master_url}?{urllib.parse.quote(json.dumps(payload, ensure_ascii=False))}"
-        r = requests.get(url, timeout=30)
-        r.encoding = "shift_jis"
-        data = json.loads(r.text)
+        data = _get_json(url, 30, "credit_margin")
         return data.get("aCLMMfdsShinyouZan", [])
 
     def get_securities_finance(self, issue_codes: list[str]) -> list[dict[str, Any]]:
@@ -239,9 +325,7 @@ class TachibanaClient:
             "sTargetIssueCode": ",".join(issue_codes),
         }
         url = f"{self._master_url}?{urllib.parse.quote(json.dumps(payload, ensure_ascii=False))}"
-        r = requests.get(url, timeout=30)
-        r.encoding = "shift_jis"
-        data = json.loads(r.text)
+        data = _get_json(url, 30, "securities_finance")
         return data.get("aCLMMfdsSyoukinZan", [])
 
     def get_short_borrowing_cost(self, issue_codes: list[str]) -> list[dict[str, Any]]:
@@ -257,9 +341,7 @@ class TachibanaClient:
             "sTargetIssueCode": ",".join(issue_codes),
         }
         url = f"{self._master_url}?{urllib.parse.quote(json.dumps(payload, ensure_ascii=False))}"
-        r = requests.get(url, timeout=30)
-        r.encoding = "shift_jis"
-        data = json.loads(r.text)
+        data = _get_json(url, 30, "short_borrowing_cost")
         return data.get("aCLMMfdsHibuInfo", [])
 
     def get_issue_detail(self, issue_codes: list[str]) -> list[dict[str, Any]]:
@@ -275,9 +357,7 @@ class TachibanaClient:
             "sTargetIssueCode": ",".join(issue_codes),
         }
         url = f"{self._master_url}?{urllib.parse.quote(json.dumps(payload, ensure_ascii=False))}"
-        r = requests.get(url, timeout=30)
-        r.encoding = "shift_jis"
-        data = json.loads(r.text)
+        data = _get_json(url, 30, "issue_detail")
         return data.get("aCLMMfdsIssueDetail", [])
 
 

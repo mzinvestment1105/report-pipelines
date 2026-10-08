@@ -188,7 +188,9 @@ def _clean_quick_title(title: str) -> str:
 def _safe_error(e: Exception) -> str:
     """ログ用の失敗理由。通信例外の文言は要求 URL（認証 ID を含む）を含み得るため型名だけにする。"""
     msg = str(e)
-    if isinstance(e, RuntimeError) and ("login failed" in msg or "認証情報" in msg):
+    # TachibanaApiError は文言に URL・認証 ID を含まない（lib/tachibana_client.py・2026-10-08）
+    if isinstance(e, RuntimeError) and ("login failed" in msg or "認証情報" in msg
+                                        or type(e).__name__ == "TachibanaApiError"):
         return f"{type(e).__name__}: {msg[:160]}"
     return type(e).__name__
 

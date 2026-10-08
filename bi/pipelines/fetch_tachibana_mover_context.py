@@ -41,6 +41,14 @@ MOVER_GENRES = {
 ISSUE_CODE_PATTERN = re.compile(r"^### (\d{4}[A-Z]?) ")
 
 
+def _safe_reason(e: Exception) -> str:
+    """ログ用の失敗理由。RuntimeError（立花クライアントの失敗・認証情報未設定）は文言に URL・認証 ID を含まないため本文を出し、
+    それ以外（鍵の読込失敗等）は型名だけにする。"""
+    if isinstance(e, RuntimeError):
+        return f"{type(e).__name__}: {str(e)[:300]}"
+    return type(e).__name__
+
+
 def extract_issue_codes(raw_md: str) -> list[str]:
     """movers_raw.md から銘柄コードを抽出（行頭 `### 6501 銘柄名 [プライム]` 形式）。"""
     codes: list[str] = []
@@ -159,15 +167,24 @@ def main() -> None:
     print(f"[INFO] 動意銘柄 {len(codes)} 件抽出")
 
     print("[INFO] 立花証券 API 接続...")
-    cli = TachibanaClient.from_env()
-    cli.login()
+    # 失敗時は理由（HTTP 状態・結果コード等）をログへ出して exit 1（2026-10-08: 従来は例外のまま 0〜1 秒で終了し理由が追えなかった）
+    try:
+        cli = TachibanaClient.from_env()
+        cli.login()
+    except Exception as e:
+        print(f"[ERROR] 立花証券 API ログイン失敗: {_safe_reason(e)}", file=sys.stderr)
+        sys.exit(1)
     print("[OK] login")
 
-    print(f"[INFO] 動意関連ニュース取得（最大 {args.news_limit} 件）...")
-    news_section = format_news_section(cli, args.news_limit)
+    try:
+        print(f"[INFO] 動意関連ニュース取得（最大 {args.news_limit} 件）...")
+        news_section = format_news_section(cli, args.news_limit)
 
-    print(f"[INFO] 信用残・逆日歩取得（{len(codes)} 銘柄）...")
-    credit_section = format_credit_section(cli, codes)
+        print(f"[INFO] 信用残・逆日歩取得（{len(codes)} 銘柄）...")
+        credit_section = format_credit_section(cli, codes)
+    except Exception as e:
+        print(f"[ERROR] 立花証券 API 取得失敗: {_safe_reason(e)}", file=sys.stderr)
+        sys.exit(1)
 
     print(f"[INFO] {raw_path.name} に立花セクション追記...")
     append_tachibana_section(raw_path, news_section, credit_section)

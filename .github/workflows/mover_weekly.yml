@@ -727,6 +727,10 @@ jobs:
         env:
           JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
           EDINETDB_API_KEYS: ${{ secrets.EDINETDB_API_KEYS }}
+          # 2026-10-08: 母集団の材料へ当日の QUICK 個別解説を入れる（lib/theme_materials.py・取れなければ何もしない）
+          TACHIBANA_DEMO_AUTH_ID: ${{ secrets.TACHIBANA_DEMO_AUTH_ID }}
+          TACHIBANA_DEMO_PRIVATE_KEY_PEM: ${{ secrets.TACHIBANA_DEMO_PRIVATE_KEY_PEM }}
+          TACHIBANA_DEMO_API_BASE: ${{ secrets.TACHIBANA_DEMO_API_BASE }}
           PYTHONIOENCODING: utf-8
         run: |
           # --weekly-roster（2026-09-12 PM 承認）: 対象週（月〜金）の動意母集団を和集合した
