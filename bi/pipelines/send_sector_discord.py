@@ -12,6 +12,13 @@
 
 from __future__ import annotations
 
+# 【送信封印・PM 2026-10-10】全レポートは「PC で読む」リンク付き PDF でしか Discord へ送らない。
+# 本スクリプト（本文テキスト送信）は import・実行のどちらでも即終了する。
+raise RuntimeError(
+    "send_sector_discord.py（レポート本文のテキスト送信）は 2026-10-10 に封印済み。"
+    "python send_report_pdf_discord.py --kind sector（または sector_full）--date {YYYY-MM-DD} を使うこと。"
+)
+
 import argparse
 import os
 import re

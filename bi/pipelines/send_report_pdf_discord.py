@@ -11,6 +11,14 @@ PM 2026-06-27: 縦長 JPEG を廃し、商品レベルの A4 PDF（日本語フ�
     python send_report_pdf_discord.py --kind earnings --month 2026-06
     python send_report_pdf_discord.py --kind us_stock --ticker AMZN --date 2026-09-28
     python send_report_pdf_discord.py --kind us_stock --ticker AMZN --date 2026-09-28 --dry-run
+    python send_report_pdf_discord.py --kind pdf --pdf bi/outputs/report_pdfs/xxx.pdf \
+        --webhook-env DISCORD_WEBHOOK_THEME --label "業界レポート" --date 2026-10-06   # 既存 PDF をそのまま送る
+
+【送信の一本化（PM 2026-10-10 指示: 全レポートはブラウザで読むリンク付きでしか送らない）】
+Discord へのレポート送信は公開関数 send_report_pdf() だけが行う。PDF を KV へ置いて「PC で読む」
+リンクを作り、実際に開けることを確かめてから本文に入れて添付送信する。リンクを作れなければ
+送らずにエラー終了する（リンク無しで添付だけ送る逃げ道は無い）。低レベルの _post_pdf() は
+本プロセスで発行・確認したリンクを本文に含む時だけ送り、それ以外は InlineLinkError で止まる。
 """
 from __future__ import annotations
 
@@ -21,6 +29,7 @@ import re
 import secrets
 import sys
 import time
+from dataclasses import dataclass
 from urllib.parse import quote
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -126,6 +135,35 @@ def _ensure_movers_doc_title(md_text: str, identifier: str, doc_label: str) -> s
 # 30 日 = 2,592,000 秒で自動的に消える。
 _PDF_VIEW_TTL_SEC = 2592000
 _PDF_VIEW_DEFAULT_BASE = "https://mizuki-fund-scheduler-1.mzinvestment1105.workers.dev/pdf"
+INLINE_LINK_LABEL = "PC で読む（クリックでブラウザに表示・30 日間有効）"
+# 閲覧リンクの形: {base}/pdf/{token 20〜64 文字}/{半角英数のファイル名}
+_VIEW_URL_RE = re.compile(r"^https://\S+/pdf/[A-Za-z0-9_-]{20,64}/[A-Za-z0-9_.-]+$")
+# upload_pdf_for_inline_view が本プロセス内で発行し、実際に開けることを確かめた URL → PDF の実パス。
+# _post_pdf はここに登録された URL を本文に含む時だけ送る（外部から直接呼ばれても送れない）。
+_ISSUED_VIEW_URLS: dict[str, str] = {}
+
+
+class InlineLinkError(RuntimeError):
+    """「PC で読む」リンクを作れない・本文に無い時に送信を止める例外（リンク無し送信を許さない）。"""
+
+
+@dataclass(frozen=True)
+class SendResult:
+    """send_report_pdf の戻り値。真偽値は送信成否（HTTP 4xx/5xx なら False）。"""
+
+    ok: bool
+    status_code: int
+    view_url: str
+    content: str
+
+    def __bool__(self) -> bool:
+        return self.ok
+
+
+def _mask_view_url(url: str) -> str:
+    """ログ用に token を伏せた URL を返す（Public リポの GHA ログは誰でも読めるため開ける URL を出さない）。"""
+    head, token, name = url.rsplit("/", 2)
+    return f"{head}/{token[:4]}…/{name}"
 
 
 def upload_pdf_for_inline_view(pdf_path: Path) -> str | None:
@@ -135,8 +173,8 @@ def upload_pdf_for_inline_view(pdf_path: Path) -> str | None:
     ブラウザに開く URL を別途用意して本文に添える。URL に含まれるランダムな
     token を知っている人だけが開ける（ログイン不要・30 日で失効）。
 
-    失敗しても送信本体は絶対に止めない（配信絶対の原則）。
-    設定が無い・検証に通らない場合は None を返し、リンク無しで従来どおり送る。
+    設定が無い・アップロード失敗・検証に通らない場合は None を返す。呼び出し側の
+    send_report_pdf() は None なら送信しない（PM 2026-10-10: リンク無しの送信を禁止）。
     """
     try:
         api_token = os.getenv("CLOUDFLARE_API_TOKEN")
@@ -144,12 +182,12 @@ def upload_pdf_for_inline_view(pdf_path: Path) -> str | None:
         namespace_id = os.getenv("CF_KV_NAMESPACE_ID")
         base_url = os.getenv("PDF_VIEW_BASE_URL", _PDF_VIEW_DEFAULT_BASE).rstrip("/")
         if not (api_token and account_id and namespace_id and base_url):
-            print("  PDF inline link: skipped (設定が未登録のためリンク無しで送信)")
+            print("  PDF inline link: failed (CLOUDFLARE_API_TOKEN / CF_ACCOUNT_ID / CF_KV_NAMESPACE_ID が未設定)")
             return None
 
         filename = pdf_path.name
         if not re.fullmatch(r"[A-Za-z0-9_.-]+", filename):
-            print(f"  PDF inline link: skipped (ファイル名が半角英数以外: {filename})")
+            print(f"  PDF inline link: failed (ファイル名が半角英数以外: {filename})")
             return None
 
         # 当て推量できないランダム文字列。Worker 側の検証は 20〜64 文字の英数字とハイフン等。
@@ -172,7 +210,7 @@ def upload_pdf_for_inline_view(pdf_path: Path) -> str | None:
                 timeout=60,
             )
         if res.status_code >= 400:
-            print(f"  PDF inline link: KV upload failed HTTP {res.status_code}（リンク無しで送信）")
+            print(f"  PDF inline link: KV upload failed HTTP {res.status_code}")
             return None
 
         view_url = f"{base_url}/{token}/{filename}"
@@ -189,27 +227,45 @@ def upload_pdf_for_inline_view(pdf_path: Path) -> str | None:
                     and disposition.lower().startswith("inline")
                 ):
                     print("  PDF inline link: ready")
+                    _ISSUED_VIEW_URLS[view_url] = str(Path(pdf_path).resolve())
                     return view_url
             except Exception as exc:  # 検証中の通信エラーは再試行で吸収する
                 print(f"  PDF inline link: check retry ({type(exc).__name__})")
             time.sleep(5)
 
-        print("  PDF inline link: 検証に通らなかったためリンク無しで送信")
+        print("  PDF inline link: failed (60 秒以内にブラウザで開ける状態にならなかった)")
         return None
-    except Exception as exc:  # 何が起きても送信本体は止めない
-        print(f"  PDF inline link: skipped ({type(exc).__name__}: {exc})")
+    except Exception as exc:
+        print(f"  PDF inline link: failed ({type(exc).__name__}: {exc})")
         return None
 
 
-def _with_inline_view_link(content: str, pdf_path: Path) -> str:
-    """Discord 本文の末尾に、ブラウザ内表示リンクを 1 行だけ添える。"""
-    url = upload_pdf_for_inline_view(pdf_path)
-    if not url:
-        return content
-    return content + f"\nPC で読む（クリックでブラウザに表示・30 日間有効）: {url}"
+def _require_inline_link(pdf_path: Path, content: str, view_url: str | None) -> None:
+    """本文にリンクが入っていなければ InlineLinkError（送信しない）。
+
+    view_url が (1) 閲覧リンクの形をしており (2) 送る PDF のファイル名で終わり
+    (3) 本プロセスで upload_pdf_for_inline_view が同じ PDF に対して発行・確認したもので
+    (4) 本文に含まれている、の全てを満たす時だけ通す。
+    """
+    if not view_url:
+        raise InlineLinkError(
+            "「PC で読む」リンクが無いレポートは送信できない（send_report_pdf() を使うこと）"
+        )
+    if not _VIEW_URL_RE.match(view_url) or not view_url.endswith("/" + Path(pdf_path).name):
+        raise InlineLinkError("リンクが閲覧用 /pdf/ の形でない、または送る PDF と一致しない")
+    if _ISSUED_VIEW_URLS.get(view_url) != str(Path(pdf_path).resolve()):
+        raise InlineLinkError("リンクが本プロセスで同じ PDF に対して作成・確認されたものではない")
+    if view_url not in content:
+        raise InlineLinkError("本文に「PC で読む」リンクが入っていない")
 
 
-def _post_pdf(webhook: str, pdf_path: Path, content: str) -> bool:
+def _post_pdf(webhook: str, pdf_path: Path, content: str, *, view_url: str | None = None) -> int:
+    """Discord へ PDF を添付送信する低レベル関数（send_report_pdf() 以外から呼ばない）。
+
+    リンク必須: _require_inline_link を満たさない呼び出しは送らずに InlineLinkError。
+    戻り値は Discord の HTTP ステータスコード。
+    """
+    _require_inline_link(pdf_path, content, view_url)
     payload = {"content": content, "attachments": [{"id": 0, "filename": pdf_path.name}]}
     with pdf_path.open("rb") as f:
         files = {
@@ -220,8 +276,38 @@ def _post_pdf(webhook: str, pdf_path: Path, content: str) -> bool:
     print(f"  status {r.status_code}  bytes={pdf_path.stat().st_size:,}")
     if r.status_code >= 400:
         print(f"  body: {r.text[:400]}")
-        return False
-    return True
+    return r.status_code
+
+
+def send_report_pdf(webhook: str, pdf_path: Path, content: str) -> SendResult:
+    """レポート PDF を Discord へ送る唯一の公開関数（PM 2026-10-10: リンク付きでしか送らない）。
+
+    1. PDF を KV へ置いて「PC で読む」リンクを作り、実際に開けることを確かめる
+    2. リンクを本文末尾に 1 行足して PDF を 1 回だけ添付送信する
+    リンクを作れなければ送らずに InlineLinkError を投げる（リンク無しで添付だけ送る経路は無い）。
+    webhook の値とリンクの token はログへ出さない。
+    """
+    pdf_path = Path(pdf_path)
+    if not webhook:
+        raise ValueError("webhook が空のため送信しない")
+    if not pdf_path.is_file():
+        raise FileNotFoundError(f"送る PDF が無い: {pdf_path}")
+    view_url = upload_pdf_for_inline_view(pdf_path)
+    if not view_url:
+        raise InlineLinkError(f"「PC で読む」リンクを作れなかったため送信しない: {pdf_path.name}")
+    body = f"{content}\n{INLINE_LINK_LABEL}: {view_url}"
+    print(f"  本文のリンク: {_mask_view_url(view_url)}")
+    status = _post_pdf(webhook, pdf_path, body, view_url=view_url)
+    return SendResult(ok=status < 400, status_code=status, view_url=view_url, content=body)
+
+
+def _send_cli(webhook: str, pdf_path: Path, content: str) -> int:
+    """CLI 用: send_report_pdf を呼び、リンク作成失敗・送信失敗を終了コード 1 にする。"""
+    try:
+        return 0 if send_report_pdf(webhook, pdf_path, content) else 1
+    except InlineLinkError as exc:
+        print(f"ERROR: {exc}（送信していない）")
+        return 1
 
 
 def _send_digest(args) -> int:
@@ -248,8 +334,38 @@ def _send_digest(args) -> int:
 
     print(f"[1/1] sending to Discord ({DIGEST_CONFIG['webhook_env']})")
     content = f"**{DIGEST_CONFIG['label']}** {date_str}"
-    content = _with_inline_view_link(content, pdf_path)
-    return 0 if _post_pdf(webhook, pdf_path, content) else 1
+    return _send_cli(webhook, pdf_path, content)
+
+
+def _send_existing_pdf(args) -> int:
+    """--kind pdf: 既にある PDF を作り直さずにリンク付きで 1 回送る（業界レポート等の md 経路外の PDF 用）。
+
+    送信先は --webhook-env で名前を指定する（DISCORD_WEBHOOK_ で始まる名前のみ・未設定なら他へ流さず止まる）。
+    """
+    if not (args.pdf and args.webhook_env and args.label):
+        print("ERROR: --kind pdf には --pdf・--webhook-env・--label が必要")
+        return 1
+    if not args.webhook_env.startswith("DISCORD_WEBHOOK_"):
+        print(f"ERROR: --webhook-env は DISCORD_WEBHOOK_ で始まる環境変数名のみ: {args.webhook_env}")
+        return 1
+    pdf_path = Path(args.pdf)
+    if not pdf_path.is_absolute():
+        pdf_path = REPO_ROOT / pdf_path
+    if pdf_path.suffix.lower() != ".pdf" or not pdf_path.is_file():
+        print(f"ERROR: 送る PDF が無い: {pdf_path}")
+        return 1
+    content = f"**{args.label}**" + (f" {args.date}" if args.date else "")
+    webhook = os.getenv(args.webhook_env)
+    if args.dry_run:
+        print(f"DRY-RUN: pdf={pdf_path}  size={pdf_path.stat().st_size:,} bytes")
+        print(f"  webhook_env : {args.webhook_env}（設定: {'あり' if webhook else 'なし'}）")
+        print(f"  message     : {content} ＋ {INLINE_LINK_LABEL}: <送信時に作成>")
+        return 0
+    if not webhook:
+        print(f"ERROR: {args.webhook_env} not set")
+        return 1
+    print(f"[1/1] sending existing PDF to Discord ({args.webhook_env})")
+    return _send_cli(webhook, pdf_path, content)
 
 
 def _us_company_name(md_path: Path, ticker: str) -> str:
@@ -271,8 +387,11 @@ def _us_company_name(md_path: Path, ticker: str) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--kind", choices=list(KIND_CONFIG) + ["digest", "us_stock", "macro_midday"], required=True
+        "--kind", choices=list(KIND_CONFIG) + ["digest", "us_stock", "macro_midday", "pdf"], required=True
     )
+    parser.add_argument("--pdf", help="既存 PDF のパス（--kind pdf 用・リポ相対または絶対）")
+    parser.add_argument("--webhook-env", help="送信先 webhook の環境変数名（--kind pdf 用・DISCORD_WEBHOOK_*）")
+    parser.add_argument("--label", help="本文の太字ラベル（--kind pdf 用）")
     parser.add_argument("--date", help="YYYY-MM-DD（JST・日次レポート用）")
     parser.add_argument("--month", help="YYYY-MM（月次レポート用・earnings 等）")
     parser.add_argument("--code", help="銘柄コード（stock 用）")
@@ -300,6 +419,9 @@ def main() -> int:
                   f"（設定: {'あり' if os.getenv(DIGEST_CONFIG['webhook_env']) else 'なし'}）")
             return 0
         return _send_digest(args)
+
+    if args.kind == "pdf":
+        return _send_existing_pdf(args)
 
     if args.kind == "us_stock":
         cfg = US_STOCK_CONFIG
@@ -455,8 +577,7 @@ def main() -> int:
 
     print(f"[2/2] sending to Discord ({cfg['webhook_env']})")
     content = f"**{cfg['label']}** {display_id}"
-    content = _with_inline_view_link(content, out_path)
-    return 0 if _post_pdf(webhook, out_path, content) else 1
+    return _send_cli(webhook, out_path, content)
 
 
 if __name__ == "__main__":

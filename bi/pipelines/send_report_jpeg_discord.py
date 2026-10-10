@@ -1,6 +1,9 @@
-"""汎用レポート→JPEG Discord 送信スクリプト。
+"""汎用レポート→JPEG 生成スクリプト（Discord 送信は封印済み）。
 
-レポート種別と日付を指定して、Markdown レポートを JPEG 化 → Discord 添付送信。
+【送信封印・PM 2026-10-10】全レポートは「PC で読む」リンク付き PDF（send_report_pdf_discord.py の
+send_report_pdf）でしか Discord へ送らない。本スクリプトは --skip-send での JPEG 生成だけを行い、
+--skip-send 無しの起動はエラー終了する。KIND_CONFIG（種別ごとの md パス・webhook 環境変数名）は
+send_report_pdf_discord.py 等が共有で使うため本ファイルに残す。
 共通レンダリングは lib/md_to_jpeg.py。
 
 使い方:
@@ -17,7 +20,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
 from datetime import datetime, timedelta, timezone
@@ -191,6 +193,14 @@ def main() -> int:
     parser.add_argument("--force", action="store_true", help="フォールバック表記検証をスキップして強制送信")
     args = parser.parse_args()
 
+    # PM 2026-10-10: 全レポートは「PC で読む」リンク付き PDF（send_report_pdf_discord.send_report_pdf）
+    # でしか Discord へ送らない。JPEG 送信は 2026-08-26 から禁止済みのため送信処理を撤去し、
+    # 本スクリプトは --skip-send での JPEG 生成だけを残す（KIND_CONFIG は PDF 側が共有で使う）。
+    if not args.skip_send:
+        print("ERROR: JPEG の Discord 送信は封印済み（全レポートはリンク付き PDF のみ）。"
+              f"python send_report_pdf_discord.py --kind {args.kind} … を使う")
+        return 1
+
     cfg = KIND_CONFIG[args.kind]
 
     # Markdown パス解決
@@ -295,12 +305,6 @@ def main() -> int:
                           if "需給" in md_text_pre[m.start():(entry_matches[entry_matches.index(m) + 1].start() if entry_matches.index(m) + 1 < len(entry_matches) else len(md_text_pre))])
         print(f"[guard] 動意レポート検証 OK（全 {len(entry_matches)} 銘柄・需給ありデータ {with_supply} 銘柄・データなし省略 {len(entry_matches) - with_supply} 銘柄）")
 
-    # Webhook
-    webhook = os.getenv(cfg["webhook_env"])
-    if not webhook:
-        print(f"ERROR: {cfg['webhook_env']} not set")
-        return 1
-
     out_dir = REPO_ROOT / "bi" / "outputs" / "report_jpegs"
 
     md_text = md_path.read_text(encoding="utf-8")
@@ -314,75 +318,18 @@ def main() -> int:
             markets = [("ALL", md_text)]
 
         prefix = "movers_weekly" if args.kind == "movers_weekly" else "movers"
-        if args.skip_send:
-            for label, md_part in markets:
-                p = out_dir / f"{prefix}_{identifier}_{label.lower()}.jpg"
-                render_markdown_to_jpeg(md_part, p, kind=args.kind, footer="Market Report")
-                print(f"  saved: {p}  size={p.stat().st_size:,} bytes")
-            return 0
-
         for label, md_part in markets:
             p = out_dir / f"{prefix}_{identifier}_{label.lower()}.jpg"
-            print(f"[render] movers/{label} → {p.name}")
             render_markdown_to_jpeg(md_part, p, kind=args.kind, footer="Market Report")
             print(f"  saved: {p}  size={p.stat().st_size:,} bytes")
-            ensure_under_discord_limit(p)
-
-            content = f"**{cfg['label']}（{label}）** {identifier}"
-            payload = {
-                "content": content,
-                "attachments": [{"id": 0, "filename": p.name}],
-            }
-            with p.open("rb") as f:
-                files = {
-                    "payload_json": (None, json.dumps(payload), "application/json"),
-                    "files[0]": (p.name, f, "image/jpeg"),
-                }
-                r = requests.post(webhook, files=files)
-            print(f"  status: {r.status_code}")
-            if r.status_code >= 400:
-                print(f"    body: {r.text[:300]}")
-                return 1
-        print("DONE")
         return 0
 
     out_path = out_dir / f"{args.kind}_{identifier}.jpg"
 
     # PM 2026-05-26 確定: 画像分割は絶対禁止・単一ページ JPEG に統一（CLAUDE.md §画像分割絶対禁止 準拠）
-    print(f"[1/3] rendering {args.kind} -> JPEG")
+    print(f"[1/1] rendering {args.kind} -> JPEG（生成のみ・Discord へは送らない）")
     render_markdown_to_jpeg(md_text, out_path, kind=args.kind, footer="Market Report")
     print(f"  saved: {out_path}  size={out_path.stat().st_size:,} bytes")
-
-    if args.skip_send:
-        return 0
-
-    ensure_under_discord_limit(out_path)
-
-    if out_path.stat().st_size > 9_500_000:
-        print(f"WARNING: JPEG exceeds 9.5MB ({out_path.stat().st_size:,} bytes). Discord may reject.")
-
-    print(f"[2/3] sending to Discord ({cfg['webhook_env']})")
-    if args.kind == "stock" and args.code:
-        company_name = _lookup_company_name(args.code, md_path)
-        display_id = f"{args.code} {company_name}　{date_str}" if company_name else identifier
-    else:
-        display_id = identifier
-    content = f"**{cfg['label']}** {display_id}"
-    payload = {
-        "content": content,
-        "attachments": [{"id": 0, "filename": out_path.name}],
-    }
-    with out_path.open("rb") as f:
-        files = {
-            "payload_json": (None, json.dumps(payload), "application/json"),
-            "files[0]": (out_path.name, f, "image/jpeg"),
-        }
-        r = requests.post(webhook, files=files)
-    print(f"[3/3] status: {r.status_code}  bytes={out_path.stat().st_size:,}")
-    if r.status_code >= 400:
-        print(f"  body: {r.text[:500]}")
-        return 1
-    print("DONE")
     return 0
 
 
