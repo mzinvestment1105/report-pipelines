@@ -8,25 +8,30 @@
 経済カレンダー API が使えず実取得 0 件だった。GHA では WebSearch / WebFetch が 404 で
 機能せず、記憶ベースの日付記載は禁止のため、レポート生成側は日程を知る手段が無かった。
 
-本スクリプトは公式サイト（FRB / 日銀 / 内閣府）から確定日程をスクレイプし、台帳 YAML を
-更新する。**ローカル実行前提**（GHA からは実行しない）。requests + BeautifulSoup のみを
+本スクリプトは公式サイト（FRB / 日銀 / 内閣府 / 米労働統計局 BLS / 米国勢調査局 Census）から
+確定日程をスクレイプし、台帳 YAML を更新する。**ローカル実行前提**（GHA からは実行しない）。requests + BeautifulSoup のみを
 使い、Claude の WebFetch ツールには依存しない。
 
 使い方
 ------
     python bi/pipelines/fetch_economic_calendar.py --dry-run
     python bi/pipelines/fetch_economic_calendar.py --source boj
+    python bi/pipelines/fetch_economic_calendar.py --source bls
     python bi/pipelines/fetch_economic_calendar.py --source all
 
 更新頻度の目安
 --------------
 - FOMC / 日銀 金融政策決定会合: 年次固定日程のため年 1 回（前年末〜年初）
 - 内閣府 GDP (QE): 四半期ごと
+- 米労働統計局 BLS（米CPI・米雇用統計・米PPI）/ 米国勢調査局 Census（米小売売上高）:
+  月 1 回程度（実行日から US_HORIZON_DAYS 日先までの発表日を取得する）
 
 方針
 ----
 - 既存台帳を読み、**新規イベントのみ追記する**。既存エントリ（過去日を含む）を消さない。
   既に同じ id が存在する場合、日付・時刻が変わっていれば更新し、そうでなければ何もしない。
+- 米国の発表時刻は米東部時間で公表されるため、zoneinfo（America/New_York → Asia/Tokyo）で
+  日本時間へ機械的に換算して台帳に入れる（夏時間の切り替えも zoneinfo に任せ、手で補正しない）。
 - 取得失敗時は明確にエラーを出す。**推測での補完を一切しない**（取れなかった項目は書かない）。
 """
 
@@ -34,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
 import re
 import sys
 from pathlib import Path
@@ -47,6 +53,7 @@ except ImportError as exc:  # pragma: no cover
     raise SystemExit(2)
 
 import yaml
+from zoneinfo import ZoneInfo
 
 # ---------------------------------------------------------------- 定数
 
@@ -56,6 +63,12 @@ LEDGER_PATH = REPO_ROOT / "market" / "calendar" / "economic_events.yml"
 URL_FOMC = "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm"
 URL_BOJ_MPM = "https://www.boj.or.jp/mopo/mpmsche_minu/index.htm"
 URL_CAO_QE = "https://www.esri.cao.go.jp/jp/sna/kouhyou/kouhyou_top.html"
+# 米労働統計局 BLS の月別リリースカレンダー（日付セル id="dMMDD" に指標名・対象月・発表時刻が並ぶ）
+URL_BLS_MONTH = "https://www.bls.gov/schedule/{year}/{month:02d}_sched.htm"
+# 米国勢調査局 Census の年別 経済指標公表スケジュール（一覧表）。年別 URL は公開済みの年だけ有効で、
+# 翌年分は年なしの URL に載る（2026-10-11 実測: 年なし URL の見出しが 2027 年版）。見出しの年で照合する。
+URL_CENSUS_LIST = "https://www.census.gov/economic-indicators/calendar-listview-{year}.html"
+URL_CENSUS_LIST_CURRENT = "https://www.census.gov/economic-indicators/calendar-listview.html"
 
 HEADERS = {
     "User-Agent": (
@@ -64,7 +77,18 @@ HEADERS = {
     ),
     "Accept-Language": "ja,en;q=0.8",
 }
+# BLS は一般ブラウザ相当の User-Agent を 403 で拒否し、取得目的を名乗る User-Agent は受け付ける
+# （2026-10-11 実測）。そのため BLS だけ専用ヘッダーを使う。
+BLS_HEADERS = {
+    "User-Agent": "economic-calendar-fetcher/1.0 (personal research script)",
+    "Accept-Language": "en-US,en;q=0.9",
+}
 TIMEOUT = 30
+
+# 米国指標は実行日から何日先までの発表日を台帳へ入れるか（約半年）
+US_HORIZON_DAYS = 183
+TZ_ET = ZoneInfo("America/New_York")
+TZ_JST = ZoneInfo("Asia/Tokyo")
 
 MONTHS_EN = {
     "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
@@ -76,8 +100,8 @@ class FetchError(RuntimeError):
     """一次情報の取得・解析に失敗したことを表す。推測補完はしない。"""
 
 
-def _get(url: str) -> BeautifulSoup:
-    resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+def _get(url: str, headers: dict | None = None) -> BeautifulSoup:
+    resp = requests.get(url, headers=headers or HEADERS, timeout=TIMEOUT)
     if resp.status_code != 200:
         raise FetchError(f"HTTP {resp.status_code}: {url}")
     resp.encoding = resp.apparent_encoding or resp.encoding
@@ -311,6 +335,217 @@ def fetch_cao(target_years: list[int]) -> list[dict]:
     return events
 
 
+# ---------------------------------------------------------------- 米国指標（BLS / Census）共通
+
+_MONTH_YEAR = re.compile(r"(" + "|".join(m.capitalize() for m in MONTHS_EN) + r")\s+(20\d{2})")
+_ET_TIME = re.compile(r"(\d{1,2}):(\d{2})\s*([AP])\.?\s*M", re.IGNORECASE)
+
+
+def _us_window() -> tuple[dt.date, dt.date]:
+    """米国指標の取得対象期間（実行日〜US_HORIZON_DAYS 日先）。"""
+    today = dt.date.today()
+    return today, today + dt.timedelta(days=US_HORIZON_DAYS)
+
+
+def _parse_ref_month(text: str) -> tuple[int, int] | None:
+    """"September 2026" → (2026, 9)。見つからなければ None。"""
+    m = _MONTH_YEAR.search(text)
+    if not m:
+        return None
+    return int(m.group(2)), MONTHS_EN[m.group(1).lower()]
+
+
+def _et_to_jst(day: dt.date, time_text: str) -> tuple[str, str] | None:
+    """米東部時間の「08:30 AM」を日本時間の (YYYY-MM-DD, HH:MM) に換算する。夏時間は zoneinfo 任せ。"""
+    m = _ET_TIME.search(time_text)
+    if not m:
+        return None
+    hour, minute, ampm = int(m.group(1)), int(m.group(2)), m.group(3).upper()
+    if ampm == "P" and hour != 12:
+        hour += 12
+    if ampm == "A" and hour == 12:
+        hour = 0
+    et = dt.datetime(day.year, day.month, day.day, hour, minute, tzinfo=TZ_ET)
+    jst = et.astimezone(TZ_JST)
+    return jst.date().isoformat(), jst.strftime("%H:%M")
+
+
+def _month_iter(start: dt.date, end: dt.date):
+    y, m = start.year, start.month
+    while (y, m) <= (end.year, end.month):
+        yield y, m
+        y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+
+
+# ---------------------------------------------------------------- 米労働統計局 BLS
+
+# 公式カレンダー上の指標名 → (id 用キー, 和名, 重要度, 注釈)。重要度は _cr §23 の星基準。
+_BLS_TARGETS = {
+    "Consumer Price Index": (
+        "cpi", "米CPI", 3,
+        "アメリカで暮らしに使うモノやサービスの値段が、1年前と比べてどれだけ上がったかを示す数字",
+    ),
+    "Employment Situation": (
+        "nfp", "米雇用統計", 3,
+        "アメリカで会社に雇われて働く人が前の月よりどれだけ増えたかと、仕事を探している人の割合（失業率）を示す数字",
+    ),
+    "Producer Price Index": (
+        "ppi", "米PPI", 2,
+        "アメリカの企業どうしが売り買いするモノやサービスの値段がどれだけ動いたかを示す数字",
+    ),
+}
+
+
+def fetch_bls(target_years: list[int]) -> list[dict]:  # noqa: ARG001 - 期間は実行日基準
+    """米労働統計局 BLS の月別リリースカレンダーから CPI・雇用統計・PPI の発表日を取得する。
+
+    ページ構造: 月ごとのカレンダー表で、日付セル `<td id="d1014">` の中に
+    `<p><strong>Consumer Price Index</strong>September 2026<br>08:30 AM</p>` 形式で
+    指標名・対象月・発表時刻（米東部時間）が並ぶ。前月末・翌月初のセルも同じ表に含まれる。
+    """
+    today, horizon = _us_window()
+    events: dict[str, dict] = {}
+    page_errors: list[str] = []
+
+    for year, month in _month_iter(today, horizon):
+        url = URL_BLS_MONTH.format(year=year, month=month)
+        try:
+            soup = _get(url, headers=BLS_HEADERS)
+        except Exception as exc:  # noqa: BLE001 - 月単位の失敗は明示して続行
+            page_errors.append(f"{year}-{month:02d}: {exc}")
+            continue
+
+        for td in soup.find_all("td", id=re.compile(r"^d\d{4}$")):
+            cell_m, cell_d = int(td["id"][1:3]), int(td["id"][3:5])
+            cell_y = year
+            if month == 1 and cell_m == 12:
+                cell_y = year - 1
+            elif month == 12 and cell_m == 1:
+                cell_y = year + 1
+            try:
+                release = dt.date(cell_y, cell_m, cell_d)
+            except ValueError:
+                continue
+            if not (today <= release <= horizon):
+                continue
+
+            for p in td.find_all("p"):
+                strong = p.find("strong")
+                if not strong:
+                    continue
+                spec = _BLS_TARGETS.get(strong.get_text(" ", strip=True))
+                if not spec:
+                    continue
+                rest = p.get_text("\n", strip=True).split("\n")[1:]
+                rest_txt = " ".join(rest)
+                ref = _parse_ref_month(rest_txt)
+                jst = _et_to_jst(release, rest_txt)
+                if not ref or not jst:
+                    # 対象月・時刻が読めない行は入れない（推測補完の禁止）
+                    continue
+                key, label, importance, note = spec
+                ref_y, ref_m = ref
+                eid = f"bls_{key}_{ref_y}_{ref_m:02d}"
+                events[eid] = {
+                    "id": eid,
+                    "name": f"{label}（{ref_m}月分）",
+                    "start_date": jst[0],
+                    "end_date": jst[0],
+                    "time": jst[1],
+                    "importance": importance,
+                    "note": note,
+                    "source_url": url,
+                    "source": "bls",
+                }
+
+    for err in page_errors:
+        print(f"[WARN] bls: 月別カレンダーを取得できませんでした {err}", file=sys.stderr)
+    if not events:
+        raise FetchError("BLS の CPI・雇用統計・PPI の発表日を 1 件も抽出できませんでした"
+                         "（ページ構造の変更または取得拒否の可能性）")
+    return list(events.values())
+
+
+# ---------------------------------------------------------------- 米国勢調査局 Census
+
+_CENSUS_RETAIL = "Advance Monthly Sales for Retail and Food Services"
+_CENSUS_DATE = re.compile(r"([A-Za-z]+)\s+(\d{1,2}),\s*(20\d{2})")
+_CENSUS_HEADING = re.compile(r"(20\d{2})\s+Economic Indicator Release Schedule")
+
+
+def _census_page_for(year: int) -> tuple[str, BeautifulSoup]:
+    """指定年の公表スケジュール一覧を返す。見出しの年が一致するページだけを採用する。"""
+    tried: list[str] = []
+    for url in (URL_CENSUS_LIST.format(year=year), URL_CENSUS_LIST_CURRENT):
+        try:
+            soup = _get(url)
+        except FetchError as exc:
+            tried.append(str(exc))
+            continue
+        heads = [h.get_text(" ", strip=True) for h in soup.find_all(["h1", "h2", "h3"])]
+        if any((m := _CENSUS_HEADING.search(h)) and int(m.group(1)) == year for h in heads):
+            return url, soup
+        tried.append(f"{url} に {year} 年版の見出しがありません")
+    raise FetchError(" / ".join(tried))
+
+
+def fetch_census(target_years: list[int]) -> list[dict]:  # noqa: ARG001 - 期間は実行日基準
+    """米国勢調査局 Census の年別 経済指標公表スケジュールから小売売上高（速報）の発表日を取得する。
+
+    ページ構造: 「指標名 / 公表日 / 公表時刻 / 対象期間」の一覧表。指標名が
+    "Advance Monthly Sales for Retail and Food Services"、公表日が "October 15, 2026"、
+    公表時刻が "8:30 AM"（米東部時間）、対象期間が "September 2026" 形式。
+    """
+    today, horizon = _us_window()
+    events: dict[str, dict] = {}
+    page_errors: list[str] = []
+
+    for year in sorted({today.year, horizon.year}):
+        try:
+            url, soup = _census_page_for(year)
+        except Exception as exc:  # noqa: BLE001 - 年単位の失敗は明示して続行
+            page_errors.append(f"{year}: {exc}")
+            continue
+
+        for tr in soup.find_all("tr"):
+            cells = [c.get_text(" ", strip=True) for c in tr.find_all("td")]
+            if len(cells) < 4 or cells[0] != _CENSUS_RETAIL:
+                continue
+            dm = _CENSUS_DATE.search(cells[1])
+            if not dm or dm.group(1).lower() not in MONTHS_EN:
+                continue
+            try:
+                release = dt.date(int(dm.group(3)), MONTHS_EN[dm.group(1).lower()], int(dm.group(2)))
+            except ValueError:
+                continue
+            if not (today <= release <= horizon):
+                continue
+            ref = _parse_ref_month(cells[3])
+            jst = _et_to_jst(release, cells[2])
+            if not ref or not jst:
+                continue
+            ref_y, ref_m = ref
+            eid = f"census_retail_{ref_y}_{ref_m:02d}"
+            events[eid] = {
+                "id": eid,
+                "name": f"米小売売上高（{ref_m}月分）",
+                "start_date": jst[0],
+                "end_date": jst[0],
+                "time": jst[1],
+                "importance": 2,
+                "note": "アメリカのお店やネット通販で、1か月にどれだけ物が売れたかを示す数字（速報値）",
+                "source_url": url,
+                "source": "census",
+            }
+
+    for err in page_errors:
+        print(f"[WARN] census: 公表スケジュールを取得できませんでした {err}", file=sys.stderr)
+    if not events:
+        raise FetchError("Census の小売売上高の発表日を 1 件も抽出できませんでした"
+                         "（ページ構造の変更または取得拒否の可能性）")
+    return list(events.values())
+
+
 # ---------------------------------------------------------------- 台帳 I/O
 
 def load_ledger() -> dict:
@@ -353,8 +588,85 @@ def merge_events(existing: list[dict], incoming: list[dict], today: str) -> tupl
     return existing, added, updated
 
 
+# 台帳の見出しグループ（id の接頭辞 → 見出し）。上から順に評価し、最初に一致したグループへ入れる。
+_LEDGER_GROUPS = [
+    ("fomc_", "FOMC（米連邦公開市場委員会）"),
+    ("boj_mpm_", "日銀 金融政策決定会合"),
+    ("boj_", "日銀 その他"),
+    ("cao_", "内閣府 四半期別GDP速報（QE）"),
+    ("bls_", "米労働統計局（BLS）: 米CPI・米雇用統計・米PPI"),
+    ("census_", "米国勢調査局（Census）: 米小売売上高"),
+]
+_FIELD_ORDER = ["id", "name", "start_date", "end_date", "time", "importance",
+                "note", "source_url", "source", "updated"]
+# 日付・時刻は文字列としてダブルクォートで保存する（date 型で読まれると再読込時の比較がぶれるため）
+_QUOTED_KEYS = {"start_date", "end_date", "time", "updated"}
+
+
+def _stringify(obj):
+    if isinstance(obj, dict):
+        return {k: _stringify(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_stringify(v) for v in obj]
+    if isinstance(obj, (dt.date, dt.datetime)):
+        return obj.isoformat()
+    return obj
+
+
+def _scalar(key: str, value) -> str:
+    """1 つの値を YAML スカラー表記にする。読み戻して同じ値になる最も素直な書き方を選ぶ。"""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    text = str(value)
+    if key not in _QUOTED_KEYS and "\n" not in text:
+        try:
+            if yaml.safe_load(f"k: {text}") == {"k": text}:
+                return text
+        except yaml.YAMLError:
+            pass
+    return json.dumps(text, ensure_ascii=False)
+
+
+def _group_label(eid: str) -> str:
+    for prefix, label in _LEDGER_GROUPS:
+        if eid.startswith(prefix):
+            return label
+    return "その他"
+
+
+def _render_body(data: dict) -> str:
+    """meta と events を書き出す。events は発表主体ごとの見出しコメント付きで、各見出し内は日付順。"""
+    lines = ["meta:"]
+    for k, v in data.get("meta", {}).items():
+        lines.append(f"  {k}: {_scalar(k, v)}")
+    lines.append("")
+    lines.append("events:")
+
+    order = [label for _, label in _LEDGER_GROUPS] + ["その他"]
+    grouped: dict[str, list[dict]] = {label: [] for label in order}
+    for ev in data.get("events", []):
+        grouped[_group_label(str(ev.get("id", "")))].append(ev)
+
+    for label in order:
+        evs = sorted(grouped[label], key=lambda e: (str(e.get("start_date")), str(e.get("id"))))
+        if not evs:
+            continue
+        sep = "" if label.endswith("）") else " "  # 既存台帳の見出し表記（全角括弧の後は空白なし）に合わせる
+        lines.append(f"  # ---- {label}{sep}----")
+        for ev in evs:
+            keys = [k for k in _FIELD_ORDER if k in ev] + [k for k in ev if k not in _FIELD_ORDER]
+            for i, k in enumerate(keys):
+                prefix = "  - " if i == 0 else "    "
+                lines.append(f"{prefix}{k}: {_scalar(k, ev[k])}")
+    return "\n".join(lines) + "\n"
+
+
 def save_ledger(data: dict) -> None:
-    """台帳を書き戻す。先頭のスキーマ説明コメントは維持する。"""
+    """台帳を書き戻す。先頭のスキーマ説明コメントは維持し、書き出し後の読み戻しで内容一致を検証する。"""
     header_lines: list[str] = []
     if LEDGER_PATH.exists():
         with LEDGER_PATH.open(encoding="utf-8") as fh:
@@ -363,18 +675,17 @@ def save_ledger(data: dict) -> None:
                     header_lines.append(line.rstrip("\n"))
                 else:
                     break
-    # 日付は文字列で保存する（date 型で書かれると再読込時の比較がぶれるため）
-    def _stringify(obj):
-        if isinstance(obj, dict):
-            return {k: _stringify(v) for k, v in obj.items()}
-        if isinstance(obj, list):
-            return [_stringify(v) for v in obj]
-        if isinstance(obj, (dt.date, dt.datetime)):
-            return obj.isoformat()
-        return obj
 
-    body = yaml.safe_dump(_stringify(data), allow_unicode=True, sort_keys=False,
-                          default_flow_style=False, width=200)
+    data = _stringify(data)
+    body = _render_body(data)
+
+    # 書き出した YAML を読み戻し、1 件でも値が食い違えば書き込まずに止める（既存行の消失・改変の防止）
+    reread = yaml.safe_load(body) or {}
+    want = sorted(data.get("events", []), key=lambda e: str(e.get("id")))
+    got = sorted(_stringify(reread.get("events", [])), key=lambda e: str(e.get("id")))
+    if want != got or _stringify(reread.get("meta")) != data.get("meta"):
+        raise FetchError("台帳の書き出し結果を読み戻すと内容が一致しません。台帳は書き換えていません。")
+
     with LEDGER_PATH.open("w", encoding="utf-8", newline="\n") as fh:
         if header_lines:
             fh.write("\n".join(header_lines).rstrip() + "\n\n")
@@ -383,13 +694,14 @@ def save_ledger(data: dict) -> None:
 
 # ---------------------------------------------------------------- CLI
 
-FETCHERS = {"fomc": fetch_fomc, "boj": fetch_boj, "cao": fetch_cao}
+FETCHERS = {"fomc": fetch_fomc, "boj": fetch_boj, "cao": fetch_cao,
+            "bls": fetch_bls, "census": fetch_census}
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="経済イベント日程台帳を公式サイトから更新する（ローカル実行専用）")
     ap.add_argument("--dry-run", action="store_true", help="取得結果を表示するだけで台帳を書き換えない")
-    ap.add_argument("--source", choices=["boj", "fomc", "cao", "all"], default="all", help="取得元（既定: all）")
+    ap.add_argument("--source", choices=[*FETCHERS, "all"], default="all", help="取得元（既定: all）")
     args = ap.parse_args()
 
     today = dt.date.today()
