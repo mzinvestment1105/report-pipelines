@@ -47,6 +47,9 @@ class Skeleton:
     h3_by_section: dict[str, list[str]] = field(default_factory=dict)
     # 小見出しを禁止したセクションの `## 文言`
     h3_forbidden_sections: set[str] = field(default_factory=set)
+    # 条件付きの `### 文言`（許可一覧には入るが、欠けても骨格検査では error にしない。
+    # 置く条件の検査は個別の検査関数が担う。例: §8 `### 信用規制の状況`・PM 2026-10-11）
+    h3_optional: set[str] = field(default_factory=set)
     # 固定表のヘッダ署名（`列 / 列 / 列` を正規化したもの）の集合
     table_headers: set[str] = field(default_factory=set)
 
@@ -154,6 +157,8 @@ def load(path: Path | None = None) -> Skeleton:
             continue
         sk.h3_by_section[section] = heads
         sk.h3_whitelist.update(heads)
+        if "条件付き" in cells[2]:
+            sk.h3_optional.update(heads)
 
     # --- 固定表の列名・列順 ----------------------------------------------
     for cells in _rows(block, _LEAD_TABLE, (_LEAD_ADDRESS, _LEAD_DECOR)):

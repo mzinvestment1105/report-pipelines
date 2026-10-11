@@ -1513,6 +1513,184 @@ _MARGIN_REG_STATUS = re.compile(
 MARGIN_REG_REQUIRED_FROM = "2026-09-13"
 
 
+# ==========================================================================
+# §8 信用規制の状況（errors・PM 2026-10-11）
+#
+# 生データ「### 信用規制の状況（…）」節の近接フラグで誌面の書き方を切り替える。
+#   近接: §8 に `### 信用規制の状況`・4 列の固定表（基準 / 現在値 / 到達水準 / 判定）・
+#         到達水準の数値・規制の見通し・直近 90 日の解除日（記載がある時）を必須とする。
+#   遠い: 小見出しは不要。§8 本文の状態 1 文（東証・日証金の状態）が無ければ warning。
+# 開始日 MARGIN_REG_SECTION_FROM より前のレポートは error を warning に落とす
+# （⑩ の MARGIN_REG_REQUIRED_FROM と同じ方式。送信済みレポートの再送を壊さない）。
+# ==========================================================================
+MARGIN_REG_SECTION_FROM = "2026-10-11"
+_MR_DATA_HEAD = "### 信用規制の状況（"
+_MR_H3 = "信用規制の状況"
+_MR_TABLE_HEAD = ["基準", "現在値", "到達水準", "判定"]
+_MR_GROUP_WORDS = ("日々公表", "増担保", "注意喚起")
+_SPECULATION = re.compile(next(p for n, p, _r in FORBIDDEN_PATTERNS if n == "推測語"))
+
+
+def _data_md_for_report(code: str, report_date: str | None) -> Path | None:
+    """レポート日付の生データを返す（同日 → それ以前で最新 → 全体の最新 の順）。"""
+    cands = list((REPO_ROOT / "research" / "stocks").glob(f"{code}_*_data.md")) + list(
+        (REPO_ROOT / "research" / "stocks" / str(code)).glob(f"{code}_*_data.md")
+    )
+    if not cands:
+        return None
+    if report_date:
+        dated = []
+        for p in cands:
+            m = re.search(r"_(\d{4}-\d{2}-\d{2})_data\.md$", p.name)
+            if m and m.group(1) <= report_date:
+                dated.append((m.group(1), p.name, p))
+        if dated:
+            return sorted(dated)[-1][2]
+    return sorted(cands, key=lambda p: p.name)[-1]
+
+
+def parse_margin_reg_data(raw: str) -> dict | None:
+    """生データの「### 信用規制の状況（…）」節から、近接フラグ・解除日・到達した基準を取り出す。
+
+    節が無い（旧形式の生データ）場合は None を返す。
+    """
+    i = raw.find(_MR_DATA_HEAD)
+    if i < 0:
+        return None
+    block = raw[i:]
+    m_end = re.search(r"\n(##|###) (?!#)", block[len(_MR_DATA_HEAD):])
+    if m_end:
+        block = block[: len(_MR_DATA_HEAD) + m_end.start()]
+    near = re.search(r"^- \*\*近接フラグ\*\*: (近接|遠い)", block, re.M)
+    rel = re.search(r"^- \*\*直近90日の解除\*\*: (.*)$", block, re.M)
+    far = re.search(r"^- \*\*状態 1 文\*\*: (.*)$", block, re.M)
+    rel_dates: list[str] = []
+    if rel and not rel.group(1).startswith("なし"):
+        for y, mo, d in re.findall(r"(\d{4})[/-](\d{1,2})[/-](\d{1,2})", rel.group(1)):
+            md_ = f"{int(mo)}/{int(d)}"
+            if md_ not in rel_dates:
+                rel_dates.append(md_)
+    reached: list[str] = []
+    for line in block.splitlines():
+        s = line.strip()
+        if not s.startswith("|"):
+            continue
+        cells = [c.strip() for c in s.strip("|").split("|")]
+        if len(cells) >= 6 and cells[-1].startswith("到達") and cells[0] not in reached:
+            reached.append(cells[0])
+    return {
+        "near": (near.group(1) == "近接") if near else None,
+        "release_dates": rel_dates,
+        "reached_groups": reached,
+        "far_sentence": far.group(1).strip() if far else None,
+    }
+
+
+def check_margin_reg_section(
+    md: str, data: dict | None, report_date: str | None = None
+) -> tuple[list[str], list[str], str]:
+    """§8 の信用規制の状況を生データの近接フラグに照らして検査する。(errors, warnings, info)"""
+    errors: list[str] = []
+    warnings: list[str] = []
+    if data is None:
+        return errors, warnings, "[信用規制の状況] 生データに小節なし → 検査スキップ（後方互換）"
+    if data.get("near") is None:
+        return errors, warnings, "[信用規制の状況] 生データに近接フラグなし（旧形式）→ 検査スキップ"
+    sec8 = None
+    for title, start, _end, body in _h2_spans(md):
+        if re.match(r"^8\.", title.strip()):
+            sec8 = (title, start, body)
+            break
+    if sec8 is None:
+        return errors, warnings, "[信用規制の状況] §8 が見つからず検査スキップ"
+    _title, start, body = sec8
+    strict = bool(report_date) and report_date >= MARGIN_REG_SECTION_FROM
+    sink = errors if strict else warnings
+
+    sub: list[str] = []
+    sub_line = None
+    in_sub = False
+    for off, line in enumerate(body, 1):
+        m = re.match(r"^###\s+(?!#)(.*?)\s*$", line)
+        if m:
+            in_sub = m.group(1) == _MR_H3
+            if in_sub:
+                sub_line = start + off
+            continue
+        if in_sub:
+            sub.append(line)
+    sub_text = "\n".join(sub)
+
+    if sub_line is not None:
+        hits = [l.strip() for l in sub if _SPECULATION.search(l)]
+        if hits:
+            sink.append(
+                f"[信用規制の状況] L{sub_line} の小節に推測語があります: {hits[0][:60]}"
+                " → 対処: 到達するか否かは書かず、到達株価・必要な売買高・必要な残高と日数を数値で書く"
+            )
+
+    if data["near"]:
+        if sub_line is None:
+            sink.append(
+                "[信用規制の状況] 生データの近接フラグが「近接」なのに §8 に `### 信用規制の状況` がありません"
+                " → 対処: 総合判定の後に小見出しを置き、状態段落・固定表（基準 / 現在値 / 到達水準 / 判定）・"
+                "規制の見通しを書く（agents/stock_analyst.md §8・_common_rules §44）"
+            )
+            return errors, warnings, "[信用規制の状況] 近接・小見出しなし"
+        tables = [(h, rows) for _ln, h, rows in _tables_with_lines(sub_text)]
+        tbl = next((rows for h, rows in tables
+                    if [re.sub(r"\s+", "", c) for c in h] == _MR_TABLE_HEAD), None)
+        if tbl is None:
+            sink.append(
+                f"[信用規制の状況] L{sub_line} の小節に固定表「基準 / 現在値 / 到達水準 / 判定」がありません"
+                " → 対処: 生データの「次に規制される条件」「解除される条件」から 3〜5 行の 4 列表を置く"
+            )
+        else:
+            reach = [r[2] for r in tbl if len(r) >= 3]
+            if not any(re.search(r"\d", c) for c in reach):
+                sink.append(
+                    f"[信用規制の状況] L{sub_line} の固定表の到達水準列に数値がありません"
+                    " → 対処: 生データの到達水準（到達株価・必要な売買高・必要な残高）を具体値で書く"
+                )
+        if not re.search(r"規制の見通し", sub_text):
+            sink.append(
+                f"[信用規制の状況] L{sub_line} の小節に「規制の見通し: 」の段落がありません"
+                " → 対処: 固定表の直後に、到達の水準と日数で 2〜3 文を書く"
+            )
+        rd = data.get("release_dates") or []
+        if rd:
+            if "解除" not in sub_text or not any(
+                re.search(r"(?<![\d/])" + re.escape(d) + r"(?![\d])", sub_text) for d in rd
+            ):
+                sink.append(
+                    f"[信用規制の状況] L{sub_line} の小節に直近 90 日の解除の事実と日付がありません"
+                    f"（生データの解除日: {'・'.join(rd)}） → 対処: 状態段落に解除の種別と日付を書く"
+                )
+        rg = data.get("reached_groups") or []
+        if rg and not ("到達" in sub_text and any(w in sub_text for w in _MR_GROUP_WORDS)):
+            sink.append(
+                f"[信用規制の状況] L{sub_line} の小節に、生データで到達している基準（{'・'.join(rg)}）の記載がありません"
+                " → 対処: 規制の見通しに「基準 X に現在値 Y で到達している」と書く"
+            )
+        return errors, warnings, (
+            f"[信用規制の状況] 近接・小見出しあり（違反 {len(errors) + len(warnings)} 件）"
+        )
+
+    # 遠い
+    if sub_line is not None:
+        warnings.append(
+            f"[信用規制の状況] L{sub_line}: 生データの近接フラグが「遠い」のに小見出しがあります"
+            " → 対処: 小見出し・表・見通しを外し、§8 本文の末尾に状態 1 文だけを書く"
+        )
+    prose = [l for l in body if l.strip() and not l.lstrip().startswith(("|", "#", ">"))]
+    if not any(("東証" in l and "日証金" in l) for l in prose):
+        warnings.append(
+            "[信用規制の状況] 生データの近接フラグが「遠い」の銘柄で、§8 本文に状態 1 文がありません"
+            f" → 対処: §8 本文の末尾に「{data.get('far_sentence') or 'M/D 時点で東証の指定・日証金の措置はなく、直近 90 日の指定・解除もない。'}」を書く"
+        )
+    return errors, warnings, "[信用規制の状況] 遠い・状態 1 文の検査のみ"
+
+
 def _report_date_from_name(name: str) -> str | None:
     """レポートのファイル名（YYYY-MM-DD.md）から日付文字列を取り出す。
 
@@ -1539,7 +1717,7 @@ def _report_date_from_md(md: str) -> str | None:
 
 
 def check_demand_table_numbers(
-    md: str, report_date: str | None = None
+    md: str, report_date: str | None = None, margin_far: bool = False
 ) -> tuple[list[str], list[str], str]:
     """§8 需給テーブルの各行の「現状」セルが数値を含むかを検査する。
 
@@ -1615,7 +1793,8 @@ def check_demand_table_numbers(
             " → 対処: 生データの「### 信用取引規制（日々公表・増担保）」節から"
             "「M/D 日々公表」「M/D 増担保」「M/D 指定なし」「M/D 取得不能」の行を 1 行足す"
         )
-    if found_table and "規制の見通し" not in md:
+    # 生データの近接フラグが「遠い」銘柄は規制の見通しを置かない（PM 2026-10-11）。
+    if found_table and "規制の見通し" not in md and not margin_far:
         sink.append(
             "[需給テーブル] §8 に「規制の見通し」の記載がありません"
             " → 対処: ⑩ の直後に 2〜3 行で、指定または解除の基準までの距離を"
@@ -2230,7 +2409,7 @@ def _check_h3_whitelist(md: str, sk) -> list[str]:
                 continue
             errs.append(
                 f"[骨格/小見出し] L{start + off}「### {h3}」（{title} 内）は許可一覧にありません"
-                " → 対処: 正本「誌面骨格」節の小見出し許可一覧 21 個の文言へ完全一致で置き換えるか、"
+                " → 対処: 正本「誌面骨格」節の小見出し許可一覧 22 個の文言へ完全一致で置き換えるか、"
                 "見出しを外して本文へ組み込む"
             )
     return errs
@@ -2251,7 +2430,9 @@ def _check_h3_required(md: str, sk) -> list[str]:
             for l in body
             if re.match(r"^###\s+(?!#)", l)
         ]
-        missing = [h for h in required if h not in got]
+        # 条件付きの小見出し（§8 `### 信用規制の状況` 等）は欠けても骨格検査では落とさない。
+        # 置く条件は個別の検査関数（check_margin_reg_section）が生データに照らして判定する。
+        missing = [h for h in required if h not in got and h not in sk.h3_optional]
         if missing:
             errs.append(
                 f"[骨格/小見出し] 「{title}」に必須の小見出しが欠けています: "
@@ -2616,7 +2797,7 @@ def _check_table_headers(md: str, sk) -> list[str]:
             ):
                 continue
             errs.append(
-                f"[骨格/表] L{ln}（{title}）の列構成が固定表 17 表に一致しません: 「{sig}」"
+                f"[骨格/表] L{ln}（{title}）の列構成が固定表 18 表に一致しません: 「{sig}」"
                 " → 対処: 正本「誌面骨格」節の固定表の列名・列順へ完全一致で合わせる"
             )
     return errs
@@ -2779,12 +2960,12 @@ SECTION_LENGTH_MAX: dict[str, int] = {
     "6": 300,
     "7": 600,
     "7-B": 600,
-    "8": 300,
+    "8": 450,
     "9": 300,
     "10": 400,
     "11": 500,
 }
-SECTION_LENGTH_TOTAL_MAX = 6400
+SECTION_LENGTH_TOTAL_MAX = 6550
 
 
 def _section_length_key(title: str) -> str:
@@ -3193,13 +3374,27 @@ def run_gate(
     #     （errors・PM 2026-09-12・_common_rules §44）。⑩ と見通しの欠落は
     #     MARGIN_REG_REQUIRED_FROM 以降のレポートのみ error、それ以前は warning。
     #     §8 の統合テーブルが無い誌面ではスキップする（後方互換）。
+    _rd = report_date or _report_date_from_md(md)
+    _mr_path = _data_md_for_report(code, _rd)
+    try:
+        _mr_data = parse_margin_reg_data(_mr_path.read_text(encoding="utf-8")) if _mr_path else None
+    except Exception:  # noqa: BLE001
+        _mr_data = None
     dt_errs, dt_warns, dt_note = check_demand_table_numbers(
-        md, report_date or _report_date_from_md(md)
+        md, _rd, margin_far=bool(_mr_data and _mr_data.get("near") is False)
     )
     errors.extend(dt_errs)
     warnings.extend(dt_warns)
     if dt_note:
         info.append(dt_note)
+
+    # 16-b. §8 信用規制の状況（errors・PM 2026-10-11・_common_rules §44）
+    #     生データの近接フラグ＝近接 なら小見出し・4 列表・到達水準・見通し・解除日を必須とし、
+    #     遠い なら状態 1 文の有無だけを warning で見る。MARGIN_REG_SECTION_FROM 前は warning。
+    mr_errs, mr_warns, mr_note = check_margin_reg_section(md, _mr_data, _rd)
+    errors.extend(mr_errs)
+    warnings.extend(mr_warns)
+    info.append(mr_note + (f"（生データ {_mr_path.name}）" if _mr_path else ""))
 
     # 18. §6 財務表の生データ突合（errors・PM 2026-09-10）
     #     誌面 §6 の「指標/前期/当期/増減」表の主要行を生データと突合し、
@@ -3212,7 +3407,7 @@ def run_gate(
         info.append(fv_note)
 
     # 17. 誌面骨格の 12 検査（errors / warnings・PM 2026-09-07）
-    #     見出し 3 段・小見出し 21 個の完全一致・固定表 17 表・装飾・住所・数値重複。
+    #     見出し 3 段・小見出し 22 個の完全一致・固定表 18 表・装飾・住所・数値重複。
     #     太字位置・住所・数値重複は誤検知が出やすいため当面 warning（3 本通過後に error へ）。
     sk_errs, sk_warns, sk_info = check_skeleton(md)
     errors.extend(sk_errs)

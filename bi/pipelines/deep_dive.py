@@ -142,6 +142,46 @@ MARGIN_ALERT_SCAN_BACK_DAYS = 90
 # 2 秒 → 4 秒 → 8 秒 と倍にしながら最大 3 回呼ぶ（= 再試行は 2 回）。
 MARGIN_ALERT_RETRIES = 3
 MARGIN_ALERT_BACKOFF_BASE_SEC = 2.0
+
+# --- 信用規制の状況（履歴・次の指定条件・解除条件）PM 2026-10-11 指示 -------------------
+# 「最近規制が解除された」事実と「このまま行くと何の条件で規制されるか」を §8 需給の小節で
+# 出すための取得元と基準値。基準値は全て下記の一次情報（2026-10-11 に PDF・HTML・画像を
+# 取得して照合）からの転記であり、記憶・一般論の数値を含まない。
+# 逐語の原文は dev/reference/jpx_margin_regulation_criteria.md（A〜C 節）に保存している。
+MARGIN_REG_JPX_URLS = {
+    # 増担保（委託保証金率の引上げ）の実施中・解除（解除は約 1 週間掲載）。列: 銘柄名/コード/実施日/規制の内容/該当基準
+    "reg":    "https://www.jpx.co.jp/markets/equities/margin-reg/index.html",
+    # 日々公表銘柄の指定中・解除（解除は約 1 週間掲載）。列: 銘柄名/コード/指定日（解除日）
+    "daily":  "https://www.jpx.co.jp/markets/equities/margin-daily/index.html",
+    # 特別周知銘柄。列: 銘柄名/コード/周知開始日
+    "notice": "https://www.jpx.co.jp/markets/equities/margin-daily/01.html",
+}
+MARGIN_REG_JSF_URLS = {
+    # 貸借取引銘柄別制限措置等一覧（注意喚起・申込制限・申込停止の現在値。cp932 の CSV）
+    "seigen":  "https://www.taisyaku.jp/data/seigenichiran.csv",
+    # 銘柄別の融資・貸株残高（直近申込日 1 日分）
+    "zandaka": "https://www.taisyaku.jp/data/zandaka.csv",
+    # 品貸料率（逆日歩）一覧（貸株超過の銘柄のみ行がある）
+    "shina":   "https://www.taisyaku.jp/data/shina.csv",
+    # 貸借取引対象銘柄（貸借銘柄区分 1=貸借銘柄・2=貸借融資銘柄）
+    "meigara": "https://www.taisyaku.jp/data/meigara.csv",
+}
+MARGIN_REG_SOURCE_URLS = {
+    "G-日々": ("https://www.jpx.co.jp/rules-participants/rules/doc/agreement/"
+               "tvdivq0000001wh1-att/guideline_hibi.pdf"),
+    "G-規制": ("https://www.jpx.co.jp/rules-participants/rules/doc/agreement/"
+               "tvdivq0000001wh1-att/guideline_kisei.pdf"),
+    "JSF基準": "https://www.taisyaku.jp/about/restrictive/",
+}
+# 売買単位（内国株式は 2018-10-01 に 100 株へ統一。https://www.jpx.co.jp/equities/improvements/unit/index.html）
+MARGIN_REG_UNIT_SHARES = 100
+# 近接フラグの閾値（PM 2026-10-11）: 到達株価が現在株価の ±15% 以内・残高比率が基準まで 5pt 以内
+# （基準が 10% 未満の比率は 基準÷2 pt 以内）
+MARGIN_REG_NEAR_PRICE_PCT = 15.0
+MARGIN_REG_NEAR_BAL_PT = 5.0
+MARGIN_REG_MA_DAYS     = 25     # 「２５日移動平均株価」（G-日々 Ⅲ・小数点以下第二位を四捨五入）
+MARGIN_REG_HTTP_TIMEOUT = 20
+MARGIN_REG_JSF_UNIT_LABEL = {"1": "貸借銘柄", "2": "貸借融資銘柄"}
 # ③-1 日々公表信用残の日次推移で並べる営業日数と、増減率を測る営業日オフセット。
 DAILY_MARGIN_TABLE_DAYS   = 15
 DAILY_MARGIN_CHG_OFFSETS  = (5, 10)
@@ -686,6 +726,9 @@ def fetch_margin_interest_series(code4: str, as_of: date | None = None) -> dict:
             "date":  d,
             "long":  _to_f(r.get("LongVol")),
             "short": _to_f(r.get("ShrtVol")),
+            # 制度信用の内訳（信用規制の状況で日証金の注意喚起基準イ・ロに使う）
+            "long_std":  _to_f(r.get("LongStdVol")),
+            "short_std": _to_f(r.get("ShrtStdVol")),
         })
     # 日次行が混ざっても 1 週 1 行になるよう、週ごとの最終行へ畳む。
     series = resample_weekly_last(series)
@@ -4777,6 +4820,8 @@ def fetch_margin_alert(code: str, target_date) -> dict:
         rows.append({"_pubdate": d, **r})
     rows.sort(key=lambda x: x["_pubdate"])
     out["history_days"] = len(rows)
+    # 走査期間（MARGIN_ALERT_SCAN_BACK_DAYS）の全公表行。信用規制の状況（指定・解除の履歴）で使う。
+    out["rows"] = rows
     if not rows:
         out["fetch_status"] = "empty"
         out["basis"] = "absent_from_margin_alert_list（基準日以前の公表行が無い）"
@@ -4836,6 +4881,961 @@ def fetch_margin_alert(code: str, target_date) -> dict:
             f"（TSEMrgnRegCls={cls!r}: {MARGIN_ALERT_CLS_LABELS.get(cls, '区分不明')}）"
         )
     return out
+
+
+# ---------------------------------------------------------------------------
+# 信用規制の状況（履歴・次の指定条件・解除条件）PM 2026-10-11 指示
+# ---------------------------------------------------------------------------
+# 取得元は 3 系統で、それぞれの役割が違う:
+#   (1) J-Quants /markets/margin-alert … 日々公表残高の公表行。行の公表区分の推移から
+#       「いつ日々公表／増担保／日証金措置の対象だったか」を 90 日分さかのぼれる（唯一の履歴源）。
+#   (2) JPX 公表ページ（HTML）… 現在の指定・実施と、解除後約 1 週間の解除日・該当基準。
+#   (3) 日証金 CSV … 注意喚起・申込制限／停止の現在値、融資・貸株残高、品貸料（逆日歩）。
+# どれかが取れなくても他の系統だけで節を組み、取れなかった系統は節の冒頭と取得経路に明記する。
+
+def _mr_http_bytes(url: str) -> bytes:
+    r = requests.get(url, headers=_YAHOO_HEADERS, timeout=MARGIN_REG_HTTP_TIMEOUT)
+    r.raise_for_status()
+    return r.content
+
+
+def _mr_cell_text(s: str) -> str:
+    import html as _html
+    s = re.sub(r"<br\s*/?>", " ", s, flags=re.I)
+    s = re.sub(r"<[^>]+>", "", s)
+    return re.sub(r"\s+", " ", _html.unescape(s)).strip()
+
+
+def _mr_html_tables(text: str) -> list:
+    """HTML の <table> を「行 × セル文字列」のリストへ落とす（JPX のページは素の HTML テーブル）。"""
+    tables = []
+    for tb in re.findall(r"<table[^>]*>(.*?)</table>", text, flags=re.S | re.I):
+        rows = []
+        for tr in re.findall(r"<tr[^>]*>(.*?)</tr>", tb, flags=re.S | re.I):
+            cells = [_mr_cell_text(c) for c in
+                     re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>", tr, flags=re.S | re.I)]
+            if cells:
+                rows.append(cells)
+        if rows:
+            tables.append(rows)
+    return tables
+
+
+def _mr_find_code_row(table: list, code4: str) -> dict | None:
+    """先頭行を列名とみなし、「コード」列が code4 に一致する行を {列名: 値} で返す。"""
+    if not table:
+        return None
+    head = table[0]
+    if "コード" not in head:
+        return None
+    ci = head.index("コード")
+    for row in table[1:]:
+        if len(row) > ci and row[ci].strip().upper() == code4.upper():
+            return {head[i]: row[i] for i in range(min(len(head), len(row)))}
+    return None
+
+
+def _mr_parse_ymd(s) -> date | None:
+    s = str(s or "").strip()
+    for fmt, n in (("%Y/%m/%d", 10), ("%Y-%m-%d", 10), ("%Y%m%d", 8)):
+        try:
+            return datetime.strptime(s[:n], fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _mr_csv_rows(raw: bytes) -> list:
+    import csv
+    import io
+    return list(csv.reader(io.StringIO(raw.decode("cp932", errors="replace"))))
+
+
+def fetch_margin_reg_public(code4: str) -> dict:
+    """JPX 公表ページと日証金 CSV から、銘柄の信用規制の現在値と直近の解除を取得する。
+
+    Returns: {"jpx": {...}, "jsf": {...}, "status": {系統: "ok" | "error:..."}}
+      jpx.reg_active / reg_released / daily_active / daily_released / notice … 該当行（無ければ None）
+      jpx.updated … 各ページの「YYYY/MM/DD 更新」
+      jsf.seigen / zandaka / shina … 該当行（無ければ None）・jsf.lending_cls … 貸借銘柄区分
+    取得失敗は status に理由を残し、「該当なし」と区別する（失敗を規制なしと読ませない）。
+    """
+    code4 = str(code4).strip().upper()
+    out: dict = {"jpx": {"updated": {}}, "jsf": {}, "status": {}}
+
+    # --- JPX（増担保・日々公表・特別周知） ---
+    for key, url in MARGIN_REG_JPX_URLS.items():
+        try:
+            text = _mr_http_bytes(url).decode("utf-8", errors="replace")
+        except Exception as e:  # noqa: BLE001
+            out["status"][f"jpx_{key}"] = f"error:{type(e).__name__}"
+            print(f"  → 取得失敗: JPX {key} {url}: {e}", file=sys.stderr)
+            continue
+        m = re.search(r"(\d{4}/\d{2}/\d{2})\s*更新", re.sub(r"<[^>]+>", " ", text))
+        out["jpx"]["updated"][key] = m.group(1) if m else None
+        tables = _mr_html_tables(text)
+        if not tables:
+            out["status"][f"jpx_{key}"] = "error:表なし"
+            continue
+        out["status"][f"jpx_{key}"] = "ok"
+        for t in tables:
+            head = " ".join(t[0])
+            if key == "reg":
+                slot = ("reg_active" if "実施日" in head else
+                        "reg_released" if "解除日" in head else None)
+            elif key == "daily":
+                slot = ("daily_active" if "指定日" in head else
+                        "daily_released" if "解除日" in head else None)
+            else:
+                slot = "notice" if "周知開始日" in head else None
+            if slot:
+                out["jpx"][slot] = _mr_find_code_row(t, code4)
+
+    # --- 日証金（制限措置一覧・残高・品貸料・貸借区分） ---
+    for key, url in MARGIN_REG_JSF_URLS.items():
+        try:
+            rows = _mr_csv_rows(_mr_http_bytes(url))
+        except Exception as e:  # noqa: BLE001
+            out["status"][f"jsf_{key}"] = f"error:{type(e).__name__}"
+            print(f"  → 取得失敗: 日証金 {key} {url}: {e}", file=sys.stderr)
+            continue
+        hi = None
+        for i, r in enumerate(rows[:10]):
+            joined = ",".join(r)
+            if "コード" in joined and "銘柄名" in joined:
+                hi = i
+                break
+        if hi is None:
+            out["status"][f"jsf_{key}"] = "error:列名行なし"
+            continue
+        head = [h.strip() for h in rows[hi]]
+        ci = next((i for i, h in enumerate(head) if "コード" in h), None)
+        hit = None
+        for r in rows[hi + 1:]:
+            if ci is None or len(r) <= ci or r[ci].strip().upper() != code4:
+                continue
+            rec = {head[i]: r[i].strip() for i in range(min(len(head), len(r)))}
+            # 残高・品貸料は取引所区分ごとに行が分かれる。東証（PTS 合算）の行を採る。
+            if key in ("zandaka", "shina"):
+                ex = rec.get("取引所区分名") or rec.get("取引所区分") or ""
+                if "東証" not in ex:
+                    continue
+            hit = rec
+            break
+        out["status"][f"jsf_{key}"] = "ok"
+        if key == "meigara":
+            out["jsf"]["lending_cls"] = (hit or {}).get("貸借銘柄区分（東証）")
+        else:
+            out["jsf"][key] = hit
+    return out
+
+
+def _mr_flags(row: dict) -> set:
+    pr = row.get("PubReason")
+    if isinstance(pr, dict):
+        return {k for k, v in pr.items() if str(v) == "1"}
+    return set()
+
+
+def _mr_kind(row: dict) -> str:
+    """公表行 1 行の公表区分を日本語の種別へ。PubReason を主・TSEMrgnRegCls を従とする。"""
+    fl = _mr_flags(row)
+    cls = str(row.get("TSEMrgnRegCls") or "")
+    if "Restricted" in fl or (not fl and cls == MARGIN_ALERT_CLS_RESTRICTED):
+        return "増担保"
+    if "DailyPublication" in fl or (not fl and cls == MARGIN_ALERT_CLS_DAILY_PUB):
+        return "日々公表"
+    if "RestrictedByJSF" in fl:
+        return "日証金 申込制限・停止"
+    if "PrecautionByJSF" in fl:
+        return "日証金 注意喚起"
+    if "UnclearOrSecOnAlert" in fl or cls == "101":
+        return "不明確・監理"
+    return f"区分{cls or '不明'}"
+
+
+def _mr_runs(rows: list, trade_days: list) -> list:
+    """公表行を「同じ種別が営業日の切れ目なく続く区間」へまとめる。
+
+    営業日の判定は株価の日足（price_df の日付）で行い、2 つの公表日の間に公表行の無い
+    営業日があれば区間を切る（祝日による日付の飛びでは切らない）。
+    """
+    tds = sorted(set(trade_days))
+    runs: list = []
+    for r in rows:
+        d = r["_pubdate"]
+        k = _mr_kind(r)
+        if runs:
+            prev = runs[-1]
+            gap = any(prev["last"] < t < d for t in tds)
+            if prev["kind"] == k and not gap:
+                prev["last"] = d
+                prev["last_row"] = r
+                prev["n"] += 1
+                continue
+        runs.append({"kind": k, "first": d, "last": d, "n": 1,
+                     "first_row": r, "last_row": r})
+    return runs
+
+
+def _mr_pct(v) -> str:
+    return "N/A" if v is None else f"{v:,.2f}%"
+
+
+def _mr_md(d) -> str:
+    return f"{d.month}/{d.day}" if d else "N/A"
+
+
+def _mr_cmp(label: str, val, thr: float, op: str = ">=", unit: str = "%", reach: str | None = None) -> dict:
+    """基準 1 項目の判定。val が None なら判定不能（hit=None）。
+
+    reach は「到達に必要な水準」（到達株価・必要な売買高・必要な残高）の表示文字列（PM 2026-10-11）。
+    """
+    if val is None:
+        return {"label": label, "val": None, "thr": thr, "op": op, "hit": None, "unit": unit,
+                "reach": reach}
+    hit = (val >= thr) if op == ">=" else (val < thr)
+    return {"label": label, "val": val, "thr": thr, "op": op, "hit": hit, "unit": unit, "reach": reach}
+
+
+def _mr_num(v: float, unit: str) -> str:
+    if unit == "%":
+        return f"{v:,.2f}%"
+    if unit == "株":
+        return f"{v:,.0f}株"
+    if unit == "日":
+        return f"{v:,.0f}日"
+    return f"{v:,.2f}{unit}"
+
+
+def _mr_fmt_val(c: dict) -> str:
+    if c.get("text"):
+        return c["text"]
+    if c["val"] is None:
+        return f"{c['label']} 算出不能"
+    return f"{c['label']} {_mr_num(c['val'], c['unit'])}"
+
+
+def _mr_fmt_gap(c: dict) -> str:
+    v, thr = c["val"], c["thr"]
+    if c.get("text"):
+        return c.get("gap_text") or c["text"]
+    if v is None:
+        return f"{c['label']} 判定不能"
+    if c["hit"]:
+        return f"{c['label']} 充足"
+    d = abs(thr - v)
+    if c["unit"] == "%":
+        return f"{c['label']} あと{d:,.2f}pt"
+    return f"{c['label']} あと{_mr_num(d, c['unit'])}"
+
+
+def _mr_verdict(hit) -> str:
+    return "到達" if hit is True else ("未到達" if hit is False else "判定不能（算出不能の項目あり）")
+
+
+def _mr_and(hits: list):
+    if any(h is False for h in hits):
+        return False
+    if all(h is True for h in hits):
+        return True
+    return None
+
+
+def _mr_or(hits: list):
+    if any(h is True for h in hits):
+        return True
+    if all(h is False for h in hits):
+        return False
+    return None
+
+
+def _mr_row(group: str, cid: str, cond: str, comps: list, *, hit="and", note: str = "") -> dict:
+    """基準 1 行。hit="and" は全項目の充足で到達。真偽値を渡せばそれを採る（OR 条件の基準用）。"""
+    h = _mr_and([c["hit"] for c in comps]) if hit == "and" else hit
+    known = [c["hit"] for c in comps if c["hit"] is not None]
+    # 公表データで測れる条件は全て充足し、残りが非公表・算出不能の項目だけの基準（近接フラグ用）
+    others_ok = (h is None and hit == "and" and bool(known) and all(known)
+                 and len(known) < len(comps))
+    return {
+        "group": group, "id": cid, "cond": cond, "verdict": _mr_verdict(h), "hit": h,
+        "note": note, "others_ok": others_ok,
+        "now": "・".join(_mr_fmt_val(c) for c in comps),
+        "gap": "・".join(_mr_fmt_gap(c) for c in comps),
+        "reach": "・".join(c.get("reach") or (f"{c['label']} 充足" if c["hit"] else f"{c['label']} 算出不能")
+                          for c in comps),
+        "reach_prices": [c["reach_price"] for c in comps if c.get("reach_price")],
+        "comps": comps,
+    }
+
+
+def _mr_f(v):
+    try:
+        x = float(str(v).replace(",", ""))
+        return None if x != x else x
+    except (TypeError, ValueError):
+        return None
+
+
+def build_margin_reg_status(code4: str, target_date, margin_alert: dict | None,
+                            price_df, sd_axes: dict | None) -> dict:
+    """信用規制の現在の状態・直近 90 日の指定／解除の履歴・次の指定条件・解除条件を組み立てる。
+
+    基準の数値は MARGIN_REG_SOURCE_URLS のガイドライン原文（逐語は dev/reference/
+    jpx_margin_regulation_criteria.md）から転記したものだけを使う。
+    公表データから算出できない項目（信用取引の新規買付・売付比率）は「算出不能」とし、
+    日々公表銘柄で買残・売残の前日比が取れる日に限り「下限値」（新規買付≧買残の増加分）を併記する。
+    """
+    res: dict = {"status": "ok", "target_date": target_date, "errors": [],
+                 "history": [], "criteria": [], "release": [], "metrics": {}, "notes": []}
+    code4 = str(code4).strip().upper()
+
+    pub = fetch_margin_reg_public(code4)
+    res["public"] = pub
+    res["errors"] += [f"{k}={v}" for k, v in pub["status"].items() if v != "ok"]
+    jpx, jsf = pub["jpx"], pub["jsf"]
+
+    # --- 株価（25 日移動平均乖離・出来高） ---
+    trade_days: list = []
+    dev_rows: list = []
+    if price_df is not None and len(price_df) >= MARGIN_REG_MA_DAYS:
+        df = price_df.copy()
+        df.index = [d.date() if hasattr(d, "date") else d for d in df.index]
+        if target_date is not None:
+            df = df[[d <= target_date for d in df.index]]
+        trade_days = list(df.index)
+        res["metrics"]["close_tail"] = [float(x) for x in df["Close"].iloc[-(MARGIN_REG_MA_DAYS - 1):]]
+        ma = df["Close"].rolling(MARGIN_REG_MA_DAYS).mean().round(1)
+        for d in df.index[-5:]:
+            c = float(df.loc[d, "Close"])
+            m = ma.loc[d]
+            m = float(m) if m == m else None
+            v = _mr_f(df.loc[d, "Volume"]) if "Volume" in df.columns else None
+            dev_rows.append({"date": d, "close": c, "ma25": m, "volume": v,
+                             "dev": ((c - m) / m * 100.0) if m else None})
+    else:
+        res["errors"].append("price=株価時系列が 25 営業日未満または取得失敗")
+    res["metrics"]["dev_rows"] = dev_rows
+    last_trade = trade_days[-1] if trade_days else target_date
+
+    # --- J-Quants 公表行（履歴の唯一の源） ---
+    ma_rows = (margin_alert or {}).get("rows") or []
+    ma_status = (margin_alert or {}).get("fetch_status") or "error:未実行"
+    if ma_status.startswith("error"):
+        res["errors"].append(f"jquants_margin_alert={ma_status}")
+    runs = _mr_runs(ma_rows, trade_days) if ma_rows else []
+    res["runs"] = runs
+    scan_from = (target_date - timedelta(days=MARGIN_ALERT_SCAN_BACK_DAYS)) if target_date else None
+    res["scan_from"] = scan_from
+
+    hist: list = []
+    src_jq = "J-Quants /markets/margin-alert（公表区分の推移）"
+    for i, run in enumerate(runs):
+        prev = runs[i - 1] if i > 0 else None
+        broken = prev is None or any(prev["last"] < t < run["first"] for t in trade_days)
+        if broken:
+            if prev is not None:
+                hist.append({"date": prev["last"], "src": src_jq,
+                             "event": f"{prev['kind']}の公表行がこの日で途切れる"})
+            near_start = scan_from is not None and (run["first"] - scan_from).days <= 7
+            hist.append({"date": run["first"], "src": src_jq,
+                         "event": f"{run['kind']}の公表行が始まる"
+                                  + ("（走査範囲の先頭のため、これより前から続いている場合がある）"
+                                     if near_start else "")})
+        else:
+            tag = ("（増担保の解除）" if prev["kind"] == "増担保" else
+                   "（増担保の実施）" if run["kind"] == "増担保" else "")
+            hist.append({"date": run["first"], "src": src_jq,
+                         "event": f"公表区分が {prev['kind']} → {run['kind']} に変わる{tag}"})
+    if runs:
+        lr = runs[-1]
+        after = [t for t in trade_days if t > lr["last"]]
+        if after:
+            hist.append({"date": lr["last"], "src": src_jq,
+                         "event": f"最後の公表行（{lr['kind']}）。{_mr_md(after[0])}〜{_mr_md(last_trade)} は"
+                                  "公表行なし（東証の指定・日証金の措置のいずれの対象でもない）"})
+
+    src_reg = f"JPX 信用取引に関する規制等（{MARGIN_REG_JPX_URLS['reg']}）"
+    src_daily = f"JPX 日々公表銘柄（{MARGIN_REG_JPX_URLS['daily']}）"
+    if jpx.get("reg_active"):
+        r = jpx["reg_active"]
+        hist.append({"date": _mr_parse_ymd(r.get("実施日")), "src": src_reg,
+                     "event": f"増担保 実施中（実施日 {r.get('実施日')}・{r.get('規制の内容', '')}・"
+                              f"該当基準 {r.get('該当基準', 'N/A')}）"})
+    if jpx.get("reg_released"):
+        r = jpx["reg_released"]
+        hist.append({"date": _mr_parse_ymd(r.get("解除日")), "src": src_reg,
+                     "event": f"増担保 解除（解除日 {r.get('解除日')}）"})
+    if jpx.get("daily_active"):
+        r = jpx["daily_active"]
+        mark = r.get("銘柄名", "")
+        hist.append({"date": _mr_parse_ymd(r.get("指定日")), "src": src_daily,
+                     "event": f"日々公表銘柄に指定中（指定日 {r.get('指定日')}"
+                              + ("・※ 規制実施中" if "※" in mark else "")
+                              + ("・◆ 特別周知銘柄" if "◆" in mark else "") + "）"})
+    if jpx.get("daily_released"):
+        r = jpx["daily_released"]
+        hist.append({"date": _mr_parse_ymd(r.get("解除日")), "src": src_daily,
+                     "event": f"日々公表銘柄の指定解除（解除日 {r.get('解除日')}）"})
+    if jpx.get("notice"):
+        r = jpx["notice"]
+        hist.append({"date": _mr_parse_ymd(r.get("周知開始日")),
+                     "src": f"JPX 特別周知銘柄（{MARGIN_REG_JPX_URLS['notice']}）",
+                     "event": f"特別周知銘柄（周知開始日 {r.get('周知開始日')}）"})
+    if jsf.get("seigen"):
+        r = jsf["seigen"]
+        hist.append({"date": _mr_parse_ymd(r.get("通知日・実施日")),
+                     "src": f"日証金 制限措置等一覧（{MARGIN_REG_JSF_URLS['seigen']}）",
+                     "event": f"日証金 {r.get('実施措置', '')}（{r.get('実施内容') or '内容記載なし'}・"
+                              f"{r.get('通知日・実施日', '')}"
+                              f"{(' ' + r['後場停止']) if r.get('後場停止') else ''}）"})
+    hist.sort(key=lambda h: (h["date"] or date.min))
+    res["history"] = hist
+
+    # --- 現在の状態 ---
+    def _ok(k):
+        return pub["status"].get(k) == "ok"
+    if jpx.get("reg_active"):
+        tse = "増担保"
+    elif jpx.get("daily_active"):
+        tse = "日々公表"
+    elif _ok("jpx_reg") and _ok("jpx_daily"):
+        tse = "指定なし"
+    elif runs and runs[-1]["last"] >= last_trade and runs[-1]["kind"] in ("増担保", "日々公表"):
+        tse = runs[-1]["kind"]
+    else:
+        tse = "取得不能"
+    if jsf.get("seigen"):
+        s = jsf["seigen"]
+        jsf_state = (f"{s.get('実施措置', '')}（{s.get('実施内容') or '内容記載なし'}・"
+                     f"{s.get('通知日・実施日', '')}）")
+    elif _ok("jsf_seigen"):
+        jsf_state = "措置なし"
+    else:
+        jsf_state = "取得不能"
+    res["tse_state"], res["jsf_state"] = tse, jsf_state
+
+    # 直近 90 日の解除（JPX の解除表 + J-Quants の区分推移）
+    releases = []
+    if jpx.get("reg_released"):
+        releases.append(f"{jpx['reg_released'].get('解除日')} 増担保 解除（JPX 掲載）")
+    if jpx.get("daily_released"):
+        releases.append(f"{jpx['daily_released'].get('解除日')} 日々公表 解除（JPX 掲載）")
+    for i, run in enumerate(runs[1:], start=1):
+        if runs[i - 1]["kind"] == "増担保" and run["kind"] != "増担保":
+            releases.append(f"{run['first'].isoformat()} 増担保 解除（J-Quants 公表区分が 増担保→"
+                            f"{run['kind']} に変わった公表日）")
+    if runs and [t for t in trade_days if t > runs[-1]["last"]]:
+        releases.append(f"{runs[-1]['last'].isoformat()} を最後に公表行なし"
+                        f"（{runs[-1]['kind']} の終了・J-Quants）")
+    res["releases"] = releases
+
+    # --- 現在値（残高・比率） ---
+    sd_raw = (sd_axes or {}).get("raw") or {}
+    shares_out = sd_raw.get("発行済株式総数")
+    # 上場株式数は JPX が日々公表残高に付ける「上場比」から逆算した値を優先する。
+    # screening_master の発行済株式総数は決算期末の値で、IPO・増資の直後は古いまま残る
+    # （2026-10-11 実測: 593A は 46,074,490 株だが JPX の上場比からは約 6,335 万株）。
+    # 上場比は公表日によって小数 4 桁と 1 桁が混在するため、丸め誤差（最終桁の半分÷比率）が
+    # 最も小さい行を採る。公表行が無い銘柄だけ発行済株式総数で代替する。
+    listed_best = None
+    for r in ma_rows:
+        lo, ra = _mr_f(r.get("LongOut")), _mr_f(r.get("LongOutRatio"))
+        if not (lo and ra):
+            continue
+        s = str(r.get("LongOutRatio"))
+        dec = len(s.split(".")[1]) if "." in s else 0
+        err = (0.5 * 10 ** (-dec)) / ra
+        if listed_best is None or err <= listed_best[3]:
+            listed_best = (lo / (ra / 100.0), r.get("AppDate"), r.get("LongOutRatio"), err)
+    if listed_best:
+        res["metrics"]["listed_from_ratio"] = listed_best[:3]
+    listed = listed_best[0] if listed_best else shares_out
+    listed_label = ("JPX 上場比から逆算した上場株式数" if listed_best else
+                    "発行済株式総数（screening_master・自己株を含む。JPX の上場株式数の代替）")
+    res["metrics"]["listed"] = listed
+    res["metrics"]["listed_label"] = listed_label
+    latest_row = ma_rows[-1] if ma_rows else None
+    daily_current = bool(latest_row and trade_days and latest_row["_pubdate"] >= trade_days[-1])
+    mt = (((sd_axes or {}).get("axes") or {}).get("margin_trend") or {}).get("latest") or {}
+    if daily_current:
+        lr = latest_row
+        long_v, short_v = _mr_f(lr.get("LongOut")), _mr_f(lr.get("ShrtOut"))
+        long_pct, short_pct = _mr_f(lr.get("LongOutRatio")), _mr_f(lr.get("ShrtOutRatio"))
+        long_std, short_std = _mr_f(lr.get("LongStdOut")), _mr_f(lr.get("ShrtStdOut"))
+        bal_date = _mr_parse_ymd(lr.get("AppDate"))
+        bal_src = (f"J-Quants 日々公表残高（申込日 {lr.get('AppDate')}・公表 {lr.get('PubDate')}）。"
+                   "買残/上場・売残/上場は JPX が公表する上場比（LongOutRatio・ShrtOutRatio）")
+    else:
+        long_v, short_v = _mr_f(mt.get("long")), _mr_f(mt.get("short"))
+        long_std, short_std = _mr_f(mt.get("long_std")), _mr_f(mt.get("short_std"))
+        long_pct = long_v / listed * 100.0 if (long_v is not None and listed) else None
+        short_pct = short_v / listed * 100.0 if (short_v is not None and listed) else None
+        bal_date = mt.get("date")
+        bal_src = f"J-Quants /markets/margin-interest（{bal_date}）÷ {listed_label}"
+    sl = (short_v / long_v * 100.0) if (short_v is not None and long_v) else None
+    res["metrics"].update({
+        "daily_current": daily_current, "bal_src": bal_src, "bal_date": bal_date,
+        "long": long_v, "short": short_v, "long_pct": long_pct, "short_pct": short_pct,
+        "sl_pct": sl, "long_std": long_std, "short_std": short_std, "shares_out": shares_out,
+    })
+
+    # 新規買付・売付比率の下限（日々公表残高の前日比 ÷ 当日出来高）。日々公表中のみ。
+    vol_by_day = {r["date"]: r.get("volume") for r in dev_rows}
+    lb_rows = []
+    if daily_current:
+        for r in ma_rows[-3:]:
+            ad = _mr_parse_ymd(r.get("AppDate"))
+            vol = vol_by_day.get(ad)
+            lc, sc = _mr_f(r.get("LongOutChg")), _mr_f(r.get("ShrtOutChg"))
+            lb_rows.append({
+                "date": ad, "volume": vol,
+                "buy_lb": (max(lc, 0.0) / vol * 100.0) if (lc is not None and vol) else None,
+                "sell_lb": (max(sc, 0.0) / vol * 100.0) if (sc is not None and vol) else None,
+            })
+    res["metrics"]["lb_rows"] = lb_rows
+
+    # --- 日証金 残高・品貸料・貸借区分 ---
+    z = jsf.get("zandaka") or {}
+    loan = _mr_f(z.get("融資残高株数")) if z else None
+    lend = _mr_f(z.get("貸株残高株数")) if z else None
+    res["metrics"].update({
+        "jsf_loan": loan, "jsf_lend": lend,
+        "jsf_date": z.get("申込日") if z else None, "jsf_kind": z.get("速報／確報") if z else None,
+        "lending_cls": MARGIN_REG_JSF_UNIT_LABEL.get(str(jsf.get("lending_cls") or ""),
+                                                     jsf.get("lending_cls")),
+        "shina": jsf.get("shina"),
+    })
+
+    # --- 判定の部品 ---
+    last = dev_rows[-1] if dev_rows else {}
+    vols3 = [r.get("volume") for r in dev_rows[-3:]] if len(dev_rows) >= 3 else []
+    min_vol3 = min(vols3) if vols3 and all(v is not None for v in vols3) else None
+
+    def _n_consec(pred) -> int:
+        n = 0
+        for r in reversed(dev_rows):
+            if r.get("dev") is None or not pred(r):
+                break
+            n += 1
+        return n
+    up30 = _n_consec(lambda r: r["dev"] >= 30.0)
+    dn30 = _n_consec(lambda r: r["dev"] <= -30.0)
+    turnover = (last.get("volume") / listed * 100.0) if (last.get("volume") and listed) else None
+    dev_last = last.get("dev")
+    up_dev = None if dev_last is None else max(dev_last, 0.0)
+    dn_dev = None if dev_last is None else max(-dev_last, 0.0)
+    unit = MARGIN_REG_UNIT_SHARES
+    res["metrics"].update({"up30": up30, "dn30": dn30, "turnover": turnover,
+                           "min_vol3": min_vol3, "dev_last": dev_last})
+
+    # --- 到達水準（PM 2026-10-11: 「株価が何円になったら・残高が何株になったら」を具体値で出す） ---
+    close_tail = res["metrics"].get("close_tail") or []
+    last_close = last.get("close")
+    last_ma = last.get("ma25")
+
+    def _next_price(k: float):
+        """翌営業日の終値 P が「P ≥ k × その日の25日線」（k<1 なら ≤）となる境界の株価。
+
+        25 日線はその日の終値を含めて再計算されるため、直近 24 本の終値の和 S24 を使い
+        P = k × (S24 + P) / 25 を解いた値 P = k × S24 / (25 − k) を返す。
+        """
+        if len(close_tail) != MARGIN_REG_MA_DAYS - 1:
+            return None
+        return k * sum(close_tail) / (MARGIN_REG_MA_DAYS - k)
+
+    def _ma_note(k: float) -> str:
+        if last_ma is None:
+            return ""
+        return (f"（基準日の25日線 {last_ma:,.1f}円×{k:g}={last_ma * k:,.0f}円。"
+                "25日線は毎営業日更新されるため、翌営業日の終値で再計算した境界値）")
+
+    def _price_reach(thr_pct: float, up: bool) -> tuple:
+        k = 1 + thr_pct / 100.0 if up else 1 - thr_pct / 100.0
+        px = _next_price(k)
+        if px is None:
+            return None, "到達株価 算出不能（株価時系列不足）"
+        return px, f"翌営業日の終値 {px:,.0f}円{'以上' if up else '以下'}{_ma_note(k)}"
+
+    def _bal_reach(name: str, thr_pct: float, cur) -> str:
+        if not listed:
+            return f"{name} 算出不能（上場株式数なし）"
+        need = listed * thr_pct / 100.0
+        if cur is None:
+            return f"{name} {need:,.0f}株以上（上場株式数の{thr_pct:g}%）"
+        if cur >= need:
+            return f"{name} {need:,.0f}株以上（上場株式数の{thr_pct:g}%・充足）"
+        return f"{name} {need:,.0f}株以上（上場株式数の{thr_pct:g}%・あと{need - cur:,.0f}株）"
+
+    def _pair_reach(name: str, base_name: str, base, thr_pct: float, cur) -> str:
+        if base is None:
+            return f"{name} 算出不能（{base_name}なし）"
+        need = base * thr_pct / 100.0
+        rest = "充足" if (cur is not None and cur >= need) else (
+            f"あと{need - cur:,.0f}株" if cur is not None else "現在値なし")
+        return f"{name} {need:,.0f}株以上（{base_name} {base:,.0f}株の{thr_pct:g}%・{rest}）"
+
+    def _abs_reach(name: str, need: float, cur) -> str:
+        rest = "充足" if (cur is not None and cur >= need) else (
+            f"あと{need - cur:,.0f}株" if cur is not None else "現在値なし")
+        return f"{name} {need:,.0f}株以上（{rest}）"
+
+    def _lb(label: str, key: str, thr: float, need: int) -> dict:
+        # 株価条件を測った直近 need 営業日と同じ日の下限が全て基準以上なら充足が確定。
+        # それ以外（日付がそろわない・下限が基準未満）は公表データからは判定できない。
+        days = [r["date"] for r in dev_rows[-need:]]
+        by_day = {r["date"]: r.get(key) for r in lb_rows}
+        vals = [by_day.get(d) for d in days]
+        if len(days) == need and all(v is not None and v >= thr for v in vals):
+            return {"label": label + "（下限）", "val": min(vals), "thr": thr,
+                    "op": ">=", "hit": True, "unit": "%",
+                    "reach": f"{label}{thr:g}%以上（下限で充足）"}
+        return {"label": label + "（銘柄別は非公表）", "val": None, "thr": thr,
+                "op": ">=", "hit": None, "unit": "%",
+                "reach": f"{label}{thr:g}%以上（公表されないため判定不能）"}
+
+    def _side(label: str, val, thr: float, want_up: bool) -> dict:
+        # 乖離の向きが条文の向きと逆なら、その基準には該当しない（値の大小を比べない）。
+        px, rtxt = _price_reach(thr, want_up)
+        if dev_last is None:
+            c = _mr_cmp(label, None, thr, reach=rtxt)
+        elif (dev_last > 0) != want_up:
+            side = "上" if dev_last > 0 else "下"
+            c = {"label": label, "val": None, "thr": thr, "op": ">=", "hit": False, "unit": "%",
+                 "text": f"株価は25日線の{side}（{dev_last:+.2f}%）", "gap_text": "向きが逆のため非該当",
+                 "reach": rtxt}
+        else:
+            c = _mr_cmp(label, abs(dev_last), thr, reach=rtxt)
+        c["reach_price"] = px
+        return c
+
+    def _dev3(direction: str) -> dict:
+        n = up30 if direction == "up" else dn30
+        up = direction == "up"
+        k3 = 1.3 if up else 0.7
+        px, rtxt = _price_reach(30.0, up)
+        if px is not None:
+            word = "以上" if up else "以下"
+            if n >= 3:
+                rtxt = f"充足（{n}日連続）。翌営業日も終値 {px:,.0f}円{word}で継続{_ma_note(k3)}"
+            else:
+                rtxt = (f"翌営業日の終値 {px:,.0f}円{word}から、各日の25日線の{k3:g}倍{word}が"
+                        f"あと{3 - n}営業日連続{_ma_note(k3)}")
+        return {"label": f"25日線乖離{'+' if up else '−'}30%以上の連続日数",
+                "val": float(n), "thr": 3.0, "op": ">=", "hit": n >= 3, "unit": "日",
+                "reach": rtxt, "reach_price": px}
+
+    G_D, G_K = "G-日々", "G-規制"
+    crit: list = []
+
+    def _ratio_crit(grp, cid_s, cid_l, s_thr, sl_thr, l_thr, with_dev):
+        crit.append(_mr_row(grp, cid_s,
+                            f"売残高の対上場株式数比率{s_thr:.0f}%以上 かつ 売残高の対買残高比率{sl_thr:.0f}%以上",
+                            [_mr_cmp("売残/上場", short_pct, s_thr, reach=_bal_reach("売残", s_thr, short_v)),
+                             _mr_cmp("売残/買残", sl, sl_thr,
+                                     reach=_pair_reach("売残", "買残", long_v, sl_thr, short_v))]))
+        comps = [_mr_cmp("買残/上場", long_pct, l_thr, reach=_bal_reach("買残", l_thr, long_v))]
+        cond = f"買残高の対上場株式数比率{l_thr:.0f}%以上"
+        if with_dev:
+            comps.append(_dev3("up"))
+            cond += " かつ 3営業日連続で25日線乖離30%以上（株価>25日線）"
+        crit.append(_mr_row(grp, cid_l, cond, comps))
+
+    _vol_reach = (f"1日の売買高 {listed:,.0f}株以上（上場株式数の100%）" if listed
+                  else "1日の売買高 算出不能（上場株式数なし）")
+
+    def _trade_crit(grp, prefix):
+        crit.append(_mr_row(grp, f"{prefix}2ロ",
+                            "3営業日連続で25日線乖離30%以上（株価>25日線）かつ 3営業日連続で信用新規買付比率40%以上"
+                            "（各日の売買高1,000売買単位以上）",
+                            [_dev3("up"), _mr_cmp("3日の最小売買高", min_vol3, 1000 * unit, unit="株",
+                                                   reach=f"各日の売買高 {1000 * unit:,.0f}株以上"),
+                             _lb("新規買付比率", "buy_lb", 40.0, 3)]))
+        crit.append(_mr_row(grp, f"{prefix}2イ",
+                            "3営業日連続で25日線乖離30%以上（株価<25日線）かつ 3営業日連続で信用新規売付比率20%以上"
+                            "（各日の売買高1,000売買単位以上）",
+                            [_dev3("down"), _mr_cmp("3日の最小売買高", min_vol3, 1000 * unit, unit="株",
+                                                     reach=f"各日の売買高 {1000 * unit:,.0f}株以上"),
+                             _lb("新規売付比率", "sell_lb", 20.0, 3)]))
+        crit.append(_mr_row(grp, f"{prefix}3ロ",
+                            "1営業日で25日線乖離20%以上（株価>25日線）かつ 売買高が上場株式数以上 かつ 信用新規買付比率60%以上",
+                            [_side("25日線上方乖離", up_dev, 20.0, True),
+                             _mr_cmp("売買高/上場", turnover, 100.0, reach=_vol_reach),
+                             _lb("新規買付比率", "buy_lb", 60.0, 1)]))
+        crit.append(_mr_row(grp, f"{prefix}3イ",
+                            "1営業日で25日線乖離20%以上（株価<25日線）かつ 売買高が上場株式数以上 かつ 信用新規売付比率30%以上",
+                            [_side("25日線下方乖離", dn_dev, 20.0, False),
+                             _mr_cmp("売買高/上場", turnover, 100.0, reach=_vol_reach),
+                             _lb("新規売付比率", "sell_lb", 30.0, 1)]))
+
+    if tse in ("指定なし", "取得不能"):
+        _ratio_crit("日々公表 指定", f"{G_D} Ⅰ1イ", f"{G_D} Ⅰ1ロ", 10.0, 60.0, 20.0, False)
+        _trade_crit("日々公表 指定", f"{G_D} Ⅰ")
+        res["notes"].append("増担保（委託保証金率の引上げ）は日々公表銘柄に指定された銘柄が対象"
+                            "（G-規制 Ⅰ1 柱書）。指定なしの銘柄は、まず上の日々公表の基準に該当するかが先に問われる。")
+    elif tse == "日々公表":
+        _ratio_crit("増担保 第一次", f"{G_K} Ⅰ1(1)イ", f"{G_K} Ⅰ1(1)ロ", 15.0, 70.0, 30.0, True)
+        _trade_crit("増担保 第一次", f"{G_K} Ⅰ1(")
+        for c in crit:  # 条文番号の体裁を (2)ロ・(3)イ の形へそろえる
+            c["id"] = re.sub(r"Ⅰ1\((\d)([イロ])$", r"Ⅰ1(\1)\2", c["id"])
+    elif tse == "増担保":
+        base = next((run["first_row"] for run in reversed(runs) if run["kind"] == "増担保"), None)
+        bl = _mr_f((base or {}).get("LongOut"))
+        bs = _mr_f((base or {}).get("ShrtOut"))
+        inc_l = ((long_v - bl) / listed * 100.0) if (long_v is not None and bl is not None and listed) else None
+        inc_s = ((short_v - bs) / listed * 100.0) if (short_v is not None and bs is not None and listed) else None
+        note = (f"第一次の実施基準該当日の残高は、増担保の最初の公表行（申込日 "
+                f"{(base or {}).get('AppDate', 'N/A')}）の残高で代用")
+        crit.append(_mr_row("増担保 第二次", f"{G_K} Ⅰ2(1)ロ",
+                            "買残高の対上場株式数比率40%以上（第一次の実施基準該当日比で上場株式数の5%以上増加）"
+                            "かつ 3営業日連続で25日線乖離30%以上（株価>25日線）",
+                            [_mr_cmp("買残/上場", long_pct, 40.0, reach=_bal_reach("買残", 40.0, long_v)),
+                             _mr_cmp("買残の増加/上場", inc_l, 5.0,
+                                     reach=(f"買残 {bl + listed * 0.05:,.0f}株以上（該当日の買残 {bl:,.0f}株＋上場株式数の5%）"
+                                            if (bl is not None and listed) else "算出不能")),
+                             _dev3("up")], note=note))
+        crit.append(_mr_row("増担保 第二次", f"{G_K} Ⅰ2(1)イ",
+                            "売残高の対上場株式数比率20%以上（第一次の実施基準該当日比で上場株式数の2.5%以上増加）"
+                            "かつ 売残高の対買残高比率80%以上",
+                            [_mr_cmp("売残/上場", short_pct, 20.0, reach=_bal_reach("売残", 20.0, short_v)),
+                             _mr_cmp("売残の増加/上場", inc_s, 2.5,
+                                     reach=(f"売残 {bs + listed * 0.025:,.0f}株以上（該当日の売残 {bs:,.0f}株＋上場株式数の2.5%）"
+                                            if (bs is not None and listed) else "算出不能")),
+                             _mr_cmp("売残/買残", sl, 80.0,
+                                     reach=_pair_reach("売残", "買残", long_v, 80.0, short_v))], note=note))
+
+    if not jsf.get("seigen"):
+        grp = "日証金 注意喚起"
+        so = listed
+        c_i1 = _mr_cmp("制度売残/上場", (short_std / so * 100.0) if (short_std is not None and so) else None, 10.0,
+                       reach=_bal_reach("制度売残", 10.0, short_std))
+        c_i2 = _mr_cmp("制度売残", short_std, 10000 * unit, unit="株",
+                       reach=_abs_reach("制度売残", 10000 * unit, short_std))
+        h_i = _mr_or([c_i1["hit"], c_i2["hit"]])
+        c_ro = _mr_cmp("制度売残/制度買残",
+                       (short_std / long_std * 100.0) if (short_std is not None and long_std) else None, 60.0,
+                       reach=_pair_reach("制度売残", "制度買残", long_std, 60.0, short_std))
+        c_h1 = _mr_cmp("貸株残/上場", (lend / so * 100.0) if (lend is not None and so) else None, 3.0,
+                       reach=_bal_reach("貸株残", 3.0, lend))
+        c_h2 = _mr_cmp("貸株残", lend, 3000 * unit, unit="株", reach=_abs_reach("貸株残", 3000 * unit, lend))
+        c_h3 = _mr_cmp("貸株残/融資残", (lend / loan * 100.0) if (lend is not None and loan) else None, 120.0,
+                       reach=_pair_reach("貸株残", "融資残", loan, 120.0, lend))
+        h_h = _mr_and([_mr_or([c_h1["hit"], c_h2["hit"]]), c_h3["hit"]])
+        crit.append(_mr_row(grp, "JSF 残高基準イ",
+                            "制度信用取引売残高/上場株式数≧10% または 制度信用取引売残高≧1万単位",
+                            [c_i1, c_i2], hit=h_i))
+        crit.append(_mr_row(grp, "JSF 残高基準ロ", "制度信用取引売残高/制度信用取引買残高≧60%", [c_ro]))
+        crit.append(_mr_row(grp, "JSF 残高基準ハ",
+                            "（貸株残高/上場株式数≧3% または 貸株残高≧3千単位）かつ 貸株残高/融資残高≧120%",
+                            [c_h1, c_h2, c_h3], hit=h_h))
+        n_hit = sum(1 for v in (h_i, c_ro["hit"], h_h) if v is True)
+        res["notes"].append(f"日証金の注意喚起は残高基準イ〜ハのうち「2以上」に該当した銘柄に通知される（JSF 基準）。"
+                            f"現在の該当数 {n_hit}/3。特性基準（買い集め・公開買付け・急激な株価変動等）は数値基準がなく、"
+                            "残高基準によらず通知されることがある（同基準の原文）。")
+    res["criteria"] = crit
+
+    # --- 解除条件（指定・措置中のみ） ---
+    rel: list = []
+    if tse in ("日々公表", "増担保"):
+        thr_s, thr_l = (8.0, 16.0) if tse == "日々公表" else (12.0, 24.0)
+        src = f"{G_D} Ⅱ" if tse == "日々公表" else f"{G_K} Ⅲ"
+        recent = [r for r in ma_rows if _mr_f(r.get("LongOutRatio")) is not None][-5:]
+
+        def _consec(pred, rows):
+            n = 0
+            for r in reversed(rows):
+                if not pred(r):
+                    break
+                n += 1
+            return n
+        n_s = _consec(lambda r: (_mr_f(r.get("ShrtOutRatio")) or 0.0) < thr_s, recent)
+        n_l = _consec(lambda r: (_mr_f(r.get("LongOutRatio")) or 0.0) < thr_l, recent)
+        n_p = _consec(lambda r: r.get("dev") is not None and abs(r["dev"]) < 15.0, dev_rows)
+
+        def _below(name, thr_pct, cur, n):
+            if not listed:
+                return f"{name} 算出不能（上場株式数なし）"
+            need = listed * thr_pct / 100.0
+            rest = (f"あと{cur - need:,.0f}株の減少" if (cur is not None and cur >= need) else "充足中")
+            return f"{name} {need:,.0f}株未満（{rest}）を5営業日連続・あと{max(5 - n, 0)}営業日"
+        lo_px, hi_px = _next_price(0.85), _next_price(1.15)
+        band = (f"翌営業日の終値 {lo_px:,.0f}円超〜{hi_px:,.0f}円未満（25日線±15%未満）を5営業日連続・"
+                f"あと{max(5 - n_p, 0)}営業日{_ma_note(1.15)}" if (lo_px and hi_px) else "算出不能（株価時系列不足）")
+        rel.append({"id": f"{src} 1イ" if tse == "日々公表" else f"{src}(1)イ",
+                    "cond": f"5営業日連続で売残高の対上場株式数比率{thr_s:.0f}%未満",
+                    "now": _mr_pct(short_pct), "gap": f"直近 {n_s}/5 営業日連続で充足",
+                    "reach": _below("売残", thr_s, short_v, n_s)})
+        rel.append({"id": f"{src} 1ロ" if tse == "日々公表" else f"{src}(1)ロ",
+                    "cond": f"5営業日連続で買残高の対上場株式数比率{thr_l:.0f}%未満",
+                    "now": _mr_pct(long_pct), "gap": f"直近 {n_l}/5 営業日連続で充足",
+                    "reach": _below("買残", thr_l, long_v, n_l)})
+        rel.append({"id": f"{src} 2" if tse == "日々公表" else f"{src}(2)",
+                    "cond": "5営業日連続で25日線乖離15%未満（指定時と反対側へ抜けた日は15%未満とみなす）",
+                    "now": (f"{dev_last:+.2f}%" if dev_last is not None else "N/A"),
+                    "gap": f"直近 {n_p}/5 営業日連続で充足（乖離の絶対値で数えた値）",
+                    "reach": band})
+        res["notes"].append("解除は上の全ての基準を満たした場合。特例基準により取引所が解除しないことがある（条文の特例基準）。")
+    if jsf.get("seigen"):
+        rel.append({"id": "日証金 取消・解除",
+                    "cond": "注意喚起・制限措置の要因となった状況等が改善された場合（数値基準は非公表）",
+                    "now": jsf_state,
+                    "gap": "数値で測れない（日証金は個別銘柄の実施理由・実施期間を公表しない）",
+                    "reach": "数値基準が非公表のため示せない"})
+    res["release"] = rel
+
+    # --- 近接フラグ（PM 2026-10-11: 誌面に小節を置くかの機械判定） ---
+    reasons: list = []
+    if tse in ("日々公表", "増担保"):
+        reasons.append(f"東証 {tse} が継続中")
+    if tse == "取得不能":
+        reasons.append("東証の状態を取得できない")
+    if jsf.get("seigen"):
+        reasons.append("日証金の措置が継続中")
+    if jsf_state == "取得不能":
+        reasons.append("日証金の状態を取得できない")
+    if hist or releases:
+        reasons.append("直近90日に指定・措置・解除の記録あり")
+    for c in crit:
+        tag = f"{c['group']} {c['id']}"
+        if c["hit"] is True:
+            reasons.append(f"{tag} に到達")
+        elif c.get("others_ok"):
+            reasons.append(f"{tag} は公表データで測れる条件を全て充足（残りは非公表の項目）")
+        for px in c.get("reach_prices") or []:
+            if last_close and abs(px / last_close - 1.0) <= MARGIN_REG_NEAR_PRICE_PCT / 100.0:
+                reasons.append(f"{tag} の到達株価 {px:,.0f}円が現在株価 {last_close:,.0f}円の"
+                               f"±{MARGIN_REG_NEAR_PRICE_PCT:g}%以内（{(px / last_close - 1) * 100:+.1f}%）")
+                break
+        for cp in c.get("comps") or []:
+            # 基準が小さい比率（日証金の貸株残/上場 3% 等）は 0% でも「5pt 以内」になるため、
+            # 近接の幅を基準値の半分までに縮める（5pt と 基準÷2 の小さい方）。
+            if not (cp.get("unit") == "%" and "/上場" in cp.get("label", "") and cp.get("hit") is False
+                    and cp.get("val") is not None):
+                continue
+            band = min(MARGIN_REG_NEAR_BAL_PT, cp["thr"] / 2.0)
+            if cp["thr"] - cp["val"] <= band:
+                reasons.append(f"{tag} の{cp['label']} {cp['val']:.2f}% が基準 {cp['thr']:g}% まで"
+                               f"{band:g}pt 以内（あと{cp['thr'] - cp['val']:.2f}pt）")
+    seen: set = set()
+    reasons = [r for r in reasons if not (r in seen or seen.add(r))]
+    res["near"] = bool(reasons)
+    res["near_reasons"] = reasons
+    td_md = _mr_md(target_date) if target_date else "N/A"
+    res["far_sentence"] = (None if reasons else
+                           f"{td_md} 時点で東証の指定・日証金の措置はなく、直近 90 日の指定・解除もない。")
+    return res
+
+
+def _fmt_margin_reg_status(res: dict | None) -> list:
+    """§8 需給の小節「信用規制の状況」の素材を data.md へ出す。"""
+    lines = ["### 信用規制の状況（現在の状態・直近90日の指定と解除・次の指定条件・解除条件）", ""]
+    if not res:
+        return lines + ["- **判定**: 取得不能（未実行）", ""]
+    td = res.get("target_date")
+    m = res.get("metrics") or {}
+    lines += [
+        f"- **現在の状態（基準日 {td.isoformat() if td else 'N/A'}）**: 東証 {res.get('tse_state')}／"
+        f"日証金 {res.get('jsf_state')}",
+        "- **直近90日の解除**: " + ("／".join(res.get("releases") or [])
+                                  or "なし（走査範囲内に解除の記録なし）"),
+        "- **近接フラグ**: " + (("近接（理由: " + "／".join(res.get("near_reasons") or []) + "）")
+                              if res.get("near") else
+                              f"遠い（到達・判定不能の基準なし／到達株価はいずれも現在株価の"
+                              f"±{MARGIN_REG_NEAR_PRICE_PCT:g}%の外／残高比率は基準まで{MARGIN_REG_NEAR_BAL_PT:g}pt超／"
+                              "指定・措置なし／直近90日の指定・解除なし）"),
+        "- **誌面の扱い**: " + ("近接 → §8 に「### 信用規制の状況」（状態段落・固定表 基準 / 現在値 / 到達水準 / 判定・"
+                               "規制の見通し）を置く" if res.get("near") else
+                               "遠い → 小見出し・表・見通しを置かず、§8 本文の末尾に次の状態 1 文だけを書く"),
+        *([f"- **状態 1 文**: {res['far_sentence']}"] if res.get("far_sentence") else []),
+        f"- **残高の出典**: {m.get('bal_src')}",
+    ]
+    if res.get("errors"):
+        lines.append("- **取得できなかった系統**: " + " / ".join(res["errors"])
+                     + "（取れなかった系統の情報を「該当なし」と読み替えないこと）")
+    upd = (res.get("public") or {}).get("jpx", {}).get("updated") or {}
+    if upd:
+        lines.append("- JPX ページの更新日: " + " / ".join(f"{k}={v}" for k, v in upd.items()))
+    lines.append("")
+
+    lines += ["#### 指定・解除の履歴（直近90日・J-Quants 公表区分の推移＋JPX・日証金の現在掲載）", "",
+              "| 日付 | 出来事 | 出典 |", "|------|--------|------|"]
+    hist = res.get("history") or []
+    if hist:
+        for h in hist:
+            d = h.get("date")
+            lines.append(f"| {d.isoformat() if d else '日付不明'} | {h['event']} | {h['src']} |")
+    else:
+        lines.append(f"| - | 走査範囲（{res.get('scan_from')} 以降）に公表行・掲載なし | J-Quants・JPX・日証金 |")
+    lines.append("")
+
+    if res.get("criteria"):
+        lines += ["#### 次に規制される条件（ガイドライン原文の数値・現在値・基準までの距離・到達水準）", "",
+                  "| 規制 | 基準（条文） | 条件（原文の数値） | 現在値 | 基準までの距離 | 到達水準 | 判定 |",
+                  "|------|------|------|------|------|------|------|"]
+        for c in res["criteria"]:
+            note = f"（{c['note']}）" if c.get("note") else ""
+            lines.append(f"| {c['group']} | {c['id']} | {c['cond']} | {c['now']} | {c['gap']} | "
+                         f"{c.get('reach') or '-'} | {c['verdict']}{note} |")
+        lines.append("")
+    if res.get("release"):
+        lines += ["#### 解除される条件（指定・措置中のみ）", "",
+                  "| 基準（条文） | 条件（原文の数値） | 現在値 | 充足状況 | 到達水準 |",
+                  "|------|------|------|------|------|"]
+        for r in res["release"]:
+            lines.append(f"| {r['id']} | {r['cond']} | {r['now']} | {r['gap']} | {r.get('reach') or '-'} |")
+        lines.append("")
+    for n in res.get("notes") or []:
+        lines.append(f"- {n}")
+
+    def fn(v, unit="株", f="{:,.0f}"):
+        return "N/A" if v is None else f"{f.format(v)}{unit}"
+
+    lines += ["", "#### 算出に使った実数", "", "| 項目 | 値 |", "|------|------|",
+              f"| 信用買残／信用売残（{m.get('bal_date')}） | {fn(m.get('long'))}／{fn(m.get('short'))} |",
+              f"| 買残/上場・売残/上場 | {_mr_pct(m.get('long_pct'))}／{_mr_pct(m.get('short_pct'))} |",
+              f"| 売残/買残 | {_mr_pct(m.get('sl_pct'))} |",
+              f"| 制度信用 買残／売残 | {fn(m.get('long_std'))}／{fn(m.get('short_std'))} |",
+              f"| 発行済株式総数（screening_master） | {fn(m.get('shares_out'))} |",
+              f"| 比率の分母に採用した株数 | {fn(m.get('listed'))}（{m.get('listed_label')}） |"]
+    lfr = m.get("listed_from_ratio")
+    if lfr:
+        lines.append(f"| 上場株式数（日々公表残高の上場比 {lfr[2]}% から逆算・申込日 {lfr[1]}） | {fn(lfr[0])} |")
+    for r in m.get("dev_rows") or []:
+        dv = "N/A" if r["dev"] is None else f"{r['dev']:+.2f}%"
+        lines.append(f"| {r['date']} 終値／25日線／乖離／出来高 | {r['close']:,.0f}円／"
+                     f"{fn(r['ma25'], '円', '{:,.1f}')}／{dv}／{fn(r['volume'])} |")
+    for r in m.get("lb_rows") or []:
+        lines.append(f"| {r['date']} 新規買付比率の下限／新規売付比率の下限 | "
+                     f"{_mr_pct(r['buy_lb'])}／{_mr_pct(r['sell_lb'])}（残高の前日比増加分÷出来高） |")
+    lines.append(f"| 売買高/上場株式数（直近日） | {_mr_pct(m.get('turnover'))} |")
+    lines.append(f"| 日証金 融資残／貸株残（申込日 {m.get('jsf_date')}・{m.get('jsf_kind')}） | "
+                 f"{fn(m.get('jsf_loan'))}／{fn(m.get('jsf_lend'))} |")
+    lines.append(f"| 日証金 貸借銘柄区分（東証） | {m.get('lending_cls') or 'N/A'} |")
+    sh = m.get("shina")
+    if sh:
+        shina_txt = (f"当日 {sh.get('当日品貸料率（円）')}円（{sh.get('当日品貸日数')}日分）・"
+                     f"貸株超過 {sh.get('貸株超過株数')}株・最高料率 {sh.get('最高料率（円）')}円"
+                     f"（申込日 {sh.get('貸借申込日')}）")
+    else:
+        shina_txt = "品貸料率一覧に行なし（貸株超過の銘柄だけが載る一覧のため、逆日歩は付いていない）"
+    lines.append(f"| 品貸料（逆日歩） | {shina_txt} |")
+    lines += [
+        "",
+        "- 出来高は yfinance の日足（JPX 定義の「売買立会による売買高」との一致は未検証）。"
+        "25日線は終値の 25 営業日平均を小数第1位に丸めた値（G-日々 Ⅲ の定義に合わせた）。",
+        "- 到達株価は「翌営業日の終値 P が、P を含めて再計算した 25 日線の (1±閾値) 倍に並ぶ値」"
+        "＝ (1±閾値) × 直近 24 営業日の終値の和 ÷ (25 − (1±閾値))。25 日線は毎営業日更新されるため基準日の値である。"
+        "連続日数の条件は 2 日目以降の境界が当日の終値で変わる。",
+        "- 信用取引の新規買付・売付比率は銘柄別に公表されていないため算出不能。日々公表中の銘柄に限り、"
+        "残高の前日比増加分÷出来高を「下限」として示す（新規の買付は少なくとも残高の増加分だけある）。",
+        f"- 基準の出典: 日々公表ガイドライン {MARGIN_REG_SOURCE_URLS['G-日々']}／"
+        f"増担保ガイドライン {MARGIN_REG_SOURCE_URLS['G-規制']}／"
+        f"日証金 注意喚起通知基準 {MARGIN_REG_SOURCE_URLS['JSF基準']}"
+        "（残高基準イ〜ハの数値は同ページの画像「残高基準の表」）。条文の逐語は "
+        "dev/reference/jpx_margin_regulation_criteria.md。",
+        "",
+    ]
+    return lines
 
 
 def fetch_daily_margin_series(code: str, target_date, shares_out=None,
@@ -5979,6 +6979,7 @@ def build_data_markdown(
     reaction_ctx: dict | None = None,
     margin_alert: dict | None = None,
     highlight_3m: dict | None = None,
+    margin_reg: dict | None = None,
 ) -> str:
     company_name = (
         company_data.get("companyName")
@@ -6148,6 +7149,8 @@ def build_data_markdown(
     # 規制セクションは取得失敗時も必ず出す（§8 需給分析で規制の有無を必ず明示するため）。
     sd_lines = _fmt_supply_demand_axes(sd_axes)
     sd_lines += _fmt_margin_alert(margin_alert)
+    # 信用規制の状況（履歴・次の指定条件・解除条件）。PM 2026-10-11 指示で §8 需給の小節の素材。
+    sd_lines += _fmt_margin_reg_status(margin_reg)
     if sd_lines:
         lines += sd_lines
         lines += ["---", ""]
@@ -6524,6 +7527,22 @@ def main() -> None:
         print(f"  → 判定: {margin_alert.get('fetch_status')} / "
               f"designated={margin_alert.get('designated')}")
 
+    # 7-1b) 信用規制の状況（現在の状態・直近 90 日の指定と解除・次の指定条件・解除条件）。
+    #       JPX 公表ページ・日証金 CSV・J-Quants 公表行・株価から組む。失敗しても他の章は出す。
+    print("[9/9] 信用規制の状況（JPX・日証金・履歴・基準までの距離）を組み立て中...")
+    try:
+        margin_reg = build_margin_reg_status(code, _ma_target, margin_alert, price_df, sd_axes)
+        provenance["margin_reg"] = (
+            f"信用規制の状況（東証 {margin_reg.get('tse_state')}／日証金 {margin_reg.get('jsf_state')}"
+            + (f"・取得失敗 {' / '.join(margin_reg['errors'])}" if margin_reg.get("errors") else "")
+            + "）"
+        )
+    except Exception as e:  # noqa: BLE001 — 失敗しても他の章は出す
+        print(f"  → 取得失敗: build_margin_reg_status: {e}", file=sys.stderr)
+        margin_reg = None
+        provenance["margin_reg"] = f"{PROV_NONE}（信用規制の状況: {type(e).__name__}: {e}）"
+    print(f"  → {provenance['margin_reg']}")
+
     # 7-2) 反応スコア対象日の外部環境。
     #      「特定できる材料が確認できなかった」で終わらせないため、値動きの原因に
     #      なりうる事実（自社開示・国内指数・米国指数・為替・同業）を機械で揃える。
@@ -6596,6 +7615,7 @@ def main() -> None:
         reaction_ctx=reaction_ctx,
         highlight_3m=highlight_3m,
         margin_alert=margin_alert,
+        margin_reg=margin_reg,
     )
     out_path.write_text(md, encoding="utf-8")
     char_count = len(md)
