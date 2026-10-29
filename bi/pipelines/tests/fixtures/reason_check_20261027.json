@@ -1,0 +1,1713 @@
+{
+ "date": "2026-10-27",
+ "kind": "daily",
+ "note": "2026-10-27 動意日次 facts（make_mover_report.py 実走・2026-10-30）の 3905・593A・2160・4493 の抜粋。理由ゲート (e)(h) と機械差し替えの回帰テスト用",
+ "stocks": {
+  "3905": {
+   "name": "データセクション",
+   "max_move_day": "2026-10-27",
+   "sigma2_days": [
+    "2026-09-24",
+    "2026-09-25",
+    "2026-10-23",
+    "2026-10-26",
+    "2026-10-27"
+   ],
+   "week_days": [
+    {
+     "date": "2026-10-21",
+     "close": 1304.0,
+     "ret_pct": 0.31,
+     "volume": 2488000.0,
+     "vol_ratio_20d": 0.41,
+     "sigma2": false,
+     "sigma2_threshold_pct": 12.21,
+     "is_max": false,
+     "high": 1350.0,
+     "low": 1275.0,
+     "disclosures": [
+      {
+       "title": "主要株主及び主要株主である筆頭株主の異動に関するお知らせ",
+       "published": "2026-10-21T12:50",
+       "time_known": true,
+       "assigned_date": "2026-10-21",
+       "pdf_url": "https://www.release.tdnet.info/inbs/140120261021554020.pdf",
+       "earnings": false,
+       "intraday": true,
+       "pre_extreme": 1350.0,
+       "pre_extreme_time": "09:25",
+       "post_range": [
+        1275.0,
+        1315.0
+       ],
+       "post_new_extreme": false,
+       "intraday_note": "",
+       "minor_impact": false,
+       "minor_checked": true
+      }
+     ],
+     "indices": [
+      {
+       "name": "日経平均",
+       "ret_pct": 0.85,
+       "chg": 545.82
+      },
+      {
+       "name": "TOPIX",
+       "ret_pct": 0.86
+      }
+     ],
+     "shikiho_release": false
+    },
+    {
+     "date": "2026-10-22",
+     "close": 1230.0,
+     "ret_pct": -5.67,
+     "volume": 2184300.0,
+     "vol_ratio_20d": 0.36,
+     "sigma2": false,
+     "sigma2_threshold_pct": 12.19,
+     "is_max": false,
+     "high": 1322.0,
+     "low": 1210.0,
+     "disclosures": [],
+     "indices": [
+      {
+       "name": "日経平均",
+       "ret_pct": -2.65,
+       "chg": -1713.4
+      },
+      {
+       "name": "TOPIX",
+       "ret_pct": -1.14
+      }
+     ],
+     "shikiho_release": false
+    },
+    {
+     "date": "2026-10-23",
+     "close": 1530.0,
+     "ret_pct": 24.39,
+     "volume": 17391400.0,
+     "vol_ratio_20d": 2.87,
+     "sigma2": true,
+     "sigma2_threshold_pct": 12.25,
+     "is_max": false,
+     "high": 1530.0,
+     "low": 1100.0,
+     "disclosures": [],
+     "indices": [
+      {
+       "name": "日経平均",
+       "ret_pct": -0.34,
+       "chg": -214.68
+      },
+      {
+       "name": "TOPIX",
+       "ret_pct": -0.79
+      }
+     ],
+     "shikiho_release": false
+    },
+    {
+     "date": "2026-10-26",
+     "close": 1930.0,
+     "ret_pct": 26.14,
+     "volume": 26611300.0,
+     "vol_ratio_20d": 4.3,
+     "sigma2": true,
+     "sigma2_threshold_pct": 13.85,
+     "is_max": true,
+     "high": 1930.0,
+     "low": 1475.0,
+     "disclosures": [],
+     "indices": [
+      {
+       "name": "日経平均",
+       "ret_pct": -0.8,
+       "chg": -503.51
+      },
+      {
+       "name": "TOPIX",
+       "ret_pct": 0.18
+      }
+     ],
+     "shikiho_release": false
+    },
+    {
+     "date": "2026-10-27",
+     "close": 2330.0,
+     "ret_pct": 20.73,
+     "volume": 33324700.0,
+     "vol_ratio_20d": 5.19,
+     "sigma2": true,
+     "sigma2_threshold_pct": 15.46,
+     "is_max": false,
+     "high": 2330.0,
+     "low": 1921.0,
+     "disclosures": [
+      {
+       "title": "（開示事項の経過）大口受注案件の稼働開始に関するお知らせ",
+       "published": "2026-10-27T15:10",
+       "time_known": true,
+       "assigned_date": "2026-10-27",
+       "pdf_url": "https://www.release.tdnet.info/inbs/140120261027556977.pdf",
+       "earnings": false,
+       "intraday": true,
+       "pre_extreme": null,
+       "pre_extreme_time": null,
+       "post_range": null,
+       "post_new_extreme": null,
+       "intraday_note": "5分足に開示前後の足が無い",
+       "minor_impact": false,
+       "minor_checked": true
+      }
+     ],
+     "indices": [
+      {
+       "name": "日経平均",
+       "ret_pct": 1.73,
+       "chg": 1078.72
+      },
+      {
+       "name": "TOPIX",
+       "ret_pct": 0.61
+      }
+     ],
+     "shikiho_release": false
+    }
+   ],
+   "month3_days": [
+    {
+     "date": "2026-10-02",
+     "close": 2042.0,
+     "ret_pct": -1.54,
+     "volume": 5564900.0,
+     "vol_ratio_20d": 1.11,
+     "sigma2": false,
+     "sigma2_threshold_pct": 12.11,
+     "is_max": false,
+     "high": 2116.0,
+     "low": 1988.0,
+     "disclosures": [
+      {
+       "title": "特定子会社の異動に関するお知らせ",
+       "published": "2026-10-01T17:20",
+       "time_known": true,
+       "assigned_date": "2026-10-02",
+       "pdf_url": "https://www.release.tdnet.info/inbs/140120261001544806.pdf",
+       "earnings": false,
+       "intraday": false,
+       "minor_impact": null,
+       "minor_checked": false
+      }
+     ],
+     "indices": [
+      {
+       "name": "日経平均",
+       "ret_pct": -0.94,
+       "chg": -647.26
+      },
+      {
+       "name": "TOPIX",
+       "ret_pct": -0.99
+      }
+     ],
+     "shikiho_release": false,
+     "kind": [
+      "disclosure"
+     ]
+    },
+    {
+     "date": "2026-10-20",
+     "close": 1300.0,
+     "ret_pct": -1.07,
+     "volume": 2081000.0,
+     "vol_ratio_20d": 0.35,
+     "sigma2": false,
+     "sigma2_threshold_pct": 12.21,
+     "is_max": false,
+     "high": 1329.0,
+     "low": 1270.0,
+     "disclosures": [
+      {
+       "title": "主要株主及び主要株主である筆頭株主の異動に関するお知らせ",
+       "published": "2026-10-19T16:30",
+       "time_known": true,
+       "assigned_date": "2026-10-20",
+       "pdf_url": "https://www.release.tdnet.info/inbs/140120261019553078.pdf",
+       "earnings": false,
+       "intraday": false,
+       "minor_impact": null,
+       "minor_checked": false
+      },
+      {
+       "title": "第23回新株予約権の行使期間満了に関するお知らせ",
+       "published": "2026-10-19T18:40",
+       "time_known": true,
+       "assigned_date": "2026-10-20",
+       "pdf_url": "https://www.release.tdnet.info/inbs/140120261019553166.pdf",
+       "earnings": false,
+       "intraday": false,
+       "minor_impact": null,
+       "minor_checked": false
+      }
+     ],
+     "indices": [
+      {
+       "name": "日経平均",
+       "ret_pct": -1.3,
+       "chg": -841.28
+      },
+      {
+       "name": "TOPIX",
+       "ret_pct": -1.43
+      }
+     ],
+     "shikiho_release": false,
+     "kind": [
+      "disclosure"
+     ]
+    },
+    {
+     "date": "2026-10-21",
+     "close": 1304.0,
+     "ret_pct": 0.31,
+     "volume": 2488000.0,
+     "vol_ratio_20d": 0.41,
+     "sigma2": false,
+     "sigma2_threshold_pct": 12.21,
+     "is_max": false,
+     "high": 1350.0,
+     "low": 1275.0,
+     "disclosures": [
+      {
+       "title": "主要株主及び主要株主である筆頭株主の異動に関するお知らせ",
+       "published": "2026-10-21T12:50",
+       "time_known": true,
+       "assigned_date": "2026-10-21",
+       "pdf_url": "https://www.release.tdnet.info/inbs/140120261021554020.pdf",
+       "earnings": false,
+       "intraday": true,
+       "pre_extreme": 1350.0,
+       "pre_extreme_time": "09:25",
+       "post_range": [
+        1275.0,
+        1315.0
+       ],
+       "post_new_extreme": false,
+       "intraday_note": "",
+       "minor_impact": null,
+       "minor_checked": false
+      }
+     ],
+     "indices": [
+      {
+       "name": "日経平均",
+       "ret_pct": 0.85,
+       "chg": 545.82
+      },
+      {
+       "name": "TOPIX",
+       "ret_pct": 0.86
+      }
+     ],
+     "shikiho_release": false,
+     "kind": [
+      "disclosure"
+     ]
+    },
+    {
+     "date": "2026-10-23",
+     "close": 1530.0,
+     "ret_pct": 24.39,
+     "volume": 17391400.0,
+     "vol_ratio_20d": 2.87,
+     "sigma2": true,
+     "sigma2_threshold_pct": 12.25,
+     "is_max": false,
+     "high": 1530.0,
+     "low": 1100.0,
+     "disclosures": [],
+     "indices": [
+      {
+       "name": "日経平均",
+       "ret_pct": -0.34,
+       "chg": -214.68
+      },
+      {
+       "name": "TOPIX",
+       "ret_pct": -0.79
+      }
+     ],
+     "shikiho_release": false,
+     "kind": [
+      "sigma2"
+     ]
+    },
+    {
+     "date": "2026-10-26",
+     "close": 1930.0,
+     "ret_pct": 26.14,
+     "volume": 26611300.0,
+     "vol_ratio_20d": 4.3,
+     "sigma2": true,
+     "sigma2_threshold_pct": 13.85,
+     "is_max": true,
+     "high": 1930.0,
+     "low": 1475.0,
+     "disclosures": [],
+     "indices": [
+      {
+       "name": "日経平均",
+       "ret_pct": -0.8,
+       "chg": -503.51
+      },
+      {
+       "name": "TOPIX",
+       "ret_pct": 0.18
+      }
+     ],
+     "shikiho_release": false,
+     "kind": [
+      "sigma2",
+      "max"
+     ]
+    },
+    {
+     "date": "2026-10-27",
+     "close": 2330.0,
+     "ret_pct": 20.73,
+     "volume": 33324700.0,
+     "vol_ratio_20d": 5.19,
+     "sigma2": true,
+     "sigma2_threshold_pct": 15.46,
+     "is_max": false,
+     "high": 2330.0,
+     "low": 1921.0,
+     "disclosures": [
+      {
+       "title": "（開示事項の経過）大口受注案件の稼働開始に関するお知らせ",
+       "published": "2026-10-27T15:10",
+       "time_known": true,
+       "assigned_date": "2026-10-27",
+       "pdf_url": "https://www.release.tdnet.info/inbs/140120261027556977.pdf",
+       "earnings": false,
+       "intraday": true,
+       "pre_extreme": null,
+       "pre_extreme_time": null,
+       "post_range": null,
+       "post_new_extreme": null,
+       "intraday_note": "5分足に開示前後の足が無い",
+       "minor_impact": null,
+       "minor_checked": false
+      }
+     ],
+     "indices": [
+      {
+       "name": "日経平均",
+       "ret_pct": 1.73,
+       "chg": 1078.72
+      },
+      {
+       "name": "TOPIX",
+       "ret_pct": 0.61
+      }
+     ],
+     "shikiho_release": false,
+     "kind": [
+      "sigma2",
+      "disclosure"
+     ]
+    }
+   ],
+   "materials": [
+    {
+     "dt": "2026-10-27T15:10",
+     "time_known": true,
+     "assigned_date": "2026-10-27",
+     "kind": "primary",
+     "source": "tdnet",
+     "publisher": "データセクション（適時開示）",
+     "title": "（開示事項の経過）大口受注案件の稼働開始に関するお知らせ",
+     "excerpt": "当社は、2026 年9月 18 日付け「大口受注(予定)に関するお知らせ」及び9月 24 日付け「(開示事項の経過)大口受注(予定)に関するお知らせ」において公表いたしましたとおり、エンタープライズ顧客向けにサービス提供する米国拠点の AI インフラ企業(以下「本件顧客」といいます。)より、当社グループが運営する AI データセンターによる GPU クラスターの提供にかかる大口案件を受注いたしまし",
+     "url": "https://www.release.tdnet.info/inbs/140120261027556977.pdf",
+     "found_via": "tdnet",
+     "is_origin": false,
+     "topic": "受注"
+    },
+    {
+     "dt": "2026-10-26T09:30",
+     "time_known": true,
+     "assigned_date": "2026-10-26",
+     "kind": "primary",
+     "source": "tdnet",
+     "publisher": "データセクション（適時開示）",
+     "title": "主要株主及び主要株主である筆頭株主の異動に関するお知らせ",
+     "excerpt": "2026 年 10 月 16 日付で、当社の主要株主及び主要株主である筆頭株主に異動がありましたので、下記のとおりお知らせいたします。 1.異動が生じた経緯記 2026 年 10 月 23 日付(報告義務発生日 2026 年 10 月 16 日)で、アースエレメンツ・キャピタル株式会社 (以下、「アースエレメンツ・キャピタル社」といいます。)より大量保有報告書が関東財務局に提出されたため、主要株主",
+     "url": "https://www.release.tdnet.info/inbs/140120261026555703.pdf",
+     "found_via": "kabutan",
+     "is_origin": false,
+     "topic": "大量保有"
+    },
+    {
+     "dt": "2026-10-26",
+     "time_known": false,
+     "assigned_date": "2026-10-26",
+     "kind": "primary",
+     "source": "ir",
+     "publisher": "データセクション（会社IR）",
+     "title": "AIデータセンターの稼働状況等に関する説明会資料",
+     "excerpt": "AIインフラ及びGPUコンピュートサービスの提供開始についてデータセクション株式会社 2026年10月26日 | 証券コード:3905(東証グロース) 2026年10月23日公表 AIインフラ及びGPUコンピュートサービスの提供を開始 2026年9月18日公表の大口契約に基づき、当初の予定どおり10月から実運用を開始しました。 スケジュール 2026年9月18日大口契約の締結を公表 2026年10",
+     "url": "https://www.datasection.co.jp/wp-content/uploads/2026/10/c6b4f48e0351d0cee8a5f0bdec59d314.pdf",
+     "found_via": "ir",
+     "is_origin": false,
+     "topic": ""
+    },
+    {
+     "dt": "2026-10-26",
+     "time_known": false,
+     "assigned_date": "2026-10-26",
+     "kind": "primary",
+     "source": "ir",
+     "publisher": "データセクション（会社IR）",
+     "title": "Briefing on the Operational Status of Al Data Centres and Other Matters",
+     "excerpt": "",
+     "url": "https://www.datasection.co.jp/news/others-20261026003",
+     "found_via": "ir",
+     "is_origin": false,
+     "topic": ""
+    },
+    {
+     "dt": "2026-10-26",
+     "time_known": false,
+     "assigned_date": "2026-10-26",
+     "kind": "primary",
+     "source": "ir",
+     "publisher": "データセクション（会社IR）",
+     "title": "AIデータセンターの稼働状況等に関する説明会動画",
+     "excerpt": "",
+     "url": "https://www.datasection.co.jp/news/others-20261026002",
+     "found_via": "ir",
+     "is_origin": false,
+     "topic": ""
+    },
+    {
+     "dt": "2026-10-23T15:48",
+     "time_known": true,
+     "assigned_date": "2026-10-26",
+     "kind": "primary",
+     "source": "kabutan",
+     "publisher": "株探",
+     "title": "データセクについて、アースエレメンツ・キャピタルは保有割合が5％を超えたと報告 [大量保有報告書]",
+     "excerpt": "は10月23日受付で財務省に大量保有報告書（5％ルール報告書）を提出した。報告書によれば、 のデータセク株式保有比率は11.41％となり、新たに5％を超えたことが判明した。報告義務発生日は10月16日。 ※上記は金融庁のEDINET（電子開示システム）で開示された書類に基づく情報です。金融商品取引法上の公衆縦覧ではありません。 ※金融商品取引法で自己株式は保有株券に含めないことになっており、そのた",
+     "url": "https://kabutan.jp/stock/news?code=3905&b=n202610230914",
+     "found_via": "kabutan",
+     "is_origin": false,
+     "topic": "大量保有"
+    },
+    {
+     "dt": "2026-10-23T13:03",
+     "time_known": true,
+     "assigned_date": "2026-10-23",
+     "kind": "primary",
+     "source": "kabutan",
+     "publisher": "株探",
+     "title": "データセクが後場プラスに転じる、ＡＩインフラ及びＧＰＵコンピュートサービスを提供開始",
+     "excerpt": "データセクション<3905>が後場プラス圏に転じている。午後０時１５分ごろ、ＡＩインフラ及びＧＰＵコンピュートサービスの提供を開始したと発表しており、材料視されている。９月１８日に発表した大口契約の締結に基づくもので、米国に本社を置く世界有数のＡＩインフラプラットフォーム提供企業に対し、ＧＰＵクラスター及び関連するＡＩコンピュートサービスを提供する。１０月から実運用を開始し、契約に基づくサービス提",
+     "url": "https://kabutan.jp/stock/news?code=3905&b=n202610230638",
+     "found_via": "kabutan",
+     "is_origin": true,
+     "topic": ""
+    },
+    {
+     "dt": "2026-10-23T12:15",
+     "time_known": true,
+     "assigned_date": "2026-10-23",
+     "kind": "primary",
+     "source": "ir",
+     "publisher": "データセクション（会社IR）",
+     "title": "AIインフラ及びGPUコンピュートサービスの提供開始に関するお知らせ",
+     "excerpt": "データセクション株式会社（本社：東京都品川区、代表取締役社長執行役員CEO：石原紀彦、東証グロース：3905、以下「当社」）は、2026年9月18日付プレスリリース「大口契約の締結に関するお知らせ」にて公表しました契約に基づき、AIインフラ及びGPUコンピュートサービスの提供を開始しましたので、お知らせいたします。 本契約は、米国に本社を置く世界有数のAIインフラプラットフォーム提供企業に対し、G",
+     "url": "https://www.datasection.co.jp/news/pressrelease-20261023002",
+     "found_via": "ir",
+     "is_origin": true,
+     "topic": "",
+     "time_approx": true,
+     "time_from": "株探"
+    },
+    {
+     "dt": "2026-10-23",
+     "time_known": false,
+     "assigned_date": "2026-10-23",
+     "kind": "primary",
+     "source": "ir",
+     "publisher": "データセクション（会社IR）",
+     "title": "【オンライン開催】データセクション株式会社「AI データセンターの稼働状況等に関する説明会」のお知らせ",
+     "excerpt": "",
+     "url": "https://www.datasection.co.jp/wp-content/uploads/2026/10/c8d38b7df64195dbbd01a9b81730c795.pdf",
+     "found_via": "ir",
+     "is_origin": true,
+     "topic": ""
+    },
+    {
+     "dt": "2026-10-21T12:50",
+     "time_known": true,
+     "assigned_date": "2026-10-21",
+     "kind": "primary",
+     "source": "tdnet",
+     "publisher": "データセクション（適時開示）",
+     "title": "主要株主及び主要株主である筆頭株主の異動に関するお知らせ",
+     "excerpt": "2026 年 10 月9日付で、当社の主要株主及び主要株主である筆頭株主に異動がありましたので、下記のとおりお知らせいたします。 1.異動が生じた経緯記 2026 年 10 月 20 日付(報告義務発生日 2026 年 10 月9日)で、アースエレメンツ・キャピタル株式会社 (以下、「アースエレメンツ・キャピタル社」といいます。)より大量保有報告書(変更報告書 No.19)が関東財務局に提出された",
+     "url": "https://www.release.tdnet.info/inbs/140120261021554020.pdf",
+     "found_via": "tdnet",
+     "is_origin": false,
+     "topic": "大量保有"
+    },
+    {
+     "dt": "2026-10-20T12:23",
+     "time_known": true,
+     "assigned_date": "2026-10-20",
+     "kind": "primary",
+     "source": "kabutan",
+     "publisher": "株探",
+     "title": "データセクについて、アースエレメンツ・キャピタルは保有割合が5％未満に減少したと報告 [変更報告書No.20]",
+     "excerpt": "は10月20日受付で財務省に変更報告書（5％ルール報告書）を提出した。報告書によれば、 のデータセク株式保有比率は9.45％→4.61％に減少した。報告義務発生日は10月13日。 ※上記は金融庁のEDINET（電子開示システム）で開示された書類に基づく情報です。金融商品取引法上の公衆縦覧ではありません。 ※金融商品取引法で自己株式は保有株券に含めないことになっており、そのため保有株数等が0と表記さ",
+     "url": "https://kabutan.jp/stock/news?code=3905&b=n202610200559",
+     "found_via": "kabutan",
+     "is_origin": false,
+     "topic": "大量保有"
+    },
+    {
+     "dt": "2026-10-20T10:32",
+     "time_known": true,
+     "assigned_date": "2026-10-20",
+     "kind": "primary",
+     "source": "kabutan",
+     "publisher": "株探",
+     "title": "データセクについて、アースエレメンツ・キャピタルは保有割合が減少したと報告 [変更報告書No.19]",
+     "excerpt": "は10月20日受付で財務省に変更報告書（5％ルール報告書）を提出した。報告書によれば、 のデータセク株式保有比率は12.71％→9.45％に減少した。報告義務発生日は10月9日。 ※上記は金融庁のEDINET（電子開示システム）で開示された書類に基づく情報です。金融商品取引法上の公衆縦覧ではありません。 ※金融商品取引法で自己株式は保有株券に含めないことになっており、そのため保有株数等が0と表記さ",
+     "url": "https://kabutan.jp/stock/news?code=3905&b=n202610200409",
+     "found_via": "kabutan",
+     "is_origin": false,
+     "topic": "大量保有"
+    },
+    {
+     "dt": "2026-10-19T18:40",
+     "time_known": true,
+     "assigned_date": "2026-10-20",
+     "kind": "primary",
+     "source": "tdnet",
+     "publisher": "データセクション（適時開示）",
+     "title": "第23回新株予約権の行使期間満了に関するお知らせ",
+     "excerpt": "当社は、2025 年9月 10 日付「第三者割当による第 23 回新株予約権(行使価額固定型)の発行及び定款一部変更に関するお知らせ」にて公表いたしましたとおり、First Plus Financial Holdings Pte. Ltd.を割当先として第 23 回新株予約権(以下「本新株予約権」といいます。)を 2025 年 10 月 17 日付で発行いたしました。 本新株予約権につきまして、本",
+     "url": "https://www.release.tdnet.info/inbs/140120261019553166.pdf",
+     "found_via": "tdnet",
+     "is_origin": false,
+     "topic": ""
+    },
+    {
+     "dt": "2026-10-19T17:01",
+     "time_known": true,
+     "assigned_date": "2026-10-20",
+     "kind": "primary",
+     "source": "kabutan",
+     "publisher": "株探",
+     "title": "データセクについて、FIRST PLUS FINANCIAL HOLDINGS PTE. LTD.は保有割合が増加したと報告 [変更報告書No.23]",
+     "excerpt": "",
+     "url": "https://kabutan.jp/stock/news?code=3905&b=n202610190826",
+     "found_via": "kabutan",
+     "is_origin": false,
+     "topic": "大量保有"
+    }
+   ],
+   "price_reports": [
+    {
+     "dt": "2026-10-27T13:58",
+     "time_known": true,
+     "assigned_date": "2026-10-27",
+     "kind": "price_report",
+     "source": "kabutan",
+     "publisher": "株探",
+     "title": "データセクの急騰続く、ＡＩデータセンター稼働状況巡る説明会内容を引き続き材料視",
+     "excerpt": "",
+     "url": "https://kabutan.jp/stock/news?code=3905&b=n202610270682",
+     "found_via": "kabutan",
+     "is_origin": false,
+     "topic": ""
+    },
+    {
+     "dt": "2026-10-26T07:32",
+     "time_known": true,
+     "assigned_date": "2026-10-26",
+     "kind": "price_report",
+     "source": "kabutan",
+     "publisher": "株探",
+     "title": "前日に動いた銘柄 part2データセク、サークレイス、日本調理機など",
+     "excerpt": "",
+     "url": "https://kabutan.jp/stock/news?code=3905&b=n202610260018",
+     "found_via": "kabutan",
+     "is_origin": false,
+     "topic": ""
+    },
+    {
+     "dt": "2026-10-24T07:32",
+     "time_known": true,
+     "assigned_date": "2026-10-26",
+     "kind": "price_report",
+     "source": "kabutan",
+     "publisher": "株探",
+     "title": "前日に動いた銘柄 part2データセク、サークレイス、日本調理機など",
+     "excerpt": "",
+     "url": "https://kabutan.jp/stock/news?code=3905&b=n202610240096",
+     "found_via": "kabutan",
+     "is_origin": false,
+     "topic": ""
+    },
+    {
+     "dt": "2026-10-20T07:32",
+     "time_known": true,
+     "assigned_date": "2026-10-20",
+     "kind": "price_report",
+     "source": "kabutan",
+     "publisher": "株探",
+     "title": "前日に動いた銘柄 part2ショーケース、ウインテスト、RSCなど",
+     "excerpt": "",
+     "url": "https://kabutan.jp/stock/news?code=3905&b=n202610200120",
+     "found_via": "kabutan",
+     "is_origin": false,
+     "topic": ""
+    }
+   ],
+   "origin_date": "2026-10-23",
+   "streak_days": 3,
+   "streak_pos": 3,
+   "window": [
+    "2026-10-19T15:30",
+    "2026-10-27T15:29"
+   ]
+  },
+  "593A": {
+   "name": "ティアフォー",
+   "max_move_day": "2026-10-27",
+   "sigma2_days": [],
+   "week_days": [
+    {
+     "date": "2026-10-21",
+     "close": 2010.0,
+     "ret_pct": 4.04,
+     "volume": 4129900.0,
+     "vol_ratio_20d": 0.28,
+     "sigma2": false,
+     "sigma2_threshold_pct": null,
+     "is_max": false,
+     "high": 2095.0,
+     "low": 1994.0,
+     "disclosures": [],
+     "indices": [
+      {
+       "name": "日経平均",
+       "ret_pct": 0.85,
+       "chg": 545.82
+      },
+      {
+       "name": "TOPIX",
+       "ret_pct": 0.86
+      }
+     ],
+     "shikiho_release": false
+    },
+    {
+     "date": "2026-10-22",
+     "close": 1943.0,
+     "ret_pct": -3.33,
+     "volume": 4078000.0,
+     "vol_ratio_20d": 0.28,
+     "sigma2": false,
+     "sigma2_threshold_pct": null,
+     "is_max": false,
+     "high": 2087.0,
+     "low": 1900.0,
+     "disclosures": [],
+     "indices": [
+      {
+       "name": "日経平均",
+       "ret_pct": -2.65,
+       "chg": -1713.4
+      },
+      {
+       "name": "TOPIX",
+       "ret_pct": -1.14
+      }
+     ],
+     "shikiho_release": false
+    },
+    {
+     "date": "2026-10-23",
+     "close": 2011.0,
+     "ret_pct": 3.5,
+     "volume": 3262400.0,
+     "vol_ratio_20d": 0.22,
+     "sigma2": false,
+     "sigma2_threshold_pct": null,
+     "is_max": false,
+     "high": 2020.0,
+     "low": 1835.0,
+     "disclosures": [],
+     "indices": [
+      {
+       "name": "日経平均",
+       "ret_pct": -0.34,
+       "chg": -214.68
+      },
+      {
+       "name": "TOPIX",
+       "ret_pct": -0.79
+      }
+     ],
+     "shikiho_release": false
+    },
+    {
+     "date": "2026-10-26",
+     "close": 2190.0,
+     "ret_pct": 8.9,
+     "volume": 3468700.0,
+     "vol_ratio_20d": 0.24,
+     "sigma2": false,
+     "sigma2_threshold_pct": null,
+     "is_max": true,
+     "high": 2198.0,
+     "low": 1983.0,
+     "disclosures": [],
+     "indices": [
+      {
+       "name": "日経平均",
+       "ret_pct": -0.8,
+       "chg": -503.51
+      },
+      {
+       "name": "TOPIX",
+       "ret_pct": 0.18
+      }
+     ],
+     "shikiho_release": false
+    },
+    {
+     "date": "2026-10-27",
+     "close": 2239.0,
+     "ret_pct": 2.24,
+     "volume": 5043300.0,
+     "vol_ratio_20d": 0.36,
+     "sigma2": false,
+     "sigma2_threshold_pct": null,
+     "is_max": false,
+     "high": 2344.0,
+     "low": 2190.0,
+     "disclosures": [],
+     "indices": [
+      {
+       "name": "日経平均",
+       "ret_pct": 1.73,
+       "chg": 1078.72
+      },
+      {
+       "name": "TOPIX",
+       "ret_pct": 0.61
+      }
+     ],
+     "shikiho_release": false
+    }
+   ],
+   "month3_days": [],
+   "materials": [
+    {
+     "dt": "2026-10-23T12:00",
+     "time_known": true,
+     "assigned_date": "2026-10-23",
+     "kind": "primary",
+     "source": "tdnet",
+     "publisher": "ティアフォー（適時開示）",
+     "title": "2026年9月期 個人投資家向け通期決算説明会（オンライン）のお知らせ",
+     "excerpt": "",
+     "url": "https://www.release.tdnet.info/inbs/140120261022554838.pdf",
+     "found_via": "kabutan",
+     "is_origin": false,
+     "topic": "決算"
+    },
+    {
+     "dt": "2026-10-22T11:00",
+     "time_known": true,
+     "assigned_date": "2026-10-22",
+     "kind": "primary",
+     "source": "tdnet",
+     "publisher": "ティアフォー（適時開示）",
+     "title": "ミュンヘン工科大学との自動運転レベル４の開発にかかるNVIDIA GTC Berlinでの協業発表に関するお知らせ",
+     "excerpt": "当社とミュンヘン工科大学(Technical University of Munich、以下「TUM」)は、「NVIDIA Hyperion」と 「NVIDIA Halos」の導入を通じて協業を拡大し、ドイツにおける安全で高性能な自動運転システムの開発を推進することといたしましたので、お知らせいたします。 記 1. 協業の概要本取り組みでは、当社と TUM が設立した研究拠点「TUM Autowa",
+     "url": "https://www.release.tdnet.info/inbs/140120261022554420.pdf",
+     "found_via": "kabutan",
+     "is_origin": false,
+     "topic": "提携"
+    },
+    {
+     "dt": "2026-10-22",
+     "time_known": false,
+     "assigned_date": "2026-10-22",
+     "kind": "primary",
+     "source": "ir",
+     "publisher": "ティアフォー（会社IR）",
+     "title": "ティアフォーとミュンヘン工科大学、「NVIDIA Hyperion」と「Autoware」を活用した自動運転レベル4の実現を加速",
+     "excerpt": "「自動運転の民主化」をビジョンに掲げる株式会社ティアフォー（本社：東京都品川区、代表取締役 CEO：加藤 真平、以下ティアフォー）とミュンヘン工科大学（Technical University of Munich、以下「TUM」）は、「NVIDIA Hyperion」と「NVIDIA Halos」の導入を通じて協業を拡大し、ドイツにおける安全で高性能な自動運転システムの開発を推進します。 「NVI",
+     "url": "https://tier4.co.jp/updates/press-release/20261022-tieriv-and-tum-bring-nvidia-hyperion-to-level4-autonomous-driving",
+     "found_via": "ir",
+     "is_origin": false,
+     "topic": ""
+    }
+   ],
+   "price_reports": [],
+   "origin_date": "2026-10-27",
+   "streak_days": 1,
+   "streak_pos": 1,
+   "window": [
+    "2026-10-19T15:30",
+    "2026-10-27T15:29"
+   ]
+  },
+  "2160": {
+   "name": "ジーエヌアイグループ",
+   "max_move_day": "2026-10-27",
+   "sigma2_days": [
+    "2026-08-17",
+    "2026-08-18",
+    "2026-09-18",
+    "2026-10-08"
+   ],
+   "week_days": [
+    {
+     "date": "2026-10-21",
+     "close": 2820.0,
+     "ret_pct": 3.11,
+     "volume": 1263600.0,
+     "vol_ratio_20d": 0.8,
+     "sigma2": false,
+     "sigma2_threshold_pct": 7.39,
+     "is_max": false,
+     "high": 2847.0,
+     "low": 2773.0,
+     "disclosures": [],
+     "indices": [
+      {
+       "name": "日経平均",
+       "ret_pct": 0.85,
+       "chg": 545.82
+      },
+      {
+       "name": "TOPIX",
+       "ret_pct": 0.86
+      }
+     ],
+     "shikiho_release": false
+    },
+    {
+     "date": "2026-10-22",
+     "close": 2685.0,
+     "ret_pct": -4.79,
+     "volume": 1902000.0,
+     "vol_ratio_20d": 1.19,
+     "sigma2": false,
+     "sigma2_threshold_pct": 7.43,
+     "is_max": false,
+     "high": 2893.0,
+     "low": 2671.0,
+     "disclosures": [],
+     "indices": [
+      {
+       "name": "日経平均",
+       "ret_pct": -2.65,
+       "chg": -1713.4
+      },
+      {
+       "name": "TOPIX",
+       "ret_pct": -1.14
+      }
+     ],
+     "shikiho_release": false
+    },
+    {
+     "date": "2026-10-23",
+     "close": 2690.0,
+     "ret_pct": 0.19,
+     "volume": 2183200.0,
+     "vol_ratio_20d": 1.39,
+     "sigma2": false,
+     "sigma2_threshold_pct": 7.48,
+     "is_max": false,
+     "high": 2706.0,
+     "low": 2564.0,
+     "disclosures": [],
+     "indices": [
+      {
+       "name": "日経平均",
+       "ret_pct": -0.34,
+       "chg": -214.68
+      },
+      {
+       "name": "TOPIX",
+       "ret_pct": -0.79
+      }
+     ],
+     "shikiho_release": false
+    },
+    {
+     "date": "2026-10-26",
+     "close": 2846.0,
+     "ret_pct": 5.8,
+     "volume": 1884000.0,
+     "vol_ratio_20d": 1.21,
+     "sigma2": false,
+     "sigma2_threshold_pct": 7.48,
+     "is_max": false,
+     "high": 2870.0,
+     "low": 2644.0,
+     "disclosures": [],
+     "indices": [
+      {
+       "name": "日経平均",
+       "ret_pct": -0.8,
+       "chg": -503.51
+      },
+      {
+       "name": "TOPIX",
+       "ret_pct": 0.18
+      }
+     ],
+     "shikiho_release": false
+    },
+    {
+     "date": "2026-10-27",
+     "close": 3020.0,
+     "ret_pct": 6.11,
+     "volume": 2078700.0,
+     "vol_ratio_20d": 1.31,
+     "sigma2": false,
+     "sigma2_threshold_pct": 7.61,
+     "is_max": true,
+     "high": 3030.0,
+     "low": 2870.0,
+     "disclosures": [],
+     "indices": [
+      {
+       "name": "日経平均",
+       "ret_pct": 1.73,
+       "chg": 1078.72
+      },
+      {
+       "name": "TOPIX",
+       "ret_pct": 0.61
+      }
+     ],
+     "shikiho_release": false
+    }
+   ],
+   "month3_days": [
+    {
+     "date": "2026-10-08",
+     "close": 3150.0,
+     "ret_pct": -8.83,
+     "volume": 2155400.0,
+     "vol_ratio_20d": 1.77,
+     "sigma2": true,
+     "sigma2_threshold_pct": 6.76,
+     "is_max": false,
+     "high": 3460.0,
+     "low": 3115.0,
+     "disclosures": [
+      {
+       "title": "グロース市場からTOPIXへ――ジーエヌアイグループ、制度改革後初の定期入替で新規採用",
+       "published": "2026-10-07T17:00",
+       "time_known": true,
+       "assigned_date": "2026-10-08",
+       "pdf_url": "https://www.release.tdnet.info/inbs/140120261007547179.pdf",
+       "earnings": false,
+       "intraday": false,
+       "minor_impact": false,
+       "minor_checked": true
+      }
+     ],
+     "indices": [
+      {
+       "name": "日経平均",
+       "ret_pct": -1.42,
+       "chg": -993.6
+      },
+      {
+       "name": "TOPIX",
+       "ret_pct": -1.51
+      }
+     ],
+     "shikiho_release": false,
+     "kind": [
+      "sigma2",
+      "disclosure"
+     ]
+    }
+   ],
+   "materials": [
+    {
+     "dt": "2026-10-23T11:30",
+     "time_known": true,
+     "assigned_date": "2026-10-23",
+     "kind": "primary",
+     "source": "tdnet",
+     "publisher": "ジーエヌアイグループ（適時開示）",
+     "title": "第三者割当に係る株式譲渡報告書（新株式）",
+     "excerpt": "東京証券取引所代表者殿 2026 年 10 月 23 日会社名株式会社ジーエヌアイグループ代表者名取締役代表執行役社長兼CEO イン・ルオ問合せ先執行役CSO (コード番号: 2160 東証グロース) 兼古拓也 (TEL. 03-6214-3600) 第三者割当により割り当てられた株式の譲渡に関する報告書 2026 年7月1日に第三者割当により割り当てた当社株式の割当先から、当該株式について、下記",
+     "url": "https://www.release.tdnet.info/inbs/140120261023555000.pdf",
+     "found_via": "kabutan",
+     "is_origin": false,
+     "topic": ""
+    },
+    {
+     "dt": "2026-10-20T12:00",
+     "time_known": true,
+     "assigned_date": "2026-10-20",
+     "kind": "primary",
+     "source": "tdnet",
+     "publisher": "ジーエヌアイグループ（適時開示）",
+     "title": "第三者割当に係る株式譲渡報告書（新株式）",
+     "excerpt": "東京証券取引所代表者殿 2026 年 10 月 20 日会社名株式会社ジーエヌアイグループ代表者名取締役代表執行役社長兼CEO イン・ルオ問合せ先執行役CSO (コード番号: 2160 東証グロース) 兼古拓也 (TEL. 03-6214-3600) 第三者割当により割り当てられた株式の譲渡に関する報告書 2026 年7月1日に第三者割当により割り当てた当社株式の割当先から、当該株式について、下記",
+     "url": "https://www.release.tdnet.info/inbs/140120261020553312.pdf",
+     "found_via": "kabutan",
+     "is_origin": false,
+     "topic": ""
+    }
+   ],
+   "price_reports": [],
+   "origin_date": "2026-10-27",
+   "streak_days": 1,
+   "streak_pos": 1,
+   "window": [
+    "2026-10-19T15:30",
+    "2026-10-27T15:29"
+   ]
+  },
+  "4493": {
+   "name": "サイバーセキュリティクラウド",
+   "max_move_day": "2026-10-27",
+   "sigma2_days": [
+    "2026-08-28",
+    "2026-09-14",
+    "2026-10-05",
+    "2026-10-06",
+    "2026-10-07",
+    "2026-10-08",
+    "2026-10-09",
+    "2026-10-13",
+    "2026-10-14",
+    "2026-10-15",
+    "2026-10-16",
+    "2026-10-22"
+   ],
+   "week_days": [
+    {
+     "date": "2026-10-21",
+     "close": 3165.0,
+     "ret_pct": 4.8,
+     "volume": 4836900.0,
+     "vol_ratio_20d": 0.78,
+     "sigma2": false,
+     "sigma2_threshold_pct": 13.54,
+     "is_max": false,
+     "high": 3445.0,
+     "low": 3130.0,
+     "disclosures": [],
+     "indices": [
+      {
+       "name": "日経平均",
+       "ret_pct": 0.85,
+       "chg": 545.82
+      },
+      {
+       "name": "TOPIX",
+       "ret_pct": 0.86
+      }
+     ],
+     "shikiho_release": false
+    },
+    {
+     "date": "2026-10-22",
+     "close": 3865.0,
+     "ret_pct": 22.12,
+     "volume": 5935800.0,
+     "vol_ratio_20d": 0.92,
+     "sigma2": true,
+     "sigma2_threshold_pct": 13.55,
+     "is_max": true,
+     "high": 3865.0,
+     "low": 3650.0,
+     "disclosures": [],
+     "indices": [
+      {
+       "name": "日経平均",
+       "ret_pct": -2.65,
+       "chg": -1713.4
+      },
+      {
+       "name": "TOPIX",
+       "ret_pct": -1.14
+      }
+     ],
+     "shikiho_release": false
+    },
+    {
+     "date": "2026-10-23",
+     "close": 3450.0,
+     "ret_pct": -10.74,
+     "volume": 4171400.0,
+     "vol_ratio_20d": 0.62,
+     "sigma2": false,
+     "sigma2_threshold_pct": 14.59,
+     "is_max": false,
+     "high": 3690.0,
+     "low": 3330.0,
+     "disclosures": [],
+     "indices": [
+      {
+       "name": "日経平均",
+       "ret_pct": -0.34,
+       "chg": -214.68
+      },
+      {
+       "name": "TOPIX",
+       "ret_pct": -0.79
+      }
+     ],
+     "shikiho_release": false
+    },
+    {
+     "date": "2026-10-26",
+     "close": 3470.0,
+     "ret_pct": 0.58,
+     "volume": 3000000.0,
+     "vol_ratio_20d": 0.43,
+     "sigma2": false,
+     "sigma2_threshold_pct": 14.88,
+     "is_max": false,
+     "high": 3780.0,
+     "low": 3350.0,
+     "disclosures": [],
+     "indices": [
+      {
+       "name": "日経平均",
+       "ret_pct": -0.8,
+       "chg": -503.51
+      },
+      {
+       "name": "TOPIX",
+       "ret_pct": 0.18
+      }
+     ],
+     "shikiho_release": false
+    },
+    {
+     "date": "2026-10-27",
+     "close": 3550.0,
+     "ret_pct": 2.31,
+     "volume": 4454000.0,
+     "vol_ratio_20d": 0.63,
+     "sigma2": false,
+     "sigma2_threshold_pct": 14.87,
+     "is_max": false,
+     "high": 3730.0,
+     "low": 3310.0,
+     "disclosures": [],
+     "indices": [
+      {
+       "name": "日経平均",
+       "ret_pct": 1.73,
+       "chg": 1078.72
+      },
+      {
+       "name": "TOPIX",
+       "ret_pct": 0.61
+      }
+     ],
+     "shikiho_release": false
+    }
+   ],
+   "month3_days": [
+    {
+     "date": "2026-10-05",
+     "close": 2118.0,
+     "ret_pct": 7.35,
+     "volume": 745300.0,
+     "vol_ratio_20d": 3.67,
+     "sigma2": true,
+     "sigma2_threshold_pct": 6.17,
+     "is_max": false,
+     "high": 2148.0,
+     "low": 2023.0,
+     "disclosures": [],
+     "indices": [
+      {
+       "name": "日経平均",
+       "ret_pct": 2.4,
+       "chg": 1637.4
+      },
+      {
+       "name": "TOPIX",
+       "ret_pct": 1.33
+      }
+     ],
+     "shikiho_release": false,
+     "kind": [
+      "sigma2"
+     ]
+    },
+    {
+     "date": "2026-10-06",
+     "close": 2618.0,
+     "ret_pct": 23.61,
+     "volume": 15404200.0,
+     "vol_ratio_20d": 66.59,
+     "sigma2": true,
+     "sigma2_threshold_pct": 6.06,
+     "is_max": true,
+     "high": 2618.0,
+     "low": 2285.0,
+     "disclosures": [],
+     "indices": [
+      {
+       "name": "日経平均",
+       "ret_pct": 1.05,
+       "chg": 737.12
+      },
+      {
+       "name": "TOPIX",
+       "ret_pct": 0.92
+      }
+     ],
+     "shikiho_release": false,
+     "kind": [
+      "sigma2",
+      "max"
+     ]
+    },
+    {
+     "date": "2026-10-07",
+     "close": 2858.0,
+     "ret_pct": 9.17,
+     "volume": 44735900.0,
+     "vol_ratio_20d": 45.19,
+     "sigma2": true,
+     "sigma2_threshold_pct": 8.56,
+     "is_max": false,
+     "high": 3120.0,
+     "low": 2640.0,
+     "disclosures": [],
+     "indices": [
+      {
+       "name": "日経平均",
+       "ret_pct": -0.92,
+       "chg": -648.27
+      },
+      {
+       "name": "TOPIX",
+       "ret_pct": -0.7
+      }
+     ],
+     "shikiho_release": false,
+     "kind": [
+      "sigma2"
+     ]
+    },
+    {
+     "date": "2026-10-08",
+     "close": 3360.0,
+     "ret_pct": 17.56,
+     "volume": 407200.0,
+     "vol_ratio_20d": 0.13,
+     "sigma2": true,
+     "sigma2_threshold_pct": 8.81,
+     "is_max": false,
+     "high": 3360.0,
+     "low": 3360.0,
+     "disclosures": [],
+     "indices": [
+      {
+       "name": "日経平均",
+       "ret_pct": -1.42,
+       "chg": -993.6
+      },
+      {
+       "name": "TOPIX",
+       "ret_pct": -1.51
+      }
+     ],
+     "shikiho_release": false,
+     "kind": [
+      "sigma2"
+     ]
+    },
+    {
+     "date": "2026-10-09",
+     "close": 3700.0,
+     "ret_pct": 10.12,
+     "volume": 18013600.0,
+     "vol_ratio_20d": 5.57,
+     "sigma2": true,
+     "sigma2_threshold_pct": 9.8,
+     "is_max": false,
+     "high": 4000.0,
+     "low": 3050.0,
+     "disclosures": [],
+     "indices": [
+      {
+       "name": "日経平均",
+       "ret_pct": -0.02,
+       "chg": -11.19
+      },
+      {
+       "name": "TOPIX",
+       "ret_pct": 0.33
+      }
+     ],
+     "shikiho_release": false,
+     "kind": [
+      "sigma2"
+     ]
+    },
+    {
+     "date": "2026-10-13",
+     "close": 4180.0,
+     "ret_pct": 12.97,
+     "volume": 12024000.0,
+     "vol_ratio_20d": 2.91,
+     "sigma2": true,
+     "sigma2_threshold_pct": 10.07,
+     "is_max": false,
+     "high": 4400.0,
+     "low": 3955.0,
+     "disclosures": [],
+     "indices": [
+      {
+       "name": "日経平均",
+       "ret_pct": -1.82,
+       "chg": -1253.4
+      },
+      {
+       "name": "TOPIX",
+       "ret_pct": 0.14
+      }
+     ],
+     "shikiho_release": false,
+     "kind": [
+      "sigma2"
+     ]
+    },
+    {
+     "date": "2026-10-14",
+     "close": 3665.0,
+     "ret_pct": -12.32,
+     "volume": 10542600.0,
+     "vol_ratio_20d": 2.23,
+     "sigma2": true,
+     "sigma2_threshold_pct": 10.48,
+     "is_max": false,
+     "high": 4100.0,
+     "low": 3580.0,
+     "disclosures": [],
+     "indices": [
+      {
+       "name": "日経平均",
+       "ret_pct": -0.05,
+       "chg": -33.23
+      },
+      {
+       "name": "TOPIX",
+       "ret_pct": -0.34
+      }
+     ],
+     "shikiho_release": false,
+     "kind": [
+      "sigma2"
+     ]
+    },
+    {
+     "date": "2026-10-15",
+     "close": 3145.0,
+     "ret_pct": -14.19,
+     "volume": 3996000.0,
+     "vol_ratio_20d": 0.76,
+     "sigma2": true,
+     "sigma2_threshold_pct": 11.07,
+     "is_max": false,
+     "high": 3555.0,
+     "low": 3090.0,
+     "disclosures": [],
+     "indices": [
+      {
+       "name": "日経平均",
+       "ret_pct": -4.9,
+       "chg": -3318.34
+      },
+      {
+       "name": "TOPIX",
+       "ret_pct": -2.38
+      }
+     ],
+     "shikiho_release": false,
+     "kind": [
+      "sigma2"
+     ]
+    },
+    {
+     "date": "2026-10-16",
+     "close": 3810.0,
+     "ret_pct": 21.14,
+     "volume": 9816800.0,
+     "vol_ratio_20d": 1.8,
+     "sigma2": true,
+     "sigma2_threshold_pct": 11.76,
+     "is_max": false,
+     "high": 3820.0,
+     "low": 3270.0,
+     "disclosures": [],
+     "indices": [
+      {
+       "name": "日経平均",
+       "ret_pct": 1.39,
+       "chg": 898.34
+      },
+      {
+       "name": "TOPIX",
+       "ret_pct": 1.67
+      }
+     ],
+     "shikiho_release": false,
+     "kind": [
+      "sigma2"
+     ]
+    },
+    {
+     "date": "2026-10-19",
+     "close": 3340.0,
+     "ret_pct": -12.34,
+     "volume": 4751200.0,
+     "vol_ratio_20d": 0.8,
+     "sigma2": false,
+     "sigma2_threshold_pct": 12.83,
+     "is_max": false,
+     "high": 3865.0,
+     "low": 3315.0,
+     "disclosures": [
+      {
+       "title": "第三者割当による第８回新株予約権（行使価額修正条項付）の大量行使、行使完了及び月間行使状況に関するお知らせ",
+       "published": "2026-10-16T16:00",
+       "time_known": true,
+       "assigned_date": "2026-10-19",
+       "pdf_url": "https://www.release.tdnet.info/inbs/140120261016552228.pdf",
+       "earnings": false,
+       "intraday": false,
+       "minor_impact": false,
+       "minor_checked": true
+      }
+     ],
+     "indices": [
+      {
+       "name": "日経平均",
+       "ret_pct": -0.62,
+       "chg": -407.59
+      },
+      {
+       "name": "TOPIX",
+       "ret_pct": 0.04
+      }
+     ],
+     "shikiho_release": false,
+     "kind": [
+      "disclosure"
+     ]
+    },
+    {
+     "date": "2026-10-22",
+     "close": 3865.0,
+     "ret_pct": 22.12,
+     "volume": 5935800.0,
+     "vol_ratio_20d": 0.92,
+     "sigma2": true,
+     "sigma2_threshold_pct": 13.55,
+     "is_max": false,
+     "high": 3865.0,
+     "low": 3650.0,
+     "disclosures": [],
+     "indices": [
+      {
+       "name": "日経平均",
+       "ret_pct": -2.65,
+       "chg": -1713.4
+      },
+      {
+       "name": "TOPIX",
+       "ret_pct": -1.14
+      }
+     ],
+     "shikiho_release": false,
+     "kind": [
+      "sigma2"
+     ]
+    }
+   ],
+   "materials": [
+    {
+     "dt": "2026-10-27",
+     "time_known": false,
+     "assigned_date": "2026-10-27",
+     "kind": "primary",
+     "source": "ir",
+     "publisher": "サイバーセキュリティクラウド（会社IR）",
+     "title": "【緊急開催セミナー】重大脆弱性を狙うサイバー攻撃への備え ～パッチ適用までのリスクを低減する「仮想パッチ」とは～",
+     "excerpt": "2026年10月30日（金）に「【緊急開催セミナー】重大脆弱性を狙うサイバー攻撃への備え～パッチ適用までのリスクを低減する『仮想パッチ』とは～」と題して自社無料オンラインセミナーを開催いたします。 詳細・お申込みは下記をご参照ください。URL：https://lp.cscloud.co.jp/csc/seminar/2026/20261030/",
+     "url": "https://www.cscloud.co.jp/news/event/202610279502/",
+     "found_via": "ir",
+     "is_origin": true,
+     "topic": ""
+    },
+    {
+     "dt": "2026-10-26",
+     "time_known": false,
+     "assigned_date": "2026-10-26",
+     "kind": "primary",
+     "source": "ir",
+     "publisher": "サイバーセキュリティクラウド（会社IR）",
+     "title": "【JAPANSecuritySummit 実行委員会主催】JAPANSecuritySummit 2026に協賛します。",
+     "excerpt": "2026年10月28日（水）～11月2日（月）に開催される、JAPANSecuritySummit 実行委員会主催の「JAPANSecuritySummit 2026」に協賛いたします。 サイバーセキュリティクラウドは10月28日(水)にブース出展をいたします。 また、下記日程でセミナー講演をいたします。 11月2日(月) 14:00-14:20「全社AWSのランサムウェア対策、鍵を握る「平時の備",
+     "url": "https://www.cscloud.co.jp/news/event/202610269491/",
+     "found_via": "ir",
+     "is_origin": false,
+     "topic": ""
+    },
+    {
+     "dt": "2026-10-25",
+     "time_known": false,
+     "assigned_date": "2026-10-26",
+     "kind": "primary",
+     "source": "ir",
+     "publisher": "サイバーセキュリティクラウド（会社IR）",
+     "title": "フジテレビ「Mr.サンデー」に主席主任 西川彰、テクニカルサポート部 萩原美海が出演しました。",
+     "excerpt": "10月25日(日)の放送回にて、西川彰、萩原美海が出演しました。",
+     "url": "https://www.cscloud.co.jp/news/media/202610259500/",
+     "found_via": "ir",
+     "is_origin": false,
+     "topic": ""
+    },
+    {
+     "dt": "2026-10-23",
+     "time_known": false,
+     "assigned_date": "2026-10-23",
+     "kind": "primary",
+     "source": "ir",
+     "publisher": "サイバーセキュリティクラウド（会社IR）",
+     "title": "テレビ東京「WBS」にセキュリティエンジニア牧瀬拓巳が出演しました。",
+     "excerpt": "10月23日(金)の放送回にて、セキュリティエンジニア牧瀬拓巳が出演しました。 テレ東BIZより、ご覧ください。「FX口座で不正操作 600万円失った…不安の声」https://txbiz.tv-tokyo.co.jp/wbs/newsl/post_351160",
+     "url": "https://www.cscloud.co.jp/news/media/202610239498/",
+     "found_via": "ir",
+     "is_origin": false,
+     "topic": ""
+    },
+    {
+     "dt": "2026-10-22",
+     "time_known": false,
+     "assigned_date": "2026-10-22",
+     "kind": "primary",
+     "source": "ir",
+     "publisher": "サイバーセキュリティクラウド（会社IR）",
+     "title": "【注意喚起】PHPの重大な脆弱性「php2shell（CVE-2026-109618／CVE-2026-109619）」について",
+     "excerpt": "",
+     "url": "https://www.cscloud.co.jp/news/info/202610229451/",
+     "found_via": "ir",
+     "is_origin": false,
+     "topic": ""
+    },
+    {
+     "dt": "2026-10-21",
+     "time_known": false,
+     "assigned_date": "2026-10-21",
+     "kind": "primary",
+     "source": "ir",
+     "publisher": "サイバーセキュリティクラウド（会社IR）",
+     "title": "AIの安全な活用へ、利用ルールの整備と技術的検証をどう進めるか",
+     "excerpt": "",
+     "url": "https://www.cscloud.co.jp/news/report/202610219442/",
+     "found_via": "ir",
+     "is_origin": false,
+     "topic": ""
+    },
+    {
+     "dt": "2026-10-21",
+     "time_known": false,
+     "assigned_date": "2026-10-21",
+     "kind": "primary",
+     "source": "ir",
+     "publisher": "サイバーセキュリティクラウド（会社IR）",
+     "title": "クラウド型WAF『攻撃遮断くん』が「ITreview Grid Award 2026 Fall」におけるWAF部門にて18期連続でLeaderを受賞",
+     "excerpt": "",
+     "url": "https://www.cscloud.co.jp/news/press/202610219437/",
+     "found_via": "ir",
+     "is_origin": false,
+     "topic": ""
+    }
+   ],
+   "price_reports": [
+    {
+     "dt": "2026-10-22T09:18",
+     "time_known": true,
+     "assigned_date": "2026-10-22",
+     "kind": "price_report",
+     "source": "yahoo",
+     "publisher": "株探ニュース",
+     "title": "話題株先取り【特別気配】速報 ＜買いトップ サイバーセキ、売りトップ デジアーツ＞",
+     "excerpt": "",
+     "url": "https://finance.yahoo.co.jp/news/detail/aea47b551abed33f0b163045c8d7f847f4373110",
+     "found_via": "yahoo",
+     "is_origin": false,
+     "topic": ""
+    },
+    {
+     "dt": "2026-10-22T09:03",
+     "time_known": true,
+     "assigned_date": "2026-10-22",
+     "kind": "price_report",
+     "source": "yahoo",
+     "publisher": "トレーダーズ・ウェブ",
+     "title": "サイバートラスト－買い気配 プログラム言語「PHP」で深刻な脆弱性を発見 セキュリティ関連に買い",
+     "excerpt": "",
+     "url": "https://finance.yahoo.co.jp/news/detail/05535997525bd7b79667302e65f08d3a3941756d",
+     "found_via": "yahoo",
+     "is_origin": false,
+     "topic": ""
+    },
+    {
+     "dt": "2026-10-19",
+     "time_known": false,
+     "assigned_date": "2026-10-19",
+     "kind": "price_report",
+     "source": "yahoo",
+     "publisher": "トレーダーズ・ウェブ",
+     "title": "ＴＷＯＳＴＯＮＥ－大幅続伸 グループ会社がサイバーセキュリティクラウドと業務提携",
+     "excerpt": "",
+     "url": "https://finance.yahoo.co.jp/news/detail/fdc9dbf6ddad198024aa55a51d5e965836702fc5",
+     "found_via": "yahoo",
+     "is_origin": false,
+     "topic": "提携"
+    }
+   ],
+   "origin_date": "2026-10-27",
+   "streak_days": 1,
+   "streak_pos": 1,
+   "window": [
+    "2026-10-19T15:30",
+    "2026-10-27T15:29"
+   ]
+  }
+ }
+}

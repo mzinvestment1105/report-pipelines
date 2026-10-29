@@ -295,6 +295,8 @@ jobs:
               sleep 1200
             fi
           done
+          # 2026-10-28: 一次材料 5 層（--materials）は既定 ON。--no-pdf は raw の TDNet 一覧の PDF 本文だけを止め、
+          # 一次材料の TDnet 本文冒頭・「影響軽微」判定は止めない（lib/mover_materials.py）。
           python make_mover_report.py --date "$D" --no-pdf --date-gate
 
       - name: Append 立花証券 e支店 API context to movers raw
@@ -358,9 +360,10 @@ jobs:
         env:
           TARGET_DATE: ${{ steps.date.outputs.value }}
         run: |
+          # 2026-10-28: 会社 IR サイトの台帳（bi/data/ir_sites.csv・lib/mover_materials.py が更新）も同じ commit に載せる。
           bash ../report-pipelines/bi/pipelines/ops/ci_commit_push.sh \
             -m "data: theme_radar accumulation ${TARGET_DATE}" \
-            -f bi/outputs/analysis/theme_radar
+            -f bi/outputs/analysis/theme_radar bi/data/ir_sites.csv
 
       - name: Discord 通知（❌ raw 生成失敗）
         if: failure() || cancelled()
@@ -560,6 +563,17 @@ jobs:
           OUT_FILES: private-repo/market/daily/movers/${{ needs.setup-raw.outputs.target_date }}_${{ matrix.market }}.md
         run: bash report-pipelines/.github/scripts/check_attempt.sh
 
+      # 2026-10-28: 書き手の実行ログ（claude-execution-output.json）を試行ごとに退避する。execution_file は
+      # 全試行で同じパスに上書きされるため、各試行の直後にコピーし、最後にまとめて artifact へ保存する。
+      - name: 実行ログを退避（1 回目）
+        if: always() && steps.gen1.outcome != 'skipped'
+        continue-on-error: true
+        env:
+          EXECUTION_FILE: ${{ steps.gen1.outputs.execution_file }}
+        run: |
+          mkdir -p /tmp/execlog
+          if [ -n "$EXECUTION_FILE" ] && [ -s "$EXECUTION_FILE" ]; then cp "$EXECUTION_FILE" /tmp/execlog/gen1.json; echo "退避: gen1.json"; else echo "1 回目の実行ログなし"; fi
+
       # PM 2026-09-05 承認: 枠切れ（Spending cap reached）は待機しても同一 run 内では回復しない。
       # 実測（2026-09-04 の夜間PTS動意 run）では枠切れ後の再試行が 1.5 秒で即時拒否されるだけで、
       # 待機が枠のリセット（数十分先）に届かず、空振りが当日の自動リトライ上限を食い潰していた。
@@ -615,6 +629,15 @@ jobs:
           OUT_FILES: private-repo/market/daily/movers/${{ needs.setup-raw.outputs.target_date }}_${{ matrix.market }}.md
         run: bash report-pipelines/.github/scripts/check_attempt.sh
 
+      - name: 実行ログを退避（2 回目）
+        if: always() && steps.gen2.outcome != 'skipped' && steps.gen2.outcome != ''
+        continue-on-error: true
+        env:
+          EXECUTION_FILE: ${{ steps.gen2.outputs.execution_file }}
+        run: |
+          mkdir -p /tmp/execlog
+          if [ -n "$EXECUTION_FILE" ] && [ -s "$EXECUTION_FILE" ]; then cp "$EXECUTION_FILE" /tmp/execlog/gen2.json; echo "退避: gen2.json"; else echo "2 回目の実行ログなし"; fi
+
       - name: Summarize generation attempts (成果物と出力上限到達の集計)
         # 以降の失敗通知が「原因」行（例: テーマ欄: 出力上限到達 2 回・成果物なし）に使う。
         id: gensum
@@ -664,6 +687,52 @@ jobs:
           PYTHONIOENCODING: utf-8
         run: bash report-pipelines/.github/scripts/reason_gate.sh
 
+      # 2026-10-28: 書き直し指示へ、一次材料の規律（(e) 循環説明・(f) 数値埋め・(g) 未特定の不合格理由）と
+      # 不合格銘柄ごとの使える primary 材料の一覧を追記する（reason_gate.sh が作る指示の「材料が無い日は
+      # 材料は確認できず と書く」の項より優先させる）。facts に materials が無い日は何も足さない。
+      - name: 修正試行の指示へ一次材料の規律と材料一覧を追記
+        if: steps.rgate.outputs.need_fix == 'true'
+        continue-on-error: true
+        env:
+          FIX_PROMPT: ${{ steps.rgate.outputs.fix_prompt }}
+          FACTS: /tmp/movers-raw/${{ needs.setup-raw.outputs.target_date }}_movers_facts.json
+          CHECK1: ${{ github.workspace }}/reason_gate_work/${{ matrix.market }}/check1.json
+          PYTHONIOENCODING: utf-8
+        working-directory: ./private-repo/bi/pipelines
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          sys.path.insert(0, ".")
+          from lib import reason_check as rc
+          facts = json.load(open(os.environ["FACTS"], encoding="utf-8"))
+          res = json.load(open(os.environ["CHECK1"], encoding="utf-8"))
+          stocks = facts.get("stocks", {})
+          codes = res.get("failed_codes", [])
+          if not any("materials" in (stocks.get(c) or {}) for c in codes):
+              print("facts に materials が無いため追記しません")
+              sys.exit(0)
+          by = {}
+          for f in res.get("failures", []):
+              if f.get("severity") == "fail":
+                  by.setdefault(f.get("code"), set()).add(f.get("check"))
+          lines = ["", "## 2026-10-28 改定（上の「書き直しの規律」の 4 より優先する）",
+                   "- 「材料は確認できず」「未特定」「材料不明」「不明」は書かない（検査 (g) で不合格）。",
+                   "- 理由は `facts_failed.json` の各銘柄の `materials` の `[strong]` の材料（一次情報。`is_origin`=true が今回の動きの起点）から書く（`[weak]`・`[参考]` は理由に使えない）。"
+                   "`price_reports`（値動きを報じた見出し）は理由に使わない（値動きの語だけで一次材料に触れない文は検査 (e) で不合格）。",
+                   "- 売買代金・出来高・時価総額・倍率（N 倍）を書かない（検査 (f)）。一次材料の中身の金額（契約額・受注額・修正幅）は書いてよい。",
+                   "- 書式: `{M/D}（{曜}）{＋/▼}{X.X}%：{M/D} {時刻}、{発信主体}が『{表題}』を公表（{要点}）。` 起点日が基準日より前なら"
+                   "「これを起点に {基準日 M/D} は N 日連続の上昇（下落）の M 日目。」を続ける。",
+                   "- strong の材料が 0 件の銘柄は理由文を書かない（固定文は検査側が入れる）。",
+                   "", "### 不合格銘柄ごとの不合格理由と使える一次材料"]
+          for c in codes:
+              st = stocks.get(c) or {}
+              chk = "".join(f"({x})" for x in sorted(by.get(c, [])))
+              lines.append(f"- {c} {st.get('name', '')}・不合格 {chk}・起点日 {st.get('origin_date') or '不定'}: {rc._material_list(st, 6)}")
+          with open(os.environ["FIX_PROMPT"], "a", encoding="utf-8") as fp:
+              fp.write("\n".join(lines) + "\n")
+          print("\n".join(lines))
+          PY
+
       - name: なぜ動いた の修正試行（不合格銘柄のみ・1 回）
         id: genfix
         if: steps.rgate.outputs.need_fix == 'true'
@@ -694,6 +763,15 @@ jobs:
           MISSING_NOUN: '誌面なし'
         run: bash report-pipelines/.github/scripts/check_attempt.sh
 
+      - name: 実行ログを退避（修正試行）
+        if: always() && steps.rgate.outputs.need_fix == 'true'
+        continue-on-error: true
+        env:
+          EXECUTION_FILE: ${{ steps.genfix.outputs.execution_file }}
+        run: |
+          mkdir -p /tmp/execlog
+          if [ -n "$EXECUTION_FILE" ] && [ -s "$EXECUTION_FILE" ]; then cp "$EXECUTION_FILE" /tmp/execlog/genfix.json; echo "退避: genfix.json"; else echo "修正試行の実行ログなし"; fi
+
       - name: 理由ゲート（修正試行後の再検査・壊れていれば修正前へ戻す）
         id: rgate2
         if: steps.rgate.outputs.need_fix == 'true'
@@ -705,6 +783,16 @@ jobs:
           FACTS: /tmp/movers-raw/${{ needs.setup-raw.outputs.target_date }}_movers_facts.json
           PYTHONIOENCODING: utf-8
         run: bash report-pipelines/.github/scripts/reason_gate.sh
+
+      - name: 書き手の実行ログを artifact へ保存（何を検索・参照したかを後から追う・14 日保持）
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: mover-daily-execlog-${{ matrix.market }}-${{ needs.setup-raw.outputs.target_date }}
+          path: /tmp/execlog/*.json
+          retention-days: 14
+          if-no-files-found: ignore
 
       - name: Upload market section as artifact
         uses: actions/upload-artifact@v4

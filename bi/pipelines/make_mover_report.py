@@ -55,6 +55,8 @@ from lib.shikiho_client import fetch_shikiho_batch
 # テーマ欄の材料の並び（当日優先）と当日の個別解説（2026-10-05 PM 承認・テーマ欄改修 A）
 from lib import theme_materials as _tm
 from lib import cross_news as _xn  # 当日の横断ニュース（2026-10-06 PM 承認・テーマ欄改修 B）
+# 「なぜ動いた」の一次情報 5 層（TDnet 本文・会社 IR・株探・Yahoo 本文・起点日の遡り）（2026-10-28 PM 承認）
+from lib import mover_materials as _mm
 from theme_radar import (
     MAX_ROWS_TODAY_MAX,
     append_early_candidates,
@@ -236,6 +238,10 @@ ASOF: datetime | None = None
 # 検証用（2026-10-04）: False のとき bi/outputs 配下の蓄積 parquet・token_usage_log.csv・
 # OHLC キャッシュへの書き込みを全て止める（--no-state-writes）。既定 True＝従来どおり。
 STATE_WRITES: bool = True
+
+# 銘柄ごとの一次材料（lib/mover_materials.py の結果・2026-10-28）。build_report の銘柄ブロックが「材料」欄に使う。
+MATERIALS_DATA: dict[str, dict] = {}
+IR_SITES_LEDGER = BASE_DIR / ".." / "data" / "ir_sites.csv"
 
 JST = timezone(timedelta(hours=9))
 
@@ -1961,6 +1967,15 @@ def _append_detail(
         lines.append(f"- 週間ランキング: {wi['label']}（週間騰落率 {wi['ret']:+.1f}%）")
     lines.append("")
 
+    # 一次材料（2026-10-28 PM 承認・lib/mover_materials.py）。「日時｜発信主体｜表題｜本文冒頭」の 1 行 1 項目。
+    # 値動きを報じた見出しは「参考（理由に使用不可）」へ分ける。市場データの数値（売買代金・出来高）は入れない。
+    if code4 in MATERIALS_DATA:
+        try:
+            lines += _mm.render_materials(MATERIALS_DATA[code4])
+        except Exception as _e:
+            print(f"  [WARN] 材料欄 {code4}: {_e}")
+            lines += [f"**材料（一次情報）:** 作成できず（{type(_e).__name__}）", ""]
+
     # 日別騰落表 2 つ＋四季報行＋開示一覧（3 か月）＋報道（2026-10-04 PM 承認・lib/move_days.py）。
     # 見出しは `**日別騰落` / `**直近3か月の大きく動いた日` で始め、`**需給` の小節より前に置く
     # （build_market_raw の需給除外に巻き込まれない）。
@@ -2777,6 +2792,12 @@ def write_facts_json(path: Path, target: date, weekly: bool, md_all: dict,
         f = dict(f)
         if c in roster_map:
             f["weekly_roster"] = roster_map[c]
+        # 一次材料（2026-10-28・lib/reason_check.py の (e)(g) 検査と機械差し替えが使う）
+        mat = MATERIALS_DATA.get(c)
+        if mat is not None:
+            for k in ("materials", "price_reports", "origin_date", "streak_days", "streak_pos", "window"):
+                f[k] = mat.get(k)
+            f["materials_fetch_log"] = mat.get("fetch_log")
         stocks[c] = f
     doc = {
         "date": target.isoformat(), "kind": "weekly" if weekly else "daily",
@@ -2792,6 +2813,10 @@ def write_facts_json(path: Path, target: date, weekly: bool, md_all: dict,
             "price": "price_history の調整後終値（欠落営業日は J-Quants で補完）",
         },
         "shikiho_meta": md_all.get("shikiho_meta"),
+        "materials_meta": {"enabled": bool(MATERIALS_DATA), "host_stats": _mm.HOST_STATS,
+                           "kinds": {"primary": "会社開示・IR リリース・決算・業績修正・受注・提携・大量保有・報道機関の材料記事",
+                                     "price_report": "値動きを報じた見出し（理由として使用不可）"},
+                           "is_origin": "今回の上昇／下落の起点日（連続して大きく動いた最初の日）に割り当たる primary"},
         "fetch_errors": {k: v for k, v in FETCH_ERRORS.items() if k in ("move_days", "shikiho", "related")},
         "stocks": stocks,
     }
@@ -3488,7 +3513,13 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(description="動意銘柄レポート 生データ生成")
     parser.add_argument("--date",   default=None, help="対象日 YYYY-MM-DD（省略時は本日）")
-    parser.add_argument("--no-pdf", action="store_true", help="TDNet PDF本文取得スキップ")
+    parser.add_argument("--no-pdf", action="store_true",
+                        help="raw の TDNet 一覧に付ける PDF 本文（直近 3 件・2,000 字）の取得だけを止める。"
+                             "「影響軽微」判定と一次材料（--materials）の TDnet 本文冒頭は止めない")
+    parser.add_argument("--materials", dest="materials", action="store_true", default=True,
+                        help="一次材料 5 層（TDnet 本文・会社 IR・株探・Yahoo 本文・起点日の遡り）を銘柄ブロックと facts へ入れる（既定 ON）")
+    parser.add_argument("--no-materials", dest="materials", action="store_false",
+                        help="一次材料の取得を止める（従来の raw）")
     parser.add_argument("--date-gate", action="store_true",
                         help="対象日ゲート（注記モード・GHA 用）: 対象日 EOD 未着でも生成を続行し、"
                              "品質注記を raw 冒頭と {対象日}_quality_flags.txt に出力する（中止しない）")
@@ -3511,7 +3542,7 @@ def main() -> None:
                         help="日別騰落表・四季報行・facts JSON を作らない（従来の raw のみ）")
     args = parser.parse_args()
 
-    global ASOF, STATE_WRITES, WEEKLY_PARQUET_PATH
+    global ASOF, STATE_WRITES, WEEKLY_PARQUET_PATH, MATERIALS_DATA
     if args.asof:
         ASOF = datetime.strptime(args.asof, "%Y-%m-%dT%H:%M")
         print(f"[asof] {ASOF:%Y-%m-%d %H:%M} より後に公表されたニュース・開示・掲示板投稿を除外します")
@@ -3667,6 +3698,25 @@ def main() -> None:
     print("TDNet取得中...")
     tdnet_data = fetch_tdnet_batch(fetch_codes, no_pdf=args.no_pdf)
 
+    # --- 一次材料（2026-10-28）: 層1〜3（TDnet 本文・株探・会社 IR）を Yahoo 取得と並行して裏で開始 ---
+    materials_col = None
+    mat_codes = list(dict.fromkeys(detail_codes + volume_codes + weekly_codes))
+    if args.materials:
+        try:
+            _names = {normalize_code_4(r["Code"]): (r["CompanyName"] if isinstance(r.get("CompanyName"), str)
+                                                    else normalize_code_4(r["Code"]))
+                      for _, r in full_df.iterrows()}
+            for r in weekly_roster_list:
+                _names.setdefault(r["code"], r.get("name") or r["code"])
+            materials_col = _mm.MaterialsCollector(today_dt, names=_names, ledger_path=IR_SITES_LEDGER,
+                                                   state_writes=STATE_WRITES, asof=ASOF)
+            materials_col.start_prefetch(
+                mat_codes, {c: (tdnet_data.get(c) or {}).get("all_entries", []) for c in mat_codes})
+            print(f"一次材料: {len(mat_codes)} 銘柄の先行取得（TDnet 本文・株探・会社 IR）を開始")
+        except Exception as e:
+            print(f"  [WARN] 一次材料の開始: {type(e).__name__} {e}")
+            materials_col = None
+
     # --- Yahoo取得 ---
     print("Yahoo Finance 取得中...")
     yahoo_data = fetch_yahoo_batch(fetch_codes)
@@ -3722,6 +3772,35 @@ def main() -> None:
             # 配信絶対の原則（_cr §36）: 表が作れなくても raw 本体は止めない
             print(f"  [WARN] 日別騰落表: {type(e).__name__} {e}")
             FETCH_ERRORS["move_days"].append(f"日別騰落表の作成全体が失敗: {type(e).__name__} {e}")
+
+    # --- 一次材料の仕上げ（起点日の判定・遡り・Yahoo 本文・分類）（2026-10-28） ---
+    if materials_col is not None:
+        try:
+            _t_mat = time.time()
+            _md_st = (move_days_all or {}).get("stocks") or {}
+            _rows = {c: list((_md_st.get(c) or {}).get("week_days") or [])
+                     + list((_md_st.get(c) or {}).get("month3_days") or []) for c in mat_codes}
+            _ynews = {}
+            for c in mat_codes:
+                n3 = (_md_st.get(c) or {}).get("news_3m")
+                if n3:
+                    _ynews[c] = _mm.yahoo_news_from_facts(n3)
+                else:
+                    _ynews[c] = [{"title": n.get("title"), "media": n.get("media"), "link": n.get("link"),
+                                  "dt": _news_when(n)[1], "date": _news_when(n)[2]}
+                                 for n in (yahoo_data.get(c) or {}).get("news", [])]
+            MATERIALS_DATA = materials_col.finalize(
+                mat_codes, _rows, _ynews, {c: (tdnet_data.get(c) or {}).get("all_entries", []) for c in mat_codes})
+            _np = sum(1 for v in MATERIALS_DATA.values() if v.get("materials"))
+            _ns = sum(1 for v in MATERIALS_DATA.values()
+                      if any(m.get("strength") == "strong" for m in v.get("materials") or []))
+            print(f"一次材料: {len(MATERIALS_DATA)} 銘柄（primary あり {_np}・strong あり {_ns}）・先行取得 "
+                  f"{materials_col.timing.get('prefetch_sec')} 秒・本体完了後の待ち {materials_col.timing.get('wait_after_main_sec')} 秒"
+                  f"・仕上げ {materials_col.timing.get('finalize_sec')} 秒（本体完了後の追加 {time.time() - _t_mat:.0f} 秒）")
+            print(f"  取得統計: {_mm.HOST_STATS}")
+        except Exception as e:
+            print(f"  [WARN] 一次材料の仕上げ: {type(e).__name__} {e}")
+            MATERIALS_DATA = {}
 
     # --- マクロレポート ---
     macro_snippet = load_latest_macro_report()

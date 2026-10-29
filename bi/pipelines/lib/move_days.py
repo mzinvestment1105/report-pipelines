@@ -248,6 +248,20 @@ def assign_day(dt: datetime, cal: list[date], time_known: bool = True) -> date |
 
 _BARS_CACHE: dict[str, pd.DataFrame | None] = {}
 _PDF_CACHE: dict[str, bool | None] = {}
+# 開示 PDF の中身（2026-10-28）。lib/mover_materials.py の層1（本文冒頭）と「影響軽微」判定で共有し、
+# 同じ PDF を 2 度ダウンロードしない。
+_PDF_BYTES_CACHE: dict[str, bytes] = {}
+# 記事ページを取った時に呼ぶフック（2026-10-28・lib/mover_materials.py が本文冒頭を控えるために設定する）
+ARTICLE_HTML_HOOK = None
+
+
+def pdf_cache_get(url: str) -> bytes | None:
+    return _PDF_BYTES_CACHE.get(url)
+
+
+def pdf_cache_put(url: str, data: bytes) -> None:
+    if url and data:
+        _PDF_BYTES_CACHE[url] = data
 
 
 def fetch_5m_bars(code4: str) -> pd.DataFrame | None:
@@ -280,19 +294,27 @@ def pdf_has_minor(pdf_url: str) -> bool | None:
     if pdf_url in _PDF_CACHE:
         return _PDF_CACHE[pdf_url]
     res = None
+    fetched = False
     try:
         import requests
         from io import BytesIO
         from pdfminer.high_level import extract_text
-        r = requests.get(pdf_url, headers=_UA, timeout=25)
-        r.raise_for_status()
-        text = extract_text(BytesIO(r.content), maxpages=30)
+        content = pdf_cache_get(pdf_url)
+        if content is None:
+            r = requests.get(pdf_url, headers=_UA, timeout=25)
+            r.raise_for_status()
+            content = r.content
+            fetched = True
+            pdf_cache_put(pdf_url, content)
+        text = extract_text(BytesIO(content), maxpages=30)
         flat = re.sub(r"\s+", "", unicodedata.normalize("NFKC", text or ""))
         res = bool(_MINOR_RE.search(flat)) if flat else None
     except Exception as e:
         print(f"  [WARN] 開示PDF取得 {pdf_url[-30:]}: {type(e).__name__}")
         res = None
-    time.sleep(REQUEST_SLEEP)
+        fetched = True
+    if fetched:
+        time.sleep(REQUEST_SLEEP)
     _PDF_CACHE[pdf_url] = res
     return res
 
@@ -431,6 +453,11 @@ def fetch_article_time(link: str, session=None) -> datetime | None:
         time.sleep(REQUEST_SLEEP)
         if r.status_code != 200:
             return None
+        if ARTICLE_HTML_HOOK is not None:
+            try:
+                ARTICLE_HTML_HOOK(link, r.text)
+            except Exception:
+                pass
         m = _TIME_TAG.search(r.text)
         return parse_dt(m.group(1)) if m else None
     except Exception:
@@ -623,7 +650,7 @@ def build_move_days(
         else:
             ad = assign_day(datetime.combine(ld, datetime.min.time()), cal, False)
             pub = ld.isoformat()
-        news.append({"title": n["title"], "source": n.get("media", ""), "published": pub,
+        news.append({"title": n["title"], "source": n.get("media", ""), "link": n.get("link", ""), "published": pub,
                      "time_known": dt is not None,
                      "assigned_date": ad.isoformat() if ad else None,
                      "own": any(k in n["title"] for k in keys),
